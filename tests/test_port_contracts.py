@@ -180,6 +180,30 @@ class SessionContractMixin:
         assert by_req is not None
         self.assertEqual(by_req.session_id, "sess_1")
 
+    def test_find_by_correlation_key_and_session_rotation(self) -> None:
+        store = self.make_sessions()
+        key = "github:kun-g/hibernaut#42"
+
+        store.save(SessionRef(session_id="sess_old", inbox_id="proj:hibernaut", correlation_key=key))
+        found = store.find_by_correlation_key("proj:hibernaut", key)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.session_id, "sess_old")
+        self.assertIsNone(store.find_by_correlation_key("proj:other", key))
+
+        # Rotating to a fresh session_id rebinds the correlation_key cleanly.
+        store.save(SessionRef(session_id="sess_new", inbox_id="proj:hibernaut", correlation_key=key))
+        rotated = store.find_by_correlation_key("proj:hibernaut", key)
+        self.assertIsNotNone(rotated)
+        assert rotated is not None
+        self.assertEqual(rotated.session_id, "sess_new")
+
+        # Old session remains accessible by its own session_id with correlation_key unbound.
+        old_loaded = store.get("sess_old")
+        self.assertIsNotNone(old_loaded)
+        assert old_loaded is not None
+        self.assertIsNone(old_loaded.correlation_key)
+
 
 class TestInMemoryContracts(
     InboxContractMixin,

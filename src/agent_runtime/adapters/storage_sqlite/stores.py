@@ -44,8 +44,8 @@ class SQLiteInboxAdapter:
                 """
                 INSERT INTO event_inbox (
                     event_id, inbox_id, source, external_id,
-                    occurred_at, payload_json, session_id, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    occurred_at, payload_json, session_id, correlation_key, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     stored.event_id,
@@ -55,6 +55,7 @@ class SQLiteInboxAdapter:
                     stored.occurred_at,
                     json.dumps(stored.payload, ensure_ascii=False),
                     stored.session_id,
+                    stored.correlation_key,
                     stored.status,
                 ),
             )
@@ -64,7 +65,7 @@ class SQLiteInboxAdapter:
         rows = self._db.conn.execute(
             """
             SELECT event_id, inbox_id, source, external_id,
-                   occurred_at, payload_json, session_id, status
+                   occurred_at, payload_json, session_id, correlation_key, status
             FROM event_inbox
             WHERE inbox_id = ? AND status = 'pending'
             ORDER BY seq ASC
@@ -80,6 +81,7 @@ class SQLiteInboxAdapter:
                 occurred_at=str(row["occurred_at"]),
                 payload=json.loads(str(row["payload_json"])),
                 session_id=row["session_id"],
+                correlation_key=row["correlation_key"],
                 status=cast(EventStatus, str(row["status"])),
             )
             for row in rows
@@ -317,7 +319,7 @@ class SQLiteSessionStoreAdapter:
     def get(self, session_id: str) -> SessionRef | None:
         row = self._db.conn.execute(
             """
-            SELECT session_id, inbox_id, checkpoint, pending_request_id, updated_at
+            SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
             FROM sessions
             WHERE session_id = ?
             """,
@@ -328,6 +330,7 @@ class SQLiteSessionStoreAdapter:
         return SessionRef(
             session_id=str(row["session_id"]),
             inbox_id=str(row["inbox_id"]),
+            correlation_key=row["correlation_key"],
             checkpoint=row["checkpoint"],
             pending_request_id=row["pending_request_id"],
             updated_at=str(row["updated_at"]),
@@ -336,7 +339,7 @@ class SQLiteSessionStoreAdapter:
     def find_by_request_id(self, request_id: str) -> SessionRef | None:
         row = self._db.conn.execute(
             """
-            SELECT session_id, inbox_id, checkpoint, pending_request_id, updated_at
+            SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
             FROM sessions
             WHERE pending_request_id = ?
             LIMIT 1
@@ -348,6 +351,29 @@ class SQLiteSessionStoreAdapter:
         return SessionRef(
             session_id=str(row["session_id"]),
             inbox_id=str(row["inbox_id"]),
+            correlation_key=row["correlation_key"],
+            checkpoint=row["checkpoint"],
+            pending_request_id=row["pending_request_id"],
+            updated_at=str(row["updated_at"]),
+        )
+
+    def find_by_correlation_key(self, inbox_id: str, correlation_key: str) -> SessionRef | None:
+        row = self._db.conn.execute(
+            """
+            SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
+            FROM sessions
+            WHERE inbox_id = ? AND correlation_key = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (inbox_id, correlation_key),
+        ).fetchone()
+        if row is None:
+            return None
+        return SessionRef(
+            session_id=str(row["session_id"]),
+            inbox_id=str(row["inbox_id"]),
+            correlation_key=row["correlation_key"],
             checkpoint=row["checkpoint"],
             pending_request_id=row["pending_request_id"],
             updated_at=str(row["updated_at"]),
@@ -355,12 +381,25 @@ class SQLiteSessionStoreAdapter:
 
     def save(self, session: SessionRef) -> None:
         with self._db.conn:
+            if session.correlation_key is not None:
+                # Rebind correlation_key exclusively to the latest active session_id (rotation).
+                self._db.conn.execute(
+                    """
+                    UPDATE sessions
+                    SET correlation_key = NULL
+                    WHERE inbox_id = ? AND correlation_key = ? AND session_id != ?
+                    """,
+                    (session.inbox_id, session.correlation_key, session.session_id),
+                )
             self._db.conn.execute(
                 """
-                INSERT INTO sessions (session_id, inbox_id, checkpoint, pending_request_id, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO sessions (
+                    session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     inbox_id = excluded.inbox_id,
+                    correlation_key = excluded.correlation_key,
                     checkpoint = excluded.checkpoint,
                     pending_request_id = excluded.pending_request_id,
                     updated_at = excluded.updated_at
@@ -368,6 +407,7 @@ class SQLiteSessionStoreAdapter:
                 (
                     session.session_id,
                     session.inbox_id,
+                    session.correlation_key,
                     session.checkpoint,
                     session.pending_request_id,
                     session.updated_at,

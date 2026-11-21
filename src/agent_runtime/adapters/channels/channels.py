@@ -70,6 +70,7 @@ def create_webhook_server(
                 external_id=str(body["external_id"]),
                 payload=dict(body.get("payload", {})),
                 session_id=body.get("session_id"),
+                correlation_key=body.get("correlation_key"),
             )
             ack = json.dumps(
                 {

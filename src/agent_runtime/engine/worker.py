@@ -123,16 +123,14 @@ class AgentWorker:
 
                     consumed_ids: set[str] = {evt.event_id for evt in batch}
                     folded_events: list[Event] = []
-                    target_session_key = (
-                        session_ref.session_id if session_ref is not None else batch[0].session_id
-                    )
+                    target_batch_key = self._batch_key(batch[0], session_ref)
                     interrupted_flag = asyncio.Event()
 
                     def _poll_folded(
                         _inbox_id: str = inbox_id,
                         _consumed: set[str] = consumed_ids,
                         _folded: list[Event] = folded_events,
-                        _target_key: str | None = target_session_key,
+                        _target_key: tuple[str, str] | None = target_batch_key,
                     ) -> list[Event]:
                         if self._new_event_policy != "fold":
                             return []
@@ -141,11 +139,7 @@ class AgentWorker:
                             if candidate.event_id in _consumed:
                                 continue
                             cand_session = self._resolve_session(candidate)
-                            cand_key = (
-                                cand_session.session_id
-                                if cand_session is not None
-                                else candidate.session_id
-                            )
+                            cand_key = self._batch_key(candidate, cand_session)
                             if cand_key == _target_key:
                                 _consumed.add(candidate.event_id)
                                 _folded.append(candidate)
@@ -182,7 +176,16 @@ class AgentWorker:
                         restarted = True
                         break
 
-                    self._apply_outcome(inbox_id, session_ref, outcome)
+                    batch_correlation_key = self._extract_correlation_key(
+                        batch + folded_events,
+                        session_ref,
+                    )
+                    final_session_id = self._apply_outcome(
+                        inbox_id,
+                        session_ref,
+                        outcome,
+                        batch_correlation_key,
+                    )
                     all_done_ids = [evt.event_id for evt in batch] + [
                         evt.event_id for evt in folded_events
                     ]
@@ -190,7 +193,7 @@ class AgentWorker:
                     reports.append(
                         RunReport(
                             inbox_id=inbox_id,
-                            session_id=session_ref.session_id if session_ref else None,
+                            session_id=final_session_id,
                             event_ids=tuple(all_done_ids),
                             outcome=outcome,
                         )
@@ -272,6 +275,29 @@ class AgentWorker:
             except asyncio.TimeoutError:
                 continue
 
+    def _batch_key(
+        self,
+        event: Event,
+        resolved_session: SessionRef | None,
+    ) -> tuple[str, str] | None:
+        if resolved_session is not None:
+            return ("session", resolved_session.session_id)
+        if event.session_id is not None:
+            return ("session", event.session_id)
+        if event.correlation_key is not None:
+            return ("corr", event.correlation_key)
+        return None
+
+    def _extract_correlation_key(
+        self,
+        events: list[Event],
+        session_ref: SessionRef | None,
+    ) -> str | None:
+        for evt in events:
+            if evt.correlation_key:
+                return evt.correlation_key
+        return session_ref.correlation_key if session_ref is not None else None
+
     def _group_into_batches(
         self,
         events: list[Event],
@@ -279,16 +305,15 @@ class AgentWorker:
         batches: list[tuple[SessionRef | None, list[Event]]] = []
         for event in events:
             resolved_session = self._resolve_session(event)
-            resolved_key = resolved_session.session_id if resolved_session else event.session_id
+            resolved_key = self._batch_key(event, resolved_session)
 
             if batches:
                 prev_session, prev_events = batches[-1]
-                prev_key = prev_session.session_id if prev_session else prev_events[-1].session_id
+                prev_key = self._batch_key(prev_events[-1], prev_session)
                 if resolved_key is not None and resolved_key == prev_key:
                     prev_events.append(event)
                     continue
                 if resolved_key is None and prev_key is None and self._new_event_policy == "interrupt":
-                    # Merge un-sessioned pending events after interrupt restart.
                     prev_events.append(event)
                     continue
 
@@ -296,6 +321,7 @@ class AgentWorker:
         return batches
 
     def _resolve_session(self, event: Event) -> SessionRef | None:
+        # 4-level priority: approval_request_id -> explicit session_id -> (inbox_id, correlation_key) -> new.
         request_id = event.payload.get("approval_request_id")
         if isinstance(request_id, str) and request_id:
             suspended = self._sessions.find_by_request_id(request_id)
@@ -303,6 +329,8 @@ class AgentWorker:
                 return suspended
         if event.session_id:
             return self._sessions.get(event.session_id)
+        if event.correlation_key:
+            return self._sessions.find_by_correlation_key(event.inbox_id, event.correlation_key)
         return None
 
     async def _execute_with_retry(
@@ -329,19 +357,40 @@ class AgentWorker:
         inbox_id: str,
         session_ref: SessionRef | None,
         outcome: RunOutcome,
-    ) -> None:
+        correlation_key: str | None,
+    ) -> str | None:
         match outcome:
             case Silent():
-                if session_ref is not None and session_ref.pending_request_id is not None:
+                if session_ref is not None:
+                    if (
+                        session_ref.pending_request_id is not None
+                        or (correlation_key is not None and session_ref.correlation_key != correlation_key)
+                    ):
+                        self._sessions.save(
+                            SessionRef(
+                                session_id=session_ref.session_id,
+                                inbox_id=inbox_id,
+                                correlation_key=correlation_key,
+                                checkpoint=None,
+                                pending_request_id=None,
+                                updated_at=utc_now_iso(),
+                            )
+                        )
+                    return session_ref.session_id
+                if correlation_key is not None:
+                    new_sid = new_id("sess")
                     self._sessions.save(
                         SessionRef(
-                            session_id=session_ref.session_id,
+                            session_id=new_sid,
                             inbox_id=inbox_id,
+                            correlation_key=correlation_key,
                             checkpoint=None,
                             pending_request_id=None,
                             updated_at=utc_now_iso(),
                         )
                     )
+                    return new_sid
+                return None
             case Emit(messages=messages, session_id=emit_session_id):
                 for text in messages:
                     self._outbox.enqueue(
@@ -349,17 +398,23 @@ class AgentWorker:
                         content=text,
                         metadata={"kind": "emit"},
                     )
-                target_sid = emit_session_id or (session_ref.session_id if session_ref else None)
+                target_sid = emit_session_id or (
+                    session_ref.session_id
+                    if session_ref is not None
+                    else (new_id("sess") if correlation_key is not None else None)
+                )
                 if target_sid is not None:
                     self._sessions.save(
                         SessionRef(
                             session_id=target_sid,
                             inbox_id=inbox_id,
+                            correlation_key=correlation_key,
                             checkpoint=None,
                             pending_request_id=None,
                             updated_at=utc_now_iso(),
                         )
                     )
+                return target_sid
             case Suspend(
                 request_id=request_id,
                 prompt=prompt,
@@ -373,6 +428,7 @@ class AgentWorker:
                     SessionRef(
                         session_id=target_sid,
                         inbox_id=inbox_id,
+                        correlation_key=correlation_key,
                         checkpoint=checkpoint,
                         pending_request_id=request_id,
                         updated_at=utc_now_iso(),
@@ -387,6 +443,7 @@ class AgentWorker:
                         "session_id": target_sid,
                     },
                 )
+                return target_sid
             case _ as unreachable:
                 _exhaustive(unreachable)
 

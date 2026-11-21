@@ -32,6 +32,7 @@ class EventHandler:
         external_id: str,
         payload: dict[str, Any],
         session_id: str | None = None,
+        correlation_key: str | None = None,
     ) -> IngestResult:
         event = Event(
             inbox_id=inbox_id,
@@ -39,6 +40,7 @@ class EventHandler:
             external_id=external_id,
             payload=dict(payload),
             session_id=session_id,
+            correlation_key=correlation_key,
         )
         stored, is_duplicate = self._inbox.append(event)
         if not is_duplicate and self._on_wake is not None:

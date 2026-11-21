@@ -34,6 +34,7 @@ class Event:
     event_id: str = field(default_factory=lambda: new_id("evt"))
     occurred_at: str = field(default_factory=utc_now_iso)
     session_id: str | None = None
+    correlation_key: str | None = None
     status: EventStatus = "pending"
 
 
@@ -41,6 +42,7 @@ class Event:
 class SessionRef:
     session_id: str
     inbox_id: str
+    correlation_key: str | None = None
     checkpoint: str | None = None
     pending_request_id: str | None = None
     updated_at: str = field(default_factory=utc_now_iso)

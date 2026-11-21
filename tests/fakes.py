@@ -21,8 +21,6 @@ BASELINE_FILES = ("instructions.md", "index.md", "reported.md")
 
 
 class InMemoryInbox:
-    """In-memory implementation of InboxPort."""
-
     def __init__(self) -> None:
         self._events: list[Event] = []
         self._seen_keys: set[tuple[str, str, str]] = set()
@@ -54,8 +52,6 @@ class InMemoryInbox:
 
 
 class InMemoryTimerStore:
-    """In-memory implementation of TimerPort."""
-
     def __init__(self) -> None:
         self._timers: dict[str, TimerSpec] = {}
 
@@ -98,8 +94,6 @@ class InMemoryTimerStore:
 
 
 class InMemoryMemoryStore:
-    """In-memory implementation of MemoryPort."""
-
     def __init__(self, initial: dict[str, str] | None = None) -> None:
         self._files: dict[str, str] = {name: "" for name in BASELINE_FILES}
         if initial:
@@ -122,8 +116,6 @@ class InMemoryMemoryStore:
 
 
 class InMemoryOutbox:
-    """In-memory implementation of OutboxPort."""
-
     def __init__(self) -> None:
         self._messages: dict[str, OutboxMessage] = {}
         self._order: list[str] = []
@@ -166,8 +158,6 @@ class InMemoryOutbox:
 
 
 class InMemoryLock:
-    """In-memory lease lock implementation of LockPort."""
-
     def __init__(self, clock: Any = time.monotonic) -> None:
         self._clock = clock
         self._leases: dict[str, tuple[str, float]] = {}
@@ -195,8 +185,6 @@ class InMemoryLock:
 
 
 class InMemorySessionStore:
-    """In-memory implementation of SessionStorePort."""
-
     def __init__(self) -> None:
         self._sessions: dict[str, SessionRef] = {}
 
@@ -209,13 +197,30 @@ class InMemorySessionStore:
                 return session
         return None
 
+    def find_by_correlation_key(self, inbox_id: str, correlation_key: str) -> SessionRef | None:
+        matches = [
+            s
+            for s in self._sessions.values()
+            if s.inbox_id == inbox_id and s.correlation_key == correlation_key
+        ]
+        if not matches:
+            return None
+        matches.sort(key=lambda s: s.updated_at, reverse=True)
+        return matches[0]
+
     def save(self, session: SessionRef) -> None:
+        if session.correlation_key is not None:
+            for sid, existing in list(self._sessions.items()):
+                if (
+                    sid != session.session_id
+                    and existing.inbox_id == session.inbox_id
+                    and existing.correlation_key == session.correlation_key
+                ):
+                    self._sessions[sid] = replace(existing, correlation_key=None)
         self._sessions[session.session_id] = session
 
 
 class InMemoryPermission:
-    """Configurable in-memory PermissionPort fake."""
-
     def __init__(self, rules: dict[str, PermissionDecision] | None = None) -> None:
         self._rules = dict(rules or {})
 
@@ -224,8 +229,6 @@ class InMemoryPermission:
 
 
 class RecordingChannel:
-    """In-memory ChannelPort that records all delivered messages."""
-
     def __init__(self, fail_times: int = 0) -> None:
         self.sent: list[tuple[str, str, dict[str, Any]]] = []
         self._fail_remaining = fail_times

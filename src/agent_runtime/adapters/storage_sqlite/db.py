@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS event_inbox (
     occurred_at TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     session_id TEXT,
+    correlation_key TEXT,
     status TEXT NOT NULL CHECK (status IN ('pending', 'done', 'dropped'))
 );
 
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS worker_leases (
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     inbox_id TEXT NOT NULL,
+    correlation_key TEXT,
     checkpoint TEXT,
     pending_request_id TEXT,
     updated_at TEXT NOT NULL
@@ -67,6 +69,9 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_request
     ON sessions (pending_request_id);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_correlation
+    ON sessions (inbox_id, correlation_key, updated_at);
 """
 
 
@@ -81,7 +86,24 @@ class SQLiteDatabase:
             self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
         self._conn.executescript(SCHEMA_SQL)
+        self._ensure_migrations()
         self._conn.commit()
+
+    def _ensure_migrations(self) -> None:
+        # Backward-compatible migration for existing SQLite files created before correlation_key.
+        for table in ("event_inbox", "sessions"):
+            cols = {
+                str(row["name"])
+                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if "correlation_key" not in cols:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN correlation_key TEXT")
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_sessions_correlation
+                ON sessions (inbox_id, correlation_key, updated_at)
+            """
+        )
 
     @property
     def conn(self) -> sqlite3.Connection:
