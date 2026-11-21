@@ -129,7 +129,10 @@ class OrcaWorktreeManager:
         base_dir = self._worktree_base_dir if self._worktree_base_dir is not None else primary.parent
         if existing is None:
             existing_names = {Path(r.workdir).name for r in self._store.list_by_repo(str(primary))}
-            existing_names.update(name.replace("hb/", "hb-", 1) for name in branches if name.startswith("hb/"))
+            refs = self._runner(["git", "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/hb/"], primary)
+            if refs.returncode != 0:
+                raise RuntimeError(f"Cannot list local branches in {primary}: {refs.stderr.strip()}")
+            existing_names.update(name.replace("hb/", "hb-", 1) for name in refs.stdout.splitlines())
             if base_dir.is_dir():
                 existing_names.update(p.name for p in base_dir.iterdir() if p.is_dir())
             dir_name, branch_name = derive_worktree_names(work_key, self._store.next_task_seq(), existing_names)
@@ -141,13 +144,16 @@ class OrcaWorktreeManager:
             expected_workdir = Path(existing.workdir)
             dir_name, branch_name = expected_workdir.name, existing.branch
 
+        reported_path = None
         if self._backend == "orca":
-            self._create_via_orca(
+            branch_name, reported_path = self._create_via_orca(
                 primary=primary,
                 dir_name=dir_name,
                 base_commit=base_commit,
                 branch_name=branch_name,
             )
+            if branch_name in branches:
+                raise RuntimeError(f"Orca returned a previously registered worktree for {branch_name!r}")
         else:
             self._create_via_git(
                 primary=primary,
@@ -157,6 +163,8 @@ class OrcaWorktreeManager:
             )
 
         actual_workdir = self._worktree_path(self._registered_worktrees(primary), primary, branch_name)
+        if reported_path is not None and reported_path != actual_workdir:
+            raise RuntimeError(f"Orca returned {reported_path} for {branch_name!r}, Git registered {actual_workdir}")
         self._store.mark_ready(work_key, workdir=str(actual_workdir), branch=branch_name)
         if self._backend == "orca" and self._create_terminal:
             self._runner(["orca", "terminal", "create", "--workdir", str(actual_workdir)], primary)
@@ -272,7 +280,7 @@ class OrcaWorktreeManager:
         dir_name: str,
         base_commit: str,
         branch_name: str,
-    ) -> None:
+    ) -> tuple[str, Path]:
         cmd = [
             "orca",
             "worktree",
@@ -288,10 +296,22 @@ class OrcaWorktreeManager:
             "--no-parent",
             "--setup",
             "skip",
+            "--json",
         ]
         res = self._runner(cmd, primary)
         if res.returncode != 0:
             raise RuntimeError(f"orca worktree create failed: {res.stderr.strip()}")
+        try:
+            worktree = json.loads(res.stdout)["result"]["worktree"]
+            ref, path = worktree["branch"], worktree["path"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError("Invalid Orca worktree creation receipt") from exc
+        if not isinstance(ref, str) or not isinstance(path, str) or not Path(path).is_absolute():
+            raise RuntimeError("Invalid branch or path in Orca worktree creation receipt")
+        branch = ref.removeprefix("refs/heads/")
+        if not re.fullmatch(re.escape(branch_name) + r"(?:-\d+)?", branch):
+            raise RuntimeError(f"Orca returned unrelated branch {branch!r} for {branch_name!r}")
+        return branch, Path(path).resolve()
 
     def _create_via_git(
         self,

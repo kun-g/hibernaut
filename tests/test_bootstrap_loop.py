@@ -113,7 +113,7 @@ class TestOrcaWorktreeManager(unittest.TestCase):
 
     def test_explicit_override_creating_reconcile_and_orca_create(self) -> None:
         commands: list[list[str]] = []
-        created = self.root / "Orca worktrees" / "hb-issue-42"
+        created = self.root / "Orca worktrees" / "hb-issue-42-2-2"
         registered: dict[str, Path] = {}
 
         def fake_runner(cmd: Any, cwd: Path | None) -> CommandResult:
@@ -122,11 +122,16 @@ class TestOrcaWorktreeManager(unittest.TestCase):
             commands.append(cmd_list)
             if cmd_list[:2] == ["git", "rev-parse"]:
                 return CommandResult(0, "abc1234\n", "")
+            if cmd_list == ["git", "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/hb/"]:
+                return CommandResult(0, "hb/issue-42\n", "")
             if cmd_list[:3] == ["orca", "worktree", "create"]:
+                self.assertEqual(cmd_list[cmd_list.index("--branch") + 1], "hb/issue-42-2")
+                self.assertIn("--json", cmd_list)
                 created.mkdir(parents=True)
                 (created / ".git").write_text("gitdir: ...", encoding="utf-8")
-                registered["hb/issue-42"] = created
-                return CommandResult(0, "Created successfully\n", "")
+                registered["hb/issue-42-2-2"] = created
+                receipt = {"branch": "refs/heads/hb/issue-42-2-2", "path": str(created)}
+                return CommandResult(0, json.dumps({"result": {"worktree": receipt}}), "")
             if cmd_list == ["git", "worktree", "list", "--porcelain", "-z"]:
                 listing = "".join(f"worktree {p}\0branch refs/heads/{b}\0\0" for b, p in registered.items())
                 return CommandResult(0, listing, "")
@@ -153,7 +158,7 @@ class TestOrcaWorktreeManager(unittest.TestCase):
         self.assertIsNotNone(rec)
         assert rec is not None
         self.assertEqual(rec.status, "ready")
-        self.assertEqual(rec.branch, "hb/issue-42")
+        self.assertEqual(rec.branch, "hb/issue-42-2-2")
 
         # Priority 2: subsequent call reuses persisted ready path without invoking orca again.
         cmd_count_before = len(commands)
@@ -190,7 +195,13 @@ class TestOrcaWorktreeManager(unittest.TestCase):
         self.assertEqual(rec99.status, "ready")
 
     def test_success_without_registered_branch_keeps_creating_intent(self) -> None:
-        mgr = OrcaWorktreeManager(workspace_store=self.store, runner=lambda *_: CommandResult(0, "", ""))
+        receipt = {"branch": "refs/heads/hb/issue-7", "path": str(self.root / "hb-issue-7")}
+
+        def runner(cmd: Any, _cwd: Path | None) -> CommandResult:
+            output = json.dumps({"result": {"worktree": receipt}}) if cmd[0] == "orca" else ""
+            return CommandResult(0, output, "")
+
+        mgr = OrcaWorktreeManager(workspace_store=self.store, runner=runner)
         for _ in range(2):
             with self.assertRaisesRegex(RuntimeError, "Expected one local linked worktree"):
                 mgr.resolve_workdir(work_key="issue:7", primary_checkout=self.primary)
