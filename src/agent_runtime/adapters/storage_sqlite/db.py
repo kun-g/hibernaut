@@ -1,5 +1,3 @@
-"""SQLite connection and schema management (WAL mode, Inbox/Timers/Outbox/Leases/Sessions)."""
-
 from __future__ import annotations
 
 import sqlite3
@@ -73,8 +71,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_request
 
 
 class SQLiteDatabase:
-    """Thin SQLite wrapper supporting both file-backed and ':memory:' databases."""
-
     def __init__(self, db_path: str | Path = ":memory:") -> None:
         self._db_path = str(db_path)
         if self._db_path != ":memory:":

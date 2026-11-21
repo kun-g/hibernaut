@@ -1,12 +1,3 @@
-"""Filesystem MemoryPort adapter enforcing the standard Always-on Agent layout:
-
-- instructions.md (Every run)
-- index.md        (Every run)
-- reported.md     (Every run)
-- notes/*         (When needed)
-- progress/*      (When needed)
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -15,8 +6,6 @@ BASELINE_FILES = ("instructions.md", "index.md", "reported.md")
 
 
 class FileSystemMemoryAdapter:
-    """Directory-backed persistent MemoryPort with path-traversal protection."""
-
     def __init__(self, root_dir: str | Path) -> None:
         self._root = Path(root_dir).resolve()
         self._root.mkdir(parents=True, exist_ok=True)
@@ -51,6 +40,7 @@ class FileSystemMemoryAdapter:
     def write(self, path: str, content: str) -> None:
         target = self._safe_resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic temp-file swap prevents partial reads across concurrent runs.
         tmp_path = target.with_suffix(target.suffix + ".tmp")
         tmp_path.write_text(content, encoding="utf-8")
         tmp_path.replace(target)

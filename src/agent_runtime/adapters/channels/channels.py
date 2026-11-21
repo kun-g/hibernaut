@@ -1,5 +1,3 @@
-"""L3 Channel Adapters: Console, outbound Webhook, and inbound HTTP Webhook server."""
-
 from __future__ import annotations
 
 import json
@@ -12,8 +10,6 @@ from agent_runtime.engine.handler import EventHandler
 
 
 class ConsoleChannelAdapter:
-    """Local stdout channel adapter for CLI / demo runs."""
-
     def __init__(self) -> None:
         self.delivered: list[tuple[str, str, dict[str, Any]]] = []
 
@@ -29,8 +25,6 @@ class ConsoleChannelAdapter:
 
 
 class WebhookChannelAdapter:
-    """Outbound HTTP POST webhook delivery adapter (stdlib only)."""
-
     def __init__(self, endpoint_url: str, timeout_seconds: float = 10.0) -> None:
         self._endpoint_url = endpoint_url
         self._timeout_seconds = timeout_seconds
@@ -60,8 +54,6 @@ def create_webhook_server(
     port: int,
     handler: EventHandler,
 ) -> HTTPServer:
-    """Create a lightweight HTTP server that ingests POST /events and returns immediate ACK."""
-
     class _IngestRequestHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
             if self.path != "/events":

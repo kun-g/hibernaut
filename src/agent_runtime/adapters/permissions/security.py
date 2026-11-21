@@ -1,5 +1,3 @@
-"""L3 Security Adapters: Auto Mode PermissionPort classifier and external Credential Proxy client."""
-
 from __future__ import annotations
 
 import json
@@ -11,13 +9,6 @@ from agent_runtime.core.models import PermissionDecision
 
 
 class AutoModePermissionAdapter:
-    """Rule-based Auto Mode permission gate (allow / block / defer).
-
-    - Low-risk read/memory/timer tools -> allow
-    - High-impact external mutations (email, payments, prod deploys) -> defer (async human approval)
-    - Destructive or exfiltration patterns -> block (feedback returned to Agent for safer alternative)
-    """
-
     DEFAULT_ALLOW_TOOLS: frozenset[str] = frozenset(
         {
             "read_memory",
@@ -90,19 +81,12 @@ class AutoModePermissionAdapter:
 
 @dataclass(frozen=True, slots=True)
 class ProxyResponse:
-    """Response returned by the external Credential Store Proxy."""
-
     status_code: int
     body: str
 
 
 class CredentialProxyClient:
-    """Forwards outbound API calls to an external Credential Proxy.
-
-    The Agent process never holds raw API keys or OAuth tokens; the external proxy
-    injects real credentials based on `service_name` before forwarding upstream.
-    """
-
+    # Agent runtime holds zero real secrets; external proxy injects credentials per service_name.
     def __init__(self, proxy_base_url: str, timeout_seconds: float = 15.0) -> None:
         self._proxy_base_url = proxy_base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds

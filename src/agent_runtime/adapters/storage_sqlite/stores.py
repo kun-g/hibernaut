@@ -1,12 +1,10 @@
-"""SQLite adapter implementations for InboxPort, TimerPort, OutboxPort, LockPort, SessionStorePort."""
-
 from __future__ import annotations
 
 import json
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import replace
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
 from agent_runtime.core.models import (
@@ -24,8 +22,6 @@ from agent_runtime.core.models import (
 
 
 class SQLiteInboxAdapter:
-    """SQLite-backed InboxPort with idempotent deduplication."""
-
     def __init__(self, db: SQLiteDatabase) -> None:
         self._db = db
 
@@ -101,8 +97,6 @@ class SQLiteInboxAdapter:
 
 
 class SQLiteTimerAdapter:
-    """SQLite-backed TimerPort supporting follow_up and recurring schedule timers."""
-
     def __init__(self, db: SQLiteDatabase) -> None:
         self._db = db
 
@@ -184,8 +178,6 @@ class SQLiteTimerAdapter:
 
 
 class SQLiteOutboxAdapter:
-    """SQLite-backed OutboxPort."""
-
     def __init__(self, db: SQLiteDatabase) -> None:
         self._db = db
 
@@ -264,8 +256,7 @@ class SQLiteOutboxAdapter:
 
 
 class SQLiteLeaseLockAdapter:
-    """Production-ready DB Lease Lock (inbox_id, worker_id, expires_at) with crash auto-takeover."""
-
+    # Lease key is inbox_id; expired leases allow automatic crash takeover.
     def __init__(
         self,
         db: SQLiteDatabase,
@@ -320,8 +311,6 @@ class SQLiteLeaseLockAdapter:
 
 
 class SQLiteSessionStoreAdapter:
-    """SQLite-backed SessionStorePort for cross-run session & Suspend checkpoints."""
-
     def __init__(self, db: SQLiteDatabase) -> None:
         self._db = db
 

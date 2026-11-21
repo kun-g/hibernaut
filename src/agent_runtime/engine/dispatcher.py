@@ -1,5 +1,3 @@
-"""L2 OutboxDispatcher: consumes Outbox messages with per-inbox pacing and retry limits."""
-
 from __future__ import annotations
 
 import asyncio
@@ -10,8 +8,6 @@ from agent_runtime.core.ports import ChannelPort, OutboxPort
 
 
 class OutboxDispatcher:
-    """Delivers pending Outbox messages to ChannelPort with throttling and failure retries."""
-
     def __init__(
         self,
         *,
@@ -29,7 +25,6 @@ class OutboxDispatcher:
         self._last_sent_at: dict[str, float] = {}
 
     async def dispatch_once(self, limit: int = 20) -> int:
-        """Attempt delivery of pending Outbox messages; returns number successfully sent."""
         pending = self._outbox.fetch_pending(limit=limit)
         sent_count = 0
 
@@ -44,7 +39,7 @@ class OutboxDispatcher:
                 and self._min_interval_seconds > 0.0
                 and (now - last_sent) < self._min_interval_seconds
             ):
-                # Pacing / anti-spam throttle: defer until min_interval_seconds elapses
+                # Pacing / anti-spam throttle: defer until min_interval_seconds elapses.
                 continue
 
             try:
@@ -63,7 +58,6 @@ class OutboxDispatcher:
         interval_seconds: float = 1.0,
         stop_event: asyncio.Event | None = None,
     ) -> None:
-        """Continuously dispatch pending Outbox messages until stop_event is set."""
         stopper = stop_event or asyncio.Event()
         while not stopper.is_set():
             await self.dispatch_once()

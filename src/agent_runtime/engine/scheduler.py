@@ -1,5 +1,3 @@
-"""L2 TimerScheduler: scans due Follow-up & Schedule timers and emits Inbox events."""
-
 from __future__ import annotations
 
 import asyncio
@@ -11,8 +9,6 @@ from agent_runtime.core.ports import InboxPort, TimerPort
 
 
 class TimerScheduler:
-    """Background scheduler that turns due persistent timers into Inbox events."""
-
     def __init__(
         self,
         *,
@@ -25,7 +21,6 @@ class TimerScheduler:
         self._on_wake = on_wake
 
     def tick(self, now_iso: str | None = None) -> int:
-        """Scan due timers once, update timer state, append Inbox events, and wake Worker."""
         current_iso = now_iso or utc_now_iso()
         due_timers = self._timers.fetch_due(current_iso)
         triggered_count = 0
@@ -62,7 +57,6 @@ class TimerScheduler:
         interval_seconds: float = 5.0,
         stop_event: asyncio.Event | None = None,
     ) -> None:
-        """Continuously poll for due timers until stop_event is set."""
         stopper = stop_event or asyncio.Event()
         while not stopper.is_set():
             self.tick()

@@ -1,10 +1,3 @@
-"""Gate 2 (Port Contract Tests):
-
-Implementation-agnostic contract suites executed identically against:
-- In-Memory Fakes (tests/fakes.py)
-- Real SQLite + Filesystem Adapters (adapters/storage_sqlite & adapters/memory_fs)
-"""
-
 from __future__ import annotations
 
 import tempfile
@@ -12,7 +5,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from agent_runtime.adapters.memory_fs import FileSystemMemoryAdapter
+from agent_runtime.adapters.memory_fs import FileSystemMemoryAdapter, WorkspacePartitionRegistry
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
     SQLiteInboxAdapter,
@@ -43,13 +36,11 @@ class InboxContractMixin:
         self.assertFalse(dup1)
         self.assertEqual(stored1.status, "pending")
 
-        # Duplicate (same inbox_id, source, external_id) must be dropped
         e1_dup = Event(inbox_id="u1", source="webhook", external_id="ext-1", payload={"v": 1})
         stored_dup, dup2 = inbox.append(e1_dup)
         self.assertTrue(dup2)
         self.assertEqual(stored_dup.status, "dropped")
 
-        # Distinct external_id is accepted
         e2 = Event(inbox_id="u1", source="webhook", external_id="ext-2", payload={"v": 2})
         stored2, dup3 = inbox.append(e2)
         self.assertFalse(dup3)
@@ -91,7 +82,6 @@ class TimerContractMixin:
         due = timers.fetch_due("2026-11-21T10:05:00+00:00")
         self.assertEqual({t.timer_id for t in due}, {t1, t2})
 
-        # Follow-up becomes done; schedule advances to next due_at
         timers.mark_triggered(t1, next_due_at=None)
         timers.mark_triggered(t2, next_due_at="2026-11-21T11:00:00+00:00")
 
@@ -155,16 +145,13 @@ class LockContractMixin:
         self.assertTrue(lock.acquire("u1", "w1", ttl_seconds=10.0))
         self.assertFalse(lock.acquire("u1", "w2", ttl_seconds=10.0))
 
-        # Renew extends lease for w1
         now_box[0] += 5.0
         self.assertTrue(lock.renew("u1", "w1", ttl_seconds=10.0))
         self.assertFalse(lock.acquire("u1", "w2", ttl_seconds=10.0))
 
-        # After lease expires (simulated crash), w2 takes over automatically
         now_box[0] += 11.0
         self.assertTrue(lock.acquire("u1", "w2", ttl_seconds=10.0))
 
-        # Release allows immediate acquisition
         lock.release("u1", "w2")
         self.assertTrue(lock.acquire("u1", "w1", ttl_seconds=10.0))
 
@@ -194,9 +181,6 @@ class SessionContractMixin:
         self.assertEqual(by_req.session_id, "sess_1")
 
 
-# --- Run all Contract Tests against In-Memory Fakes ---
-
-
 class TestInMemoryContracts(
     InboxContractMixin,
     TimerContractMixin,
@@ -224,9 +208,6 @@ class TestInMemoryContracts(
 
     def make_sessions(self) -> Any:
         return InMemorySessionStore()
-
-
-# --- Run the EXACT SAME Contract Tests against SQLite + FileSystem Adapters ---
 
 
 class TestSQLiteAndFileSystemContracts(
@@ -264,6 +245,18 @@ class TestSQLiteAndFileSystemContracts(
 
     def make_sessions(self) -> Any:
         return SQLiteSessionStoreAdapter(self._db)
+
+
+class TestPartitionedMemoryContract(MemoryContractMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="part_mem_contract_")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def make_memory(self) -> Any:
+        registry = WorkspacePartitionRegistry(Path(self._tmp.name))
+        return registry.memory_for("proj:contract-test")
 
 
 if __name__ == "__main__":

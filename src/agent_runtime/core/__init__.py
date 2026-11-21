@@ -1,5 +1,3 @@
-"""L0/L1 core package: domain contracts and port protocols (zero external dependencies)."""
-
 from agent_runtime.core.models import (
     Emit,
     Event,

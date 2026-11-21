@@ -1,5 +1,3 @@
-"""Composition Root: the ONLY place where L3 adapters are wired into the L2 engine."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -33,8 +31,6 @@ from agent_runtime.engine import (
 
 @dataclass
 class AgentRuntimeApp:
-    """Assembled Always-on Agent runtime exposing engine components and lifecycle close()."""
-
     db: SQLiteDatabase
     handler: EventHandler
     worker: AgentWorker
@@ -58,7 +54,6 @@ def build_runtime(
     channel: ChannelPort | None = None,
     min_outbox_interval_seconds: float = 0.0,
 ) -> AgentRuntimeApp:
-    """Wire L3 adapters into L2 orchestration engine cleanly via constructor injection."""
     db = SQLiteDatabase(db_path)
     inbox = SQLiteInboxAdapter(db)
     timers = SQLiteTimerAdapter(db)

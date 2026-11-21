@@ -1,5 +1,3 @@
-"""L2 Lifecycle Orchestration Engine: depends ONLY on core/ and Python stdlib."""
-
 from agent_runtime.engine.dispatcher import OutboxDispatcher
 from agent_runtime.engine.handler import EventHandler, IngestResult
 from agent_runtime.engine.scheduler import TimerScheduler

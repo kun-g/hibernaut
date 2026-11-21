@@ -1,5 +1,3 @@
-"""L2 AgentWorker: Single-Active-Worker lock, session batching, Run execution, and outcome handling."""
-
 from __future__ import annotations
 
 import asyncio
@@ -32,8 +30,6 @@ from agent_runtime.core.ports import (
 
 @dataclass(frozen=True, slots=True)
 class _ScopedCapabilities:
-    """Concrete RunCapabilities bundle passed into ExecutorPort.execute()."""
-
     memory: MemoryPort
     timers: TimerPort
     permissions: PermissionPort
@@ -41,8 +37,6 @@ class _ScopedCapabilities:
 
 @dataclass(frozen=True, slots=True)
 class RunReport:
-    """Structured summary of a single processed event batch."""
-
     inbox_id: str
     session_id: str | None
     event_ids: tuple[str, ...]
@@ -50,11 +44,6 @@ class RunReport:
 
 
 class AgentWorker:
-    """Orchestrates Sleep -> Wake -> Run -> Write-back lifecycle per inbox_id.
-
-    Depends strictly on L0 + L1 contracts; contains zero storage or LLM SDK imports.
-    """
-
     def __init__(
         self,
         *,
@@ -94,10 +83,6 @@ class AgentWorker:
         return self._new_event_policy
 
     async def process_inbox(self, inbox_id: str) -> list[RunReport]:
-        """Acquire Single-Active-Worker lock and drain pending events in session batches.
-
-        Returns an empty list if another worker currently holds the lease for inbox_id.
-        """
         if not self._lock.acquire(inbox_id, self._worker_id, self._lease_ttl_seconds):
             return []
 
@@ -135,7 +120,6 @@ class AgentWorker:
         self,
         events: list[Event],
     ) -> list[tuple[SessionRef | None, list[Event]]]:
-        """Batch consecutive events belonging to the same session, resolving approval resumes."""
         batches: list[tuple[SessionRef | None, list[Event]]] = []
         for event in events:
             resolved_session = self._resolve_session(event)
@@ -152,7 +136,6 @@ class AgentWorker:
         return batches
 
     def _resolve_session(self, event: Event) -> SessionRef | None:
-        """Resolve an existing SessionRef by explicit session_id or approval request_id."""
         request_id = event.payload.get("approval_request_id")
         if isinstance(request_id, str) and request_id:
             suspended = self._sessions.find_by_request_id(request_id)
@@ -184,7 +167,6 @@ class AgentWorker:
         session_ref: SessionRef | None,
         outcome: RunOutcome,
     ) -> None:
-        """Exhaustively handle Silent | Emit | Suspend outcomes."""
         match outcome:
             case Silent():
                 if session_ref is not None and session_ref.pending_request_id is not None:

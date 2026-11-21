@@ -1,13 +1,3 @@
-"""L3 Whitebox Executor implementing ExecutorPort.
-
-Features:
-- Loads baseline Memory (instructions.md, index.md, reported.md) into a prompt-cacheable prefix
-- Intercepts EVERY tool call via caps.permissions.check() -> allow / block / defer
-- On `defer`, persists a JSON session checkpoint and returns Suspend immediately (non-blocking)
-- On resume (with approval event), executes the deferred tool call and continues the loop
-- Compact context hook when message transcript exceeds `max_messages_before_compact`
-"""
-
 from __future__ import annotations
 
 import json
@@ -31,16 +21,12 @@ ToolHandler = Callable[[dict[str, Any], RunCapabilities], str]
 
 @dataclass(frozen=True, slots=True)
 class ToolCallRequest:
-    """Single tool invocation requested by the LLM backend."""
-
     tool_name: str
     args: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class LLMMessage:
-    """Normalized conversation turn passed to the LLM backend."""
-
     role: str
     content: str
     cache_control: str | None = None
@@ -48,16 +34,12 @@ class LLMMessage:
 
 @dataclass(frozen=True, slots=True)
 class LLMReply:
-    """Structured response from one LLM reasoning turn."""
-
     tool_calls: tuple[ToolCallRequest, ...] = ()
     emit_messages: tuple[str, ...] = ()
     silent: bool = False
 
 
 class LLMBackend(Protocol):
-    """Pluggable LLM API client (Anthropic / OpenAI / Gemini / local test double)."""
-
     async def complete(
         self,
         *,
@@ -68,8 +50,6 @@ class LLMBackend(Protocol):
 
 
 class WhiteboxExecutor:
-    """Framework-managed tool-use loop with explicit Silent / Emit / Suspend outcomes."""
-
     def __init__(
         self,
         *,
@@ -106,8 +86,8 @@ class WhiteboxExecutor:
             ]
             pending_deferred = state.get("deferred_tool")
 
-        # Append incoming events first so causal order is preserved:
-        # User/Approval Event -> Deferred Tool Execution -> LLM Observation
+        # Append incoming events first to preserve causal order:
+        # User/Approval Event -> Deferred Tool Execution -> LLM Observation.
         for evt in events:
             messages.append(
                 LLMMessage(
@@ -123,7 +103,6 @@ class WhiteboxExecutor:
                 )
             )
 
-        # Handle resume from Suspend if an approval event arrived
         if pending_deferred is not None:
             approved = any(bool(e.payload.get("approved")) for e in events)
             tool_name = str(pending_deferred["tool_name"])
@@ -254,8 +233,6 @@ class WhiteboxExecutor:
 
 
 class RuleBasedDemoLLM:
-    """Deterministic zero-API-key LLM backend for local demos and E2E verification."""
-
     async def complete(
         self,
         *,
@@ -266,23 +243,18 @@ class RuleBasedDemoLLM:
         _ = (system_prefix, available_tools)
         last = messages[-1]
 
-        # If a deferred tool was just approved and executed, report completion to user.
         if last.role == "tool" and last.content.startswith("[APPROVED]"):
             return LLMReply(emit_messages=(f"已完成已批准操作：{last.content}",))
 
-        # If a tool was rejected by user, report cancellation.
         if last.role == "tool" and last.content.startswith("[REJECTED BY USER]"):
             return LLMReply(emit_messages=(f"已取消操作：{last.content}",))
 
-        # If a tool was blocked by Auto Mode, respond safely without retrying the blocked call.
         if last.role == "tool" and last.content.startswith("[BLOCKED]"):
             return LLMReply(emit_messages=(f"高危操作已被安全策略拦截，已中止执行：{last.content}",))
 
-        # After a regular tool finishes, emit completion summary.
         if last.role == "tool" and last.content.startswith("[OK]"):
             return LLMReply(emit_messages=(f"后台任务执行完成：{last.content}",))
 
-        # Parse incoming event payload
         try:
             event_obj = json.loads(last.content)
         except json.JSONDecodeError:

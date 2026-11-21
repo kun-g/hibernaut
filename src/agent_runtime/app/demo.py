@@ -1,5 +1,3 @@
-"""Runnable end-to-end demonstration of the Sleep -> Wake -> Run -> Suspend -> Resume cycle."""
-
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +18,6 @@ async def run_demo() -> None:
         try:
             app.memory.write("instructions.md", "默认静默运行，仅在有明确结果或需审批时发声。")
 
-            # 1. Silent Run: background heartbeat produces no user notification
             app.handler.ingest(
                 inbox_id="user-1",
                 source="cron",
@@ -30,7 +27,6 @@ async def run_demo() -> None:
             r1 = await app.worker.process_inbox("user-1")
             print("Run 1 (Silent):", r1[0].outcome)
 
-            # 2. Suspend Run: high-impact send_email triggers async approval without blocking Worker
             app.handler.ingest(
                 inbox_id="user-1",
                 source="im",
@@ -42,7 +38,6 @@ async def run_demo() -> None:
             assert isinstance(r2[0].outcome, Suspend)
             req_id = r2[0].outcome.request_id
 
-            # 3. Resume Run: human approval arrives as a new Event in Inbox -> resumes suspended Session
             app.handler.ingest(
                 inbox_id="user-1",
                 source="approval_ui",
