@@ -65,7 +65,7 @@
 ## 5. 多 `inbox_id` Actor 分区并发与 `NewEventPolicy`
 
 - **多 `inbox_id` 并发**：`AsyncWorkerPool` 跨 `inbox_id` 并行、同 `inbox_id` 单活互斥（`worker_leases` 主键即 `inbox_id`）、`Suspend` 立即放锁；`WorkspacePartitionRegistry` 强制禁止不同 `inbox_id` 挂载同一本地代码目录，全局 `global/instructions.md` 只读共享。
-- **HTTP 入站与 SQLite 并发**：`WebhookHTTPServer`（`ThreadingHTTPServer`，`request_queue_size=128`）每请求一线程；`shutdown()` 等待在途请求全部写完 Inbox 后返回，Worker 停止与配置热加载据此排空。`SQLiteDatabase` 只有一条连接，所有语句经同一把可重入锁串行；写操作走 `transaction()`（`BEGIN IMMEDIATE`），去重、租约等先读后写在线程间和共享同一文件的进程间保持原子；租约时钟在拿到写锁后读取，等锁时间不计入 TTL；`mark_done()` 按 SQLite 参数上限分段更新；文件库开启 WAL 与 `busy_timeout`。回收 worktree 时，`claim_for_reclaim()` 以读到的 `updated_at` 做比较并交换：进行中的 `reclaiming` 认领是排他的，只有超过 `reclaim_stale_after_seconds`（默认 600 秒，认领方已崩溃）的认领才可被接管；删除期间心跳线程定期续期认领，慢删除不会被当作过期而被接管；删除成功后 `finish_reclaim()` 同样按认领做比较并交换，认领已失效时不删除被他人重新登记的记录；删除失败时 `release_reclaim()` 恢复原状态，可直接重试。
+- **HTTP 入站与 SQLite 并发**：`WebhookHTTPServer`（`ThreadingHTTPServer`，`request_queue_size=128`）每请求一线程；`shutdown()` 等待在途请求全部写完 Inbox 后返回，Worker 停止与配置热加载据此排空。`SQLiteDatabase` 只有一条连接，所有语句经同一把可重入锁串行；写操作走 `transaction()`（`BEGIN IMMEDIATE`），去重、租约等先读后写在线程间和共享同一文件的进程间保持原子；租约时钟在拿到写锁后读取，等锁时间不计入 TTL；`mark_done()` 按 SQLite 参数上限分段更新；文件库开启 WAL 与 `busy_timeout`。回收 worktree 时，`claim_for_reclaim()` 以读到的 `updated_at` 做比较并交换：进行中的 `reclaiming` 认领是排他的，只有超过 `reclaim_stale_after_seconds`（默认 600 秒，认领方已崩溃）的认领才可被接管；删除期间心跳线程定期续期认领（遇到临时的 `SQLITE_BUSY`/`SQLITE_LOCKED` 缩短间隔重试，不退出），慢删除不会被当作过期而被接管；删除成功后 `finish_reclaim()` 同样按认领做比较并交换，认领已失效时不删除被他人重新登记的记录；删除失败时 `release_reclaim()` 恢复原状态，可直接重试。
 - **`NewEventPolicy` 三策略**：`defer`（默认，推迟到下一轮）、`fold`（回合间隙通过 `poll_folded_events()` 增量注入同会话/同关联键事件并统一 `mark_done()`）、`interrupt`（安全取消当前 Run/CLI 子进程，绝不向 Outbox 写半成品，原批次保持 `pending` 与新事件同租约合并重启）。
 
 ## 6. 三道防腐化门禁与核心词汇表（Glossary）

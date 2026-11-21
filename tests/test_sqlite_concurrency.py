@@ -287,6 +287,59 @@ class TestSQLiteThreadSafety(unittest.TestCase):
         self.assertEqual(len(removals), 1)
         db.close()
 
+    def test_heartbeat_survives_a_transient_lock_on_renewal(self) -> None:
+        db = SQLiteDatabase(self.db_path, busy_timeout_ms=20)
+        store = SQLiteWorkspaceStore(db)
+        self._ready_workspace(store)
+        # Stands in for another process; used from the remove and heartbeat threads.
+        blocker = sqlite3.connect(self.db_path, check_same_thread=False)
+        renew_errors: list[BaseException] = []
+        real_renew = store.renew_reclaim
+
+        def spy_renew(work_key: str, *, claim: str) -> str | None:
+            try:
+                return real_renew(work_key, claim=claim)
+            except BaseException as exc:
+                renew_errors.append(exc)
+                if len(renew_errors) == 1:
+                    blocker.commit()  # the lock is held only across the first renewal
+                raise
+
+        store.renew_reclaim = spy_renew  # type: ignore[method-assign]
+        in_remove = threading.Event()
+        finish_remove = threading.Event()
+        removals: list[tuple[str, ...]] = []
+
+        def runner(argv: Sequence[str], cwd: Path | None) -> CommandResult:
+            _ = cwd
+            if "remove" in argv:
+                removals.append(tuple(argv))
+                if len(removals) == 1:
+                    blocker.execute("BEGIN IMMEDIATE")
+                    in_remove.set()
+                    finish_remove.wait(timeout=5)
+            return CommandResult(0, "", "")
+
+        manager = OrcaWorktreeManager(
+            workspace_store=store,
+            backend="git",
+            runner=runner,
+            reclaim_stale_after_seconds=0.45,
+        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(manager.reclaim, "x")
+            self.assertTrue(in_remove.wait(timeout=5))
+            threading.Event().wait(0.9)  # two stale windows after the failed renewal
+            second = manager.reclaim("x")
+            finish_remove.set()
+            self.assertTrue(first.result(timeout=5).reclaimed)
+
+        self.assertEqual(len(renew_errors), 1)
+        self.assertFalse(second.reclaimed)
+        self.assertEqual(len(removals), 1)
+        blocker.close()
+        db.close()
+
     def test_reclaim_that_lost_its_claim_keeps_the_new_record(self) -> None:
         db = SQLiteDatabase(self.db_path)
         store = SQLiteWorkspaceStore(db)

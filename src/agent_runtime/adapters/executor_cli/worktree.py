@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import subprocess
 import threading
 from collections.abc import Callable, Sequence
@@ -336,6 +337,9 @@ class OrcaWorktreeManager:
             outbox.enqueue(inbox_id, message, metadata={"kind": "reclaim_alert"})
 
 
+_TRANSIENT_SQLITE_ERRORS = {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+
+
 class _ClaimHeartbeat:
     # Keeps a reclaim claim fresh while a slow removal runs, so no caller treats a live
     # claim as stale and removes the same path concurrently.
@@ -356,11 +360,21 @@ class _ClaimHeartbeat:
         self._thread.start()
 
     def _run(self) -> None:
-        while not self._stopped.wait(self._interval):
-            renewed = self._store.renew_reclaim(self._work_key, claim=self._claim)
+        delay = self._interval
+        while not self._stopped.wait(delay):
+            try:
+                renewed = self._store.renew_reclaim(self._work_key, claim=self._claim)
+            except sqlite3.OperationalError as exc:
+                # A transient lock must not end the heartbeat; retry soon, well inside
+                # the stale window, so the live claim is not taken over.
+                if getattr(exc, "sqlite_errorcode", None) not in _TRANSIENT_SQLITE_ERRORS:
+                    raise
+                delay = self._interval / 4
+                continue
             if renewed is None:
                 return
             self._claim = renewed
+            delay = self._interval
 
     def stop(self) -> str:
         self._stopped.set()
