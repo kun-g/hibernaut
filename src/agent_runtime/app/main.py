@@ -4,12 +4,17 @@ import argparse
 import asyncio
 import signal
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent_runtime.adapters.channels import ConsoleChannelAdapter, create_webhook_server
+from agent_runtime.adapters.channels import (
+    ConsoleChannelAdapter,
+    FeishuWebhookAdapter,
+    GitHubWebhookAdapter,
+    create_webhook_server,
+)
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
     RuleBasedDemoLLM,
@@ -53,12 +58,23 @@ class AsyncWorkerPool:
         self._requeue: set[str] = set()
         self._idle_event = asyncio.Event()
         self._idle_event.set()
+        self._loop: asyncio.AbstractEventLoop | None = None
         self.reports: list[RunReport] = []
 
     def wake(self, inbox_id: str) -> None:
+        # HTTP webhook threads call wake() off-loop; marshal safely onto the event loop.
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if self._loop is not None and running is not self._loop and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._wake_on_loop, inbox_id)
+            return
+        self._wake_on_loop(inbox_id)
+
+    def _wake_on_loop(self, inbox_id: str) -> None:
         active_worker = self._active.get(inbox_id)
         if active_worker is not None:
-            # Notify active worker immediately (for interrupt policy) and ensure re-drain.
             active_worker.notify_new_event(inbox_id)
             self._requeue.add(inbox_id)
             return
@@ -87,11 +103,12 @@ class AsyncWorkerPool:
                 self._queue.task_done()
                 if inbox_id in self._requeue:
                     self._requeue.discard(inbox_id)
-                    self.wake(inbox_id)
+                    self._wake_on_loop(inbox_id)
                 elif not self._queued and not self._active:
                     self._idle_event.set()
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
+        self._loop = asyncio.get_running_loop()
         tasks = [
             asyncio.create_task(self._worker_loop(idx, stop_event))
             for idx in range(self._max_concurrency)
@@ -121,6 +138,8 @@ class AlwaysOnDaemon:
     lock: SQLiteLeaseLockAdapter
     sessions: SQLiteSessionStoreAdapter
     channel: ChannelPort
+    github_webhook: GitHubWebhookAdapter | None = None
+    feishu_webhook: FeishuWebhookAdapter | None = None
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def register_partition(
@@ -144,7 +163,13 @@ class AlwaysOnDaemon:
         server_thread = None
 
         if webhook_host is not None and webhook_port is not None:
-            server = create_webhook_server(webhook_host, webhook_port, self.handler)
+            server = create_webhook_server(
+                webhook_host,
+                webhook_port,
+                self.handler,
+                github_adapter=self.github_webhook,
+                feishu_adapter=self.feishu_webhook,
+            )
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
 
@@ -182,6 +207,10 @@ def build_daemon(
     min_outbox_interval_seconds: float = 0.0,
     lease_ttl_seconds: float = 60.0,
     new_event_policy: NewEventPolicy = "defer",
+    github_webhook_secret: str | None = None,
+    github_repo_inbox_map: Mapping[str, str] | None = None,
+    feishu_verification_token: str | None = None,
+    feishu_chat_inbox_map: Mapping[str, str] | None = None,
 ) -> AlwaysOnDaemon:
     db = SQLiteDatabase(db_path)
     inbox = SQLiteInboxAdapter(db)
@@ -234,6 +263,16 @@ def build_daemon(
         channel=resolved_channel,
         min_interval_seconds=min_outbox_interval_seconds,
     )
+    github_webhook = GitHubWebhookAdapter(
+        handler,
+        webhook_secret=github_webhook_secret,
+        repo_inbox_map=github_repo_inbox_map,
+    )
+    feishu_webhook = FeishuWebhookAdapter(
+        handler,
+        verification_token=feishu_verification_token,
+        chat_inbox_map=feishu_chat_inbox_map,
+    )
 
     return AlwaysOnDaemon(
         db=db,
@@ -248,6 +287,8 @@ def build_daemon(
         lock=lock,
         sessions=sessions,
         channel=resolved_channel,
+        github_webhook=github_webhook,
+        feishu_webhook=feishu_webhook,
     )
 
 
@@ -259,6 +300,8 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--policy", choices=("defer", "fold", "interrupt"), default="defer")
+    parser.add_argument("--github-secret", default=None)
+    parser.add_argument("--feishu-token", default=None)
     args = parser.parse_args()
 
     daemon = build_daemon(
@@ -266,6 +309,8 @@ def main() -> None:
         memory_root=args.memory_root,
         max_concurrency=args.workers,
         new_event_policy=args.policy,
+        github_webhook_secret=args.github_secret,
+        feishu_verification_token=args.feishu_token,
     )
 
     async def _serve() -> None:

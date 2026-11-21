@@ -8,7 +8,7 @@
 
 单轮 Run 四步循环：
 
-1. **An event arrives**：外部事件（用户消息、Webhook、定时触发、审批回复）写入全局 Event Inbox 并快速 ACK。
+1. **An event arrives**：外部事件（用户消息、GitHub/飞书 Webhook、定时触发、审批回复）写入全局 Event Inbox 并快速 ACK。
 2. **A session starts**：按 4 级优先级解析会话（`approval_request_id` → 显式 `session_id` → `(inbox_id, correlation_key)` → 新建），加载跨 Run 持久化状态（基线 Memory + Session 断点/历史）。
 3. **The agent loop runs**：在 `PermissionPort` 门禁下执行推理、工具调用、按需读取记忆与设置后续定时器。
 4. **The run writes back**：持久化新状态、记忆与 `(inbox_id, correlation_key) → session_id` 映射，产出强类型终态 `RunOutcome = Silent | Emit | Suspend` 后释放租约重新休眠。
@@ -22,7 +22,7 @@
 | **L0 领域契约层** | `core/models.py` | 不可变领域数据结构（含 `Event.correlation_key`、`SessionRef.correlation_key`）与强类型终态 `RunOutcome`、`NewEventPolicy` | 零外部依赖，仅 Python 标准库 |
 | **L1 核心端口层** | `core/ports.py` | 定义 9 个纯抽象 `Protocol` 端口及 `RunCapabilities` 控制钩子 | 仅依赖 Python 标准库 + L0 |
 | **L2 生命周期编排层** | `engine/` | `EventHandler`、`AgentWorker`、`TimerScheduler`、`OutboxDispatcher` | 仅依赖 L0 + L1，严禁 `import adapters/` 或 `app/` |
-| **L3 基础设施与组装层** | `adapters/` + `app/` | SQLite 存储、分区文件系统 Memory、Auto Mode + Credential Proxy、白盒/黑盒执行器、Webhook/Console 通道、`bootstrap.py`、`main.py` | 实现 L1 端口，仅在 `app/` 组装注入 |
+| **L3 基础设施与组装层** | `adapters/` + `app/` | SQLite 存储、分区文件系统 Memory、Auto Mode + Credential Proxy、白盒/黑盒执行器、Webhook/GitHub/飞书入站与 Console 通道、`bootstrap.py`、`main.py` | 实现 L1 端口或驱动 L2 `EventHandler`，仅在 `app/` 组装注入 |
 
 ### L1 全部 9 个核心端口与 RunCapabilities
 
@@ -39,13 +39,17 @@
 | `ExecutorPort` | Agent 单轮推理边界（白盒或黑盒实现），输入批次事件与 `RunCapabilities`，输出 `RunOutcome` |
 | `RunCapabilities` | 注入单轮 Run 的受控能力集合：`memory`、`timers`、`permissions`、`poll_folded_events()`、`is_interrupted()` |
 
-## 3. 外部关联键 `correlation_key` 映射与 4 级会话解析
+## 3. 外部关联键 `correlation_key` 与 L3 入站驱动适配器
 
-外部系统（GitHub Issue/PR、飞书话题、邮件线程、工单系统）不了解 Hibernaut 内部 `session_id`，但可由 L3 入站适配器从平台载荷提取确定性 `correlation_key`（如 `github:kun-g/hibernaut#42`、`jira:PROJ-108`）：
+外部系统（GitHub Issue/PR、飞书话题、邮件线程、工单系统）不了解 Hibernaut 内部 `session_id`，由 L3 入站驱动适配器完成验签/握手、幂等键提取、分区路由与确定性 `correlation_key` 提取后直接调用 L2 `EventHandler.ingest()`（不实现 L1 出站 Port）：
 
 - **4 级会话解析优先级**（`AgentWorker._resolve_session()`）：`approval_request_id` → 显式 `session_id` → `(inbox_id, correlation_key)` → 新建 `session_id`。
 - **同键批处理与落盘**：`_group_into_batches()` 与 `fold` 同步支持按 `correlation_key` 归组；Run 产生新会话时自动持久化 `(inbox_id, correlation_key) → session_id` 映射。
-- **会话轮换重绑**：当上下文过长需要重置开新 Session 时，向 `SessionStorePort.save()` 写入带有同一 `(inbox_id, correlation_key)` 的新 `SessionRef`，旧会话记录的 `correlation_key` 自动解绑但仍可按旧 `session_id` 回溯，后续外部事件无缝路由到新活跃会话。
+- **会话轮换重绑**：上下文过长重置开新 Session 时，向 `SessionStorePort.save()` 写入带有同一 `(inbox_id, correlation_key)` 的新 `SessionRef`，旧会话自动解绑 `correlation_key` 但保留其 `session_id` 可查，后续外部事件无缝路由到新活跃会话。
+- **统一多路由 HTTP 入口**（`adapters/channels/channels.py` & `app/main.py`）：
+  - `POST /events`：通用 JSON 事件接入（快速 202 ACK）。
+  - `POST /webhooks/github`（`GitHubWebhookAdapter`）：HMAC-SHA256 `X-Hub-Signature-256` 验签（失败 401）、`X-GitHub-Delivery` 幂等键、`repo -> inbox_id` 映射（默认 `proj:{repo}`）、Issue/PR 自动提取 `correlation_key = f"github:{repo}#{number}"` 并秒回 202。
+  - `POST /webhooks/feishu`（`FeishuWebhookAdapter`）：支持飞书 v2.0 `url_verification` Challenge 握手（200 OK）、`verification_token` 校验（失败 401）、`header.event_id` 幂等键、`chat_id -> inbox_id` 映射、话题/回复链提取 `correlation_key = f"feishu:{chat_id}:{thread_id or root_id or message_id}"`，以及交互审批卡片回调透传 `approval_request_id` + `approved` 直接恢复 `Suspend` 会话。
 
 ## 4. 五大核心原语与运行终态
 
@@ -86,7 +90,7 @@
 - **黑盒执行器（可随时插拔 `adapters/executor_blackbox/`）**：实现 `ExecutorPort` 并将外部 Agent CLI/SDK 的 Hook 或 MCP 桥接到 `RunCapabilities`，`core/` 与 `engine/` 零改动。
 - **三道自动化门禁**（本地提交前与 `.github/workflows/ci.yml` 强制执行）：
   1. `lint-imports`：验证 `.importlinter` 分层与反向依赖禁令。
-  2. `pytest -v`：运行 AST 静态依赖检查、双实现 Port 契约测试、多 `inbox_id` 并发隔离、`NewEventPolicy` 与 `correlation_key` 端到端测试。
+  2. `pytest -v`：运行 AST 静态依赖检查、双实现 Port 契约测试、多 `inbox_id` 并发隔离、`NewEventPolicy`、`correlation_key` 与 GitHub/飞书 Webhook 端到端测试。
   3. `pyright`：对 `core/` 与 `engine/` 执行 strict 静态类型检查（含 `RunOutcome` `assert_never` 穷尽检查）。
 
 ## 8. 核心词汇表（Glossary）
@@ -98,5 +102,5 @@
 | **`inbox_id`** | 标识单个逻辑 Inbox 的一等路由键与 `worker_leases` 主键 | 决定并发锁边界、项目 Memory 与代码工作区隔离 |
 | **Event** | 进入 Event Inbox 的不可变输入信封，状态为 `pending` / `done` / `dropped` | 必属某个 `inbox_id`，可附带 `session_id` 或 `correlation_key` |
 | **`session_id`** | 隶属于某个 `inbox_id` 的跨 Run 对话转录与 `Suspend` 断点上下文单元 | 一个 `inbox_id` 下可有多个 `session_id` |
-| **`correlation_key`** | 外部业务实体的确定性关联键（如 `github:kun-g/hibernaut#42`），由 L3 入站适配器提取 | 经 `SessionStorePort.find_by_correlation_key()` 映射到当前活跃 `session_id`，支持跨事件续接与会话轮换重绑 |
+| **`correlation_key`** | 外部业务实体的确定性关联键（如 `github:kun-g/hibernaut#42`、`feishu:<chat>:<thread>`），由 L3 入站适配器提取 | 经 `SessionStorePort.find_by_correlation_key()` 映射到当前活跃 `session_id`，支持跨事件续接与会话轮换重绑 |
 | **Run / Lease** | 单次唤醒执行的推理循环 / 以 `inbox_id` 为主键的限时互斥租约 | `Suspend` 立即释放租约；进程崩溃后租约到期自动接管 |

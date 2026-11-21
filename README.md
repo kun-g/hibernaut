@@ -12,19 +12,19 @@ Clean Architecture (L0–L3) Python runtime for **Always-on Agents** built aroun
 ```text
 src/agent_runtime/
 ├── core/                  # L0 + L1: Zero external dependencies (Python stdlib only)
-│   ├── models.py          # Event, SessionRef, TimerSpec, OutboxMessage, PermissionDecision, RunOutcome, NewEventPolicy
+│   ├── models.py          # Event, SessionRef (with correlation_key), TimerSpec, OutboxMessage, PermissionDecision, RunOutcome, NewEventPolicy
 │   └── ports.py           # 9 L1 Ports + RunCapabilities (with fold / interrupt control hooks)
 ├── engine/                # L2: Depends ONLY on core/ (never imports adapters/ or app/)
 │   ├── handler.py         # EventHandler: lightweight ingest, idempotent dedup (dropped), fast ACK, async Worker wake
-│   ├── worker.py          # AgentWorker: per-inbox_id lease lock, session batching, defer/fold/interrupt, exhaustive RunOutcome
+│   ├── worker.py          # AgentWorker: per-inbox_id lease lock, 4-level session resolution, defer/fold/interrupt, exhaustive RunOutcome
 │   ├── scheduler.py       # TimerScheduler: scans due Follow-up & Schedule timers -> appends Inbox events
 │   └── dispatcher.py      # OutboxDispatcher: paced Outbox delivery with anti-spam throttling and retries
 ├── adapters/              # L3: Volatile infrastructure implementations
-│   ├── storage_sqlite/    # SQLite WAL persistence (Inbox, Timers, Outbox, Lease Locks, Sessions)
+│   ├── storage_sqlite/    # SQLite WAL persistence (Inbox, Timers, Outbox, Lease Locks, Sessions + correlation_key rotation)
 │   ├── memory_fs/         # FileSystemMemoryAdapter + PartitionedMemoryAdapter & WorkspacePartitionRegistry
 │   ├── permissions/       # Auto Mode classifier (allow / block / defer) + external CredentialProxyClient
 │   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
-│   └── channels/          # Console, outbound Webhook, inbound HTTP Webhook server (fast 202 ACK)
+│   └── channels/          # Multi-route HTTP server (/events, /webhooks/github, /webhooks/feishu), GitHubWebhookAdapter, FeishuWebhookAdapter, Console & outbound Webhook
 └── app/
     ├── bootstrap.py       # Single-inbox Composition Root
     ├── main.py            # Multi-inbox_id AlwaysOnDaemon & AsyncWorkerPool (--policy defer|fold|interrupt)
@@ -42,10 +42,13 @@ cd hibernaut
 # Run single-inbox end-to-end demo
 PYTHONPATH=src python3 -m agent_runtime.app.demo
 
-# Run multi-inbox concurrent daemon (supports --policy defer|fold|interrupt)
-PYTHONPATH=src python3 -m agent_runtime.app.main --workers 4 --policy defer --port 8080
+# Run multi-inbox concurrent daemon (/events, /webhooks/github, /webhooks/feishu)
+PYTHONPATH=src python3 -m agent_runtime.app.main \
+  --workers 4 --policy defer --port 8080 \
+  --github-secret "$GITHUB_WEBHOOK_SECRET" \
+  --feishu-token "$FEISHU_VERIFICATION_TOKEN"
 
-# Run all tests (AST boundary gate + Port Contract Tests + Multi-inbox + NewEventPolicy E2E)
+# Run all tests (AST boundary gate + Port Contract Tests + Multi-inbox + NewEventPolicy + Webhooks E2E)
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
@@ -55,7 +58,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 pip install -e ".[dev]"
 
 lint-imports   # Gate 1: Static import boundary checks
-pytest -v      # Gate 2: Contract, concurrency, NewEventPolicy & E2E tests
+pytest -v      # Gate 2: Contract, concurrency, NewEventPolicy, correlation_key & Webhook tests
 pyright        # Gate 3: Strict static type checking on core/ and engine/
 ```
 
