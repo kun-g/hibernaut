@@ -70,9 +70,6 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_request
     ON sessions (pending_request_id);
 
-CREATE INDEX IF NOT EXISTS idx_sessions_correlation
-    ON sessions (inbox_id, correlation_key, updated_at);
-
 CREATE TABLE IF NOT EXISTS workspaces (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     work_key TEXT NOT NULL UNIQUE,
