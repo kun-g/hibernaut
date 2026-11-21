@@ -136,7 +136,7 @@ class AgentWorker:
                         _folded: list[Event] = folded_events,
                         _target_key: tuple[str, str] | None = target_batch_key,
                     ) -> list[Event]:
-                        if self._new_event_policy != "fold":
+                        if self._new_event_policy != "fold" or _target_key is None:
                             return []
                         newly_folded: list[Event] = []
                         for candidate in self._inbox.fetch_pending(_inbox_id):
@@ -306,18 +306,41 @@ class AgentWorker:
         self,
         events: list[Event],
     ) -> list[tuple[SessionRef | None, list[Event]]]:
-        # One batch per resolved key (anonymous events share the None key); events keep seq
-        # order inside a batch and batches run in order of each group's first event.
-        groups: dict[tuple[str, str] | None, tuple[SessionRef | None, list[Event]]] = {}
+        # Same-key events form one batch in seq order; batches run in order of first seq.
+        # Events without session_id/correlation_key are unrelated, so each runs alone
+        # (interrupt restarts still merge them). An approval decision runs alone and closes
+        # its key for this pass; later events of that key wait for the next fetch so they
+        # resolve against the post-decision session.
+        batches: list[tuple[SessionRef | None, list[Event]]] = []
+        open_batches: dict[tuple[str, str] | None, list[Event]] = {}
+        closed_keys: set[tuple[str, str] | None] = set()
         for event in events:
             resolved_session = self._resolve_session(event)
             resolved_key = self._batch_key(event, resolved_session)
-            group = groups.get(resolved_key)
-            if group is None:
-                groups[resolved_key] = (resolved_session, [event])
-            else:
-                group[1].append(event)
-        return list(groups.values())
+            if resolved_key in closed_keys:
+                continue
+            if self._is_approval_decision(event):
+                if resolved_key is not None:
+                    closed_keys.add(resolved_key)
+                if resolved_key is None or resolved_key not in open_batches:
+                    batches.append((resolved_session, [event]))
+                continue
+            if resolved_key is None and self._new_event_policy != "interrupt":
+                batches.append((resolved_session, [event]))
+                continue
+            open_batch = open_batches.get(resolved_key)
+            if open_batch is not None:
+                open_batch.append(event)
+                continue
+            new_batch = [event]
+            open_batches[resolved_key] = new_batch
+            batches.append((resolved_session, new_batch))
+        return batches
+
+    @staticmethod
+    def _is_approval_decision(event: Event) -> bool:
+        request_id = event.payload.get("approval_request_id")
+        return isinstance(request_id, str) and bool(request_id)
 
     def _resolve_session(self, event: Event) -> SessionRef | None:
         # 4-level priority: approval_request_id -> explicit session_id -> (inbox_id, correlation_key) -> new.

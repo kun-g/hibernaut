@@ -208,7 +208,12 @@ class OrcaWorktreeManager:
                 self._alert(notify_outbox, inbox_id, msg)
                 return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
 
-        self._store.mark_reclaiming(work_key)
+        if not self._store.claim_for_reclaim(work_key, seen_updated_at=record.updated_at):
+            return ReclaimResult(
+                reclaimed=False,
+                reason="workspace changed or is being reclaimed by another caller",
+                workdir=record.workdir,
+            )
         primary = Path(record.repo_checkout)
         if self._backend == "orca":
             rm_res = self._runner(["orca", "worktree", "remove", str(workdir)], primary)

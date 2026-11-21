@@ -119,13 +119,21 @@ class SQLiteWorkspaceStore:
         assert rec is not None
         return rec
 
-    def mark_reclaiming(self, work_key: str) -> None:
+    def claim_for_reclaim(self, work_key: str, *, seen_updated_at: str) -> bool:
+        # Compare-and-set on updated_at: of several callers that read the same record, only
+        # one moves it to 'reclaiming'; a crashed claim can still be retried from a fresh read.
         now = utc_now_iso()
+        while now == seen_updated_at:
+            now = utc_now_iso()
         with self._db.transaction() as conn:
-            conn.execute(
-                "UPDATE workspaces SET status = 'reclaiming', updated_at = ? WHERE work_key = ?",
-                (now, work_key),
+            cur = conn.execute(
+                """
+                UPDATE workspaces SET status = 'reclaiming', updated_at = ?
+                WHERE work_key = ? AND updated_at = ?
+                """,
+                (now, work_key, seen_updated_at),
             )
+            return cur.rowcount == 1
 
     def delete(self, work_key: str) -> None:
         with self._db.transaction() as conn:

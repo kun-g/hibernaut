@@ -42,7 +42,7 @@
 ## 3. 外部关联键 `correlation_key` 与 L3 入站/出站通道
 
 - **4 级会话解析优先级**（`AgentWorker._resolve_session()`）：`approval_request_id` → 显式 `session_id` → `(inbox_id, correlation_key)` → 新建 `session_id`。
-- **同键批处理与会话轮换重绑**：`_group_into_batches()` 按解析后的键（`session_id` → `correlation_key` → 无会话事件共用一个匿名组）稳定分组，同组全部 `pending` 事件并入一批（批内保持 `seq` 顺序），批次按各组首条事件的 `seq` 执行，三种 `NewEventPolicy` 一致；`fold` 按同一键注入；重置开新 Session 时向 `SessionStorePort.save()` 写入同一 `(inbox_id, correlation_key)` 自动解绑旧会话并指向新活跃会话。
+- **同键批处理与会话轮换重绑**：`_group_into_batches()` 按解析后的键（`session_id` → `correlation_key`）稳定分组，同键全部 `pending` 事件并入一批（批内保持 `seq` 顺序），批次按各组首条事件的 `seq` 执行。无键事件彼此无关，`defer`/`fold` 下各自单独成批且不被 `fold` 注入，仅 `interrupt` 重启时合并。带 `approval_request_id` 的审批事件单独成批，同键后续事件留到下一轮重新解析会话后再执行；`fold` 按同一键注入；重置开新 Session 时向 `SessionStorePort.save()` 写入同一 `(inbox_id, correlation_key)` 自动解绑旧会话并指向新活跃会话。
 - **L3 入站驱动适配器**（直接调用 `EventHandler.ingest()`）：
   - `POST /events`：通用 JSON 事件接入（202 ACK）。
   - `POST /webhooks/github`（`GitHubWebhookAdapter`）：HMAC-SHA256 `X-Hub-Signature-256` 验签、`X-GitHub-Delivery` 幂等键、`repo -> inbox_id` 映射、Issue/PR 自动提取 `correlation_key = f"github:{repo}#{number}"`。
@@ -65,7 +65,7 @@
 ## 5. 多 `inbox_id` Actor 分区并发与 `NewEventPolicy`
 
 - **多 `inbox_id` 并发**：`AsyncWorkerPool` 跨 `inbox_id` 并行、同 `inbox_id` 单活互斥（`worker_leases` 主键即 `inbox_id`）、`Suspend` 立即放锁；`WorkspacePartitionRegistry` 强制禁止不同 `inbox_id` 挂载同一本地代码目录，全局 `global/instructions.md` 只读共享。
-- **HTTP 入站与 SQLite 并发**：`WebhookHTTPServer`（`ThreadingHTTPServer`，`request_queue_size=128`）每请求一线程；`shutdown()` 等待在途请求全部写完 Inbox 后返回，Worker 停止与配置热加载据此排空。`SQLiteDatabase` 只有一条连接，所有语句经同一把可重入锁串行；写操作走 `transaction()`（`BEGIN IMMEDIATE`），去重、租约等先读后写在线程间和共享同一文件的进程间保持原子；文件库开启 WAL 与 `busy_timeout`。
+- **HTTP 入站与 SQLite 并发**：`WebhookHTTPServer`（`ThreadingHTTPServer`，`request_queue_size=128`）每请求一线程；`shutdown()` 等待在途请求全部写完 Inbox 后返回，Worker 停止与配置热加载据此排空。`SQLiteDatabase` 只有一条连接，所有语句经同一把可重入锁串行；写操作走 `transaction()`（`BEGIN IMMEDIATE`），去重、租约等先读后写在线程间和共享同一文件的进程间保持原子；租约时钟在拿到写锁后读取，等锁时间不计入 TTL；`mark_done()` 按 SQLite 参数上限分段更新；文件库开启 WAL 与 `busy_timeout`。并发回收同一 worktree 时，`claim_for_reclaim()` 以 `updated_at` 做比较并交换，只有一个调用方执行删除。
 - **`NewEventPolicy` 三策略**：`defer`（默认，推迟到下一轮）、`fold`（回合间隙通过 `poll_folded_events()` 增量注入同会话/同关联键事件并统一 `mark_done()`）、`interrupt`（安全取消当前 Run/CLI 子进程，绝不向 Outbox 写半成品，原批次保持 `pending` 与新事件同租约合并重启）。
 
 ## 6. 三道防腐化门禁与核心词汇表（Glossary）

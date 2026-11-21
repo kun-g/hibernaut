@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -89,12 +90,17 @@ class SQLiteInboxAdapter:
     def mark_done(self, event_ids: Sequence[str]) -> None:
         if not event_ids:
             return
-        placeholders = ",".join("?" for _ in event_ids)
+        ids = list(event_ids)
         with self._db.transaction() as conn:
-            conn.execute(
-                f"UPDATE event_inbox SET status = 'done' WHERE event_id IN ({placeholders})",
-                tuple(event_ids),
-            )
+            # Chunk under SQLite's bound-parameter limit; one transaction keeps the ack atomic.
+            chunk = max(1, conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+            for start in range(0, len(ids), chunk):
+                part = ids[start : start + chunk]
+                placeholders = ",".join("?" for _ in part)
+                conn.execute(
+                    f"UPDATE event_inbox SET status = 'done' WHERE event_id IN ({placeholders})",
+                    tuple(part),
+                )
 
 
 class SQLiteTimerAdapter:
@@ -267,9 +273,11 @@ class SQLiteLeaseLockAdapter:
         self._clock = clock
 
     def acquire(self, inbox_id: str, worker_id: str, ttl_seconds: float) -> bool:
-        now = float(self._clock())
-        expires_at = now + ttl_seconds
         with self._db.transaction() as conn:
+            # Read the clock after the write lock is held; time spent waiting must not
+            # be charged to the new lease.
+            now = float(self._clock())
+            expires_at = now + ttl_seconds
             row = conn.execute(
                 "SELECT worker_id, expires_at FROM worker_leases WHERE inbox_id = ?",
                 (inbox_id,),
@@ -289,9 +297,9 @@ class SQLiteLeaseLockAdapter:
         return False
 
     def renew(self, inbox_id: str, worker_id: str, ttl_seconds: float) -> bool:
-        now = float(self._clock())
-        expires_at = now + ttl_seconds
         with self._db.transaction() as conn:
+            now = float(self._clock())
+            expires_at = now + ttl_seconds
             cur = conn.execute(
                 """
                 UPDATE worker_leases

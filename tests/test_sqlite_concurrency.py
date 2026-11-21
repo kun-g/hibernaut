@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import threading
 import unittest
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from agent_runtime.adapters.executor_cli.worktree import CommandResult, OrcaWorktreeManager
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
     SQLiteInboxAdapter,
     SQLiteLeaseLockAdapter,
     SQLiteOutboxAdapter,
+    SQLiteWorkspaceStore,
 )
 from agent_runtime.core.models import Event
 
@@ -157,6 +161,60 @@ class TestSQLiteThreadSafety(unittest.TestCase):
                 inner.execute("INSERT INTO worker_leases VALUES ('b', 'w', 0)")
         rows = db.fetchall("SELECT inbox_id FROM worker_leases ORDER BY inbox_id")
         self.assertEqual([r["inbox_id"] for r in rows], ["a", "b"])
+        db.close()
+
+
+    def test_lease_ttl_starts_after_write_lock_is_acquired(self) -> None:
+        db = SQLiteDatabase(self.db_path)
+        advanced = threading.Event()
+        lease = SQLiteLeaseLockAdapter(db, clock=lambda: 100.0 + (2.0 if advanced.is_set() else 0.0))
+        blocker = sqlite3.connect(self.db_path)
+        blocker.execute("BEGIN IMMEDIATE")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(lease.acquire, INBOX, "A", 1.0)
+            # Time passes while A waits on another process's write lock.
+            advanced.set()
+            blocker.commit()
+            self.assertTrue(first.result(timeout=5))
+        self.assertFalse(lease.acquire(INBOX, "B", 1.0))
+        blocker.close()
+        db.close()
+
+    def test_mark_done_splits_ids_beyond_variable_limit(self) -> None:
+        db = SQLiteDatabase(":memory:")
+        inbox = SQLiteInboxAdapter(db)
+        ids = [inbox.append(_event(f"e{idx}"))[0].event_id for idx in range(10)]
+        with db.transaction() as conn:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 3)
+        inbox.mark_done(ids)
+        self.assertEqual(inbox.fetch_pending(INBOX), [])
+        db.close()
+
+    def test_concurrent_reclaim_removes_worktree_once(self) -> None:
+        db = SQLiteDatabase(self.db_path)
+        store = SQLiteWorkspaceStore(db)
+        folder = self.db_path.parent / "hb-fixture"
+        folder.mkdir()
+        store.reserve_creating(work_key="x", repo_checkout=str(folder.parent), workdir=str(folder), branch="b")
+        store.mark_ready("x", workdir=str(folder), branch="b")
+        both_past_gates = threading.Barrier(2, timeout=5)
+        removals: list[tuple[str, ...]] = []
+
+        def runner(argv: Sequence[str], cwd: Path | None) -> CommandResult:
+            _ = cwd
+            if list(argv[:2]) == ["gh", "pr"]:
+                both_past_gates.wait()
+            if "remove" in argv:
+                removals.append(tuple(argv))
+            return CommandResult(0, "", "")
+
+        manager = OrcaWorktreeManager(workspace_store=store, backend="git", runner=runner)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(manager.reclaim, ["x", "x"]))
+
+        self.assertEqual(len(removals), 1)
+        self.assertEqual(sorted(r.reclaimed for r in results), [False, True])
+        self.assertIsNone(store.get("x"))
         db.close()
 
 
