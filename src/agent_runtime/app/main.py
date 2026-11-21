@@ -38,6 +38,7 @@ from agent_runtime.adapters.executor_whitebox import (
 )
 from agent_runtime.adapters.memory_fs import WorkspacePartitionRegistry
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter
+from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
     SQLiteInboxAdapter,
@@ -477,6 +478,7 @@ def build_daemon_from_config(
             for name, role in config.roles.items()
             if role.role == CODER_REVIEWER_ROLE
         }
+        terminal_bindings = SQLiteTerminalBindingStore(daemon.db)
         executors_by_inbox: dict[str, dict[str, ExecutorPort]] = {}
         wt_mgr_by_inbox: dict[str, OrcaWorktreeManager] = {}
         for proj in config.projects.values():
@@ -494,6 +496,7 @@ def build_daemon_from_config(
                     templates=config.executors,
                     default_executor=exec_name,
                     orca_workspace=proj.worktree_backend == "orca",
+                    terminal_bindings=terminal_bindings,
                 )
                 for exec_name in config.executors
             }

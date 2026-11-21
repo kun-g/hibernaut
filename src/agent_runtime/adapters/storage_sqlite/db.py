@@ -93,6 +93,20 @@ CREATE TABLE IF NOT EXISTS workspaces (
 
 CREATE INDEX IF NOT EXISTS idx_workspaces_repo
     ON workspaces (repo_checkout, status);
+
+CREATE TABLE IF NOT EXISTS terminal_bindings (
+    session_id TEXT PRIMARY KEY,
+    executor_id TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    workdir TEXT NOT NULL,
+    handle TEXT,
+    incarnation_id TEXT,
+    native_session_id TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_terminal_bindings_native
+    ON terminal_bindings (executor_id, native_session_id);
 """
 
 

@@ -7,9 +7,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent_runtime.adapters.executor_cli.orca import run_visible
+from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout, last_text, supervise, target_events
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
+from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.core.models import (
     Emit,
     Event,
@@ -55,8 +56,11 @@ class LocalCLIExecutor:
         default_executor: str = "claude",
         interrupt_poll_interval: float = 0.05,
         orca_workspace: bool = False,
+        terminal_bindings: SQLiteTerminalBindingStore | None = None,
+        visible_runner: OrcaVisibleRunner | None = None,
     ) -> None:
         self._orca_workspace = orca_workspace
+        self._visible = visible_runner or OrcaVisibleRunner(bindings=terminal_bindings)
         self._worktree_manager = worktree_manager
         self._inbox_checkout_map: dict[str, Path] = {
             k: Path(v).resolve() for k, v in inbox_checkout_map.items()
@@ -115,7 +119,20 @@ class LocalCLIExecutor:
 
         prompt = self._build_prompt(events, session, caps)
         if self._orca_workspace and template.orca_agent and explicit_workdir is None:
-            return await run_visible(template.orca_agent, workdir, prompt, session_id, caps, template.timeout_seconds)
+            config_dir = template.env.get("CLAUDE_CONFIG_DIR")
+            return await self._visible.run(
+                executor_id=template.name,
+                agent=template.orca_agent,
+                command=template.command,
+                workdir=workdir,
+                prompt=prompt,
+                session=session,
+                session_id=session_id,
+                events=events,
+                caps=caps,
+                timeout=template.timeout_seconds,
+                transcript_dirs=(config_dir,) if config_dir else (),
+            )
         cli_args = self._render_cli_args(template, prompt=prompt, session=session)
         env = dict(os.environ)
         env.update(template.env)
