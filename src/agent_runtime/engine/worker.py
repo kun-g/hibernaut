@@ -258,9 +258,15 @@ class AgentWorker:
         batch: list[Event],
         session_ref: SessionRef | None,
     ) -> ExecutorPort:
-        holder = self._suspended_holder(batch, session_ref)
-        if holder is not None:
+        if self._resumes_suspended(batch, session_ref):
+            assert session_ref is not None
             # The checkpoint belongs to the executor that suspended; only it can resume.
+            holder = self._suspended_holder(batch, session_ref)
+            if holder is None:
+                raise ExecutorFailed(
+                    f"Suspended session '{session_ref.session_id}' predates executor binding and "
+                    "its executor cannot be determined; set sessions.executor_id to resume it"
+                )
             held = self._executors.get(holder)
             if held is None:
                 raise ExecutorFailed(f"Executor '{holder}' holding the suspended session is not registered")
@@ -440,19 +446,35 @@ class AgentWorker:
             batches.append((resolved_session, new_batch))
         return batches
 
+    @staticmethod
+    def _resumes_suspended(batch: list[Event], session_ref: SessionRef | None) -> bool:
+        if session_ref is None or not session_ref.pending_request_id:
+            return False
+        return any(
+            evt.payload.get("approval_request_id") == session_ref.pending_request_id for evt in batch
+        )
+
     def _suspended_holder(
         self,
         batch: list[Event],
         session_ref: SessionRef | None,
     ) -> str | None:
-        if session_ref is None or not session_ref.pending_request_id:
+        if not self._resumes_suspended(batch, session_ref):
             return None
+        assert session_ref is not None
+        if session_ref.executor_id:
+            return session_ref.executor_id
+        # Sessions suspended before executor binding carry no executor_id, and the old
+        # runtime could already pick a non-default CLI template per event, so the current
+        # default proves nothing. Accept only an executor the approval names or the sole
+        # registered one; otherwise the caller keeps the checkpoint and events pending.
         for evt in batch:
             if evt.payload.get("approval_request_id") == session_ref.pending_request_id:
-                # Sessions suspended before executor binding existed have no executor_id;
-                # that runtime ran every inbox on the global default executor. If it is not
-                # registered, _select_executor fails and the checkpoint and events stay pending.
-                return session_ref.executor_id or self._global_default_executor
+                named = self._routed_executor_id(evt)
+                if named is not None:
+                    return named
+        if len(self._executors) == 1:
+            return next(iter(self._executors))
         return None
 
     @staticmethod

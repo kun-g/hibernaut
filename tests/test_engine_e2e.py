@@ -8,7 +8,7 @@ import unittest
 from collections.abc import Sequence
 from pathlib import Path
 
-from agent_runtime.app.bootstrap import build_runtime
+from agent_runtime.app.bootstrap import AgentRuntimeApp, build_runtime
 from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Silent, Suspend
 from agent_runtime.core.ports import RunCapabilities
 from agent_runtime.engine import OutboxDispatcher
@@ -229,9 +229,9 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[APPROVED]", outcome.messages[0])
         self.assertEqual(other.calls, [])
 
-    async def test_legacy_suspended_session_resumes_on_the_default_executor(self) -> None:
-        # Suspend, then rewrite the sessions table to the pre-binding schema and reopen so
-        # the real migration backfills executor_id as NULL.
+    async def _legacy_suspended_app(self) -> tuple[AgentRuntimeApp, str, str, _OtherExecutor]:
+        # Suspend on whitebox, rewrite sessions to the pre-binding schema and reopen so the
+        # real migration backfills executor_id as NULL; then make "other" the new default.
         root = Path(self._tmp.name) / "legacy"
         app = build_runtime(db_path=root / "runtime.db", memory_dir=root / "memory", channel=RecordingChannel())
         app.handler.ingest(
@@ -244,6 +244,7 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
         suspend_outcome = reports[0].outcome
         assert isinstance(suspend_outcome, Suspend)
         session_id = reports[0].session_id
+        assert session_id is not None
         app.close()
         with sqlite3.connect(root / "runtime.db") as raw:
             raw.execute("ALTER TABLE sessions DROP COLUMN executor_id")
@@ -258,6 +259,11 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tuple(migrated), (None, suspend_outcome.request_id))
         other = _OtherExecutor()
         app.worker._executors["other"] = other  # pyright: ignore[reportPrivateUsage]
+        app.worker._global_default_executor = "other"  # pyright: ignore[reportPrivateUsage]
+        return app, session_id, suspend_outcome.request_id, other
+
+    async def test_legacy_suspended_session_resumes_on_the_executor_the_approval_names(self) -> None:
+        app, session_id, request_id, other = await self._legacy_suspended_app()
         app.handler.ingest(
             inbox_id="u1",
             source="im",
@@ -269,7 +275,7 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
             inbox_id="u1",
             source="approval_ui",
             external_id="legacy-approve",
-            payload={"approval_request_id": suspend_outcome.request_id, "approved": True},
+            payload={"approval_request_id": request_id, "approved": True, "executor_id": "whitebox"},
         )
         reports = await app.worker.process_inbox("u1")
 
@@ -277,6 +283,34 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert isinstance(first, Emit)
         self.assertIn("[APPROVED]", first.messages[0])
         self.assertEqual(other.calls, [["legacy-switch"]])
+
+    async def test_legacy_suspended_session_without_known_executor_waits_for_binding(self) -> None:
+        app, session_id, request_id, other = await self._legacy_suspended_app()
+        app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="legacy-approve",
+            payload={"approval_request_id": request_id, "approved": True},
+        )
+        with self.assertRaises(ExecutorFailed):
+            await app.worker.process_inbox("u1")
+
+        self.assertEqual(other.calls, [])
+        session = app.db.fetchone(
+            "SELECT checkpoint, pending_request_id FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        assert session is not None
+        self.assertIsNotNone(session["checkpoint"])
+        self.assertEqual(session["pending_request_id"], request_id)
+
+        # Recovery: once the binding is filled in, the original approval completes.
+        with app.db.transaction() as conn:
+            conn.execute("UPDATE sessions SET executor_id = 'whitebox' WHERE session_id = ?", (session_id,))
+        reports = await app.worker.process_inbox("u1")
+        outcome = reports[0].outcome
+        assert isinstance(outcome, Emit)
+        self.assertIn("[APPROVED]", outcome.messages[0])
+        self.assertEqual(other.calls, [])
 
     async def test_suspended_session_whose_holder_is_unregistered_stays_pending(self) -> None:
         session_id, request_id, other = await self._suspend_on_whitebox("req-email-6")
