@@ -312,6 +312,36 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[APPROVED]", outcome.messages[0])
         self.assertEqual(other.calls, [])
 
+    async def test_legacy_session_is_not_resumed_by_a_sole_replacement_executor(self) -> None:
+        app, session_id, request_id, other = await self._legacy_suspended_app()
+        registry = app.worker._executors  # pyright: ignore[reportPrivateUsage]
+        whitebox = registry.pop("whitebox")
+        app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="legacy-approve",
+            payload={"approval_request_id": request_id, "approved": True},
+        )
+        with self.assertRaises(ExecutorFailed):
+            await app.worker.process_inbox("u1")
+
+        self.assertEqual(other.calls, [])
+        session = app.db.fetchone(
+            "SELECT checkpoint, pending_request_id FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        assert session is not None
+        self.assertIsNotNone(session["checkpoint"])
+        self.assertEqual(session["pending_request_id"], request_id)
+
+        registry["whitebox"] = whitebox
+        with app.db.transaction() as conn:
+            conn.execute("UPDATE sessions SET executor_id = 'whitebox' WHERE session_id = ?", (session_id,))
+        reports = await app.worker.process_inbox("u1")
+        outcome = reports[0].outcome
+        assert isinstance(outcome, Emit)
+        self.assertIn("[APPROVED]", outcome.messages[0])
+        self.assertEqual(other.calls, [])
+
     async def test_suspended_session_whose_holder_is_unregistered_stays_pending(self) -> None:
         session_id, request_id, other = await self._suspend_on_whitebox("req-email-6")
         with self.app.db.transaction() as conn:

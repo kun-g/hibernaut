@@ -464,17 +464,15 @@ class AgentWorker:
         assert session_ref is not None
         if session_ref.executor_id:
             return session_ref.executor_id
-        # Sessions suspended before executor binding carry no executor_id, and the old
-        # runtime could already pick a non-default CLI template per event, so the current
-        # default proves nothing. Accept only an executor the approval names or the sole
-        # registered one; otherwise the caller keeps the checkpoint and events pending.
+        # Sessions suspended before executor binding carry no executor_id. Neither the current
+        # default nor a sole registered executor proves who wrote the checkpoint (the old CLI
+        # runtime could pick templates per event; executors can be replaced). Accept only an
+        # executor the approval names; otherwise the caller keeps checkpoint and events pending.
         for evt in batch:
             if evt.payload.get("approval_request_id") == session_ref.pending_request_id:
                 named = self._routed_executor_id(evt)
                 if named is not None:
                     return named
-        if len(self._executors) == 1:
-            return next(iter(self._executors))
         return None
 
     @staticmethod
