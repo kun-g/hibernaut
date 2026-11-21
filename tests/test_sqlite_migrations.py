@@ -28,9 +28,9 @@ class TestSQLiteMigrations(unittest.TestCase):
                 """)
             for _ in range(2):
                 with closing(SQLiteDatabase(path)) as db:
-                    event = db.conn.execute("SELECT status, correlation_key FROM event_inbox WHERE event_id='e1'").fetchone()
+                    event = db.fetchone("SELECT status, correlation_key FROM event_inbox WHERE event_id='e1'")
                     self.assertEqual(tuple(event), ('pending', None))
-                    session = db.conn.execute("SELECT checkpoint, pending_request_id, correlation_key FROM sessions WHERE session_id='s1'").fetchone()
+                    session = db.fetchone("SELECT checkpoint, pending_request_id, correlation_key FROM sessions WHERE session_id='s1'")
                     self.assertEqual(tuple(session), ('saved', 'r1', None))
-                    index = db.conn.execute("PRAGMA index_info(idx_sessions_correlation)")
+                    index = db.fetchall("PRAGMA index_info(idx_sessions_correlation)")
                     self.assertEqual([col['name'] for col in index], ['inbox_id', 'correlation_key', 'updated_at'])

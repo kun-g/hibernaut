@@ -1,6 +1,7 @@
 from agent_runtime.adapters.channels.channels import (
     ConsoleChannelAdapter,
     WebhookChannelAdapter,
+    WebhookHTTPServer,
     create_webhook_server,
 )
 from agent_runtime.adapters.channels.feishu_channel import (
@@ -22,6 +23,7 @@ __all__ = [
     "MCPServerAdapter",
     "PollTarget",
     "WebhookChannelAdapter",
+    "WebhookHTTPServer",
     "WebhookResponse",
     "build_feishu_or_console_channel",
     "create_webhook_server",

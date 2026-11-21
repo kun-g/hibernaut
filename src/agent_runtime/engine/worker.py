@@ -306,23 +306,18 @@ class AgentWorker:
         self,
         events: list[Event],
     ) -> list[tuple[SessionRef | None, list[Event]]]:
-        batches: list[tuple[SessionRef | None, list[Event]]] = []
+        # One batch per resolved key (anonymous events share the None key); events keep seq
+        # order inside a batch and batches run in order of each group's first event.
+        groups: dict[tuple[str, str] | None, tuple[SessionRef | None, list[Event]]] = {}
         for event in events:
             resolved_session = self._resolve_session(event)
             resolved_key = self._batch_key(event, resolved_session)
-
-            if batches:
-                prev_session, prev_events = batches[-1]
-                prev_key = self._batch_key(prev_events[-1], prev_session)
-                if resolved_key is not None and resolved_key == prev_key:
-                    prev_events.append(event)
-                    continue
-                if resolved_key is None and prev_key is None and self._new_event_policy == "interrupt":
-                    prev_events.append(event)
-                    continue
-
-            batches.append((resolved_session, [event]))
-        return batches
+            group = groups.get(resolved_key)
+            if group is None:
+                groups[resolved_key] = (resolved_session, [event])
+            else:
+                group[1].append(event)
+        return list(groups.values())
 
     def _resolve_session(self, event: Event) -> SessionRef | None:
         # 4-level priority: approval_request_id -> explicit session_id -> (inbox_id, correlation_key) -> new.

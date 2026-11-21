@@ -26,8 +26,7 @@ class SQLiteInboxAdapter:
         self._db = db
 
     def append(self, event: Event) -> tuple[Event, bool]:
-        conn = self._db.conn
-        with conn:
+        with self._db.transaction() as conn:
             existing = conn.execute(
                 """
                 SELECT 1 FROM event_inbox
@@ -62,7 +61,7 @@ class SQLiteInboxAdapter:
         return stored, is_duplicate
 
     def fetch_pending(self, inbox_id: str) -> list[Event]:
-        rows = self._db.conn.execute(
+        rows = self._db.fetchall(
             """
             SELECT event_id, inbox_id, source, external_id,
                    occurred_at, payload_json, session_id, correlation_key, status
@@ -71,7 +70,7 @@ class SQLiteInboxAdapter:
             ORDER BY seq ASC
             """,
             (inbox_id,),
-        ).fetchall()
+        )
         return [
             Event(
                 event_id=str(row["event_id"]),
@@ -91,8 +90,8 @@ class SQLiteInboxAdapter:
         if not event_ids:
             return
         placeholders = ",".join("?" for _ in event_ids)
-        with self._db.conn:
-            self._db.conn.execute(
+        with self._db.transaction() as conn:
+            conn.execute(
                 f"UPDATE event_inbox SET status = 'done' WHERE event_id IN ({placeholders})",
                 tuple(event_ids),
             )
@@ -113,8 +112,8 @@ class SQLiteTimerAdapter:
         session_id: str | None = None,
     ) -> str:
         timer_id = new_id("tmr")
-        with self._db.conn:
-            self._db.conn.execute(
+        with self._db.transaction() as conn:
+            conn.execute(
                 """
                 INSERT INTO timers (
                     timer_id, inbox_id, kind, due_at,
@@ -134,7 +133,7 @@ class SQLiteTimerAdapter:
         return timer_id
 
     def fetch_due(self, now_iso: str) -> list[TimerSpec]:
-        rows = self._db.conn.execute(
+        rows = self._db.fetchall(
             """
             SELECT timer_id, inbox_id, kind, due_at,
                    payload_json, recurrence_seconds, session_id, status
@@ -143,7 +142,7 @@ class SQLiteTimerAdapter:
             ORDER BY due_at ASC
             """,
             (now_iso,),
-        ).fetchall()
+        )
         return [
             TimerSpec(
                 timer_id=str(row["timer_id"]),
@@ -159,8 +158,8 @@ class SQLiteTimerAdapter:
         ]
 
     def mark_triggered(self, timer_id: str, next_due_at: str | None = None) -> None:
-        with self._db.conn:
-            row = self._db.conn.execute(
+        with self._db.transaction() as conn:
+            row = conn.execute(
                 "SELECT kind FROM timers WHERE timer_id = ?",
                 (timer_id,),
             ).fetchone()
@@ -168,12 +167,12 @@ class SQLiteTimerAdapter:
                 raise KeyError(f"Timer not found: {timer_id}")
             kind = str(row["kind"])
             if kind == "schedule" and next_due_at is not None:
-                self._db.conn.execute(
+                conn.execute(
                     "UPDATE timers SET due_at = ?, status = 'pending' WHERE timer_id = ?",
                     (next_due_at, timer_id),
                 )
             else:
-                self._db.conn.execute(
+                conn.execute(
                     "UPDATE timers SET status = 'done' WHERE timer_id = ?",
                     (timer_id,),
                 )
@@ -198,8 +197,8 @@ class SQLiteOutboxAdapter:
             attempts=0,
             metadata=dict(metadata or {}),
         )
-        with self._db.conn:
-            self._db.conn.execute(
+        with self._db.transaction() as conn:
+            conn.execute(
                 """
                 INSERT INTO outbox (
                     message_id, inbox_id, created_at, content,
@@ -219,7 +218,7 @@ class SQLiteOutboxAdapter:
         return msg
 
     def fetch_pending(self, limit: int = 20) -> list[OutboxMessage]:
-        rows = self._db.conn.execute(
+        rows = self._db.fetchall(
             """
             SELECT message_id, inbox_id, created_at, content, status, attempts, metadata_json
             FROM outbox
@@ -228,7 +227,7 @@ class SQLiteOutboxAdapter:
             LIMIT ?
             """,
             (limit,),
-        ).fetchall()
+        )
         return [
             OutboxMessage(
                 message_id=str(row["message_id"]),
@@ -243,15 +242,15 @@ class SQLiteOutboxAdapter:
         ]
 
     def mark_sent(self, message_id: str) -> None:
-        with self._db.conn:
-            self._db.conn.execute(
+        with self._db.transaction() as conn:
+            conn.execute(
                 "UPDATE outbox SET status = 'sent' WHERE message_id = ?",
                 (message_id,),
             )
 
     def mark_failed(self, message_id: str, error: str) -> None:
-        with self._db.conn:
-            self._db.conn.execute(
+        with self._db.transaction() as conn:
+            conn.execute(
                 "UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE message_id = ?",
                 (error, message_id),
             )
@@ -270,8 +269,7 @@ class SQLiteLeaseLockAdapter:
     def acquire(self, inbox_id: str, worker_id: str, ttl_seconds: float) -> bool:
         now = float(self._clock())
         expires_at = now + ttl_seconds
-        conn = self._db.conn
-        with conn:
+        with self._db.transaction() as conn:
             row = conn.execute(
                 "SELECT worker_id, expires_at FROM worker_leases WHERE inbox_id = ?",
                 (inbox_id,),
@@ -293,8 +291,8 @@ class SQLiteLeaseLockAdapter:
     def renew(self, inbox_id: str, worker_id: str, ttl_seconds: float) -> bool:
         now = float(self._clock())
         expires_at = now + ttl_seconds
-        with self._db.conn:
-            cur = self._db.conn.execute(
+        with self._db.transaction() as conn:
+            cur = conn.execute(
                 """
                 UPDATE worker_leases
                 SET expires_at = ?
@@ -305,8 +303,8 @@ class SQLiteLeaseLockAdapter:
             return cur.rowcount > 0
 
     def release(self, inbox_id: str, worker_id: str) -> None:
-        with self._db.conn:
-            self._db.conn.execute(
+        with self._db.transaction() as conn:
+            conn.execute(
                 "DELETE FROM worker_leases WHERE inbox_id = ? AND worker_id = ?",
                 (inbox_id, worker_id),
             )
@@ -317,14 +315,14 @@ class SQLiteSessionStoreAdapter:
         self._db = db
 
     def get(self, session_id: str) -> SessionRef | None:
-        row = self._db.conn.execute(
+        row = self._db.fetchone(
             """
             SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
             FROM sessions
             WHERE session_id = ?
             """,
             (session_id,),
-        ).fetchone()
+        )
         if row is None:
             return None
         return SessionRef(
@@ -337,7 +335,7 @@ class SQLiteSessionStoreAdapter:
         )
 
     def find_by_request_id(self, request_id: str) -> SessionRef | None:
-        row = self._db.conn.execute(
+        row = self._db.fetchone(
             """
             SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
             FROM sessions
@@ -345,7 +343,7 @@ class SQLiteSessionStoreAdapter:
             LIMIT 1
             """,
             (request_id,),
-        ).fetchone()
+        )
         if row is None:
             return None
         return SessionRef(
@@ -358,7 +356,7 @@ class SQLiteSessionStoreAdapter:
         )
 
     def find_by_correlation_key(self, inbox_id: str, correlation_key: str) -> SessionRef | None:
-        row = self._db.conn.execute(
+        row = self._db.fetchone(
             """
             SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
             FROM sessions
@@ -367,7 +365,7 @@ class SQLiteSessionStoreAdapter:
             LIMIT 1
             """,
             (inbox_id, correlation_key),
-        ).fetchone()
+        )
         if row is None:
             return None
         return SessionRef(
@@ -395,7 +393,7 @@ class SQLiteSessionStoreAdapter:
         elif status == "active":
             clauses.append("pending_request_id IS NULL")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self._db.conn.execute(
+        rows = self._db.fetchall(
             f"""
             SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
             FROM sessions
@@ -403,7 +401,7 @@ class SQLiteSessionStoreAdapter:
             ORDER BY updated_at DESC
             """,
             tuple(params),
-        ).fetchall()
+        )
         return [
             SessionRef(
                 session_id=str(row["session_id"]),
@@ -417,10 +415,10 @@ class SQLiteSessionStoreAdapter:
         ]
 
     def save(self, session: SessionRef) -> None:
-        with self._db.conn:
+        with self._db.transaction() as conn:
             if session.correlation_key is not None:
                 # Rebind correlation_key exclusively to the latest active session_id (rotation).
-                self._db.conn.execute(
+                conn.execute(
                     """
                     UPDATE sessions
                     SET correlation_key = NULL
@@ -428,7 +426,7 @@ class SQLiteSessionStoreAdapter:
                     """,
                     (session.inbox_id, session.correlation_key, session.session_id),
                 )
-            self._db.conn.execute(
+            conn.execute(
                 """
                 INSERT INTO sessions (
                     session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at

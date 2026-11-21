@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS event_inbox (
@@ -87,37 +91,76 @@ CREATE INDEX IF NOT EXISTS idx_workspaces_repo
 
 
 class SQLiteDatabase:
-    def __init__(self, db_path: str | Path = ":memory:") -> None:
+    # One connection shared by the event loop and HTTP handler threads. Every statement runs
+    # under one re-entrant lock, and writes use BEGIN IMMEDIATE so check-then-write sequences
+    # (dedup, leases) stay atomic across threads and across processes sharing the file.
+    def __init__(self, db_path: str | Path = ":memory:", *, busy_timeout_ms: int = 5000) -> None:
         self._db_path = str(db_path)
         if self._db_path != ":memory:":
             Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._lock = threading.RLock()
+        self._tx_depth = 0
+        self._conn = sqlite3.connect(
+            self._db_path,
+            check_same_thread=False,
+            isolation_level=None,
+            timeout=busy_timeout_ms / 1000,
+        )
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)};")
         if self._db_path != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
         self._conn.executescript(SCHEMA_SQL)
-        self._ensure_migrations()
-        self._conn.commit()
+        with self.transaction() as conn:
+            self._ensure_migrations(conn)
 
-    def _ensure_migrations(self) -> None:
+    @staticmethod
+    def _ensure_migrations(conn: sqlite3.Connection) -> None:
         for table in ("event_inbox", "sessions"):
             cols = {
                 str(row["name"])
-                for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
             }
             if "correlation_key" not in cols:
-                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN correlation_key TEXT")
-        self._conn.execute(
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN correlation_key TEXT")
+        conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_sessions_correlation
                 ON sessions (inbox_id, correlation_key, updated_at)
             """
         )
 
-    @property
-    def conn(self) -> sqlite3.Connection:
-        return self._conn
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            if self._tx_depth:
+                self._tx_depth += 1
+                try:
+                    yield self._conn
+                finally:
+                    self._tx_depth -= 1
+                return
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._tx_depth = 1
+            try:
+                yield self._conn
+                self._conn.execute("COMMIT")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+            finally:
+                self._tx_depth = 0
+
+    def fetchall(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    def fetchone(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()

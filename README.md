@@ -21,7 +21,7 @@ src/agent_runtime/
 │   ├── scheduler.py       # TimerScheduler: scans due Follow-up & Schedule timers -> appends Inbox events
 │   └── dispatcher.py      # OutboxDispatcher: paced Outbox delivery with anti-spam throttling and retries
 ├── adapters/              # L3: Volatile infrastructure implementations
-│   ├── storage_sqlite/    # SQLite WAL (Inbox, Timers, Outbox, Leases, Sessions + correlation_key rotation, Workspaces)
+│   ├── storage_sqlite/    # SQLite WAL, one lock-guarded connection + BEGIN IMMEDIATE writes (Inbox, Timers, Outbox, Leases, Sessions + correlation_key rotation, Workspaces)
 │   ├── memory_fs/         # FileSystemMemoryAdapter + PartitionedMemoryAdapter & WorkspacePartitionRegistry
 │   ├── permissions/       # Auto Mode classifier (allow / block / defer) + external CredentialProxyClient
 │   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
@@ -50,6 +50,8 @@ PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
 ```
 
 The HTTP daemon watches the file passed to `--config` once per second, including under `scripts/run_updating.py`. Save project mappings, CLI templates, worker limits or channel settings and look for `[config] Reloaded` in the console. The daemon finishes accepted work before activating the new settings, so incoming requests may briefly wait. Invalid TOML or a busy replacement port leaves the current configuration active. Changing `db_path` or `memory_root`, updating the process environment, or reconfiguring a stdio MCP session requires a restart.
+
+The HTTP endpoints handle requests on parallel threads (backlog 128); stopping or reloading the daemon waits for requests already accepted. SQLite access from those threads and the worker loop goes through one locked connection, and writes use `BEGIN IMMEDIATE`, so deduplication and leases stay atomic. Under every `NewEventPolicy`, a worker runs all pending events that share a session (by `session_id`, then `correlation_key`) as one batch, and all events without either as another, in order of each group's first event.
 
 Hibernaut locates managed worktrees by branch in the primary repository's Git worktree list. On the next wake, it repairs stale SQLite paths for registered worktrees. If an executor exhausts its retries, the daemon logs the affected inbox and keeps the batch pending. A new event in that inbox wakes it for another attempt.
 

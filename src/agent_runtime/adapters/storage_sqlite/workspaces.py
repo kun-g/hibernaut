@@ -39,18 +39,18 @@ class SQLiteWorkspaceStore:
         )
 
     def get(self, work_key: str) -> WorkspaceRecord | None:
-        row = self._db.conn.execute(
+        row = self._db.fetchone(
             """
             SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at
             FROM workspaces
             WHERE work_key = ?
             """,
             (work_key,),
-        ).fetchone()
+        )
         return self._row_to_record(row) if row is not None else None
 
     def list_by_repo(self, repo_checkout: str) -> list[WorkspaceRecord]:
-        rows = self._db.conn.execute(
+        rows = self._db.fetchall(
             """
             SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at
             FROM workspaces
@@ -58,21 +58,21 @@ class SQLiteWorkspaceStore:
             ORDER BY seq ASC
             """,
             (repo_checkout,),
-        ).fetchall()
+        )
         return [self._row_to_record(row) for row in rows]
 
     def list_all(self) -> list[WorkspaceRecord]:
-        rows = self._db.conn.execute(
+        rows = self._db.fetchall(
             """
             SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at
             FROM workspaces
             ORDER BY seq ASC
             """
-        ).fetchall()
+        )
         return [self._row_to_record(row) for row in rows]
 
     def next_task_seq(self) -> int:
-        row = self._db.conn.execute("SELECT COALESCE(MAX(seq), 0) AS max_seq FROM workspaces").fetchone()
+        row = self._db.fetchone("SELECT COALESCE(MAX(seq), 0) AS max_seq FROM workspaces")
         return int(row["max_seq"]) + 1 if row is not None else 1
 
     def reserve_creating(
@@ -84,8 +84,8 @@ class SQLiteWorkspaceStore:
         branch: str,
     ) -> WorkspaceRecord:
         now = utc_now_iso()
-        with self._db.conn:
-            self._db.conn.execute(
+        with self._db.transaction() as conn:
+            conn.execute(
                 """
                 INSERT INTO workspaces (
                     work_key, repo_checkout, workdir, branch, status, created_at, updated_at
@@ -106,8 +106,8 @@ class SQLiteWorkspaceStore:
 
     def mark_ready(self, work_key: str, *, workdir: str, branch: str) -> WorkspaceRecord:
         now = utc_now_iso()
-        with self._db.conn:
-            self._db.conn.execute(
+        with self._db.transaction() as conn:
+            conn.execute(
                 """
                 UPDATE workspaces
                 SET workdir = ?, branch = ?, status = 'ready', updated_at = ?
@@ -121,12 +121,12 @@ class SQLiteWorkspaceStore:
 
     def mark_reclaiming(self, work_key: str) -> None:
         now = utc_now_iso()
-        with self._db.conn:
-            self._db.conn.execute(
+        with self._db.transaction() as conn:
+            conn.execute(
                 "UPDATE workspaces SET status = 'reclaiming', updated_at = ? WHERE work_key = ?",
                 (now, work_key),
             )
 
     def delete(self, work_key: str) -> None:
-        with self._db.conn:
-            self._db.conn.execute("DELETE FROM workspaces WHERE work_key = ?", (work_key,))
+        with self._db.transaction() as conn:
+            conn.execute("DELETE FROM workspaces WHERE work_key = ?", (work_key,))

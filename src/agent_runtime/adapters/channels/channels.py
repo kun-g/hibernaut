@@ -1,15 +1,70 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
 import urllib.request
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from agent_runtime.adapters.channels.feishu_webhook import FeishuWebhookAdapter
 from agent_runtime.adapters.channels.github_webhook import GitHubWebhookAdapter
 from agent_runtime.adapters.channels.mcp_server import MCPServerAdapter
 from agent_runtime.engine.handler import EventHandler
+
+
+class WebhookHTTPServer(ThreadingHTTPServer):
+    request_queue_size = 128
+    daemon_threads = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_class: type[BaseHTTPRequestHandler],
+        bind_and_activate: bool = True,
+    ) -> None:
+        self._inflight = 0
+        self._idle = threading.Condition()
+        super().__init__(server_address, handler_class, bind_and_activate)
+
+    def process_request(
+        self,
+        request: socket.socket | tuple[bytes, socket.socket],
+        client_address: Any,
+    ) -> None:
+        with self._idle:
+            self._inflight += 1
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_finished()
+            raise
+
+    def process_request_thread(
+        self,
+        request: socket.socket | tuple[bytes, socket.socket],
+        client_address: Any,
+    ) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_finished()
+
+    def _request_finished(self) -> None:
+        with self._idle:
+            self._inflight -= 1
+            self._idle.notify_all()
+
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        with self._idle:
+            return self._idle.wait_for(lambda: self._inflight == 0, timeout)
+
+    def shutdown(self) -> None:
+        # Callers rely on shutdown() meaning every accepted request has finished ingesting,
+        # as it did with the single-threaded server (drain before stopping workers or reloading).
+        super().shutdown()
+        self.wait_idle()
 
 
 class ConsoleChannelAdapter:
@@ -124,8 +179,8 @@ def create_webhook_server(
     github_adapter: GitHubWebhookAdapter | None = None,
     feishu_adapter: FeishuWebhookAdapter | None = None,
     mcp_adapter: MCPServerAdapter | None = None,
-) -> HTTPServer:
-    return HTTPServer((host, port), webhook_request_handler(
+) -> WebhookHTTPServer:
+    return WebhookHTTPServer((host, port), webhook_request_handler(
         handler, github_adapter=github_adapter, feishu_adapter=feishu_adapter,
         mcp_adapter=mcp_adapter,
     ))
