@@ -25,7 +25,7 @@ src/agent_runtime/
 │   ├── memory_fs/         # FileSystemMemoryAdapter + PartitionedMemoryAdapter & WorkspacePartitionRegistry
 │   ├── permissions/       # Auto Mode classifier (allow / block / defer) + external CredentialProxyClient
 │   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
-│   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + resume_args + magpie env) & OrcaWorktreeManager (3 safety gates)
+│   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + resume_args + magpie env), CoderReviewerExecutor (read-only review) & OrcaWorktreeManager (3 safety gates)
 │   └── channels/          # Multi-route HTTP (/events, /webhooks/github, /webhooks/feishu, /mcp), MCPServerAdapter, GitHubIssuePoller, FeishuChannelAdapter, Console
 └── app/
     ├── config.py          # Stdlib tomllib loader for hibernaut.toml
@@ -76,6 +76,40 @@ python3 scripts/run_updating.py --port 8080
 The supervisor checks the configured `origin/main` every 300 seconds. Use `--interval 60` for one-minute checks. Daemon options such as `--db`, `--memory-root`, `--workers`, and `--policy` are forwarded across restarts. Stop with `Ctrl+C`.
 
 Use an origin you trust to supply executable code. A dirty checkout (including untracked files), another branch, a divergent history, or a failed fetch leaves the running daemon in place. On a fast-forward, the old daemon closes ingress and drains accepted work before the supervisor applies the commit and relaunches. Clients should retry during this short interruption using the same external event ID. Keep runtime state in ignored paths or outside the checkout. The supervisor reuses those paths. If a new daemon fails to start, the supervisor exits with its status for operator recovery.
+
+## Independent Code Review (`coder-reviewer`)
+
+Register a reviewer in `hibernaut.toml` (defaults shown; only `role` is required):
+
+```toml
+[executors.coder-reviewer]
+role = "coder-reviewer"
+harness = "claude-code"    # only claude-code
+billing = "subscription"   # subscription | api
+model = "claude-opus-5-5"  # Claude full name or alias (opus, sonnet, haiku, fable)
+effort = "high"            # low | medium | high | xhigh | max
+```
+
+Dispatch a review with `executor_id = "coder-reviewer"`:
+
+```bash
+curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
+  "inbox_id": "proj:hibernaut", "external_id": "review-42-r1", "correlation_key": "review:task-42",
+  "payload": {
+    "executor_id": "coder-reviewer",
+    "text": "Task requirements the change must meet",
+    "test_evidence": "pytest -v: 119 passed; pyright: 0 errors",
+    "review_of": "task-42",
+    "base_ref": "origin/main"
+  }}'
+```
+
+- Workspace: `explicit_workdir`, or the ready workspace of `review_of` (the developer task's `correlation_key`). The reviewer never creates a worktree. Use its own `correlation_key` so the developer session stays bound to its executor.
+- Diff: computed by the executor from the merge base with `base_ref` (default `origin/HEAD`, then `main`), including uncommitted and untracked files.
+- Result: one Outbox message with `verdict=pass` or `verdict=changes_requested`. Each blocking item lists location, trigger, impact and an optional fix. After a fix, send a new event (new `external_id`) for a fresh, independent review.
+- Read-only: edit tools are denied and the working tree is fingerprinted before and after; any change discards the review.
+- Billing: `subscription` removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the Bedrock/Vertex/Foundry switches from the child environment, and stops at session start if Claude Code still reports a paid credential source. `api` reads the key from the daemon environment; never put credentials in `hibernaut.toml` (the parser rejects them).
+- Hot reload: save the four settings and the next review uses them. Invalid values or combinations print `[config] Invalid ... (ValueError: <reason>)` and keep the running settings.
 
 ## MCP Server Integration (`stdio` & Remote `/mcp`)
 

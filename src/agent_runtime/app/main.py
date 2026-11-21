@@ -25,7 +25,11 @@ from agent_runtime.adapters.channels import (
     build_feishu_or_console_channel,
 )
 from agent_runtime.adapters.channels.channels import webhook_request_handler
-from agent_runtime.adapters.executor_cli import LocalCLIExecutor, OrcaWorktreeManager
+from agent_runtime.adapters.executor_cli import (
+    CoderReviewerExecutor,
+    LocalCLIExecutor,
+    OrcaWorktreeManager,
+)
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
     RuleBasedDemoLLM,
@@ -434,7 +438,8 @@ def build_daemon_from_config(
     )
 
     has_configured_executor = (
-        bool(config.executors) and config.runtime.default_executor in config.executors
+        config.runtime.default_executor in config.executors
+        or config.runtime.default_executor in config.reviewers
     )
     ingest_only = (not demo) and (not has_configured_executor)
     if ingest_only:
@@ -465,6 +470,11 @@ def build_daemon_from_config(
 
     if has_configured_executor and not demo:
         # Instantiate all configured [executors.<id>] per project so AgentWorker can sticky-route.
+        # Reviewers are rebuilt with each config reload, so the next review uses the new profile.
+        reviewer_executors: dict[str, ExecutorPort] = {
+            name: CoderReviewerExecutor(profile=profile, workspaces=daemon.workspaces)
+            for name, profile in config.reviewers.items()
+        }
         executors_by_inbox: dict[str, dict[str, ExecutorPort]] = {}
         wt_mgr_by_inbox: dict[str, OrcaWorktreeManager] = {}
         for proj in config.projects.values():
@@ -485,6 +495,7 @@ def build_daemon_from_config(
                 )
                 for exec_name in config.executors
             }
+            executors_by_inbox[proj.inbox_id].update(reviewer_executors)
 
         default_mgr = OrcaWorktreeManager(
             workspace_store=daemon.workspaces,
@@ -499,6 +510,7 @@ def build_daemon_from_config(
             )
             for exec_name in config.executors
         }
+        fallback_executors.update(reviewer_executors)
 
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
             return AgentWorker(

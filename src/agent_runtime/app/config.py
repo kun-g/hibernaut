@@ -11,6 +11,11 @@ from typing import Any, Literal, cast
 
 from agent_runtime.adapters.channels.github_poller import PollMode
 from agent_runtime.adapters.executor_cli.executor import CLITemplate
+from agent_runtime.adapters.executor_cli.reviewer import (
+    CODER_REVIEWER_ROLE,
+    ReviewerProfile,
+    parse_reviewer_profile,
+)
 from agent_runtime.adapters.executor_cli.worktree import WorktreeBackend
 from agent_runtime.core.models import NewEventPolicy
 
@@ -58,6 +63,7 @@ class HibernautConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
     executors: dict[str, CLITemplate] = field(default_factory=dict)
+    reviewers: dict[str, ReviewerProfile] = field(default_factory=dict)
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
 
@@ -100,8 +106,9 @@ async def config_changes(
                 raise ValueError("empty configuration")
             config = parse_config(raw)
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+            detail = f": {exc}" if type(exc) is ValueError else ""
             print(
-                f"[config] Invalid {path} ({type(exc).__name__}); keeping current settings.",
+                f"[config] Invalid {path} ({type(exc).__name__}{detail}); keeping current settings.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -152,7 +159,14 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
     )
 
     executors: dict[str, CLITemplate] = {}
+    reviewers: dict[str, ReviewerProfile] = {}
     for name, item in raw.get("executors", {}).items():
+        role = item.get("role")
+        if role is not None:
+            if role != CODER_REVIEWER_ROLE:
+                raise ValueError(f"executors.{name}: unsupported role '{role}' (supported: {CODER_REVIEWER_ROLE})")
+            reviewers[str(name)] = parse_reviewer_profile(str(name), item)
+            continue
         env_raw = item.get("env", {})
         resume_raw = item.get("resume_args")
         orca_agent = item.get("orca_agent")
@@ -196,5 +210,6 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
         runtime=runtime,
         channels=channels,
         executors=executors,
+        reviewers=reviewers,
         projects=projects,
     )
