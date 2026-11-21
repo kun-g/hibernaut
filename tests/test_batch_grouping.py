@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 
 from agent_runtime.core.models import Event, NewEventPolicy, RunOutcome, SessionRef, Silent
 from agent_runtime.core.ports import RunCapabilities
@@ -23,6 +24,8 @@ POLICIES: tuple[NewEventPolicy, ...] = ("defer", "fold", "interrupt")
 class _RecordingExecutor:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.started: list[list[str]] = []
+        self.during_run: Callable[[list[str]], Awaitable[None]] | None = None
 
     async def execute(
         self,
@@ -32,6 +35,9 @@ class _RecordingExecutor:
     ) -> RunOutcome:
         _ = session
         batch = [evt.external_id for evt in events]
+        self.started.append(list(batch))
+        if self.during_run is not None:
+            await self.during_run(batch)
         batch += [evt.external_id for evt in caps.poll_folded_events()]
         self.calls.append(batch)
         return Silent()
@@ -60,12 +66,13 @@ def _event(
     *,
     session_id: str | None = None,
     correlation_key: str | None = None,
+    workdir: str | None = None,
 ) -> Event:
     return Event(
         inbox_id=INBOX,
         source="test",
         external_id=external_id,
-        payload={},
+        payload={"explicit_workdir": workdir} if workdir else {},
         session_id=session_id,
         correlation_key=correlation_key,
     )
@@ -123,7 +130,7 @@ class TestBatchGrouping(unittest.IsolatedAsyncioTestCase):
             [["n1"], ["c1", "c2"], ["s1", "s2"], ["n2"], ["c3"]],
         )
 
-    async def test_approval_decision_runs_alone_and_later_events_wait(self) -> None:
+    async def test_approval_decision_closes_batch_and_later_events_wait(self) -> None:
         worker, inbox, executor = _build("defer")
         inbox.append(_event("A1", session_id="chat_1"))
         inbox.append(_approval("A-approve", session_id="chat_1"))
@@ -132,8 +139,70 @@ class TestBatchGrouping(unittest.IsolatedAsyncioTestCase):
 
         await worker.process_inbox(INBOX)
 
-        self.assertEqual(executor.calls, [["A1"], ["B1"], ["A-approve"], ["A2"]])
+        self.assertEqual(executor.calls, [["A1", "A-approve"], ["B1"], ["A2"]])
         self.assertEqual(inbox.fetch_pending(INBOX), [])
+
+    async def test_events_with_different_execution_targets_do_not_share_a_run(self) -> None:
+        worker, inbox, executor = _build("defer")
+        inbox.append(_event("A1", session_id="chat_1", workdir="/repo/a"))
+        inbox.append(_event("B1", session_id="chat_2"))
+        inbox.append(_event("A2", session_id="chat_1", workdir="/repo/b"))
+        inbox.append(_event("A3", session_id="chat_1", workdir="/repo/b"))
+
+        await worker.process_inbox(INBOX)
+
+        self.assertEqual(executor.calls, [["A1"], ["B1"], ["A2", "A3"]])
+
+    async def test_fold_does_not_cross_approval_boundary(self) -> None:
+        worker, inbox, executor = _build("fold")
+        inbox.append(_approval("A-approve", session_id="chat_1"))
+        inbox.append(_event("A2", session_id="chat_1"))
+
+        await worker.process_inbox(INBOX)
+
+        self.assertEqual(executor.calls, [["A-approve"], ["A2"]])
+
+    async def test_fold_stops_before_an_approval_arriving_mid_run(self) -> None:
+        worker, inbox, executor = _build("fold")
+        inbox.append(_event("A1", session_id="chat_1"))
+
+        async def arrive(batch: list[str]) -> None:
+            if batch == ["A1"]:
+                inbox.append(_approval("A-approve", session_id="chat_1"))
+                inbox.append(_event("A2", session_id="chat_1"))
+
+        executor.during_run = arrive
+        await worker.process_inbox(INBOX)
+
+        self.assertEqual(executor.calls, [["A1"], ["A-approve"], ["A2"]])
+
+    async def test_interrupt_ignores_events_already_in_the_snapshot(self) -> None:
+        worker, inbox, executor = _build("interrupt")
+        inbox.append(_event("A1", session_id="chat_1"))
+        inbox.append(_event("B1", session_id="chat_2"))
+
+        async def slow(batch: list[str]) -> None:
+            _ = batch
+            await asyncio.sleep(0.1)
+
+        executor.during_run = slow
+        await worker.process_inbox(INBOX)
+
+        self.assertEqual(executor.started, [["A1"], ["B1"]])
+
+    async def test_interrupt_does_not_restart_an_approval_run(self) -> None:
+        worker, inbox, executor = _build("interrupt")
+        inbox.append(_approval("A-approve", session_id="chat_1"))
+
+        async def arrive(batch: list[str]) -> None:
+            if batch == ["A-approve"]:
+                inbox.append(_event("B1", session_id="chat_2"))
+                await asyncio.sleep(0.1)
+
+        executor.during_run = arrive
+        await worker.process_inbox(INBOX)
+
+        self.assertEqual(executor.started, [["A-approve"], ["B1"]])
 
 
 def _approval(external_id: str, *, session_id: str) -> Event:

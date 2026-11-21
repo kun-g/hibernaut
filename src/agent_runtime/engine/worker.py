@@ -60,6 +60,11 @@ class _RunInterrupted(Exception):
     pass
 
 
+# Payload keys that pick where/how an executor runs (e.g. LocalCLIExecutor's workdir and CLI
+# template). Events that disagree on them must not share a Run.
+_TARGET_PAYLOAD_KEYS = ("explicit_workdir", "executor")
+
+
 class AgentWorker:
     def __init__(
         self,
@@ -120,6 +125,10 @@ class AgentWorker:
                     break
 
                 restarted = False
+                # Interrupt judges "new" against the whole scheduling snapshot, so events this
+                # pass deliberately runs later (other keys, held-back same-key events) never
+                # interrupt the current batch; only arrivals after the fetch do.
+                snapshot_ids = {evt.event_id for evt in pending}
                 batches = self._group_into_batches(pending)
                 for session_ref, batch in batches:
                     self._lock.renew(inbox_id, self._worker_id, self._lease_ttl_seconds)
@@ -128,6 +137,8 @@ class AgentWorker:
                     consumed_ids: set[str] = {evt.event_id for evt in batch}
                     folded_events: list[Event] = []
                     target_batch_key = self._batch_key(batch[0], session_ref)
+                    has_decision = any(self._is_approval_decision(evt) for evt in batch)
+                    batch_target = self._batch_target(batch)
                     interrupted_flag = asyncio.Event()
 
                     def _poll_folded(
@@ -135,19 +146,28 @@ class AgentWorker:
                         _consumed: set[str] = consumed_ids,
                         _folded: list[Event] = folded_events,
                         _target_key: tuple[str, str] | None = target_batch_key,
+                        _has_decision: bool = has_decision,
+                        _batch_target: tuple[object, ...] | None = batch_target,
                     ) -> list[Event]:
-                        if self._new_event_policy != "fold" or _target_key is None:
+                        # Never fold across an approval boundary or into a different
+                        # execution target; those events run in a later pass.
+                        if self._new_event_policy != "fold" or _target_key is None or _has_decision:
                             return []
                         newly_folded: list[Event] = []
                         for candidate in self._inbox.fetch_pending(_inbox_id):
                             if candidate.event_id in _consumed:
                                 continue
                             cand_session = self._resolve_session(candidate)
-                            cand_key = self._batch_key(candidate, cand_session)
-                            if cand_key == _target_key:
-                                _consumed.add(candidate.event_id)
-                                _folded.append(candidate)
-                                newly_folded.append(candidate)
+                            if self._batch_key(candidate, cand_session) != _target_key:
+                                continue
+                            if self._is_approval_decision(candidate) or (
+                                _batch_target is not None
+                                and self._execution_target(candidate) != _batch_target
+                            ):
+                                break
+                            _consumed.add(candidate.event_id)
+                            _folded.append(candidate)
+                            newly_folded.append(candidate)
                         return newly_folded
 
                     caps: RunCapabilities = _ScopedCapabilities(
@@ -158,9 +178,12 @@ class AgentWorker:
                         _is_interrupted=interrupted_flag.is_set,
                     )
 
+                    # A decision Run executes the approved tool before the LLM turn; restarting
+                    # it would execute the tool again.
                     allow_interrupt = (
                         self._new_event_policy == "interrupt"
                         and interrupt_restarts < self._max_interrupt_restarts
+                        and not has_decision
                     )
                     try:
                         outcome = await self._execute_batch(
@@ -168,7 +191,7 @@ class AgentWorker:
                             batch=batch,
                             session_ref=session_ref,
                             caps=caps,
-                            known_ids=consumed_ids,
+                            known_ids=snapshot_ids,
                             interrupted_flag=interrupted_flag,
                             wake_signal=wake_signal,
                             allow_interrupt=allow_interrupt,
@@ -308,9 +331,11 @@ class AgentWorker:
     ) -> list[tuple[SessionRef | None, list[Event]]]:
         # Same-key events form one batch in seq order; batches run in order of first seq.
         # Events without session_id/correlation_key are unrelated, so each runs alone
-        # (interrupt restarts still merge them). An approval decision runs alone and closes
-        # its key for this pass; later events of that key wait for the next fetch so they
-        # resolve against the post-decision session.
+        # (interrupt restarts still merge them). A key's batch closes at an approval decision
+        # (earlier same-key events stay with it: a suspended session treats a Run without
+        # the decision as a rejection) or at an event with a different execution target.
+        # Later events of a closed key wait for the next fetch, which resolves them against
+        # the updated session.
         batches: list[tuple[SessionRef | None, list[Event]]] = []
         open_batches: dict[tuple[str, str] | None, list[Event]] = {}
         closed_keys: set[tuple[str, str] | None] = set()
@@ -319,10 +344,12 @@ class AgentWorker:
             resolved_key = self._batch_key(event, resolved_session)
             if resolved_key in closed_keys:
                 continue
-            if self._is_approval_decision(event):
-                if resolved_key is not None:
-                    closed_keys.add(resolved_key)
-                if resolved_key is None or resolved_key not in open_batches:
+            if self._is_approval_decision(event) and resolved_key is not None:
+                closed_keys.add(resolved_key)
+                open_batch = open_batches.get(resolved_key)
+                if open_batch is not None:
+                    open_batch.append(event)
+                else:
                     batches.append((resolved_session, [event]))
                 continue
             if resolved_key is None and self._new_event_policy != "interrupt":
@@ -330,12 +357,26 @@ class AgentWorker:
                 continue
             open_batch = open_batches.get(resolved_key)
             if open_batch is not None:
+                if self._execution_target(event) != self._batch_target(open_batch):
+                    closed_keys.add(resolved_key)
+                    continue
                 open_batch.append(event)
                 continue
             new_batch = [event]
             open_batches[resolved_key] = new_batch
             batches.append((resolved_session, new_batch))
         return batches
+
+    @staticmethod
+    def _execution_target(event: Event) -> tuple[object, ...]:
+        return tuple(event.payload.get(key) for key in _TARGET_PAYLOAD_KEYS)
+
+    def _batch_target(self, batch: list[Event]) -> tuple[object, ...] | None:
+        # Approval decisions carry no target of their own and inherit the batch's.
+        for evt in batch:
+            if not self._is_approval_decision(evt):
+                return self._execution_target(evt)
+        return None
 
     @staticmethod
     def _is_approval_decision(event: Event) -> bool:

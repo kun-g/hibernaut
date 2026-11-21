@@ -89,6 +89,39 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
         await self.app.dispatcher.dispatch_once()
         self.assertEqual(len(self.channel.sent), 2)
 
+    async def test_approval_still_applies_when_same_session_note_is_queued_first(self) -> None:
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="req-email-2",
+            payload={"action": "send_email", "to": "bob@example.com", "subject": "Report"},
+        )
+        reports1 = await self.app.worker.process_inbox("u1")
+        suspend_outcome = reports1[0].outcome
+        assert isinstance(suspend_outcome, Suspend)
+        session_id = reports1[0].session_id
+
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="note-2",
+            payload={"text": "any update?"},
+            session_id=session_id,
+        )
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="appr-email-2",
+            payload={"approval_request_id": suspend_outcome.request_id, "approved": True},
+        )
+        reports2 = await self.app.worker.process_inbox("u1")
+
+        self.assertEqual(len(reports2), 1)
+        outcome = reports2[0].outcome
+        assert isinstance(outcome, Emit)
+        self.assertIn("[APPROVED]", outcome.messages[0])
+        self.assertIn("bob@example.com", outcome.messages[0])
+
     async def test_auto_mode_blocks_dangerous_tool_call(self) -> None:
         self.app.handler.ingest(
             inbox_id="u1",

@@ -5,6 +5,7 @@ import re
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -82,8 +83,10 @@ class OrcaWorktreeManager:
         create_terminal: bool = False,
         runner: CommandRunner | None = None,
         worktree_base_dir: str | Path | None = None,
+        reclaim_stale_after_seconds: float = 600.0,
     ) -> None:
         self._store = workspace_store
+        self._reclaim_stale_after_seconds = reclaim_stale_after_seconds
         self._backend: WorktreeBackend = backend
         self._create_terminal = create_terminal
         self._runner: CommandRunner = runner or _default_runner
@@ -208,18 +211,31 @@ class OrcaWorktreeManager:
                 self._alert(notify_outbox, inbox_id, msg)
                 return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
 
-        if not self._store.claim_for_reclaim(work_key, seen_updated_at=record.updated_at):
+        stale_before = (
+            datetime.now(timezone.utc) - timedelta(seconds=self._reclaim_stale_after_seconds)
+        ).isoformat()
+        claim = self._store.claim_for_reclaim(
+            work_key,
+            seen_updated_at=record.updated_at,
+            stale_before=stale_before,
+        )
+        if claim is None:
             return ReclaimResult(
                 reclaimed=False,
                 reason="workspace changed or is being reclaimed by another caller",
                 workdir=record.workdir,
             )
         primary = Path(record.repo_checkout)
-        if self._backend == "orca":
-            rm_res = self._runner(["orca", "worktree", "remove", str(workdir)], primary)
-        else:
-            rm_res = self._runner(["git", "worktree", "remove", str(workdir)], primary)
+        try:
+            if self._backend == "orca":
+                rm_res = self._runner(["orca", "worktree", "remove", str(workdir)], primary)
+            else:
+                rm_res = self._runner(["git", "worktree", "remove", str(workdir)], primary)
+        except BaseException:
+            self._store.release_reclaim(work_key, claim=claim, status=record.status)
+            raise
         if rm_res.returncode != 0:
+            self._store.release_reclaim(work_key, claim=claim, status=record.status)
             msg = f"Failed to remove worktree '{workdir}': {rm_res.stderr.strip()}"
             self._alert(notify_outbox, inbox_id, msg)
             return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)

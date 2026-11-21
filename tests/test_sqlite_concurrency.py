@@ -218,5 +218,77 @@ class TestSQLiteThreadSafety(unittest.TestCase):
         db.close()
 
 
+    def _ready_workspace(self, store: SQLiteWorkspaceStore) -> Path:
+        folder = self.db_path.parent / "hb-fixture"
+        folder.mkdir(exist_ok=True)
+        store.reserve_creating(work_key="x", repo_checkout=str(folder.parent), workdir=str(folder), branch="b")
+        store.mark_ready("x", workdir=str(folder), branch="b")
+        return folder
+
+    def test_reclaim_started_during_another_removal_is_refused(self) -> None:
+        db = SQLiteDatabase(self.db_path)
+        store = SQLiteWorkspaceStore(db)
+        self._ready_workspace(store)
+        in_remove = threading.Event()
+        finish_remove = threading.Event()
+        removals: list[tuple[str, ...]] = []
+
+        def runner(argv: Sequence[str], cwd: Path | None) -> CommandResult:
+            _ = cwd
+            if "remove" in argv:
+                removals.append(tuple(argv))
+                in_remove.set()
+                finish_remove.wait(timeout=5)
+            return CommandResult(0, "", "")
+
+        manager = OrcaWorktreeManager(workspace_store=store, backend="git", runner=runner)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(manager.reclaim, "x")
+            self.assertTrue(in_remove.wait(timeout=5))
+            second = manager.reclaim("x")
+            finish_remove.set()
+            self.assertTrue(first.result(timeout=5).reclaimed)
+
+        self.assertFalse(second.reclaimed)
+        self.assertEqual(len(removals), 1)
+        db.close()
+
+    def test_stale_reclaim_claim_can_be_taken_over(self) -> None:
+        db = SQLiteDatabase(self.db_path)
+        store = SQLiteWorkspaceStore(db)
+        self._ready_workspace(store)
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE workspaces SET status = 'reclaiming', updated_at = ? WHERE work_key = 'x'",
+                ("2000-01-01T00:00:00+00:00",),
+            )
+        manager = OrcaWorktreeManager(
+            workspace_store=store,
+            backend="git",
+            runner=lambda argv, cwd: CommandResult(0, "", ""),
+        )
+        self.assertTrue(manager.reclaim("x").reclaimed)
+        self.assertIsNone(store.get("x"))
+        db.close()
+
+    def test_failed_removal_releases_claim_for_retry(self) -> None:
+        db = SQLiteDatabase(self.db_path)
+        store = SQLiteWorkspaceStore(db)
+        self._ready_workspace(store)
+        outcomes = iter([CommandResult(1, "", "busy"), CommandResult(0, "", "")])
+
+        def runner(argv: Sequence[str], cwd: Path | None) -> CommandResult:
+            _ = cwd
+            return next(outcomes) if "remove" in argv else CommandResult(0, "", "")
+
+        manager = OrcaWorktreeManager(workspace_store=store, backend="git", runner=runner)
+        self.assertFalse(manager.reclaim("x").reclaimed)
+        record = store.get("x")
+        assert record is not None
+        self.assertEqual(record.status, "ready")
+        self.assertTrue(manager.reclaim("x").reclaimed)
+        db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

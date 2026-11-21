@@ -119,9 +119,16 @@ class SQLiteWorkspaceStore:
         assert rec is not None
         return rec
 
-    def claim_for_reclaim(self, work_key: str, *, seen_updated_at: str) -> bool:
-        # Compare-and-set on updated_at: of several callers that read the same record, only
-        # one moves it to 'reclaiming'; a crashed claim can still be retried from a fresh read.
+    def claim_for_reclaim(
+        self,
+        work_key: str,
+        *,
+        seen_updated_at: str,
+        stale_before: str,
+    ) -> str | None:
+        # Compare-and-set on the version the caller read. A live 'reclaiming' claim is
+        # exclusive; only one older than stale_before (its owner crashed) may be taken over.
+        # Returns the claim token (new updated_at) or None when another caller holds it.
         now = utc_now_iso()
         while now == seen_updated_at:
             now = utc_now_iso()
@@ -130,10 +137,22 @@ class SQLiteWorkspaceStore:
                 """
                 UPDATE workspaces SET status = 'reclaiming', updated_at = ?
                 WHERE work_key = ? AND updated_at = ?
+                  AND (status != 'reclaiming' OR updated_at < ?)
                 """,
-                (now, work_key, seen_updated_at),
+                (now, work_key, seen_updated_at, stale_before),
             )
-            return cur.rowcount == 1
+            return now if cur.rowcount == 1 else None
+
+    def release_reclaim(self, work_key: str, *, claim: str, status: WorkspaceStatus) -> None:
+        now = utc_now_iso()
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE workspaces SET status = ?, updated_at = ?
+                WHERE work_key = ? AND status = 'reclaiming' AND updated_at = ?
+                """,
+                (status, now, work_key, claim),
+            )
 
     def delete(self, work_key: str) -> None:
         with self._db.transaction() as conn:
