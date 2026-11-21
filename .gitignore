@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Tests & type checkers
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime state & secrets
+*.db
+*.db-wal
+*.db-shm
+agent_memory/
+.env
+.env.*

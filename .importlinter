@@ -1,0 +1,28 @@
+[importlinter]
+root_package = agent_runtime
+
+[importlinter:contract:clean-layers]
+name = Clean Architecture L0-L3 dependency direction
+type = layers
+layers =
+    agent_runtime.app
+    agent_runtime.adapters
+    agent_runtime.engine
+    agent_runtime.core
+
+[importlinter:contract:engine-no-adapters]
+name = Engine must never import adapters or app
+type = forbidden
+source_modules =
+    agent_runtime.engine
+forbidden_modules =
+    agent_runtime.adapters
+    agent_runtime.app
+
+[importlinter:contract:models-no-ports]
+name = L0 models must not import L1 ports
+type = forbidden
+source_modules =
+    agent_runtime.core.models
+forbidden_modules =
+    agent_runtime.core.ports

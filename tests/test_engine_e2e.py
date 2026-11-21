@@ -1,0 +1,150 @@
+"""End-to-end tests covering Sleep-Wake-Run, Suspend/Resume approval, Timers, Lock, and Outbox."""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from agent_runtime.app.bootstrap import build_runtime
+from agent_runtime.core.models import Emit, Silent, Suspend
+from agent_runtime.engine import OutboxDispatcher
+from tests.fakes import RecordingChannel
+
+
+class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="e2e_agent_")
+        root = Path(self._tmp.name)
+        self.channel = RecordingChannel()
+        self.app = build_runtime(
+            db_path=root / "runtime.db",
+            memory_dir=root / "memory",
+            channel=self.channel,
+        )
+
+    def tearDown(self) -> None:
+        self.app.close()
+        self._tmp.cleanup()
+
+    async def test_silent_emit_and_idempotent_dedup(self) -> None:
+        r1 = self.app.handler.ingest(
+            inbox_id="u1",
+            source="cron",
+            external_id="hb-1",
+            payload={"action": "heartbeat_check"},
+        )
+        r1_dup = self.app.handler.ingest(
+            inbox_id="u1",
+            source="cron",
+            external_id="hb-1",
+            payload={"action": "heartbeat_check"},
+        )
+        self.assertFalse(r1.duplicate)
+        self.assertTrue(r1_dup.duplicate)
+        self.assertEqual(r1_dup.status, "dropped")
+
+        reports = await self.app.worker.process_inbox("u1")
+        self.assertEqual(len(reports), 1)
+        self.assertIsInstance(reports[0].outcome, Silent)
+        self.assertEqual(await self.app.dispatcher.dispatch_once(), 0)
+        self.assertEqual(self.channel.sent, [])
+
+    async def test_suspend_and_async_human_approval_resume(self) -> None:
+        # 1. Trigger high-impact tool -> Suspend without blocking Worker
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="req-email-1",
+            payload={"action": "send_email", "to": "alice@example.com", "subject": "Report"},
+        )
+        reports1 = await self.app.worker.process_inbox("u1")
+        self.assertEqual(len(reports1), 1)
+        self.assertIsInstance(reports1[0].outcome, Suspend)
+        suspend_outcome = reports1[0].outcome
+        assert isinstance(suspend_outcome, Suspend)
+
+        # Approval prompt delivered via Outbox
+        sent_count = await self.app.dispatcher.dispatch_once()
+        self.assertEqual(sent_count, 1)
+        self.assertEqual(self.channel.sent[0][2]["kind"], "approval_request")
+        self.assertEqual(self.channel.sent[0][2]["request_id"], suspend_outcome.request_id)
+
+        # 2. Human approves -> arrives as new Event in Inbox -> resumes suspended Session
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="appr-email-1",
+            payload={
+                "approval_request_id": suspend_outcome.request_id,
+                "approved": True,
+            },
+        )
+        reports2 = await self.app.worker.process_inbox("u1")
+        self.assertEqual(len(reports2), 1)
+        self.assertIsInstance(reports2[0].outcome, Emit)
+        assert isinstance(reports2[0].outcome, Emit)
+        self.assertIn("alice@example.com", reports2[0].outcome.messages[0])
+
+        await self.app.dispatcher.dispatch_once()
+        self.assertEqual(len(self.channel.sent), 2)
+
+    async def test_auto_mode_blocks_dangerous_tool_call(self) -> None:
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="danger-1",
+            payload={"action": "dangerous_cmd"},
+        )
+        reports = await self.app.worker.process_inbox("u1")
+        self.assertEqual(len(reports), 1)
+        self.assertIsInstance(reports[0].outcome, Emit)
+        assert isinstance(reports[0].outcome, Emit)
+        self.assertIn("安全策略拦截", reports[0].outcome.messages[0])
+
+    async def test_timer_scheduler_and_memory_persistence(self) -> None:
+        self.app.timers.schedule(
+            kind="follow_up",
+            due_at="2026-11-21T09:00:00+00:00",
+            payload={"action": "remember", "path": "progress/job1.md", "content": "step 2 ok"},
+            inbox_id="u1",
+        )
+        triggered = self.app.scheduler.tick(now_iso="2026-11-21T09:01:00+00:00")
+        self.assertEqual(triggered, 1)
+
+        reports = await self.app.worker.process_inbox("u1")
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(self.app.memory.read_on_demand("progress/job1.md"), "step 2 ok")
+
+    async def test_outbox_dispatcher_pacing_and_retry(self) -> None:
+        flaky_channel = RecordingChannel(fail_times=1)
+        now_box = [100.0]
+        dispatcher = OutboxDispatcher(
+            outbox=self.app.outbox,
+            channel=flaky_channel,
+            min_interval_seconds=10.0,
+            max_attempts=3,
+            clock=lambda: now_box[0],
+        )
+        self.app.outbox.enqueue("u1", "msg-1")
+        self.app.outbox.enqueue("u1", "msg-2")
+
+        # First attempt fails on msg-1, succeeds on msg-2
+        sent1 = await dispatcher.dispatch_once()
+        self.assertEqual(sent1, 1)
+        self.assertEqual(len(flaky_channel.sent), 1)
+        self.assertEqual(flaky_channel.sent[0][1], "msg-2")
+
+        # Immediately retrying msg-1 is throttled by min_interval_seconds=10
+        sent_throttled = await dispatcher.dispatch_once()
+        self.assertEqual(sent_throttled, 0)
+
+        # Advance clock past pacing window -> msg-1 retries and succeeds
+        now_box[0] += 11.0
+        sent2 = await dispatcher.dispatch_once()
+        self.assertEqual(sent2, 1)
+        self.assertEqual(flaky_channel.sent[1][1], "msg-1")
+
+
+if __name__ == "__main__":
+    unittest.main()

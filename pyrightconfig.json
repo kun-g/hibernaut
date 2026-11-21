@@ -1,0 +1,12 @@
+{
+  "include": [
+    "src/agent_runtime/core",
+    "src/agent_runtime/engine"
+  ],
+  "extraPaths": [
+    "src"
+  ],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "strict",
+  "reportUnnecessaryTypeIgnoreComment": "error"
+}

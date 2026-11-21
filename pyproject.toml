@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hibernaut"
+version = "0.1.0"
+description = "Clean Architecture (L0-L3) Python runtime for Always-on Agents (Sleep -> Wake -> Run -> Write-back)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/kun-g/hibernaut"
+Repository = "https://github.com/kun-g/hibernaut"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pyright>=1.1.380",
+    "mypy>=1.11",
+    "import-linter>=2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["agent_runtime.core", "agent_runtime.engine"]
