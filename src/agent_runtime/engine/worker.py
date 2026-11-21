@@ -258,6 +258,14 @@ class AgentWorker:
         batch: list[Event],
         session_ref: SessionRef | None,
     ) -> ExecutorPort:
+        holder = self._suspended_holder(batch, session_ref)
+        if holder is not None:
+            # The checkpoint belongs to the executor that suspended; only it can resume.
+            held = self._executors.get(holder)
+            if held is None:
+                raise ExecutorFailed(f"Executor '{holder}' holding the suspended session is not registered")
+            return held
+
         event_executor_id: str | None = None
         # Same rule as LocalCLIExecutor: an approval resumes the ordinary events' Run.
         target_events = [e for e in batch if not self._is_approval_decision(e)] or batch
@@ -383,15 +391,20 @@ class AgentWorker:
         # wait for the next fetch, which resolves them against the updated session.
         # A suspended session treats any Run without the decision as a rejection, so when
         # the snapshot holds a decision for a key, that key's first batch must carry it:
-        # incompatible events ahead of the decision are held back instead of closing the key.
+        # incompatible events ahead of the decision are held back instead of closing the key,
+        # and so are events routed away from the executor that holds the checkpoint.
         resolved: list[tuple[Event, SessionRef | None, tuple[str, str] | None]] = []
         keys_with_decision: set[tuple[str, str]] = set()
+        decision_holders: dict[tuple[str, str], str] = {}
         for event in events:
             resolved_session = self._resolve_session(event)
             resolved_key = self._batch_key(event, resolved_session)
             resolved.append((event, resolved_session, resolved_key))
             if resolved_key is not None and self._is_approval_decision(event):
                 keys_with_decision.add(resolved_key)
+                holder = self._suspended_holder([event], resolved_session)
+                if holder is not None:
+                    decision_holders.setdefault(resolved_key, holder)
 
         batches: list[tuple[SessionRef | None, list[Event]]] = []
         open_batches: dict[tuple[str, str] | None, list[Event]] = {}
@@ -410,6 +423,10 @@ class AgentWorker:
             if resolved_key is None and self._new_event_policy != "interrupt":
                 batches.append((resolved_session, [event]))
                 continue
+            holder = decision_holders.get(resolved_key) if resolved_key is not None else None
+            routed_to = self._routed_executor_id(event)
+            if holder is not None and routed_to is not None and routed_to != holder:
+                continue
             open_batch = open_batches.get(resolved_key)
             if open_batch is not None:
                 if self._execution_target(event) != self._batch_target(open_batch):
@@ -422,6 +439,23 @@ class AgentWorker:
             open_batches[resolved_key] = new_batch
             batches.append((resolved_session, new_batch))
         return batches
+
+    def _suspended_holder(
+        self,
+        batch: list[Event],
+        session_ref: SessionRef | None,
+    ) -> str | None:
+        if session_ref is None or not session_ref.pending_request_id or not session_ref.executor_id:
+            return None
+        for evt in batch:
+            if evt.payload.get("approval_request_id") == session_ref.pending_request_id:
+                return session_ref.executor_id
+        return None
+
+    @staticmethod
+    def _routed_executor_id(event: Event) -> str | None:
+        raw = event.payload.get("executor_id")
+        return raw.strip() if isinstance(raw, str) and raw.strip() else None
 
     @staticmethod
     def _execution_target(event: Event) -> tuple[object, ...]:

@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 
 from agent_runtime.app.bootstrap import build_runtime
-from agent_runtime.core.models import Emit, Silent, Suspend
+from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Silent, Suspend
+from agent_runtime.core.ports import RunCapabilities
 from agent_runtime.engine import OutboxDispatcher
 from tests.fakes import RecordingChannel
+
+
+class _OtherExecutor:
+    executor_id = "other"
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    async def execute(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+    ) -> RunOutcome:
+        _ = (session, caps)
+        self.calls.append([evt.external_id for evt in events])
+        return Silent()
 
 
 class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
@@ -154,6 +173,59 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert isinstance(first, Emit)
         self.assertIn("[APPROVED]", first.messages[0])
         self.assertEqual(len(reports2), 2)
+
+    async def _suspend_on_whitebox(self, external_id: str) -> tuple[str, str, _OtherExecutor]:
+        other = _OtherExecutor()
+        self.app.worker._executors["other"] = other  # pyright: ignore[reportPrivateUsage]
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id=external_id,
+            payload={"action": "send_email", "to": "dave@example.com", "subject": "Report"},
+        )
+        reports = await self.app.worker.process_inbox("u1")
+        suspend_outcome = reports[0].outcome
+        assert isinstance(suspend_outcome, Suspend)
+        session_id = reports[0].session_id
+        assert session_id is not None
+        return session_id, suspend_outcome.request_id, other
+
+    async def test_approval_resumes_on_the_executor_holding_the_checkpoint(self) -> None:
+        session_id, request_id, other = await self._suspend_on_whitebox("req-email-4")
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="switch-note",
+            payload={"text": "move on", "executor_id": "other"},
+            session_id=session_id,
+        )
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="appr-email-4",
+            payload={"approval_request_id": request_id, "approved": True},
+        )
+        reports = await self.app.worker.process_inbox("u1")
+
+        first = reports[0].outcome
+        assert isinstance(first, Emit)
+        self.assertIn("[APPROVED]", first.messages[0])
+        self.assertEqual(other.calls, [["switch-note"]])
+
+    async def test_approval_routed_elsewhere_still_resumes_the_holder(self) -> None:
+        _, request_id, other = await self._suspend_on_whitebox("req-email-5")
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="appr-email-5",
+            payload={"approval_request_id": request_id, "approved": True, "executor_id": "other"},
+        )
+        reports = await self.app.worker.process_inbox("u1")
+
+        outcome = reports[0].outcome
+        assert isinstance(outcome, Emit)
+        self.assertIn("[APPROVED]", outcome.messages[0])
+        self.assertEqual(other.calls, [])
 
     async def test_auto_mode_blocks_dangerous_tool_call(self) -> None:
         self.app.handler.ingest(
