@@ -16,6 +16,7 @@ class AutoModePermissionAdapter:
             "schedule_timer",
             "send_message",
             "fetch_status",
+            "orca.agent.launch",
         }
     )
     DEFAULT_DEFER_TOOLS: frozenset[str] = frozenset(

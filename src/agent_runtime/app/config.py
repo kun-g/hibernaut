@@ -155,6 +155,12 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
     for name, item in raw.get("executors", {}).items():
         env_raw = item.get("env", {})
         resume_raw = item.get("resume_args")
+        orca_agent = item.get("orca_agent")
+        if orca_agent is not None and (not isinstance(orca_agent, str) or not orca_agent.strip()):
+            raise ValueError(f"Invalid orca_agent for '{name}'")
+        timeout = float(item.get("timeout_seconds", 300.0))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError(f"Invalid timeout_seconds for '{name}'")
         executors[str(name)] = CLITemplate(
             name=str(name),
             command=str(item["command"]),
@@ -163,7 +169,8 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
                 tuple(str(a) for a in resume_raw) if resume_raw is not None else ()
             ),
             env={str(k): str(v) for k, v in env_raw.items()},
-            timeout_seconds=float(item.get("timeout_seconds", 300.0)),
+            timeout_seconds=timeout,
+            orca_agent=orca_agent,
         )
 
     projects: dict[str, ProjectConfig] = {}

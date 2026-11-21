@@ -466,6 +466,7 @@ def build_daemon_from_config(
                     inbox_checkout_map=inbox_checkout_map,
                     templates=config.executors,
                     default_executor=exec_name,
+                    orca_workspace=proj.worktree_backend == "orca",
                 )
                 for exec_name in config.executors
             }

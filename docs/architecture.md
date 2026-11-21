@@ -64,6 +64,7 @@
   2. **路径落盘**：创建后按主仓库和分支查询 `git worktree list --porcelain -z`，确认唯一且可用的独立工作区后再标记 `ready`。复用时用同一登记表校正 SQLite 的旧路径。执行器重试耗尽后，Worker 池记录 inbox 和异常，保留该批次为 `pending`，继续处理其他 inbox。同 inbox 下次唤醒时重试。
   3. **三关安全回收**（`reclaim()`）：双重归属校验（`hb-` 前缀 + `workspaces` 表记录）+ 三关检查（无开着 PR / 无未提交改动 / 无未推送提交），任一不通过即保留目录并经 Outbox 告警。
 - **可配置本地 CLI 执行器**（`LocalCLIExecutor`）：实现 `ExecutorPort`，内置 `claude`（默认）、`cursor-agent`、`grok`、`dsh` 模板，支持可选 `resume_args` 原生会话续接（自动从 JSON 输出提取 `executor_session_id` / `session_id`）及透传环境变量对接本地模型网关（如 `yetone/magpie`），响应 `caps.is_interrupted()` 安全终止子进程。
+- **Orca 可见执行**：模板的 `orca_agent` 指定 Orca 管理的 agent。项目使用 Orca worktree 时，执行器通过 `orca agent launch --surface terminal` 在后台标签页提交任务，按回执绑定终端。完成以每轮唯一的临时结果文件为准。中断或超时按本轮终端句柄关闭，启动回执不确定时转为 `Suspend` 供人工确认。
 - **声明式配置与禁止静默回退 Demo**（`hibernaut.example.toml` + `app/config.py` + `app/main.py --config`）：使用标准库 `tomllib` 解析，仅存静态主检出、执行器模板（全部 `[executors.<id>]` 注册进 `AgentWorker`，`[projects.<name>]` 支持可选 `executor`）与凭据环境变量名，绝不存动态 worktree 路径。以 `--config` 正式启动时严禁静默回退 `RuleBasedDemoLLM`：若未配置 `[executors]` 或缺少 `default_executor`，则向 `stderr` 打印清晰提示并以 **`ingest-only`（仅入站控制面）模式**启动，不启动消费 Worker 池，所有新事件安全保持 `pending` 等待配置修复（仅无 `--config` 或显式传 `--demo` 时才允许使用 Demo 执行器）。HTTP daemon 热加载时先组装新配置，待旧 Worker 池排空后再切换，沿用同一条 SQLite 连接及未变更的监听 socket。
 
 ## 5. 多 `inbox_id` Actor 分区并发与 `NewEventPolicy`

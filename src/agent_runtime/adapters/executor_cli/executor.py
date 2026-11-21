@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_runtime.adapters.executor_cli.orca import run_visible
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
 from agent_runtime.core.models import (
     Emit,
@@ -32,6 +33,7 @@ class CLITemplate:
     resume_args: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=_empty_env)
     timeout_seconds: float = 300.0
+    orca_agent: str | None = None
 
 
 DEFAULT_CLI_TEMPLATES: dict[str, CLITemplate] = {
@@ -51,7 +53,9 @@ class LocalCLIExecutor:
         templates: Mapping[str, CLITemplate] | None = None,
         default_executor: str = "claude",
         interrupt_poll_interval: float = 0.05,
+        orca_workspace: bool = False,
     ) -> None:
+        self._orca_workspace = orca_workspace
         self._worktree_manager = worktree_manager
         self._inbox_checkout_map: dict[str, Path] = {
             k: Path(v).resolve() for k, v in inbox_checkout_map.items()
@@ -108,6 +112,8 @@ class LocalCLIExecutor:
             )
 
         prompt = self._build_prompt(events, session, caps)
+        if self._orca_workspace and template.orca_agent and explicit_workdir is None:
+            return await run_visible(template.orca_agent, workdir, prompt, session_id, caps, template.timeout_seconds)
         cli_args = self._render_cli_args(template, prompt=prompt, session=session)
         env = dict(os.environ)
         env.update(template.env)

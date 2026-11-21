@@ -55,6 +55,8 @@ The HTTP daemon watches the file passed to `--config` once per second, including
 
 Hibernaut locates managed worktrees by branch in the primary repository's Git worktree list. On the next wake, it repairs stale SQLite paths for registered worktrees. If an executor exhausts its retries, the daemon logs the affected inbox and keeps the batch pending. A new event in that inbox wakes it for another attempt.
 
+For a visible agent session, set `orca_agent = "claude"` under `[executors.claude]` and use `worktree_backend = "orca"` for the project. Restart the daemon after installing this version. Each managed run opens an Orca terminal in the background where you can watch progress and respond to permission prompts. The agent returns its `Silent`, `Emit`, or `Suspend` outcome in a per-run temporary file. Successful terminal tabs stay open. `timeout_seconds` includes time spent waiting for input. Configure agent accounts and environment in Orca. The template's `command`, `args`, and `env` apply to direct CLI runs, including Git worktrees and explicit directory overrides.
+
 ### Versioning
 
 The daemon and demo print `Hibernaut <version>` at startup. To check the version directly, run `PYTHONPATH=src python3 -m agent_runtime.app.main --version`.
