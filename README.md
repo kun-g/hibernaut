@@ -52,6 +52,12 @@ PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
 PYTHONPATH=src python3 -m agent_runtime.app.demo
 ```
 
+### Versioning
+
+The daemon and demo print `Hibernaut <version>` at startup. To check the version directly, run `PYTHONPATH=src python3 -m agent_runtime.app.main --version`.
+
+Stable releases use SemVer `MAJOR.MINOR.PATCH`. Bump the major number for incompatible API changes, minor for compatible features, and patch for compatible fixes. Set `__version__` in `src/agent_runtime/__init__.py` when preparing a release. The package metadata and startup banner both read that value.
+
 ### Run with automatic updates (macOS / Linux)
 
 From a dedicated Git checkout on `main`, launch the supervisor with Python 3.11+ and Git installed:

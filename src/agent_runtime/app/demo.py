@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 from pathlib import Path
 
+from agent_runtime import __version__
 from agent_runtime.app.bootstrap import build_runtime
 from agent_runtime.core.models import Suspend
 
@@ -52,4 +53,5 @@ async def run_demo() -> None:
 
 
 if __name__ == "__main__":
+    print(f"Hibernaut {__version__}", flush=True)
     asyncio.run(run_demo())

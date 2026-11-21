@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agent_runtime import __version__
 from agent_runtime.adapters.channels import (
     ConsoleChannelAdapter,
     FeishuWebhookAdapter,
@@ -451,7 +452,10 @@ def main() -> None:
     parser.add_argument("--policy", choices=("defer", "fold", "interrupt"), default="defer")
     parser.add_argument("--github-secret", default=None)
     parser.add_argument("--feishu-token", default=None)
+    banner = f"Hibernaut {__version__}"
+    parser.add_argument("--version", action="version", version=banner)
     args = parser.parse_args()
+    print(banner, flush=True)
 
     if args.config:
         cfg = load_config(args.config)

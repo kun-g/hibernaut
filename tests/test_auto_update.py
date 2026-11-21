@@ -13,6 +13,7 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_runtime import __version__
 from scripts import run_updating
 
 
@@ -58,8 +59,11 @@ class AutoUpdateTests(unittest.TestCase):
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         db = self.root / "events.db"
+        log_path = self.root / "daemon.log"
+        log = self.enterContext(log_path.open("w"))
         proc = subprocess.Popen(
             [sys.executable, "scripts/run_updating.py", "--interval", "1", "--port", str(port), "--db", str(db)],
+            stdout=log,
             cwd=self.checkout, env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
 
@@ -83,10 +87,17 @@ class AutoUpdateTests(unittest.TestCase):
 
         try:
             send_until_reply("收到事件：")
+            self.assertEqual(log_path.read_text().splitlines()[0], f"Hibernaut {__version__}")
+            self.assertRegex(__version__, r"\A(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}\Z")
+            major, minor, patch_number = __version__.split(".")
+            next_version = f"{major}.{minor}.{int(patch_number) + 1}"
+            version_file = self.origin / "src/agent_runtime/__init__.py"
+            version_file.write_text(version_file.read_text().replace(__version__, next_version))
             backend = self.origin / "src/agent_runtime/adapters/executor_whitebox/executor.py"
             backend.write_text(backend.read_text().replace("收到事件：", "updated: "))
             self.commit(self.origin)
             send_until_reply("updated: ")
+            self.assertIn(f"Hibernaut {next_version}", log_path.read_text().splitlines())
             self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "HEAD"))
             with sqlite3.connect(db) as conn:
                 self.assertTrue(conn.execute("SELECT 1 FROM outbox WHERE content = '收到事件：收到事件：'").fetchone())
