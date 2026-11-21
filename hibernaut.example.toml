@@ -19,6 +19,8 @@ feishu_app_id_env = "FEISHU_APP_ID"
 feishu_app_secret_env = "FEISHU_APP_SECRET"
 feishu_verification_token_env = "FEISHU_VERIFICATION_TOKEN"
 feishu_default_chat_id = ""
+mcp_enabled = false
+mcp_token_env = "HIBERNAUT_MCP_TOKEN"
 
 [executors.claude]
 command = "claude"

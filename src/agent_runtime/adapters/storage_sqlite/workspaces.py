@@ -61,6 +61,16 @@ class SQLiteWorkspaceStore:
         ).fetchall()
         return [self._row_to_record(row) for row in rows]
 
+    def list_all(self) -> list[WorkspaceRecord]:
+        rows = self._db.conn.execute(
+            """
+            SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at
+            FROM workspaces
+            ORDER BY seq ASC
+            """
+        ).fetchall()
+        return [self._row_to_record(row) for row in rows]
+
     def next_task_seq(self) -> int:
         row = self._db.conn.execute("SELECT COALESCE(MAX(seq), 0) AS max_seq FROM workspaces").fetchone()
         return int(row["max_seq"]) + 1 if row is not None else 1

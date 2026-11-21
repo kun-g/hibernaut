@@ -11,6 +11,7 @@ from agent_runtime.adapters.channels.feishu_webhook import FeishuWebhookAdapter
 from agent_runtime.adapters.channels.github_poller import GitHubIssuePoller, PollTarget
 from agent_runtime.adapters.channels.github_webhook import GitHubWebhookAdapter
 from agent_runtime.adapters.channels.http_types import WebhookResponse
+from agent_runtime.adapters.channels.mcp_server import MCPServerAdapter
 
 __all__ = [
     "ConsoleChannelAdapter",
@@ -18,6 +19,7 @@ __all__ = [
     "FeishuWebhookAdapter",
     "GitHubIssuePoller",
     "GitHubWebhookAdapter",
+    "MCPServerAdapter",
     "PollTarget",
     "WebhookChannelAdapter",
     "WebhookResponse",

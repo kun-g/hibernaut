@@ -1,0 +1,292 @@
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import tempfile
+import threading
+import unittest
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from agent_runtime.adapters.channels import create_webhook_server
+from agent_runtime.adapters.executor_cli import CommandResult, OrcaWorktreeManager
+from agent_runtime.app.main import build_daemon
+from agent_runtime.core.models import Emit, Suspend
+from tests.fakes import RecordingChannel
+
+
+class TestMCPServerAdapter(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="mcp_test_")
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_stdio_handshake_tools_list_and_workspace_reclaim(self) -> None:
+        wt_dir = self.root / "hb-issue-11"
+        wt_dir.mkdir()
+        daemon = build_daemon(
+            db_path=self.root / "stdio.db",
+            memory_root=self.root / "mem_stdio",
+            mcp_bearer_token="mcp-secret",
+        )
+        assert daemon.mcp_server is not None
+        daemon.workspaces.reserve_creating(
+            work_key="github:kun-g/hibernaut#11",
+            repo_checkout=str(self.root / "repo"),
+            workdir=str(wt_dir),
+            branch="hb/issue-11",
+        )
+        daemon.workspaces.mark_ready(
+            "github:kun-g/hibernaut#11",
+            workdir=str(wt_dir),
+            branch="hb/issue-11",
+        )
+        # Swap worktree manager with clean mock runner for deterministic reclaim test
+        daemon.mcp_server._worktree_manager = OrcaWorktreeManager(
+            workspace_store=daemon.workspaces,
+            backend="git",
+            runner=lambda cmd, _cwd: CommandResult(0, "[]" if "pr" in cmd else "", ""),
+        )
+
+        frames = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "hibernaut_list_workspaces", "arguments": {}},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "hibernaut_reclaim_workspace",
+                    "arguments": {"work_key": "github:kun-g/hibernaut#11"},
+                },
+            },
+        ]
+        stdin = io.StringIO("\n".join(json.dumps(f) for f in frames) + "\n")
+        stdout = io.StringIO()
+        try:
+            daemon.mcp_server.serve_stdio(stdin, stdout)
+        finally:
+            daemon.close()
+
+        replies = [json.loads(line) for line in stdout.getvalue().strip().splitlines()]
+        # Notification emits no reply -> 5 responses for ids 1..5.
+        self.assertEqual([r["id"] for r in replies], [1, 2, 3, 4, 5])
+        self.assertEqual(replies[0]["result"]["serverInfo"]["name"], "hibernaut-mcp")
+        self.assertEqual(replies[1]["result"], {})
+
+        tool_names = [t["name"] for t in replies[2]["result"]["tools"]]
+        self.assertEqual(
+            tool_names,
+            [
+                "hibernaut_ingest_event",
+                "hibernaut_list_sessions",
+                "hibernaut_list_workspaces",
+                "hibernaut_resolve_approval",
+                "hibernaut_reclaim_workspace",
+            ],
+        )
+
+        ws_list = replies[3]["result"]["structuredContent"]["workspaces"]
+        self.assertEqual(len(ws_list), 1)
+        self.assertEqual(ws_list[0]["work_key"], "github:kun-g/hibernaut#11")
+
+        reclaim_res = replies[4]["result"]["structuredContent"]
+        self.assertTrue(reclaim_res["reclaimed"])
+
+    async def test_http_mcp_auth_guard_disabled_without_token_and_suspend_resume_e2e(self) -> None:
+        # 1. Without bearer token, /mcp endpoint must be disabled (404).
+        disabled_daemon = build_daemon(
+            db_path=self.root / "disabled.db",
+            memory_root=self.root / "mem_disabled",
+            mcp_bearer_token=None,
+        )
+        srv_disabled = create_webhook_server(
+            "127.0.0.1",
+            0,
+            disabled_daemon.handler,
+            mcp_adapter=disabled_daemon.mcp_server,
+        )
+        port_disabled = srv_disabled.server_address[1]
+        t_disabled = threading.Thread(target=srv_disabled.serve_forever, daemon=True)
+        t_disabled.start()
+
+        def _post(
+            port: int,
+            path: str,
+            payload: dict[str, object],
+            token: str | None = None,
+        ) -> tuple[int, dict[str, object]]:
+            headers = {"Content-Type": "application/json"}
+            if token is not None:
+                headers["Authorization"] = f"Bearer {token}"
+            req = urllib.request.Request(
+                url=f"http://127.0.0.1:{port}{path}",
+                data=json.dumps(payload).encode("utf-8"),
+                method="POST",
+                headers=headers,
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    return int(resp.status), json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as err:
+                return int(err.code), json.loads(err.read().decode("utf-8"))
+
+        try:
+            code_disabled, _ = await asyncio.to_thread(
+                _post,
+                port_disabled,
+                "/mcp",
+                {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            )
+            self.assertEqual(code_disabled, 404)
+        finally:
+            srv_disabled.shutdown()
+            srv_disabled.server_close()
+            t_disabled.join(timeout=2.0)
+            disabled_daemon.close()
+
+        # 2. With bearer token enabled: unauthorized -> 401; authorized -> full E2E dispatch + Suspend resume.
+        channel = RecordingChannel()
+        token = "super-secret-mcp-token"
+        daemon = build_daemon(
+            db_path=self.root / "mcp_http.db",
+            memory_root=self.root / "mem_http",
+            max_concurrency=2,
+            channel=channel,
+            mcp_bearer_token=token,
+        )
+        server = create_webhook_server(
+            "127.0.0.1",
+            0,
+            daemon.handler,
+            mcp_adapter=daemon.mcp_server,
+        )
+        port = server.server_address[1]
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        stop = asyncio.Event()
+        daemon_task = asyncio.create_task(
+            daemon.run(stop_event=stop, timer_interval_seconds=0.1, outbox_interval_seconds=0.05)
+        )
+
+        try:
+            unauth_code, _ = await asyncio.to_thread(
+                _post,
+                port,
+                "/mcp",
+                {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                "wrong-token",
+            )
+            self.assertEqual(unauth_code, 401)
+
+            # Ingest an event that triggers Suspend via hibernaut_ingest_event
+            ingest_code, ingest_body = await asyncio.to_thread(
+                _post,
+                port,
+                "/mcp",
+                {
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "hibernaut_ingest_event",
+                        "arguments": {
+                            "inbox_id": "proj:hibernaut",
+                            "source": "mcp:claude_code",
+                            "external_id": "mcp-evt-1",
+                            "correlation_key": "github:kun-g/hibernaut#88",
+                            "payload": {
+                                "action": "send_email",
+                                "to": "team@example.com",
+                                "subject": "MCP Ship",
+                            },
+                        },
+                    },
+                },
+                token,
+            )
+            self.assertEqual(ingest_code, 200)
+            self.assertFalse(ingest_body["result"]["structuredContent"]["duplicate"])  # type: ignore[index]
+
+            await asyncio.sleep(0.05)
+            await daemon.pool.wait_until_idle(timeout_seconds=3.0)
+
+            # Query suspended sessions via hibernaut_list_sessions
+            list_code, list_body = await asyncio.to_thread(
+                _post,
+                port,
+                "/mcp",
+                {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "hibernaut_list_sessions",
+                        "arguments": {"inbox_id": "proj:hibernaut", "status": "suspended"},
+                    },
+                },
+                token,
+            )
+            self.assertEqual(list_code, 200)
+            sessions = list_body["result"]["structuredContent"]["sessions"]  # type: ignore[index]
+            self.assertEqual(len(sessions), 1)
+            req_id = sessions[0]["pending_approval_id"]
+            self.assertTrue(req_id)
+
+            # Resolve approval via hibernaut_resolve_approval -> resumes Suspend to Emit
+            resolve_code, _ = await asyncio.to_thread(
+                _post,
+                port,
+                "/mcp",
+                {
+                    "jsonrpc": "2.0",
+                    "id": 12,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "hibernaut_resolve_approval",
+                        "arguments": {
+                            "inbox_id": "proj:hibernaut",
+                            "approval_request_id": req_id,
+                            "approved": True,
+                            "comment": "LGTM from MCP",
+                        },
+                    },
+                },
+                token,
+            )
+            self.assertEqual(resolve_code, 200)
+
+            await asyncio.sleep(0.05)
+            await daemon.pool.wait_until_idle(timeout_seconds=3.0)
+            await daemon.dispatcher.dispatch_once()
+
+            suspend_reports = [r for r in daemon.pool.reports if isinstance(r.outcome, Suspend)]
+            emit_reports = [r for r in daemon.pool.reports if isinstance(r.outcome, Emit)]
+            self.assertEqual(len(suspend_reports), 1)
+            self.assertEqual(len(emit_reports), 1)
+            assert isinstance(emit_reports[0].outcome, Emit)
+            self.assertIn("team@example.com", emit_reports[0].outcome.messages[0])
+        finally:
+            stop.set()
+            await daemon_task
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2.0)
+            daemon.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

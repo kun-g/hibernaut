@@ -8,7 +8,7 @@
 
 单轮 Run 四步循环：
 
-1. **An event arrives**：外部事件（用户消息、GitHub/飞书 Webhook、GitHub Issue 轮询、定时触发、审批回复）写入全局 Event Inbox 并快速 ACK。
+1. **An event arrives**：外部事件（用户消息、GitHub/飞书 Webhook、GitHub Issue 轮询、MCP 控制面调用、定时触发、审批回复）写入全局 Event Inbox 并快速 ACK。
 2. **A session starts**：按 4 级优先级解析会话（`approval_request_id` → 显式 `session_id` → `(inbox_id, correlation_key)` → 新建），加载跨 Run 持久化状态（基线 Memory + Session 断点/历史）。
 3. **The agent loop runs**：在 `PermissionPort` 门禁下执行推理、工具调用或本地 CLI 子进程，按需读取记忆与设置后续定时器。
 4. **The run writes back**：持久化新状态、记忆与 `(inbox_id, correlation_key) → session_id` 映射，产出强类型终态 `RunOutcome = Silent | Emit | Suspend` 后释放租约重新休眠。
@@ -22,7 +22,7 @@
 | **L0 领域契约层** | `core/models.py` | 不可变领域数据结构（含 `Event.correlation_key`、`SessionRef.correlation_key`）与强类型终态 `RunOutcome`、`NewEventPolicy` | 零外部依赖，仅 Python 标准库 |
 | **L1 核心端口层** | `core/ports.py` | 定义 9 个纯抽象 `Protocol` 端口及 `RunCapabilities` 控制钩子 | 仅依赖 Python 标准库 + L0 |
 | **L2 生命周期编排层** | `engine/` | `EventHandler`、`AgentWorker`、`TimerScheduler`、`OutboxDispatcher` | 仅依赖 L0 + L1，严禁 `import adapters/` 或 `app/` |
-| **L3 基础设施与组装层** | `adapters/` + `app/` | SQLite 存储（含 `workspaces` 表）、分区 Memory、Auto Mode + Credential Proxy、白盒执行器、`LocalCLIExecutor` + `OrcaWorktreeManager`、GitHub/飞书入站与轮询、飞书出站通道、`config.py`、`bootstrap.py`、`main.py` | 实现 L1 端口或驱动 L2 `EventHandler`，仅在 `app/` 组装注入 |
+| **L3 基础设施与组装层** | `adapters/` + `app/` | SQLite 存储（含 `workspaces` 表）、分区 Memory、Auto Mode + Credential Proxy、白盒执行器、`LocalCLIExecutor` + `OrcaWorktreeManager`、GitHub/飞书入站与轮询、`MCPServerAdapter`、飞书出站通道、`config.py`、`bootstrap.py`、`main.py` | 实现 L1 端口或驱动 L2 `EventHandler`，仅在 `app/` 组装注入 |
 
 ### L1 全部 9 个核心端口与 RunCapabilities
 
@@ -48,6 +48,7 @@
   - `POST /webhooks/github`（`GitHubWebhookAdapter`）：HMAC-SHA256 `X-Hub-Signature-256` 验签、`X-GitHub-Delivery` 幂等键、`repo -> inbox_id` 映射、Issue/PR 自动提取 `correlation_key = f"github:{repo}#{number}"`。
   - `GitHubIssuePoller`（`adapters/channels/github_poller.py`）：无公网 Webhook 时的本机定时轮询入口（支持 `gh issue list` 或 GitHub REST API 及 label 过滤），生成 `external_id = f"github-poll:{repo}#{number}:{updated_at}"` 与完全一致的 `correlation_key = f"github:{repo}#{number}"`。
   - `POST /webhooks/feishu`（`FeishuWebhookAdapter`）：支持飞书 v2.0 `url_verification` Challenge 握手（200 OK）、`verification_token` 校验、`header.event_id` 幂等键、话题 `correlation_key` 提取与审批卡片回调恢复 `Suspend`。
+  - `MCPServerAdapter`（`adapters/channels/mcp_server.py`）：纯标准库 MCP JSON-RPC 2.0 入站控制面（`initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call`），暴露 5 个最小核心 Tool（`hibernaut_ingest_event`、`hibernaut_list_sessions`、`hibernaut_list_workspaces`、`hibernaut_resolve_approval`、`hibernaut_reclaim_workspace`），同时支持本机 `--mcp-stdio` 行帧直连与远程 `POST /mcp` Streamable HTTP（强制 `Authorization: Bearer <HIBERNAUT_MCP_TOKEN>` 校验，未配置 token 时默认禁用返回 404）。
 - **L3 飞书出站通道**（`FeishuChannelAdapter`，`adapters/channels/feishu_channel.py`）：仅用标准库 `urllib.request`，基于 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 自动缓存刷新 `tenant_access_token`，发送普通文本通知与 `Suspend` 交互审批卡片；未配置凭据时自动降级为 `ConsoleChannelAdapter`。
 
 ## 4. 本机自举闭环：`OrcaWorktreeManager`、`LocalCLIExecutor` 与声明式配置

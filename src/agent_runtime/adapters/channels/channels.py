@@ -8,6 +8,7 @@ from typing import Any
 
 from agent_runtime.adapters.channels.feishu_webhook import FeishuWebhookAdapter
 from agent_runtime.adapters.channels.github_webhook import GitHubWebhookAdapter
+from agent_runtime.adapters.channels.mcp_server import MCPServerAdapter
 from agent_runtime.engine.handler import EventHandler
 
 
@@ -58,6 +59,7 @@ def create_webhook_server(
     *,
     github_adapter: GitHubWebhookAdapter | None = None,
     feishu_adapter: FeishuWebhookAdapter | None = None,
+    mcp_adapter: MCPServerAdapter | None = None,
 ) -> HTTPServer:
     class _IngestRequestHandler(BaseHTTPRequestHandler):
         def _write_json(self, status_code: int, payload: dict[str, Any]) -> None:
@@ -100,6 +102,11 @@ def create_webhook_server(
 
             if self.path == "/webhooks/feishu" and feishu_adapter is not None:
                 resp = feishu_adapter.handle(raw, header_map)
+                self._write_json(resp.status_code, resp.body)
+                return
+
+            if self.path == "/mcp" and mcp_adapter is not None and mcp_adapter.http_enabled:
+                resp = mcp_adapter.handle_http(raw, header_map)
                 self._write_json(resp.status_code, resp.body)
                 return
 

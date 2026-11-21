@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import os
 import signal
+import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from agent_runtime.adapters.channels import (
     FeishuWebhookAdapter,
     GitHubIssuePoller,
     GitHubWebhookAdapter,
+    MCPServerAdapter,
     PollTarget,
     build_feishu_or_console_channel,
     create_webhook_server,
@@ -150,6 +152,7 @@ class AlwaysOnDaemon:
     github_webhook: GitHubWebhookAdapter | None = None
     feishu_webhook: FeishuWebhookAdapter | None = None
     github_poller: GitHubIssuePoller | None = None
+    mcp_server: MCPServerAdapter | None = None
     poll_interval_seconds: float = 60.0
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -175,10 +178,17 @@ class AlwaysOnDaemon:
 
         if webhook_host is not None and webhook_port is not None:
             loop = asyncio.get_running_loop()
-            webhook_handler = EventHandler(self.inbox, lambda key: loop.call_soon_threadsafe(self.pool.wake, key))
+            webhook_handler = EventHandler(
+                self.inbox,
+                lambda key: loop.call_soon_threadsafe(self.pool.wake, key),
+            )
             server = create_webhook_server(
-                webhook_host, webhook_port, webhook_handler,
-                github_adapter=self.github_webhook, feishu_adapter=self.feishu_webhook,
+                webhook_host,
+                webhook_port,
+                webhook_handler,
+                github_adapter=self.github_webhook,
+                feishu_adapter=self.feishu_webhook,
+                mcp_adapter=self.mcp_server,
             )
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
@@ -190,9 +200,12 @@ class AlwaysOnDaemon:
             tasks.create_task(self.dispatcher.run_forever(outbox_interval_seconds, stopper))
             poll_task = None
             if self.github_poller is not None:
-                poll_task = tasks.create_task(self.github_poller.run_forever(
-                    interval_seconds=self.poll_interval_seconds, stop_event=stopper,
-                ))
+                poll_task = tasks.create_task(
+                    self.github_poller.run_forever(
+                        interval_seconds=self.poll_interval_seconds,
+                        stop_event=stopper,
+                    )
+                )
             try:
                 await stopper.wait()
                 if poll_task is not None:
@@ -227,6 +240,8 @@ def build_daemon(
     feishu_chat_inbox_map: Mapping[str, str] | None = None,
     poll_targets: list[PollTarget] | None = None,
     poll_interval_seconds: float = 60.0,
+    mcp_bearer_token: str | None = None,
+    worktree_manager: OrcaWorktreeManager | None = None,
 ) -> AlwaysOnDaemon:
     db = SQLiteDatabase(db_path)
     inbox = SQLiteInboxAdapter(db)
@@ -299,6 +314,14 @@ def build_daemon(
         if poll_targets
         else None
     )
+    mcp_server = MCPServerAdapter(
+        handler=handler,
+        sessions=sessions,
+        workspaces=workspaces,
+        worktree_manager=worktree_manager or OrcaWorktreeManager(workspace_store=workspaces),
+        outbox=outbox,
+        bearer_token=mcp_bearer_token,
+    )
 
     return AlwaysOnDaemon(
         db=db,
@@ -317,6 +340,7 @@ def build_daemon(
         github_webhook=github_webhook,
         feishu_webhook=feishu_webhook,
         github_poller=github_poller,
+        mcp_server=mcp_server,
         poll_interval_seconds=poll_interval_seconds,
     )
 
@@ -331,12 +355,10 @@ def build_daemon_from_config(
     inbox_chat_map: dict[str, str] = {}
     chat_inbox_map: dict[str, str] = {}
     poll_targets: list[PollTarget] = []
-    project_backends: dict[str, tuple[str, bool]] = {}
 
     for proj in config.projects.values():
         repo_inbox_map[proj.repo] = proj.inbox_id
         inbox_checkout_map[proj.inbox_id] = proj.checkout
-        project_backends[proj.inbox_id] = (proj.worktree_backend, proj.orca_create_terminal)
         if proj.feishu_chat_id:
             inbox_chat_map[proj.inbox_id] = proj.feishu_chat_id
             chat_inbox_map[proj.feishu_chat_id] = proj.inbox_id
@@ -357,8 +379,12 @@ def build_daemon_from_config(
 
     gh_secret = os.environ.get(config.channels.github_webhook_secret_env) or None
     feishu_token = os.environ.get(config.channels.feishu_verification_token_env) or None
+    mcp_token = (
+        (os.environ.get(config.channels.mcp_token_env) or None)
+        if config.channels.mcp_enabled
+        else None
+    )
 
-    # Create DB & workspace store up front so LocalCLIExecutor shares the same SQLite database.
     daemon = build_daemon(
         db_path=config.runtime.db_path,
         memory_root=config.runtime.memory_root,
@@ -371,6 +397,7 @@ def build_daemon_from_config(
         feishu_chat_inbox_map=chat_inbox_map,
         poll_targets=poll_targets,
         poll_interval_seconds=config.runtime.poll_interval_seconds,
+        mcp_bearer_token=mcp_token,
     )
 
     if config.projects:
@@ -437,6 +464,14 @@ def build_daemon_from_config(
             github_token_env=config.channels.github_token_env,
             repo_inbox_map=repo_inbox_map,
         )
+        daemon.mcp_server = MCPServerAdapter(
+            handler=daemon.handler,
+            sessions=daemon.sessions,
+            workspaces=daemon.workspaces,
+            worktree_manager=default_mgr,
+            outbox=daemon.outbox,
+            bearer_token=mcp_token,
+        )
 
     return daemon
 
@@ -444,6 +479,11 @@ def build_daemon_from_config(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hibernaut multi-inbox Always-on Agent daemon")
     parser.add_argument("--config", default=None, help="Path to hibernaut.toml")
+    parser.add_argument(
+        "--mcp-stdio",
+        action="store_true",
+        help="Run Hibernaut MCP Server over stdio (JSON-RPC 2.0 lines)",
+    )
     parser.add_argument("--db", default="./hibernaut.db")
     parser.add_argument("--memory-root", default="./agent_memory")
     parser.add_argument("--workers", type=int, default=4)
@@ -452,10 +492,10 @@ def main() -> None:
     parser.add_argument("--policy", choices=("defer", "fold", "interrupt"), default="defer")
     parser.add_argument("--github-secret", default=None)
     parser.add_argument("--feishu-token", default=None)
+    parser.add_argument("--mcp-token", default=None)
     banner = f"Hibernaut {__version__}"
     parser.add_argument("--version", action="version", version=banner)
     args = parser.parse_args()
-    print(banner, flush=True)
 
     if args.config:
         cfg = load_config(args.config)
@@ -470,9 +510,21 @@ def main() -> None:
             new_event_policy=args.policy,
             github_webhook_secret=args.github_secret,
             feishu_verification_token=args.feishu_token,
+            mcp_bearer_token=args.mcp_token,
         )
         host = args.host
         port = args.port
+
+    if args.mcp_stdio:
+        # Keep stdout clean for JSON-RPC 2.0 frames in stdio mode.
+        assert daemon.mcp_server is not None
+        try:
+            daemon.mcp_server.serve_stdio(sys.stdin, sys.stdout)
+        finally:
+            daemon.close()
+        return
+
+    print(banner, flush=True)
 
     async def _serve() -> None:
         stop_event = asyncio.Event()

@@ -32,6 +32,8 @@ class ChannelsConfig:
     feishu_app_secret_env: str = "FEISHU_APP_SECRET"
     feishu_verification_token_env: str = "FEISHU_VERIFICATION_TOKEN"
     feishu_default_chat_id: str = ""
+    mcp_enabled: bool = False
+    mcp_token_env: str = "HIBERNAUT_MCP_TOKEN"
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +94,8 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
             ch_raw.get("feishu_verification_token_env", "FEISHU_VERIFICATION_TOKEN")
         ),
         feishu_default_chat_id=str(ch_raw.get("feishu_default_chat_id", "")),
+        mcp_enabled=bool(ch_raw.get("mcp_enabled", False)),
+        mcp_token_env=str(ch_raw.get("mcp_token_env", "HIBERNAUT_MCP_TOKEN")),
     )
 
     executors: dict[str, CLITemplate] = {}

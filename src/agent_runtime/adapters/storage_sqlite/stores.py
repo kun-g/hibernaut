@@ -379,6 +379,43 @@ class SQLiteSessionStoreAdapter:
             updated_at=str(row["updated_at"]),
         )
 
+    def list_sessions(
+        self,
+        *,
+        inbox_id: str | None = None,
+        status: str | None = None,
+    ) -> list[SessionRef]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if inbox_id:
+            clauses.append("inbox_id = ?")
+            params.append(inbox_id)
+        if status == "suspended":
+            clauses.append("pending_request_id IS NOT NULL")
+        elif status == "active":
+            clauses.append("pending_request_id IS NULL")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._db.conn.execute(
+            f"""
+            SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
+            FROM sessions
+            {where}
+            ORDER BY updated_at DESC
+            """,
+            tuple(params),
+        ).fetchall()
+        return [
+            SessionRef(
+                session_id=str(row["session_id"]),
+                inbox_id=str(row["inbox_id"]),
+                correlation_key=row["correlation_key"],
+                checkpoint=row["checkpoint"],
+                pending_request_id=row["pending_request_id"],
+                updated_at=str(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
     def save(self, session: SessionRef) -> None:
         with self._db.conn:
             if session.correlation_key is not None:

@@ -2,7 +2,7 @@
 
 Clean Architecture (L0–L3) Python runtime for **Always-on Agents** built around the **Sleep → Wake → Run → Write-back** lifecycle, **multi-`inbox_id` Actor partition concurrency**, and a **zero-dependency local self-bootstrap loop**.
 
-> Asleep by default (no tokens spent), wakes only when events, polled GitHub Issues, or timers arrive, runs in isolated dynamic worktrees, and exits cleanly with explicit `Silent | Emit | Suspend` outcomes.
+> Asleep by default (no tokens spent), wakes only when events, polled GitHub Issues, MCP tool calls, or timers arrive, runs in isolated dynamic worktrees, and exits cleanly with explicit `Silent | Emit | Suspend` outcomes.
 
 - Full up-to-date architecture & glossary: [`docs/architecture.md`](docs/architecture.md)
 - Contributor & coding-agent rules: [`AGENTS.md`](AGENTS.md)
@@ -26,11 +26,11 @@ src/agent_runtime/
 │   ├── permissions/       # Auto Mode classifier (allow / block / defer) + external CredentialProxyClient
 │   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
 │   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + magpie env) & OrcaWorktreeManager (3 safety gates)
-│   └── channels/          # Multi-route HTTP server (/events, /webhooks/github, /webhooks/feishu), GitHubIssuePoller, FeishuChannelAdapter, Console
+│   └── channels/          # Multi-route HTTP (/events, /webhooks/github, /webhooks/feishu, /mcp), MCPServerAdapter, GitHubIssuePoller, FeishuChannelAdapter, Console
 └── app/
     ├── config.py          # Stdlib tomllib loader for hibernaut.toml
     ├── bootstrap.py       # Single-inbox Composition Root
-    ├── main.py            # Multi-inbox_id AlwaysOnDaemon & AsyncWorkerPool (--config hibernaut.toml)
+    ├── main.py            # Multi-inbox_id AlwaysOnDaemon (--config hibernaut.toml | --mcp-stdio)
     └── demo.py            # Zero-API-key end-to-end demo (Silent -> Suspend -> Human Approval -> Resume -> Emit)
 ```
 
@@ -47,9 +47,6 @@ cp hibernaut.example.toml hibernaut.toml
 
 # 2. Launch full local Always-on daemon (GitHub Issue Poller + LocalCLIExecutor + Dynamic Worktree + Feishu/Console)
 PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
-
-# Or run the zero-config single-inbox demo
-PYTHONPATH=src python3 -m agent_runtime.app.demo
 ```
 
 ### Versioning
@@ -70,12 +67,48 @@ The supervisor checks the configured `origin/main` every 300 seconds. Use `--int
 
 Use an origin you trust to supply executable code. A dirty checkout (including untracked files), another branch, a divergent history, or a failed fetch leaves the running daemon in place. On a fast-forward, the old daemon closes ingress and drains accepted work before the supervisor applies the commit and relaunches. Clients should retry during this short interruption using the same external event ID. Keep runtime state in ignored paths or outside the checkout. The supervisor reuses those paths. If a new daemon fails to start, the supervisor exits with its status for operator recovery.
 
+## MCP Server Integration (`stdio` & Remote `/mcp`)
+
+Hibernaut exposes 5 minimal MCP tools (`hibernaut_ingest_event`, `hibernaut_list_sessions`, `hibernaut_list_workspaces`, `hibernaut_resolve_approval`, `hibernaut_reclaim_workspace`).
+
+### 1. Local IDE / CLI (`stdio`)
+
+Add to your Claude Code / Cursor / Claude Desktop MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "hibernaut": {
+      "command": "python3",
+      "args": ["-m", "agent_runtime.app.main", "--mcp-stdio", "--config", "/abs/path/to/hibernaut.toml"],
+      "env": {
+        "PYTHONPATH": "/abs/path/to/hibernaut/src"
+      }
+    }
+  }
+}
+```
+
+### 2. Remote Access via Cloudflare Tunnel (`POST /mcp`, Streamable HTTP)
+
+Set `mcp_enabled = true` in `hibernaut.toml`, export a strong token, and expose the local port through Cloudflare Tunnel:
+
+```bash
+export HIBERNAUT_MCP_TOKEN="replace-with-strong-random-token"
+PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
+
+# In another terminal, publish https://mcp.yourdomain.com -> http://127.0.0.1:8080
+cloudflared tunnel --url http://127.0.0.1:8080
+```
+
+Remote clients call `POST https://<your-tunnel-host>/mcp` with header `Authorization: Bearer <HIBERNAUT_MCP_TOKEN>`. If `HIBERNAUT_MCP_TOKEN` is unset or `mcp_enabled = false`, `/mcp` stays disabled (404).
+
 ## Anti-Corruption Gates (CI)
 
 ```bash
 pip install -e ".[dev]"
 
 lint-imports   # Gate 1: Static import boundary checks
-pytest -v      # Gate 2: Contract, concurrency, NewEventPolicy, correlation_key, Webhook & Bootstrap tests
+pytest -v      # Gate 2: Contract, concurrency, NewEventPolicy, correlation_key, Webhook, Bootstrap & MCP tests
 pyright        # Gate 3: Strict static type checking on core/ and engine/
 ```
