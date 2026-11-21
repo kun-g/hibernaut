@@ -66,6 +66,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     inbox_id TEXT NOT NULL,
     correlation_key TEXT,
+    executor_id TEXT,
+    executor_session_id TEXT,
     checkpoint TEXT,
     pending_request_id TEXT,
     updated_at TEXT NOT NULL
@@ -124,6 +126,13 @@ class SQLiteDatabase:
             }
             if "correlation_key" not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN correlation_key TEXT")
+        session_cols = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        for col in ("executor_id", "executor_session_id"):
+            if col not in session_cols:
+                conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_sessions_correlation

@@ -113,7 +113,10 @@ class AsyncWorkerPool:
                 batch_reports = await worker.process_inbox(inbox_id)
                 self.reports.extend(batch_reports)
             except ExecutorFailed:
-                logging.getLogger(__name__).exception("Executor failed for inbox %s; batch remains pending", inbox_id)
+                logging.getLogger(__name__).exception(
+                    "Executor failed for inbox %s; batch remains pending",
+                    inbox_id,
+                )
             finally:
                 self._active.pop(inbox_id, None)
                 self._queue.task_done()
@@ -160,6 +163,7 @@ class AlwaysOnDaemon:
     github_poller: GitHubIssuePoller | None = None
     mcp_server: MCPServerAdapter | None = None
     poll_interval_seconds: float = 60.0
+    ingest_only: bool = False
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def register_partition(
@@ -198,7 +202,8 @@ class AlwaysOnDaemon:
 
         workers_stop = asyncio.Event()
         async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(self.pool.run_forever(workers_stop))
+            if not self.ingest_only:
+                tasks.create_task(self.pool.run_forever(workers_stop))
             tasks.create_task(self.scheduler.run_forever(timer_interval_seconds, stopper))
             tasks.create_task(self.dispatcher.run_forever(outbox_interval_seconds, stopper))
             poll_task = None
@@ -235,6 +240,9 @@ def build_daemon(
     max_concurrency: int = 4,
     llm: LLMBackend | None = None,
     executor_factory: Callable[[str], ExecutorPort] | None = None,
+    executors_factory: Callable[[str], Mapping[str, ExecutorPort]] | None = None,
+    project_default_executor: str | None = None,
+    global_default_executor: str | None = None,
     channel: ChannelPort | None = None,
     min_outbox_interval_seconds: float = 0.0,
     lease_ttl_seconds: float = 60.0,
@@ -247,6 +255,7 @@ def build_daemon(
     poll_interval_seconds: float = 60.0,
     mcp_bearer_token: str | None = None,
     worktree_manager: OrcaWorktreeManager | None = None,
+    ingest_only: bool = False,
 ) -> AlwaysOnDaemon:
     db = database if database is not None else SQLiteDatabase(db_path)
     inbox = SQLiteInboxAdapter(db)
@@ -274,6 +283,22 @@ def build_daemon(
     )
 
     def _make_worker(inbox_id: str, worker_id: str) -> AgentWorker:
+        if executors_factory is not None:
+            return AgentWorker(
+                worker_id=worker_id,
+                inbox=inbox,
+                timers=timers,
+                memory=partitions.memory_for(inbox_id),
+                permissions=permissions,
+                outbox=outbox,
+                executors=executors_factory(inbox_id),
+                project_default_executor=project_default_executor,
+                global_default_executor=global_default_executor,
+                lock=lock,
+                sessions=sessions,
+                lease_ttl_seconds=lease_ttl_seconds,
+                new_event_policy=new_event_policy,
+            )
         executor = executor_factory(inbox_id) if executor_factory is not None else default_executor
         return AgentWorker(
             worker_id=worker_id,
@@ -293,8 +318,9 @@ def build_daemon(
         worker_factory=_make_worker,
         max_concurrency=max_concurrency,
     )
-    handler = EventHandler(inbox=inbox, on_wake=pool.wake)
-    scheduler = TimerScheduler(timers=timers, inbox=inbox, on_wake=pool.wake)
+    wake_cb = None if ingest_only else pool.wake
+    handler = EventHandler(inbox=inbox, on_wake=wake_cb)
+    scheduler = TimerScheduler(timers=timers, inbox=inbox, on_wake=wake_cb)
     dispatcher = OutboxDispatcher(
         outbox=outbox,
         channel=resolved_channel,
@@ -323,6 +349,7 @@ def build_daemon(
         handler=handler,
         sessions=sessions,
         workspaces=workspaces,
+        inbox=inbox,
         worktree_manager=worktree_manager or OrcaWorktreeManager(workspace_store=workspaces),
         outbox=outbox,
         bearer_token=mcp_bearer_token,
@@ -347,6 +374,7 @@ def build_daemon(
         github_poller=github_poller,
         mcp_server=mcp_server,
         poll_interval_seconds=poll_interval_seconds,
+        ingest_only=ingest_only,
     )
 
 
@@ -355,16 +383,19 @@ def build_daemon_from_config(
     *,
     channel: ChannelPort | None = None,
     database: SQLiteDatabase | None = None,
+    demo: bool = False,
 ) -> AlwaysOnDaemon:
     repo_inbox_map: dict[str, str] = {}
     inbox_checkout_map: dict[str, str] = {}
     inbox_chat_map: dict[str, str] = {}
     chat_inbox_map: dict[str, str] = {}
+    inbox_project_executor: dict[str, str | None] = {}
     poll_targets: list[PollTarget] = []
 
     for proj in config.projects.values():
         repo_inbox_map[proj.repo] = proj.inbox_id
         inbox_checkout_map[proj.inbox_id] = proj.checkout
+        inbox_project_executor[proj.inbox_id] = proj.executor
         if proj.feishu_chat_id:
             inbox_chat_map[proj.inbox_id] = proj.feishu_chat_id
             chat_inbox_map[proj.feishu_chat_id] = proj.inbox_id
@@ -391,6 +422,19 @@ def build_daemon_from_config(
         else None
     )
 
+    has_configured_executor = (
+        bool(config.executors) and config.runtime.default_executor in config.executors
+    )
+    ingest_only = (not demo) and (not has_configured_executor)
+    if ingest_only:
+        print(
+            f"[hibernaut] Executor '{config.runtime.default_executor}' is not configured in "
+            "[executors]; starting in ingest-only mode (events remain pending). "
+            "Pass --demo to enable RuleBasedDemoLLM.",
+            file=sys.stderr,
+            flush=True,
+        )
+
     daemon = build_daemon(
         db_path=config.runtime.db_path,
         database=database,
@@ -405,30 +449,39 @@ def build_daemon_from_config(
         poll_targets=poll_targets,
         poll_interval_seconds=config.runtime.poll_interval_seconds,
         mcp_bearer_token=mcp_token,
+        ingest_only=ingest_only,
     )
 
-    if config.projects:
-        executors_by_inbox: dict[str, LocalCLIExecutor] = {}
+    if has_configured_executor and not demo:
+        # Instantiate all configured [executors.<id>] per project so AgentWorker can sticky-route.
+        executors_by_inbox: dict[str, dict[str, ExecutorPort]] = {}
         for proj in config.projects.values():
             wt_mgr = OrcaWorktreeManager(
                 workspace_store=daemon.workspaces,
                 backend=proj.worktree_backend,
                 create_terminal=proj.orca_create_terminal,
             )
-            executors_by_inbox[proj.inbox_id] = LocalCLIExecutor(
-                worktree_manager=wt_mgr,
-                inbox_checkout_map=inbox_checkout_map,
-                templates=config.executors,
-                default_executor=config.runtime.default_executor,
-            )
+            executors_by_inbox[proj.inbox_id] = {
+                exec_name: LocalCLIExecutor(
+                    worktree_manager=wt_mgr,
+                    inbox_checkout_map=inbox_checkout_map,
+                    templates=config.executors,
+                    default_executor=exec_name,
+                    orca_workspace=proj.worktree_backend == "orca",
+                )
+                for exec_name in config.executors
+            }
 
         default_mgr = OrcaWorktreeManager(workspace_store=daemon.workspaces)
-        fallback_cli = LocalCLIExecutor(
-            worktree_manager=default_mgr,
-            inbox_checkout_map=inbox_checkout_map,
-            templates=config.executors,
-            default_executor=config.runtime.default_executor,
-        )
+        fallback_executors: dict[str, ExecutorPort] = {
+            exec_name: LocalCLIExecutor(
+                worktree_manager=default_mgr,
+                inbox_checkout_map=inbox_checkout_map,
+                templates=config.executors,
+                default_executor=exec_name,
+            )
+            for exec_name in config.executors
+        }
 
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
             return AgentWorker(
@@ -438,7 +491,9 @@ def build_daemon_from_config(
                 memory=daemon.partitions.memory_for(inbox_id),
                 permissions=AutoModePermissionAdapter(),
                 outbox=daemon.outbox,
-                executor=executors_by_inbox.get(inbox_id, fallback_cli),
+                executors=executors_by_inbox.get(inbox_id, fallback_executors),
+                project_default_executor=inbox_project_executor.get(inbox_id),
+                global_default_executor=config.runtime.default_executor,
                 lock=daemon.lock,
                 sessions=daemon.sessions,
                 new_event_policy=config.runtime.new_event_policy,
@@ -464,6 +519,17 @@ def build_daemon_from_config(
             verification_token=feishu_token,
             chat_inbox_map=chat_inbox_map,
         )
+        daemon.mcp_server = MCPServerAdapter(
+            handler=daemon.handler,
+            sessions=daemon.sessions,
+            workspaces=daemon.workspaces,
+            inbox=daemon.inbox,
+            worktree_manager=default_mgr,
+            outbox=daemon.outbox,
+            bearer_token=mcp_token,
+        )
+
+    if poll_targets:
         daemon.github_poller = GitHubIssuePoller(
             daemon.handler,
             targets=poll_targets,
@@ -471,20 +537,17 @@ def build_daemon_from_config(
             github_token_env=config.channels.github_token_env,
             repo_inbox_map=repo_inbox_map,
         )
-        daemon.mcp_server = MCPServerAdapter(
-            handler=daemon.handler,
-            sessions=daemon.sessions,
-            workspaces=daemon.workspaces,
-            worktree_manager=default_mgr,
-            outbox=daemon.outbox,
-            bearer_token=mcp_token,
-        )
 
     return daemon
 
 
 async def serve_configured(
-    path: Path, config: HibernautConfig, daemon: AlwaysOnDaemon, stop: asyncio.Event,
+    path: Path,
+    config: HibernautConfig,
+    daemon: AlwaysOnDaemon,
+    stop: asyncio.Event,
+    *,
+    demo: bool = False,
 ) -> None:
     server = WebhookHTTPServer((config.channels.host, config.channels.port), daemon.http_handler())
     changes = config_changes(path, stop)
@@ -499,18 +562,32 @@ async def serve_configured(
                         if candidate == config:
                             continue
                         if (candidate.runtime.db_path, candidate.runtime.memory_root) != (
-                            config.runtime.db_path, config.runtime.memory_root,
+                            config.runtime.db_path,
+                            config.runtime.memory_root,
                         ):
-                            print('[config] Storage path changes require a restart.', file=sys.stderr, flush=True)
+                            print(
+                                "[config] Storage path changes require a restart.",
+                                file=sys.stderr,
+                                flush=True,
+                            )
                             continue
                         address = (candidate.channels.host, candidate.channels.port)
                         try:
-                            replacement = build_daemon_from_config(candidate, database=daemon.db)
+                            replacement = build_daemon_from_config(
+                                candidate,
+                                database=daemon.db,
+                                demo=demo,
+                            )
                             handler = replacement.http_handler()
                             if address != (config.channels.host, config.channels.port):
                                 next_server = WebhookHTTPServer(address, handler)
                         except (OSError, ValueError, OverflowError) as exc:
-                            print(f'[config] Cannot activate settings ({type(exc).__name__}); keeping current settings.', file=sys.stderr, flush=True)
+                            print(
+                                f"[config] Cannot activate settings ({type(exc).__name__}); "
+                                "keeping current settings.",
+                                file=sys.stderr,
+                                flush=True,
+                            )
                             continue
                         break
                     else:
@@ -523,7 +600,7 @@ async def serve_configured(
                 server = next_server
             server.RequestHandlerClass = handler
             daemon, config = replacement, candidate
-            print(f'[config] Reloaded {path}', file=sys.stderr, flush=True)
+            print(f"[config] Reloaded {path}", file=sys.stderr, flush=True)
     finally:
         await changes.aclose()
         if next_server is not server:
@@ -534,6 +611,11 @@ async def serve_configured(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hibernaut multi-inbox Always-on Agent daemon")
     parser.add_argument("--config", default=None, help="Path to hibernaut.toml")
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Explicitly allow RuleBasedDemoLLM when starting with --config",
+    )
     parser.add_argument(
         "--mcp-stdio",
         action="store_true",
@@ -554,7 +636,7 @@ def main() -> None:
 
     if args.config:
         cfg = load_config(args.config)
-        daemon = build_daemon_from_config(cfg)
+        daemon = build_daemon_from_config(cfg, demo=args.demo)
         host = cfg.channels.host
         port = cfg.channels.port
     else:
@@ -591,7 +673,13 @@ def main() -> None:
                 pass
         try:
             if args.config:
-                await serve_configured(Path(args.config), cfg, daemon, stop_event)
+                await serve_configured(
+                    Path(args.config),
+                    cfg,
+                    daemon,
+                    stop_event,
+                    demo=args.demo,
+                )
             else:
                 await daemon.run(stop_event=stop_event, webhook_host=host, webhook_port=port)
         finally:

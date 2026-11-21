@@ -23,8 +23,11 @@ mcp_enabled = false
 mcp_token_env = "HIBERNAUT_MCP_TOKEN"
 
 [executors.claude]
+orca_agent = "claude"
 command = "claude"
-args = ["-p"]
+args = ["-p", "{prompt}", "--output-format", "json"]
+# 可选：当 session.executor_id == "claude" 且存在 executor_session_id 时，自动使用原生会话续接参数
+resume_args = ["-p", "{prompt}", "--resume", "{executor_session_id}", "--output-format", "json"]
 timeout_seconds = 300.0
 # 可选：透传本地模型网关（如 yetone/magpie）所需环境变量
 # [executors.claude.env]
@@ -37,7 +40,8 @@ timeout_seconds = 300.0
 
 [executors.grok]
 command = "grok"
-args = ["-p"]
+args = ["-p", "{prompt}"]
+# resume_args = ["-p", "{prompt}", "--resume", "{executor_session_id}"]
 timeout_seconds = 300.0
 
 [executors.dsh]
@@ -51,5 +55,7 @@ repo = "kun-g/hibernaut"
 checkout = "/absolute/path/to/your/hibernaut"
 poll_labels = ["hibernaut"]
 worktree_backend = "orca"    # orca | git
-orca_create_terminal = false
+orca_create_terminal = false    # agent launch opens its own terminal
 feishu_chat_id = ""
+# 可选：项目级默认执行器（未设置时回退到 runtime.default_executor）
+# executor = "claude"

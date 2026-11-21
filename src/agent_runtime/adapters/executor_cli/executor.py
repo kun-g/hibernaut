@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_runtime.adapters.executor_cli.orca import run_visible
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
 from agent_runtime.core.models import (
     Emit,
@@ -29,8 +30,10 @@ class CLITemplate:
     name: str
     command: str
     args: tuple[str, ...] = ()
+    resume_args: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=_empty_env)
     timeout_seconds: float = 300.0
+    orca_agent: str | None = None
 
 
 DEFAULT_CLI_TEMPLATES: dict[str, CLITemplate] = {
@@ -50,7 +53,9 @@ class LocalCLIExecutor:
         templates: Mapping[str, CLITemplate] | None = None,
         default_executor: str = "claude",
         interrupt_poll_interval: float = 0.05,
+        orca_workspace: bool = False,
     ) -> None:
+        self._orca_workspace = orca_workspace
         self._worktree_manager = worktree_manager
         self._inbox_checkout_map: dict[str, Path] = {
             k: Path(v).resolve() for k, v in inbox_checkout_map.items()
@@ -61,6 +66,10 @@ class LocalCLIExecutor:
         self._templates = merged
         self._default_executor = default_executor
         self._interrupt_poll_interval = interrupt_poll_interval
+
+    @property
+    def executor_id(self) -> str:
+        return self._default_executor
 
     async def execute(
         self,
@@ -106,13 +115,15 @@ class LocalCLIExecutor:
             )
 
         prompt = self._build_prompt(events, session, caps)
+        if self._orca_workspace and template.orca_agent and explicit_workdir is None:
+            return await run_visible(template.orca_agent, workdir, prompt, session_id, caps, template.timeout_seconds)
+        cli_args = self._render_cli_args(template, prompt=prompt, session=session)
         env = dict(os.environ)
         env.update(template.env)
 
         proc = await asyncio.create_subprocess_exec(
             template.command,
-            *template.args,
-            prompt,
+            *cli_args,
             cwd=str(workdir),
             env=env,
             stdout=asyncio.subprocess.PIPE,
@@ -136,6 +147,35 @@ class LocalCLIExecutor:
             )
 
         return self._parse_outcome(stdout, session_id=session_id)
+
+    def _render_cli_args(
+        self,
+        template: CLITemplate,
+        *,
+        prompt: str,
+        session: SessionRef | None,
+    ) -> list[str]:
+        # Only resume natively when executor_id matches and executor_session_id is present.
+        can_resume = (
+            session is not None
+            and session.executor_id == template.name
+            and bool(session.executor_session_id)
+            and bool(template.resume_args)
+        )
+        raw_args = template.resume_args if can_resume else template.args
+        exec_sid = session.executor_session_id if (can_resume and session is not None) else ""
+
+        rendered: list[str] = []
+        prompt_inserted = False
+        for token in raw_args:
+            if "{prompt}" in token:
+                prompt_inserted = True
+            rendered.append(
+                token.replace("{prompt}", prompt).replace("{executor_session_id}", exec_sid or "")
+            )
+        if not prompt_inserted:
+            rendered.append(prompt)
+        return rendered
 
     async def _wait_with_interrupt(
         self,
@@ -229,21 +269,38 @@ class LocalCLIExecutor:
             return Emit(messages=(stdout,), session_id=session_id)
 
         if isinstance(parsed, dict):
+            raw_exec_sid = parsed.get("executor_session_id") or parsed.get("session_id")
+            native_sid = str(raw_exec_sid) if isinstance(raw_exec_sid, str) and raw_exec_sid else None
             kind = str(parsed.get("outcome", "")).lower()
             if kind == "silent":
-                return Silent()
+                return Silent(executor_session_id=native_sid)
             if kind == "suspend":
                 return Suspend(
                     request_id=str(parsed.get("request_id") or new_id("req")),
                     prompt=str(parsed.get("prompt") or "需要人工确认"),
                     session_checkpoint=str(parsed.get("session_checkpoint") or "{}"),
                     session_id=session_id,
+                    executor_session_id=native_sid,
                 )
             if kind == "emit":
                 msgs = parsed.get("messages")
                 if isinstance(msgs, list) and msgs:
-                    return Emit(messages=tuple(str(m) for m in msgs), session_id=session_id)
-                return Silent()
+                    return Emit(
+                        messages=tuple(str(m) for m in msgs),
+                        session_id=session_id,
+                        executor_session_id=native_sid,
+                    )
+                return Silent(executor_session_id=native_sid)
+            # Support native Claude Code `--output-format json` envelope (`{"result": "...", "session_id": "..."}`).
+            if isinstance(parsed.get("result"), str):
+                text = parsed["result"].strip()
+                if text:
+                    return Emit(
+                        messages=(text,),
+                        session_id=session_id,
+                        executor_session_id=native_sid,
+                    )
+                return Silent(executor_session_id=native_sid)
 
         return Emit(messages=(stdout,), session_id=session_id)
 

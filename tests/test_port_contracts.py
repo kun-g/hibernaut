@@ -204,6 +204,44 @@ class SessionContractMixin:
         assert old_loaded is not None
         self.assertIsNone(old_loaded.correlation_key)
 
+    def test_executor_binding_persisted_and_updated(self) -> None:
+        store = self.make_sessions()
+        ref = SessionRef(
+            session_id="sess_exec",
+            inbox_id="proj:hibernaut",
+            correlation_key="github:kun-g/hibernaut#99",
+            executor_id="claude",
+            executor_session_id="claude-native-123",
+        )
+        store.save(ref)
+        loaded = store.get("sess_exec")
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.executor_id, "claude")
+        self.assertEqual(loaded.executor_session_id, "claude-native-123")
+
+        by_corr = store.find_by_correlation_key("proj:hibernaut", "github:kun-g/hibernaut#99")
+        self.assertIsNotNone(by_corr)
+        assert by_corr is not None
+        self.assertEqual(by_corr.executor_id, "claude")
+        self.assertEqual(by_corr.executor_session_id, "claude-native-123")
+
+        # Switching executor clears/replaces the prior native session id.
+        store.save(
+            SessionRef(
+                session_id="sess_exec",
+                inbox_id="proj:hibernaut",
+                correlation_key="github:kun-g/hibernaut#99",
+                executor_id="cursor-agent",
+                executor_session_id=None,
+            )
+        )
+        switched = store.get("sess_exec")
+        self.assertIsNotNone(switched)
+        assert switched is not None
+        self.assertEqual(switched.executor_id, "cursor-agent")
+        self.assertIsNone(switched.executor_session_id)
+
 
 class TestInMemoryContracts(
     InboxContractMixin,

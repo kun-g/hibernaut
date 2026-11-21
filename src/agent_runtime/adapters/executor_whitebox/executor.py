@@ -59,12 +59,18 @@ class WhiteboxExecutor:
         system_prompt: str = "You are a quiet, reliable always-on background agent.",
         max_steps: int = 8,
         max_messages_before_compact: int = 24,
+        executor_id: str = "whitebox",
     ) -> None:
         self._llm = llm
         self._custom_tools: dict[str, ToolHandler] = dict(tools or {})
         self._system_prompt = system_prompt
         self._max_steps = max_steps
         self._max_messages_before_compact = max_messages_before_compact
+        self._executor_id = executor_id
+
+    @property
+    def executor_id(self) -> str:
+        return self._executor_id
 
     def _format_event_message(self, evt: Event) -> LLMMessage:
         return LLMMessage(

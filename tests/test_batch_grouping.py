@@ -22,6 +22,8 @@ POLICIES: tuple[NewEventPolicy, ...] = ("defer", "fold", "interrupt")
 
 
 class _RecordingExecutor:
+    executor_id = "recording"
+
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
         self.started: list[list[str]] = []
@@ -214,6 +216,43 @@ class TestBatchGrouping(unittest.IsolatedAsyncioTestCase):
         await worker.process_inbox(INBOX)
 
         self.assertEqual(executor.started, [["A-approve"], ["B1"]])
+
+    async def test_executor_routing_follows_ordinary_events_not_the_approval(self) -> None:
+        primary, other = _RecordingExecutor(), _RecordingExecutor()
+        other.executor_id = "other"
+        worker = AgentWorker(
+            worker_id="w1",
+            inbox=(inbox := InMemoryInbox()),
+            timers=InMemoryTimerStore(),
+            memory=InMemoryMemoryStore(),
+            permissions=InMemoryPermission(),
+            outbox=InMemoryOutbox(),
+            executors={"recording": primary, "other": other},
+            global_default_executor="recording",
+            lock=InMemoryLock(),
+            sessions=InMemorySessionStore(),
+        )
+        inbox.append(_routed("A1", executor_id="other"))
+        inbox.append(_routed("A-approve", executor_id="recording", approval=True))
+        inbox.append(_routed("A2", executor_id="recording"))
+
+        await worker.process_inbox(INBOX)
+
+        self.assertEqual(other.calls, [["A1", "A-approve"]])
+        self.assertEqual(primary.calls, [["A2"]])
+
+
+def _routed(external_id: str, *, executor_id: str, approval: bool = False) -> Event:
+    payload: dict[str, object] = {"executor_id": executor_id}
+    if approval:
+        payload |= {"approval_request_id": "req-1", "approved": True}
+    return Event(
+        inbox_id=INBOX,
+        source="test",
+        external_id=external_id,
+        payload=payload,
+        session_id="chat_1",
+    )
 
 
 def _approval(external_id: str, *, session_id: str) -> Event:

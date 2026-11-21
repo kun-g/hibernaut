@@ -50,6 +50,7 @@ class ProjectConfig:
     worktree_backend: WorktreeBackend = "orca"
     orca_create_terminal: bool = False
     feishu_chat_id: str = ""
+    executor: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +66,11 @@ def load_config(path: str | Path) -> HibernautConfig:
     return parse_config(raw)
 
 
-async def config_changes(path: Path, stop: asyncio.Event, interval: float = 1.0) -> AsyncIterator[HibernautConfig]:
+async def config_changes(
+    path: Path,
+    stop: asyncio.Event,
+    interval: float = 1.0,
+) -> AsyncIterator[HibernautConfig]:
     previous: bytes | None = None
     missing = False
     while not stop.is_set():
@@ -78,7 +83,11 @@ async def config_changes(path: Path, stop: asyncio.Event, interval: float = 1.0)
             contents = path.read_bytes()
         except OSError as exc:
             if not missing:
-                print(f"[config] Cannot read {path}: {exc.strerror}; keeping current settings.", file=sys.stderr, flush=True)
+                print(
+                    f"[config] Cannot read {path}: {exc.strerror}; keeping current settings.",
+                    file=sys.stderr,
+                    flush=True,
+                )
             missing = True
             continue
         missing = False
@@ -86,12 +95,16 @@ async def config_changes(path: Path, stop: asyncio.Event, interval: float = 1.0)
             continue
         previous = contents
         try:
-            raw = tomllib.loads(contents.decode('utf-8'))
+            raw = tomllib.loads(contents.decode("utf-8"))
             if not raw:
-                raise ValueError('empty configuration')
+                raise ValueError("empty configuration")
             config = parse_config(raw)
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
-            print(f"[config] Invalid {path} ({type(exc).__name__}); keeping current settings.", file=sys.stderr, flush=True)
+            print(
+                f"[config] Invalid {path} ({type(exc).__name__}); keeping current settings.",
+                file=sys.stderr,
+                flush=True,
+            )
             continue
         yield config
 
@@ -141,12 +154,23 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
     executors: dict[str, CLITemplate] = {}
     for name, item in raw.get("executors", {}).items():
         env_raw = item.get("env", {})
+        resume_raw = item.get("resume_args")
+        orca_agent = item.get("orca_agent")
+        if orca_agent is not None and (not isinstance(orca_agent, str) or not orca_agent.strip()):
+            raise ValueError(f"Invalid orca_agent for '{name}'")
+        timeout = float(item.get("timeout_seconds", 300.0))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError(f"Invalid timeout_seconds for '{name}'")
         executors[str(name)] = CLITemplate(
             name=str(name),
             command=str(item["command"]),
             args=tuple(str(a) for a in item.get("args", ())),
+            resume_args=(
+                tuple(str(a) for a in resume_raw) if resume_raw is not None else ()
+            ),
             env={str(k): str(v) for k, v in env_raw.items()},
-            timeout_seconds=float(item.get("timeout_seconds", 300.0)),
+            timeout_seconds=timeout,
+            orca_agent=orca_agent,
         )
 
     projects: dict[str, ProjectConfig] = {}
@@ -154,6 +178,8 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
         backend = str(item.get("worktree_backend", "orca"))
         if backend not in ("orca", "git"):
             raise ValueError(f"Unsupported worktree_backend for '{name}': {backend}")
+        proj_exec_raw = item.get("executor")
+        proj_exec = str(proj_exec_raw).strip() if proj_exec_raw is not None else None
         projects[str(name)] = ProjectConfig(
             name=str(name),
             inbox_id=str(item.get("inbox_id", f"proj:{name}")),
@@ -163,6 +189,7 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
             worktree_backend=cast(Literal["orca", "git"], backend),
             orca_create_terminal=bool(item.get("orca_create_terminal", False)),
             feishu_chat_id=str(item.get("feishu_chat_id", "")),
+            executor=proj_exec or None,
         )
 
     return HibernautConfig(

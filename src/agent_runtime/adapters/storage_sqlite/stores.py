@@ -87,6 +87,49 @@ class SQLiteInboxAdapter:
             for row in rows
         ]
 
+    def list_events(
+        self,
+        *,
+        inbox_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[Event]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if inbox_id:
+            clauses.append("inbox_id = ?")
+            params.append(inbox_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(limit, 500)))
+        rows = self._db.fetchall(
+            f"""
+            SELECT event_id, inbox_id, source, external_id,
+                   occurred_at, payload_json, session_id, correlation_key, status
+            FROM event_inbox
+            {where}
+            ORDER BY seq DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        return [
+            Event(
+                event_id=str(row["event_id"]),
+                inbox_id=str(row["inbox_id"]),
+                source=str(row["source"]),
+                external_id=str(row["external_id"]),
+                occurred_at=str(row["occurred_at"]),
+                payload=json.loads(str(row["payload_json"])),
+                session_id=row["session_id"],
+                correlation_key=row["correlation_key"],
+                status=cast(EventStatus, str(row["status"])),
+            )
+            for row in rows
+        ]
+
     def mark_done(self, event_ids: Sequence[str]) -> None:
         if not event_ids:
             return
@@ -322,51 +365,48 @@ class SQLiteSessionStoreAdapter:
     def __init__(self, db: SQLiteDatabase) -> None:
         self._db = db
 
-    def get(self, session_id: str) -> SessionRef | None:
-        row = self._db.fetchone(
-            """
-            SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
-            FROM sessions
-            WHERE session_id = ?
-            """,
-            (session_id,),
-        )
-        if row is None:
-            return None
+    def _row_to_session(self, row: Any) -> SessionRef:
         return SessionRef(
             session_id=str(row["session_id"]),
             inbox_id=str(row["inbox_id"]),
             correlation_key=row["correlation_key"],
+            executor_id=row["executor_id"],
+            executor_session_id=row["executor_session_id"],
             checkpoint=row["checkpoint"],
             pending_request_id=row["pending_request_id"],
             updated_at=str(row["updated_at"]),
         )
 
+    def get(self, session_id: str) -> SessionRef | None:
+        row = self._db.fetchone(
+            """
+            SELECT session_id, inbox_id, correlation_key, executor_id,
+                   executor_session_id, checkpoint, pending_request_id, updated_at
+            FROM sessions
+            WHERE session_id = ?
+            """,
+            (session_id,),
+        )
+        return self._row_to_session(row) if row is not None else None
+
     def find_by_request_id(self, request_id: str) -> SessionRef | None:
         row = self._db.fetchone(
             """
-            SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
+            SELECT session_id, inbox_id, correlation_key, executor_id,
+                   executor_session_id, checkpoint, pending_request_id, updated_at
             FROM sessions
             WHERE pending_request_id = ?
             LIMIT 1
             """,
             (request_id,),
         )
-        if row is None:
-            return None
-        return SessionRef(
-            session_id=str(row["session_id"]),
-            inbox_id=str(row["inbox_id"]),
-            correlation_key=row["correlation_key"],
-            checkpoint=row["checkpoint"],
-            pending_request_id=row["pending_request_id"],
-            updated_at=str(row["updated_at"]),
-        )
+        return self._row_to_session(row) if row is not None else None
 
     def find_by_correlation_key(self, inbox_id: str, correlation_key: str) -> SessionRef | None:
         row = self._db.fetchone(
             """
-            SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
+            SELECT session_id, inbox_id, correlation_key, executor_id,
+                   executor_session_id, checkpoint, pending_request_id, updated_at
             FROM sessions
             WHERE inbox_id = ? AND correlation_key = ?
             ORDER BY updated_at DESC
@@ -374,16 +414,7 @@ class SQLiteSessionStoreAdapter:
             """,
             (inbox_id, correlation_key),
         )
-        if row is None:
-            return None
-        return SessionRef(
-            session_id=str(row["session_id"]),
-            inbox_id=str(row["inbox_id"]),
-            correlation_key=row["correlation_key"],
-            checkpoint=row["checkpoint"],
-            pending_request_id=row["pending_request_id"],
-            updated_at=str(row["updated_at"]),
-        )
+        return self._row_to_session(row) if row is not None else None
 
     def list_sessions(
         self,
@@ -403,24 +434,15 @@ class SQLiteSessionStoreAdapter:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._db.fetchall(
             f"""
-            SELECT session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
+            SELECT session_id, inbox_id, correlation_key, executor_id,
+                   executor_session_id, checkpoint, pending_request_id, updated_at
             FROM sessions
             {where}
             ORDER BY updated_at DESC
             """,
             tuple(params),
         )
-        return [
-            SessionRef(
-                session_id=str(row["session_id"]),
-                inbox_id=str(row["inbox_id"]),
-                correlation_key=row["correlation_key"],
-                checkpoint=row["checkpoint"],
-                pending_request_id=row["pending_request_id"],
-                updated_at=str(row["updated_at"]),
-            )
-            for row in rows
-        ]
+        return [self._row_to_session(row) for row in rows]
 
     def save(self, session: SessionRef) -> None:
         with self._db.transaction() as conn:
@@ -437,12 +459,15 @@ class SQLiteSessionStoreAdapter:
             conn.execute(
                 """
                 INSERT INTO sessions (
-                    session_id, inbox_id, correlation_key, checkpoint, pending_request_id, updated_at
+                    session_id, inbox_id, correlation_key, executor_id,
+                    executor_session_id, checkpoint, pending_request_id, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     inbox_id = excluded.inbox_id,
                     correlation_key = excluded.correlation_key,
+                    executor_id = excluded.executor_id,
+                    executor_session_id = excluded.executor_session_id,
                     checkpoint = excluded.checkpoint,
                     pending_request_id = excluded.pending_request_id,
                     updated_at = excluded.updated_at
@@ -451,6 +476,8 @@ class SQLiteSessionStoreAdapter:
                     session.session_id,
                     session.inbox_id,
                     session.correlation_key,
+                    session.executor_id,
+                    session.executor_session_id,
                     session.checkpoint,
                     session.pending_request_id,
                     session.updated_at,

@@ -13,6 +13,8 @@ from tests.fakes import RecordingChannel
 
 
 class _SessionTrackingExecutor:
+    executor_id = "mock-tracking"
+
     def __init__(self) -> None:
         self.calls: list[tuple[str | None, list[str]]] = []
 

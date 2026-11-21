@@ -43,9 +43,27 @@ class SessionRef:
     session_id: str
     inbox_id: str
     correlation_key: str | None = None
+    executor_id: str | None = None
+    executor_session_id: str | None = None
     checkpoint: str | None = None
     pending_request_id: str | None = None
     updated_at: str = field(default_factory=utc_now_iso)
+
+
+def resolve_executor_id(
+    event_executor_id: str | None,
+    session: SessionRef | None,
+    project_default: str | None,
+    global_default: str,
+) -> str:
+    # 4-level sticky routing: event explicit -> existing session -> project default -> global default.
+    if event_executor_id:
+        return event_executor_id
+    if session is not None and session.executor_id:
+        return session.executor_id
+    if project_default:
+        return project_default
+    return global_default
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,13 +97,14 @@ class PermissionDecision:
 
 @dataclass(frozen=True, slots=True)
 class Silent:
-    pass
+    executor_session_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Emit:
     messages: tuple[str, ...]
     session_id: str | None = None
+    executor_session_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +113,7 @@ class Suspend:
     prompt: str
     session_checkpoint: str
     session_id: str | None = None
+    executor_session_id: str | None = None
 
 
 RunOutcome: TypeAlias = Silent | Emit | Suspend

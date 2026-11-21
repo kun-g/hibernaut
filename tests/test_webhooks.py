@@ -33,6 +33,8 @@ def _github_signature(secret: str, raw_body: bytes) -> str:
 
 
 class _TrackingExecutor:
+    executor_id = "mock-webhook-tracking"
+
     def __init__(self) -> None:
         self.calls: list[tuple[str, str | None, str | None]] = []
 

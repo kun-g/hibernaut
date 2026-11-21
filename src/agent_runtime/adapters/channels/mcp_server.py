@@ -8,7 +8,10 @@ from typing import Any, TextIO
 from agent_runtime import __version__
 from agent_runtime.adapters.channels.http_types import WebhookResponse
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
-from agent_runtime.adapters.storage_sqlite.stores import SQLiteSessionStoreAdapter
+from agent_runtime.adapters.storage_sqlite.stores import (
+    SQLiteInboxAdapter,
+    SQLiteSessionStoreAdapter,
+)
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.core.models import new_id
 from agent_runtime.core.ports import OutboxPort
@@ -41,6 +44,18 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "properties": {
                 "inbox_id": {"type": "string"},
                 "status": {"type": "string", "enum": ["active", "suspended"]},
+            },
+        },
+    },
+    {
+        "name": "hibernaut_list_events",
+        "description": "List events from Hibernaut Event Inbox filtered by inbox_id or status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "inbox_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["pending", "done", "dropped"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
             },
         },
     },
@@ -84,6 +99,7 @@ class MCPServerAdapter:
         handler: EventHandler,
         sessions: SQLiteSessionStoreAdapter,
         workspaces: SQLiteWorkspaceStore,
+        inbox: SQLiteInboxAdapter | None = None,
         worktree_manager: OrcaWorktreeManager | None = None,
         outbox: OutboxPort | None = None,
         bearer_token: str | None = None,
@@ -91,6 +107,7 @@ class MCPServerAdapter:
         self._handler = handler
         self._sessions = sessions
         self._workspaces = workspaces
+        self._inbox = inbox
         self._worktree_manager = worktree_manager
         self._outbox = outbox
         self._bearer_token = bearer_token.strip() if bearer_token else None
@@ -236,10 +253,37 @@ class MCPServerAdapter:
                         "session_id": s.session_id,
                         "inbox_id": s.inbox_id,
                         "correlation_key": s.correlation_key,
+                        "executor_id": s.executor_id,
+                        "executor_session_id": s.executor_session_id,
                         "pending_approval_id": s.pending_request_id,
                         "updated_at": s.updated_at,
                     }
                     for s in rows
+                ]
+            }
+
+        if tool_name == "hibernaut_list_events":
+            if self._inbox is None:
+                raise ValueError("event inbox is not attached to MCPServerAdapter")
+            inbox_id = str(args["inbox_id"]) if args.get("inbox_id") is not None else None
+            status = str(args["status"]) if args.get("status") is not None else None
+            if status is not None and status not in ("pending", "done", "dropped"):
+                raise ValueError(f"Unsupported event status: {status}")
+            limit = int(args.get("limit", 50))
+            events = self._inbox.list_events(inbox_id=inbox_id, status=status, limit=limit)
+            return {
+                "events": [
+                    {
+                        "event_id": e.event_id,
+                        "inbox_id": e.inbox_id,
+                        "source": e.source,
+                        "external_id": e.external_id,
+                        "status": e.status,
+                        "correlation_key": e.correlation_key,
+                        "session_id": e.session_id,
+                        "created_at": e.occurred_at,
+                    }
+                    for e in events
                 ]
             }
 
