@@ -14,7 +14,11 @@ if log:
             "argv": argv,
             "prompt": prompt,
             "cwd": os.getcwd(),
-            "paid_env": sorted(k for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK") if k in os.environ),
+            "paid_env": sorted(k for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_OAUTH_TOKEN") if k in os.environ),
+            "api_key": os.environ.get("ANTHROPIC_API_KEY"),
+            "base_url": os.environ.get("ANTHROPIC_BASE_URL"),
+            "launcher": os.environ.get("FAKE_LAUNCHER"),
+            "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"),
         }
         stream.write(json.dumps(record) + "\n")
 

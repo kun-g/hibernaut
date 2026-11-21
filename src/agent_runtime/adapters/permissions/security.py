@@ -81,6 +81,10 @@ class AutoModePermissionAdapter:
         )
 
 
+def proxy_service_url(proxy_base_url: str, service_name: str) -> str:
+    return f"{proxy_base_url.rstrip('/')}/proxy/{service_name}"
+
+
 @dataclass(frozen=True, slots=True)
 class ProxyResponse:
     status_code: int
@@ -101,7 +105,7 @@ class CredentialProxyClient:
         path: str,
         payload: dict[str, Any] | None = None,
     ) -> ProxyResponse:
-        url = f"{self._proxy_base_url}/proxy/{service_name}/{path.lstrip('/')}"
+        url = f"{proxy_service_url(self._proxy_base_url, service_name)}/{path.lstrip('/')}"
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         req = urllib.request.Request(
             url=url,

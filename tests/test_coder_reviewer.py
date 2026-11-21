@@ -12,9 +12,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from agent_runtime.adapters.executor_cli.claude_code import (
+    PROXY_PLACEHOLDER_KEY,
+    ClaudeCodeLauncher,
+    ClaudeCodeProfile,
+    child_env,
+    harness_args,
+)
 from agent_runtime.adapters.executor_cli.reviewer import (
     CoderReviewerExecutor,
-    ReviewerProfile,
     worktree_fingerprint,
 )
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase
@@ -25,6 +31,8 @@ from agent_runtime.core.models import Emit, Event, PermissionDecision, Suspend
 from tests.fakes import InMemoryPermission
 
 FAKE_CLAUDE = Path(__file__).with_name("fake_claude.py")
+FAKE_LAUNCHER = Path(__file__).with_name("fake_launcher.sh")
+PROXY_URL = "http://127.0.0.1:9/proxy/anthropic"
 CHANGES_REQUESTED = {
     "verdict": "changes_requested",
     "summary": "division is unguarded",
@@ -67,6 +75,20 @@ def fake_command(root: Path) -> str:
     return str(script)
 
 
+def launcher_env(root: Path, name: str, strip: bool = True) -> dict[str, str]:
+    return {
+        "FAKE_LAUNCHER_NAME": name,
+        "FAKE_LAUNCHER_ROOT": str(root),
+        "FAKE_LAUNCHER_STRIP": "1" if strip else "0",
+        "FAKE_PYTHON": sys.executable,
+        "FAKE_CLAUDE": str(FAKE_CLAUDE),
+    }
+
+
+def sg_launcher(root: Path, name: str = "sg", strip: bool = True) -> ClaudeCodeLauncher:
+    return ClaudeCodeLauncher(name=name, command=str(FAKE_LAUNCHER), env=launcher_env(root, name, strip))
+
+
 def event(payload, correlation_key=None):
     return Event(
         inbox_id="proj:x",
@@ -80,12 +102,26 @@ def event(payload, correlation_key=None):
 class TestReviewerProfile(unittest.TestCase):
     def test_role_only_uses_documented_defaults(self):
         cfg = parse_config({"executors": {"coder-reviewer": {"role": "coder-reviewer"}}})
-        profile = cfg.reviewers["coder-reviewer"]
+        role = cfg.roles["coder-reviewer"]
+        profile = role.profile
+        self.assertEqual(role.role, "coder-reviewer")
         self.assertEqual(
-            (profile.harness, profile.billing, profile.model, profile.effort),
-            ("claude-code", "subscription", "claude-opus-5-5", "high"),
+            (profile.harness, profile.launcher.name, profile.launcher.command, profile.billing, profile.model, profile.effort),
+            ("claude-code", "claude", "claude", "subscription", "claude-opus-5-5", "high"),
         )
         self.assertNotIn("coder-reviewer", cfg.executors)
+
+    def test_role_harness_launcher_billing_and_model_are_separate_settings(self):
+        cfg = parse_config({
+            "credential_proxy": {"url": "http://127.0.0.1:9000/"},
+            "launchers": {"sg": {"command": "claude-sg", "env": {"HTTPS_PROXY": "http://127.0.0.1:1"}}},
+            "executors": {"r": {"role": "coder-reviewer", "launcher": "sg", "billing": "api",
+                                "model": "sonnet", "effort": "max"}},
+        })
+        profile = cfg.roles["r"].profile
+        self.assertEqual((profile.launcher.command, profile.launcher.env), ("claude-sg", {"HTTPS_PROXY": "http://127.0.0.1:1"}))
+        self.assertEqual((profile.billing, profile.model, profile.effort), ("api", "sonnet", "max"))
+        self.assertEqual(profile.credential_proxy_url, "http://127.0.0.1:9000/proxy/anthropic")
 
     def test_invalid_values_and_combinations_fail_with_a_reason(self):
         cases = {
@@ -95,13 +131,28 @@ class TestReviewerProfile(unittest.TestCase):
             "model 'gpt-5' is not a Claude model": {"model": "gpt-5"},
             "env.ANTHROPIC_API_KEY looks like a credential": {"env": {"ANTHROPIC_API_KEY": "x"}},
             "env.CLAUDE_CODE_USE_BEDROCK looks like a credential": {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}},
+            "env.ANTHROPIC_BASE_URL looks like a credential": {"env": {"ANTHROPIC_BASE_URL": "http://x"}},
             "args, orca_agent not supported": {"args": ["-p"], "orca_agent": "claude"},
+            "command not supported": {"command": "/bin/claude"},
+            "unknown launcher 'nope'": {"launcher": "nope"},
+            "billing 'api' needs \\[credential_proxy\\] url": {"billing": "api"},
         }
         for message, override in cases.items():
             with self.subTest(message), self.assertRaisesRegex(ValueError, message):
                 parse_config({"executors": {"coder-reviewer": {"role": "coder-reviewer", **override}}})
         with self.assertRaisesRegex(ValueError, "unsupported role 'sde'"):
             parse_config({"executors": {"sde": {"role": "sde"}}})
+        launcher_cases = {
+            "launchers.sg: env.CLAUDE_CODE_OAUTH_TOKEN looks like a credential": {"command": "x", "env": {"CLAUDE_CODE_OAUTH_TOKEN": "t"}},
+            "launchers.sg: unsupported harness 'codex'": {"command": "x", "harness": "codex"},
+            "launchers.sg: command is required": {},
+            "launchers.sg: model not supported": {"command": "x", "model": "opus"},
+        }
+        for message, launcher in launcher_cases.items():
+            with self.subTest(message), self.assertRaisesRegex(ValueError, message):
+                parse_config({"launchers": {"sg": launcher}})
+        with self.assertRaisesRegex(ValueError, "credential_proxy.url must be an http"):
+            parse_config({"credential_proxy": {"url": "file:///tmp/x"}})
 
     def test_reviewer_alone_is_enough_to_leave_ingest_only(self):
         cfg = parse_config({
@@ -128,7 +179,8 @@ class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
         self.caps.is_interrupted.return_value = False
 
     def executor(self, **overrides):
-        profile = ReviewerProfile(name="coder-reviewer", command=fake_command(self.root), **overrides)
+        overrides.setdefault("launcher", ClaudeCodeLauncher(name="fake", command=fake_command(self.root)))
+        profile = ClaudeCodeProfile(name="coder-reviewer", **overrides)
         return CoderReviewerExecutor(profile=profile, workspaces=self.workspaces)
 
     def calls(self):
@@ -184,18 +236,52 @@ class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertIn("apiKeyHelper", outcome.messages[0])
         self.assertNotIn("verdict=", outcome.messages[0])
 
-    async def test_api_billing_requires_a_key_in_the_daemon_environment(self):
-        env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
-        with patch.dict(os.environ, env, clear=True):
-            outcome = await self.executor(billing="api").execute([event(self.payload())], None, self.caps)
+    async def test_subscription_drops_daemon_token_and_gateway(self):
+        with patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "daemon-token", "ANTHROPIC_BASE_URL": "http://gw"}):
+            outcome = await self.executor().execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Emit)
-        self.assertIn("billing 'api' needs ANTHROPIC_API_KEY", outcome.messages[0])
-        self.assertEqual(self.calls(), [])
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "placeholder"}):
-            outcome = await self.executor(billing="api").execute([event(self.payload())], None, self.caps)
+        self.assertIn("verdict=pass", outcome.messages[0])
+        call = self.calls()[0]
+        self.assertEqual((call["paid_env"], call["base_url"]), ([], None))
+
+    async def test_api_billing_goes_through_the_credential_proxy_without_the_real_key(self):
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-real-secret", "ANTHROPIC_AUTH_TOKEN": "real-token"}):
+            outcome = await self.executor(billing="api", credential_proxy_url=PROXY_URL).execute(
+                [event(self.payload())], None, self.caps
+            )
         assert isinstance(outcome, Emit)
         self.assertIn("billing=api", outcome.messages[0])
-        self.assertEqual(self.calls()[-1]["paid_env"], ["ANTHROPIC_API_KEY"])
+        call = self.calls()[-1]
+        self.assertEqual((call["api_key"], call["base_url"]), (PROXY_PLACEHOLDER_KEY, PROXY_URL))
+        self.assertEqual(call["paid_env"], ["ANTHROPIC_API_KEY"])
+
+    async def test_api_billing_stops_when_the_launcher_drops_the_proxy_route(self):
+        launcher = sg_launcher(self.root)
+        outcome = await self.executor(billing="api", credential_proxy_url=PROXY_URL, launcher=launcher).execute(
+            [event(self.payload())], None, self.caps
+        )
+        assert isinstance(outcome, Emit)
+        self.assertIn("billing is 'api' but Claude Code (launcher 'sg') authenticated with 'none'", outcome.messages[0])
+
+    async def test_launcher_receives_harness_args_unchanged_and_stays_read_only(self):
+        launcher = sg_launcher(self.root)
+        executor = self.executor(launcher=launcher, model="claude-sonnet-5-5", effort="max")
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-real-secret"}):
+            outcome = await executor.execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit)
+        self.assertIn("launcher=sg billing=subscription model=claude-sonnet-5-5 effort=max", outcome.messages[0])
+        (call,) = self.calls()
+        role_args = call["argv"][call["argv"].index("--permission-mode") + 2:]
+        self.assertEqual(call["argv"], harness_args(executor.profile, permission_mode="dontAsk", role_args=role_args))
+        self.assertNotIn("bypassPermissions", call["argv"])
+        self.assertEqual((call["launcher"], call["config_dir"]), ("sg", str(self.root / "sg-config")))
+        self.assertEqual(call["paid_env"], [])
+
+    def test_child_env_layers_launcher_then_role_env(self):
+        launcher = ClaudeCodeLauncher(name="l", command="x", env={"A": "launcher", "B": "launcher"})
+        profile = ClaudeCodeProfile(name="r", launcher=launcher, env={"B": "role"})
+        env = child_env(profile, {"PATH": "/bin", "ANTHROPIC_API_KEY": "sk"})
+        self.assertEqual(env, {"PATH": "/bin", "A": "launcher", "B": "role"})
 
     async def test_model_mismatch_is_reported(self):
         with patch.dict(os.environ, {"FAKE_MODEL": "claude-haiku-5-5"}):
@@ -276,31 +362,35 @@ class TestDispatchAndHotReload(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         repo = make_repo(root)
         log = root / "calls.jsonl"
-        command = fake_command(root)
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         db_path = root / "hb.db"
         path = root / "hibernaut.toml"
 
-        def write_config(model, effort):
+        def launcher_table(name):
+            env = ", ".join(f'{k} = "{v}"' for k, v in launcher_env(root, name).items())
+            return f'[launchers.{name}]\ncommand = "{FAKE_LAUNCHER}"\nenv = {{ {env} }}\n'
+
+        def write_config(launcher, model, effort):
             path.write_text(
                 f'[runtime]\ndb_path = "{db_path}"\nmemory_root = "{root / "mem"}"\ndefault_executor = "claude"\n'
                 f"[channels]\nport = {port}\n"
-                '[executors.claude]\ncommand = "false"\n'
-                f'[executors.coder-reviewer]\nrole = "coder-reviewer"\ncommand = "{command}"\n'
+                + launcher_table("sg-a") + launcher_table("sg-b")
+                + '[executors.claude]\ncommand = "false"\n'
+                f'[executors.coder-reviewer]\nrole = "coder-reviewer"\nlauncher = "{launcher}"\n'
                 f'model = "{model}"\neffort = "{effort}"\n'
             )
 
-        write_config("claude-opus-5-5", "high")
+        write_config("sg-a", "claude-opus-5-5", "high")
         self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(log)}))
         stderr = self.enterContext(patch("sys.stderr", new_callable=_Capture))
 
-        def post(n):
+        def post(n, **extra):
             body = {
                 "inbox_id": "review", "external_id": f"r{n}", "correlation_key": f"review:{n}",
                 "payload": {"executor_id": "coder-reviewer", "text": "divide works",
-                            "explicit_workdir": str(repo), "base_ref": "main"},
+                            "explicit_workdir": str(repo), "base_ref": "main", **extra},
             }
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
             try:
@@ -318,7 +408,11 @@ class TestDispatchAndHotReload(unittest.TestCase):
 
         def settings(call):
             argv = call["argv"]
-            return argv[argv.index("--model") + 1], argv[argv.index("--effort") + 1]
+            # The launcher must not inject its bypassPermissions default over the reviewer's read-only mode.
+            self.assertEqual(argv.count("--permission-mode"), 1)
+            self.assertNotIn("bypassPermissions", argv)
+            return (call["launcher"], argv[argv.index("--model") + 1], argv[argv.index("--effort") + 1],
+                    argv[argv.index("--permission-mode") + 1])
 
         async def scenario():
             from agent_runtime.app.config import load_config
@@ -340,26 +434,34 @@ class TestDispatchAndHotReload(unittest.TestCase):
                     await asyncio.sleep(0.05)
                 self.fail(stderr.getvalue())
 
-            async def post_async(n):
-                await asyncio.to_thread(post, n)
+            async def post_async(n, **extra):
+                await asyncio.to_thread(post, n, **extra)
 
             try:
                 await wait_for(lambda: post(0) is None)
                 await wait_for(lambda: len(calls()) == 1)
-                self.assertEqual(settings(calls()[0]), ("claude-opus-5-5", "high"))
-                await wait_for(lambda: any("verdict=pass" in m for m in outbox()))
+                self.assertEqual(settings(calls()[0]), ("sg-a", "claude-opus-5-5", "high", "dontAsk"))
+                await wait_for(lambda: any("verdict=pass" in m and "launcher=sg-a" in m for m in outbox()))
 
-                write_config("claude-sonnet-5-5", "max")
+                write_config("sg-b", "claude-sonnet-5-5", "max")
                 await wait_for(lambda: "[config] Reloaded" in stderr.getvalue())
                 await post_async(1)
                 await wait_for(lambda: len(calls()) == 2)
-                self.assertEqual(settings(calls()[1]), ("claude-sonnet-5-5", "max"))
+                self.assertEqual(settings(calls()[1]), ("sg-b", "claude-sonnet-5-5", "max", "dontAsk"))
+                self.assertEqual(calls()[1]["config_dir"], str(root / "sg-b-config"))
 
-                write_config("claude-sonnet-5-5", "ultra")
+                write_config("sg-b", "claude-sonnet-5-5", "ultra")
                 await wait_for(lambda: "unsupported effort 'ultra'" in stderr.getvalue())
                 await post_async(2)
                 await wait_for(lambda: len(calls()) == 3)
-                self.assertEqual(settings(calls()[2]), ("claude-sonnet-5-5", "max"))
+                self.assertEqual(settings(calls()[2]), ("sg-b", "claude-sonnet-5-5", "max", "dontAsk"))
+
+                # A reload naming an undeclared launcher is rejected; events cannot pick one either.
+                write_config("ghost", "claude-sonnet-5-5", "max")
+                await wait_for(lambda: "unknown launcher 'ghost'" in stderr.getvalue())
+                await post_async(3, launcher="ghost", command="/bin/sh")
+                await wait_for(lambda: len(calls()) == 4)
+                self.assertEqual(settings(calls()[3]), ("sg-b", "claude-sonnet-5-5", "max", "dontAsk"))
             finally:
                 stop.set()
                 await server

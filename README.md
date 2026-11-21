@@ -25,7 +25,7 @@ src/agent_runtime/
 │   ├── memory_fs/         # FileSystemMemoryAdapter + PartitionedMemoryAdapter & WorkspacePartitionRegistry
 │   ├── permissions/       # Auto Mode classifier (allow / block / defer) + external CredentialProxyClient
 │   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
-│   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + resume_args + magpie env), CoderReviewerExecutor (read-only review) & OrcaWorktreeManager (3 safety gates)
+│   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + resume_args + magpie env), shared Claude Code launch adapter (claude_code.py), CoderReviewerExecutor (read-only review) & OrcaWorktreeManager (3 safety gates)
 │   └── channels/          # Multi-route HTTP (/events, /webhooks/github, /webhooks/feishu, /mcp), MCPServerAdapter, GitHubIssuePoller, FeishuChannelAdapter, Console
 └── app/
     ├── config.py          # Stdlib tomllib loader for hibernaut.toml
@@ -79,12 +79,19 @@ Use an origin you trust to supply executable code. A dirty checkout (including u
 
 ## Independent Code Review (`coder-reviewer`)
 
-Register a reviewer in `hibernaut.toml` (defaults shown; only `role` is required):
+Register a reviewer in `hibernaut.toml` (defaults shown; only `role` is required). Role, harness, launcher, billing and model are separate settings:
 
 ```toml
+[launchers.claude-sg]       # optional; built-in "claude" runs `claude`
+command = "claude-sg"       # trusted launcher on the deployment host
+
+[credential_proxy]          # required only for billing = "api"
+url = "http://127.0.0.1:9000"
+
 [executors.coder-reviewer]
 role = "coder-reviewer"
 harness = "claude-code"    # only claude-code
+launcher = "claude"        # a [launchers.<name>] entry
 billing = "subscription"   # subscription | api
 model = "claude-opus-5-5"  # Claude full name or alias (opus, sonnet, haiku, fable)
 effort = "high"            # low | medium | high | xhigh | max
@@ -108,8 +115,9 @@ curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
 - Diff: computed by the executor from the merge base with `base_ref` (default `origin/HEAD`, then `main`), including uncommitted and untracked files.
 - Result: one Outbox message with `verdict=pass` or `verdict=changes_requested`. Each blocking item lists location, trigger, impact and an optional fix. After a fix, send a new event (new `external_id`) for a fresh, independent review.
 - Read-only: edit tools are denied and the working tree is fingerprinted before and after; any change discards the review.
-- Billing: `subscription` removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the Bedrock/Vertex/Foundry switches from the child environment, and stops at session start if Claude Code still reports a paid credential source. `api` reads the key from the daemon environment; never put credentials in `hibernaut.toml` (the parser rejects them).
-- Hot reload: save the four settings and the next review uses them. Invalid values or combinations print `[config] Invalid ... (ValueError: <reason>)` and keep the running settings.
+- Launcher: chosen only in `hibernaut.toml`; event payloads cannot name a launcher or command. The launcher may set its own config dir, account, gateway or proxy (like `claude-sg`) and receives `-p --output-format stream-json --verbose --model --effort --permission-mode dontAsk` plus the reviewer's tool and schema arguments unchanged. The permission mode is always explicit, so a launcher's own default (such as `bypassPermissions`) never applies.
+- Billing: both modes remove `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL` and the Bedrock/Vertex/Foundry switches from the daemon environment before starting the launcher. `subscription` uses the launcher's own login and stops at session start if Claude Code reports any paid credential source. `api` points Claude Code at `<credential_proxy.url>/proxy/anthropic` with a placeholder key; the external proxy injects the real key, and the run stops if Claude Code authenticates any other way. Credentials never go in `hibernaut.toml` (the parser rejects them).
+- Hot reload: save the settings (including launcher) and the next review uses them. Invalid values or combinations print `[config] Invalid ... (ValueError: <reason>)` and keep the running settings.
 
 ## MCP Server Integration (`stdio` & Remote `/mcp`)
 

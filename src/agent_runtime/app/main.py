@@ -26,6 +26,7 @@ from agent_runtime.adapters.channels import (
 )
 from agent_runtime.adapters.channels.channels import webhook_request_handler
 from agent_runtime.adapters.executor_cli import (
+    CODER_REVIEWER_ROLE,
     CoderReviewerExecutor,
     LocalCLIExecutor,
     OrcaWorktreeManager,
@@ -439,7 +440,7 @@ def build_daemon_from_config(
 
     has_configured_executor = (
         config.runtime.default_executor in config.executors
-        or config.runtime.default_executor in config.reviewers
+        or config.runtime.default_executor in config.roles
     )
     ingest_only = (not demo) and (not has_configured_executor)
     if ingest_only:
@@ -470,10 +471,11 @@ def build_daemon_from_config(
 
     if has_configured_executor and not demo:
         # Instantiate all configured [executors.<id>] per project so AgentWorker can sticky-route.
-        # Reviewers are rebuilt with each config reload, so the next review uses the new profile.
+        # Role executors are rebuilt with each config reload, so the next run uses the new profile and launcher.
         reviewer_executors: dict[str, ExecutorPort] = {
-            name: CoderReviewerExecutor(profile=profile, workspaces=daemon.workspaces)
-            for name, profile in config.reviewers.items()
+            name: CoderReviewerExecutor(profile=role.profile, workspaces=daemon.workspaces)
+            for name, role in config.roles.items()
+            if role.role == CODER_REVIEWER_ROLE
         }
         executors_by_inbox: dict[str, dict[str, ExecutorPort]] = {}
         wt_mgr_by_inbox: dict[str, OrcaWorktreeManager] = {}
