@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -65,6 +66,19 @@ class WhiteboxExecutor:
         self._max_steps = max_steps
         self._max_messages_before_compact = max_messages_before_compact
 
+    def _format_event_message(self, evt: Event) -> LLMMessage:
+        return LLMMessage(
+            role="user",
+            content=json.dumps(
+                {
+                    "source": evt.source,
+                    "occurred_at": evt.occurred_at,
+                    "payload": evt.payload,
+                },
+                ensure_ascii=False,
+            ),
+        )
+
     async def execute(
         self,
         events: Sequence[Event],
@@ -89,19 +103,7 @@ class WhiteboxExecutor:
         # Append incoming events first to preserve causal order:
         # User/Approval Event -> Deferred Tool Execution -> LLM Observation.
         for evt in events:
-            messages.append(
-                LLMMessage(
-                    role="user",
-                    content=json.dumps(
-                        {
-                            "source": evt.source,
-                            "occurred_at": evt.occurred_at,
-                            "payload": evt.payload,
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
-            )
+            messages.append(self._format_event_message(evt))
 
         if pending_deferred is not None:
             approved = any(bool(e.payload.get("approved")) for e in events)
@@ -128,7 +130,15 @@ class WhiteboxExecutor:
         )
         emitted: list[str] = []
 
-        for _ in range(self._max_steps):
+        for step in range(self._max_steps):
+            if caps.is_interrupted():
+                raise asyncio.CancelledError("Run interrupted by new event")
+
+            if step > 0:
+                folded = caps.poll_folded_events()
+                for evt in folded:
+                    messages.append(self._format_event_message(evt))
+
             messages = self._compact_if_needed(messages)
             reply = await self._llm.complete(
                 system_prefix=system_prefix,
@@ -136,15 +146,27 @@ class WhiteboxExecutor:
                 available_tools=available_tools,
             )
 
+            if caps.is_interrupted():
+                raise asyncio.CancelledError("Run interrupted by new event")
+
             if reply.emit_messages:
                 emitted.extend(reply.emit_messages)
 
             if not reply.tool_calls:
+                # Re-check folded events before exiting so mid-turn arrivals are absorbed.
+                trailing_folded = caps.poll_folded_events()
+                if trailing_folded:
+                    for evt in trailing_folded:
+                        messages.append(self._format_event_message(evt))
+                    continue
                 if emitted:
                     return Emit(messages=tuple(emitted), session_id=session_id)
                 return Silent()
 
             for call in reply.tool_calls:
+                if caps.is_interrupted():
+                    raise asyncio.CancelledError("Run interrupted by new event")
+
                 decision = caps.permissions.check(call.tool_name, call.args)
                 if decision.action == "block":
                     messages.append(

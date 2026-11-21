@@ -1,6 +1,6 @@
 # AGENTS.md — Hibernaut 开发与架构规范
 
-本文档是 Hibernaut（Always-on Agent Runtime）代码仓库的统一开发与编程 Agent 入口规范。任何修改在提交前必须满足以下 6 项硬约束。
+本文档是 Hibernaut（Always-on Agent Runtime）代码仓库的统一开发与编程 Agent 入口规范。任何修改在提交前必须满足以下 6 项硬约束；完整架构说明见 [`docs/architecture.md`](docs/architecture.md)。
 
 ## 1. L0–L3 单向依赖铁律
 
@@ -13,7 +13,7 @@
 
 ## 2. 核心词汇表与并发红线
 
-完整术语定义见 Google Drive [《Always-on Agent 核心词汇表（Glossary）》](https://docs.google.com/document/d/1JU8HWE_kbY0T7kHNs5E87KhbH6SL-U3OWPpmvrv5nps/edit?usp=drivesdk&ouid=111695824259514941899)，核心区分如下：
+完整术语定义见 [`docs/architecture.md`](docs/architecture.md) 与 Google Drive [《Always-on Agent 核心词汇表（Glossary）》](https://docs.google.com/document/d/1JU8HWE_kbY0T7kHNs5E87KhbH6SL-U3OWPpmvrv5nps/edit?usp=drivesdk&ouid=111695824259514941899)，核心区分如下：
 
 | 术语 | 精确定义 | 作用域 / 约束 |
 | :--- | :--- | :--- |
@@ -32,7 +32,7 @@
 - **全量权限门禁**：执行器内的每一次工具调用均须先经 `PermissionPort.check()` 判定（`allow` / `block` / `defer`），不可绕过。
 - **路径防穿越**：所有文件系统 `MemoryPort` 实现必须校验解析后路径位于分区根目录内，拒绝 `../` 越权读写；全局 `instructions.md` 对分区运行态只读。
 - **入队幂等去重**：`InboxPort.append()` 必须按 `(inbox_id, source, external_id)` 幂等去重，重复事件标记为 `dropped` 且不得进入 `fetch_pending()`。
-- **显式三态终态**：`ExecutorPort.execute()` 必须返回 `RunOutcome = Silent | Emit | Suspend`，L2 编排层必须使用 `assert_never` 做穷尽匹配。
+- **显式三态终态与中断安全**：`ExecutorPort.execute()` 必须返回 `RunOutcome = Silent | Emit | Suspend`，L2 编排层必须使用 `assert_never` 做穷尽匹配；`interrupt` 中止的 Run 严禁向 Outbox 写入半成品消息，原批次必须保持 `pending` 与新事件合并重启。
 
 ## 4. 精简代码注释规范
 
@@ -51,11 +51,11 @@ pyright
 ```
 
 - `lint-imports`：验证 `.importlinter` 全部架构分层与反向依赖契约（0 broken）。
-- `pytest -v`：验证 AST 静态边界测试、In-Memory 与 SQLite/FS 双实现 Port Contract Tests、分区隔离及并发端到端测试。
+- `pytest -v`：验证 AST 静态边界测试、Port 契约测试、多 `inbox_id` 并发隔离及 `NewEventPolicy`（`defer`/`fold`/`interrupt`）端到端测试。
 - `pyright`：对 `src/agent_runtime/core` 与 `src/agent_runtime/engine` 执行 strict 静态类型检查（0 errors, 0 warnings）。
 
-## 6. 文档增量协作约定
+## 6. 文档增量协作闭环规范
 
-- **基线只读**：Google Drive 原基准设计文档《Always-on Agent 整洁架构设计方案（Task 交接文档）》保持只读不动，不直接覆写。
-- **增量追踪**：新增架构讨论与待落地改动先记录在《Always-on Agent 架构增量变更（待落地）》。
-- **闭环清理**：仅在代码推送至 GitHub、三道门禁全绿且经确认后，再从增量变更文档中删除已落地条目。
+- **Drive 基准只读**：Google Drive 原基准设计文档《Always-on Agent 整洁架构设计方案（Task 交接文档）》保持只读不动，不直接覆写。
+- **增量追踪**：新增架构讨论与待落地改动先记录在 Google Drive《Always-on Agent 架构增量变更（待落地）》。
+- **Git 文档同步与闭环清理**：**代码落地时必须同步更新仓库内的 `docs/architecture.md` 与 `README.md`**；待三道门禁全绿、推送至 `main` 并经确认后，再从 Drive《Always-on Agent 架构增量变更（待落地）》中清空已落地条目。

@@ -25,6 +25,7 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteSessionStoreAdapter,
     SQLiteTimerAdapter,
 )
+from agent_runtime.core.models import NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, RunCapabilities
 from agent_runtime.engine import (
     AgentWorker,
@@ -48,15 +49,17 @@ class AsyncWorkerPool:
         self._max_concurrency = max_concurrency
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._queued: set[str] = set()
-        self._active: set[str] = set()
+        self._active: dict[str, AgentWorker] = {}
         self._requeue: set[str] = set()
         self._idle_event = asyncio.Event()
         self._idle_event.set()
         self.reports: list[RunReport] = []
 
     def wake(self, inbox_id: str) -> None:
-        if inbox_id in self._active:
-            # Re-run after current Run releases the per-inbox lease so no wake is lost.
+        active_worker = self._active.get(inbox_id)
+        if active_worker is not None:
+            # Notify active worker immediately (for interrupt policy) and ensure re-drain.
+            active_worker.notify_new_event(inbox_id)
             self._requeue.add(inbox_id)
             return
         if inbox_id in self._queued:
@@ -74,13 +77,13 @@ class AsyncWorkerPool:
                 continue
 
             self._queued.discard(inbox_id)
-            self._active.add(inbox_id)
+            worker = self._worker_factory(inbox_id, worker_id)
+            self._active[inbox_id] = worker
             try:
-                worker = self._worker_factory(inbox_id, worker_id)
                 batch_reports = await worker.process_inbox(inbox_id)
                 self.reports.extend(batch_reports)
             finally:
-                self._active.discard(inbox_id)
+                self._active.pop(inbox_id, None)
                 self._queue.task_done()
                 if inbox_id in self._requeue:
                     self._requeue.discard(inbox_id)
@@ -178,6 +181,7 @@ def build_daemon(
     channel: ChannelPort | None = None,
     min_outbox_interval_seconds: float = 0.0,
     lease_ttl_seconds: float = 60.0,
+    new_event_policy: NewEventPolicy = "defer",
 ) -> AlwaysOnDaemon:
     db = SQLiteDatabase(db_path)
     inbox = SQLiteInboxAdapter(db)
@@ -216,6 +220,7 @@ def build_daemon(
             lock=lock,
             sessions=sessions,
             lease_ttl_seconds=lease_ttl_seconds,
+            new_event_policy=new_event_policy,
         )
 
     pool = AsyncWorkerPool(
@@ -253,12 +258,14 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--policy", choices=("defer", "fold", "interrupt"), default="defer")
     args = parser.parse_args()
 
     daemon = build_daemon(
         db_path=args.db,
         memory_root=args.memory_root,
         max_concurrency=args.workers,
+        new_event_policy=args.policy,
     )
 
     async def _serve() -> None:

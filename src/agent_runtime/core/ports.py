@@ -89,6 +89,10 @@ class RunCapabilities(Protocol):
     @property
     def permissions(self) -> PermissionPort: ...
 
+    def poll_folded_events(self) -> list[Event]: ...
+
+    def is_interrupted(self) -> bool: ...
+
 
 class ExecutorPort(Protocol):
     async def execute(
