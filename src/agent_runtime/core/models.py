@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 from typing import Any, Literal, TypeAlias
 from uuid import uuid4
 
-EventStatus: TypeAlias = Literal["pending", "done", "dropped"]
+EventStatus: TypeAlias = Literal["pending", "processing", "done", "failed", "dropped"]
+SessionStatus: TypeAlias = Literal["active", "suspended", "archived", "closed"]
 TimerKind: TypeAlias = Literal["follow_up", "schedule"]
 TimerStatus: TypeAlias = Literal["pending", "done", "cancelled"]
 OutboxStatus: TypeAlias = Literal["pending", "sent", "failed"]
@@ -36,6 +37,8 @@ class Event:
     session_id: str | None = None
     correlation_key: str | None = None
     status: EventStatus = "pending"
+    attempts: int = 0
+    last_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +48,8 @@ class SessionRef:
     correlation_key: str | None = None
     executor_id: str | None = None
     executor_session_id: str | None = None
+    status: SessionStatus = "active"
+    work_key: str | None = None
     checkpoint: str | None = None
     pending_request_id: str | None = None
     updated_at: str = field(default_factory=utc_now_iso)

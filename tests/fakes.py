@@ -15,6 +15,7 @@ from agent_runtime.core.models import (
     TimerKind,
     TimerSpec,
     new_id,
+    utc_now_iso,
 )
 
 BASELINE_FILES = ("instructions.md", "index.md", "reported.md")
@@ -43,12 +44,58 @@ class InMemoryInbox:
             if evt.inbox_id == inbox_id and evt.status == "pending"
         ]
 
+    def fetch_processing(self, inbox_id: str) -> list[Event]:
+        return [
+            evt
+            for evt in self._events
+            if evt.inbox_id == inbox_id and evt.status == "processing"
+        ]
+
+    def claim_pending(self, inbox_id: str) -> list[Event]:
+        claimed: list[Event] = []
+        updated: list[Event] = []
+        for evt in self._events:
+            if evt.inbox_id == inbox_id and evt.status == "pending":
+                nxt = replace(evt, status="processing", attempts=evt.attempts + 1)
+                claimed.append(nxt)
+                updated.append(nxt)
+            else:
+                updated.append(evt)
+        self._events = updated
+        return claimed
+
+    def bind_session(self, event_ids: Sequence[str], session_id: str) -> None:
+        target = set(event_ids)
+        self._events = [
+            replace(evt, session_id=session_id) if evt.event_id in target else evt
+            for evt in self._events
+        ]
+
+    def requeue_processing(self, event_ids: Sequence[str]) -> None:
+        target = set(event_ids)
+        self._events = [
+            replace(evt, status="pending")
+            if evt.event_id in target and evt.status == "processing"
+            else evt
+            for evt in self._events
+        ]
+
     def mark_done(self, event_ids: Sequence[str]) -> None:
         target = set(event_ids)
         self._events = [
             replace(evt, status="done") if evt.event_id in target else evt
             for evt in self._events
         ]
+
+    def mark_failed(self, event_ids: Sequence[str], error: str) -> None:
+        target = set(event_ids)
+        self._events = [
+            replace(evt, status="failed", last_error=error) if evt.event_id in target else evt
+            for evt in self._events
+        ]
+
+    def all_events(self) -> list[Event]:
+        return list(self._events)
 
 
 class InMemoryTimerStore:
@@ -201,22 +248,61 @@ class InMemorySessionStore:
         matches = [
             s
             for s in self._sessions.values()
-            if s.inbox_id == inbox_id and s.correlation_key == correlation_key
+            if s.inbox_id == inbox_id
+            and s.correlation_key == correlation_key
+            and s.status in ("active", "suspended")
         ]
         if not matches:
             return None
         matches.sort(key=lambda s: s.updated_at, reverse=True)
         return matches[0]
 
+    def count_active_by_work_key(self, work_key: str) -> int:
+        return sum(
+            1
+            for s in self._sessions.values()
+            if s.work_key == work_key and s.status in ("active", "suspended")
+        )
+
+    def archive_session(self, session_id: str) -> None:
+        existing = self._sessions.get(session_id)
+        if existing is not None:
+            self._sessions[session_id] = replace(
+                existing,
+                status="archived",
+                correlation_key=None,
+                pending_request_id=None,
+                updated_at=utc_now_iso(),
+            )
+
+    def close_session(self, session_id: str) -> None:
+        existing = self._sessions.get(session_id)
+        if existing is not None:
+            self._sessions[session_id] = replace(
+                existing,
+                status="closed",
+                correlation_key=None,
+                pending_request_id=None,
+                checkpoint=None,
+                updated_at=utc_now_iso(),
+            )
+
     def save(self, session: SessionRef) -> None:
-        if session.correlation_key is not None:
+        if session.correlation_key is not None and session.status in ("active", "suspended"):
             for sid, existing in list(self._sessions.items()):
                 if (
                     sid != session.session_id
                     and existing.inbox_id == session.inbox_id
                     and existing.correlation_key == session.correlation_key
+                    and existing.status in ("active", "suspended")
                 ):
-                    self._sessions[sid] = replace(existing, correlation_key=None)
+                    self._sessions[sid] = replace(
+                        existing,
+                        status="archived",
+                        correlation_key=None,
+                        pending_request_id=None,
+                        updated_at=utc_now_iso(),
+                    )
         self._sessions[session.session_id] = session
 
 

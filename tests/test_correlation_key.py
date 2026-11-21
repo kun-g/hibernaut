@@ -69,7 +69,7 @@ class TestCorrelationKeyRouting(unittest.IsolatedAsyncioTestCase):
             first_sid = daemon.pool.reports[0].session_id
             self.assertIsNotNone(first_sid)
             assert first_sid is not None
-            self.assertEqual(executor.calls[0], (None, ["gh-evt-1"]))
+            self.assertEqual(executor.calls[0], (first_sid, ["gh-evt-1"]))
 
             # Webhook 2 for same issue arrives without session_id -> automatically resumes first_sid.
             daemon.handler.ingest(
@@ -151,7 +151,8 @@ class TestCorrelationKeyRouting(unittest.IsolatedAsyncioTestCase):
             await daemon_task
 
             self.assertEqual(len(executor.calls), 1)
-            self.assertEqual(executor.calls[0], (None, ["batch-1", "batch-2"]))
+            self.assertIsNotNone(executor.calls[0][0])
+            self.assertEqual(executor.calls[0][1], ["batch-1", "batch-2"])
         finally:
             daemon.close()
 

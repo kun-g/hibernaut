@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS event_inbox (
     payload_json TEXT NOT NULL,
     session_id TEXT,
     correlation_key TEXT,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'done', 'dropped'))
+    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'done', 'failed', 'dropped')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_inbox_pending
@@ -68,6 +70,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     correlation_key TEXT,
     executor_id TEXT,
     executor_session_id TEXT,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'archived', 'closed')),
+    work_key TEXT,
     checkpoint TEXT,
     pending_request_id TEXT,
     updated_at TEXT NOT NULL
@@ -119,24 +123,96 @@ class SQLiteDatabase:
 
     @staticmethod
     def _ensure_migrations(conn: sqlite3.Connection) -> None:
-        for table in ("event_inbox", "sessions"):
-            cols = {
-                str(row["name"])
-                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-            }
-            if "correlation_key" not in cols:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN correlation_key TEXT")
+        inbox_cols = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(event_inbox)").fetchall()
+        }
+        if "correlation_key" not in inbox_cols:
+            conn.execute("ALTER TABLE event_inbox ADD COLUMN correlation_key TEXT")
+        if "attempts" not in inbox_cols:
+            conn.execute("ALTER TABLE event_inbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        if "last_error" not in inbox_cols:
+            conn.execute("ALTER TABLE event_inbox ADD COLUMN last_error TEXT")
+
+        # Legacy event_inbox tables had CHECK (status IN ('pending', 'done', 'dropped'));
+        # rebuild once in-transaction when 'processing' is missing from the table DDL.
+        ddl_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'event_inbox'"
+        ).fetchone()
+        if ddl_row is not None and "'processing'" not in str(ddl_row["sql"]):
+            conn.execute(
+                """
+                CREATE TABLE event_inbox_v9 (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    inbox_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    session_id TEXT,
+                    correlation_key TEXT,
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'done', 'failed', 'dropped')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO event_inbox_v9 (
+                    seq, event_id, inbox_id, source, external_id, occurred_at,
+                    payload_json, session_id, correlation_key, status, attempts, last_error
+                )
+                SELECT
+                    seq, event_id, inbox_id, source, external_id, occurred_at,
+                    payload_json, session_id, correlation_key, status, attempts, last_error
+                FROM event_inbox
+                """
+            )
+            conn.execute("DROP TABLE event_inbox")
+            conn.execute("ALTER TABLE event_inbox_v9 RENAME TO event_inbox")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_inbox_pending
+                    ON event_inbox (inbox_id, status, seq)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_inbox_dedup
+                    ON event_inbox (inbox_id, source, external_id, status)
+                """
+            )
+
         session_cols = {
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
         }
-        for col in ("executor_id", "executor_session_id"):
+        if "correlation_key" not in session_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN correlation_key TEXT")
+        for col in ("executor_id", "executor_session_id", "work_key"):
             if col not in session_cols:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
+        if "status" not in session_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status = 'suspended'
+                WHERE pending_request_id IS NOT NULL AND status = 'active'
+                """
+            )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_sessions_correlation
                 ON sessions (inbox_id, correlation_key, updated_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_sessions_work_key
+                ON sessions (work_key, status)
             """
         )
 

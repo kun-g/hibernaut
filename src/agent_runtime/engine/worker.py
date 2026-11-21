@@ -82,6 +82,7 @@ class AgentWorker:
         executors: Mapping[str, ExecutorPort] | None = None,
         project_default_executor: str | None = None,
         global_default_executor: str | None = None,
+        on_worktree_reclaim: Callable[[str], object] | None = None,
         lease_ttl_seconds: float = 60.0,
         max_retries: int = 2,
         new_event_policy: NewEventPolicy = "defer",
@@ -108,6 +109,7 @@ class AgentWorker:
         self._executors = registry
         self._project_default_executor = project_default_executor
         self._global_default_executor = resolved_global
+        self._on_worktree_reclaim = on_worktree_reclaim
         self._lock = lock
         self._sessions = sessions
         self._lease_ttl_seconds = lease_ttl_seconds
@@ -136,114 +138,206 @@ class AgentWorker:
         self._wake_signals[inbox_id] = wake_signal
 
         try:
+            # Recover any orphaned 'processing' events left by a crashed prior lease holder.
+            orphans = self._inbox.fetch_processing(inbox_id)
+            if orphans:
+                self._inbox.requeue_processing([evt.event_id for evt in orphans])
+
             while True:
-                pending = self._inbox.fetch_pending(inbox_id)
-                if not pending:
+                claimed = self._inbox.claim_pending(inbox_id)
+                if not claimed:
                     break
 
                 restarted = False
-                # Interrupt judges "new" against the whole scheduling snapshot, so events this
-                # pass deliberately runs later (other keys, held-back same-key events) never
-                # interrupt the current batch; only arrivals after the fetch do.
-                snapshot_ids = {evt.event_id for evt in pending}
-                batches = self._group_into_batches(pending)
-                for session_ref, batch in batches:
-                    self._lock.renew(inbox_id, self._worker_id, self._lease_ttl_seconds)
-                    wake_signal.clear()
+                snapshot_ids = {evt.event_id for evt in claimed}
+                batches = self._group_into_batches(claimed)
+                scheduled_ids = {evt.event_id for _, b in batches for evt in b}
+                unscheduled_ids = [evt.event_id for evt in claimed if evt.event_id not in scheduled_ids]
+                completed_or_failed_ids: set[str] = set()
 
-                    selected_executor = self._select_executor(batch, session_ref)
+                try:
+                    for batch_idx, (session_ref, batch) in enumerate(batches):
+                        self._lock.renew(inbox_id, self._worker_id, self._lease_ttl_seconds)
+                        wake_signal.clear()
+                        batch_ids = [evt.event_id for evt in batch]
 
-                    consumed_ids: set[str] = {evt.event_id for evt in batch}
-                    folded_events: list[Event] = []
-                    target_batch_key = self._batch_key(batch[0], session_ref)
-                    has_decision = any(self._is_approval_decision(evt) for evt in batch)
-                    batch_target = self._batch_target(batch)
-                    interrupted_flag = asyncio.Event()
+                        if self._is_close_session_batch(batch):
+                            closed_sid = self._handle_close_session(batch, session_ref)
+                            if closed_sid is not None:
+                                self._inbox.bind_session(batch_ids, closed_sid)
+                            self._inbox.mark_done(batch_ids)
+                            completed_or_failed_ids.update(batch_ids)
+                            reports.append(
+                                RunReport(
+                                    inbox_id=inbox_id,
+                                    session_id=closed_sid,
+                                    event_ids=tuple(batch_ids),
+                                    outcome=Silent(),
+                                )
+                            )
+                            continue
 
-                    def _poll_folded(
-                        _inbox_id: str = inbox_id,
-                        _consumed: set[str] = consumed_ids,
-                        _folded: list[Event] = folded_events,
-                        _target_key: tuple[str, str] | None = target_batch_key,
-                        _has_decision: bool = has_decision,
-                        _batch_target: tuple[object, ...] | None = batch_target,
-                    ) -> list[Event]:
-                        # Never fold across an approval boundary or into a different
-                        # execution target; those events run in a later pass.
-                        if self._new_event_policy != "fold" or _target_key is None or _has_decision:
-                            return []
-                        newly_folded: list[Event] = []
-                        for candidate in self._inbox.fetch_pending(_inbox_id):
-                            if candidate.event_id in _consumed:
-                                continue
-                            cand_session = self._resolve_session(candidate)
-                            if self._batch_key(candidate, cand_session) != _target_key:
-                                continue
-                            if self._is_approval_decision(candidate) or (
-                                _batch_target is not None
-                                and self._execution_target(candidate) != _batch_target
-                            ):
-                                break
-                            _consumed.add(candidate.event_id)
-                            _folded.append(candidate)
-                            newly_folded.append(candidate)
-                        return newly_folded
+                        try:
+                            selected_executor = self._select_executor(batch, session_ref)
+                        except ExecutorFailed:
+                            # Missing/unregistered executor for a suspended checkpoint: requeue
+                            # pending so operator recovery can resume it cleanly.
+                            remaining_ids = [
+                                evt.event_id
+                                for _, rem in batches[batch_idx:]
+                                for evt in rem
+                            ] + unscheduled_ids
+                            self._inbox.requeue_processing(remaining_ids)
+                            completed_or_failed_ids.update(remaining_ids)
+                            raise
 
-                    caps: RunCapabilities = _ScopedCapabilities(
-                        memory=self._memory,
-                        timers=self._timers,
-                        permissions=self._permissions,
-                        _poll_folded=_poll_folded,
-                        _is_interrupted=interrupted_flag.is_set,
-                    )
+                        batch_correlation_key = self._extract_correlation_key(batch, session_ref)
+                        batch_work_key = self._extract_work_key(batch, session_ref, batch_correlation_key)
 
-                    # A decision Run executes the approved tool before the LLM turn; restarting
-                    # it would execute the tool again.
-                    allow_interrupt = (
-                        self._new_event_policy == "interrupt"
-                        and interrupt_restarts < self._max_interrupt_restarts
-                        and not has_decision
-                    )
-                    try:
-                        outcome = await self._execute_batch(
-                            executor=selected_executor,
+                        # Create & persist active SessionRef BEFORE execute(), then bind events immediately.
+                        explicit_sid = next((e.session_id for e in batch if e.session_id), None)
+                        active_session = self._ensure_active_session(
                             inbox_id=inbox_id,
-                            batch=batch,
                             session_ref=session_ref,
-                            caps=caps,
-                            known_ids=snapshot_ids,
-                            interrupted_flag=interrupted_flag,
-                            wake_signal=wake_signal,
-                            allow_interrupt=allow_interrupt,
+                            explicit_session_id=explicit_sid,
+                            correlation_key=batch_correlation_key,
+                            work_key=batch_work_key,
+                            executor_id=selected_executor.executor_id,
                         )
-                    except _RunInterrupted:
-                        interrupt_restarts += 1
-                        restarted = True
-                        break
+                        self._inbox.bind_session(batch_ids, active_session.session_id)
 
-                    batch_correlation_key = self._extract_correlation_key(
-                        batch + folded_events,
-                        session_ref,
-                    )
-                    final_session_id = self._apply_outcome(
-                        inbox_id,
-                        session_ref,
-                        outcome,
-                        batch_correlation_key,
-                        selected_executor,
-                    )
-                    all_done_ids = [evt.event_id for evt in batch] + [
-                        evt.event_id for evt in folded_events
-                    ]
-                    self._inbox.mark_done(all_done_ids)
-                    reports.append(
-                        RunReport(
-                            inbox_id=inbox_id,
-                            session_id=final_session_id,
-                            event_ids=tuple(all_done_ids),
-                            outcome=outcome,
+                        consumed_ids: set[str] = set(batch_ids)
+                        folded_events: list[Event] = []
+                        target_batch_key = self._batch_key(batch[0], active_session)
+                        has_decision = any(self._is_approval_decision(evt) for evt in batch)
+                        batch_target = self._batch_target(batch)
+                        interrupted_flag = asyncio.Event()
+
+                        def _poll_folded(
+                            _inbox_id: str = inbox_id,
+                            _consumed: set[str] = consumed_ids,
+                            _folded: list[Event] = folded_events,
+                            _target_key: tuple[str, str] | None = target_batch_key,
+                            _has_decision: bool = has_decision,
+                            _batch_target: tuple[object, ...] | None = batch_target,
+                            _active_sid: str = active_session.session_id,
+                        ) -> list[Event]:
+                            if self._new_event_policy != "fold" or _target_key is None or _has_decision:
+                                return []
+                            newly_folded: list[Event] = []
+                            for candidate in self._inbox.fetch_pending(_inbox_id):
+                                if candidate.event_id in _consumed:
+                                    continue
+                                cand_session = self._resolve_session(candidate)
+                                if self._batch_key(candidate, cand_session) != _target_key:
+                                    continue
+                                if self._is_approval_decision(candidate) or (
+                                    _batch_target is not None
+                                    and self._execution_target(candidate) != _batch_target
+                                ):
+                                    break
+                                _consumed.add(candidate.event_id)
+                                _folded.append(candidate)
+                                newly_folded.append(candidate)
+                            if newly_folded:
+                                self._inbox.bind_session(
+                                    [e.event_id for e in newly_folded],
+                                    _active_sid,
+                                )
+                            return newly_folded
+
+                        caps: RunCapabilities = _ScopedCapabilities(
+                            memory=self._memory,
+                            timers=self._timers,
+                            permissions=self._permissions,
+                            _poll_folded=_poll_folded,
+                            _is_interrupted=interrupted_flag.is_set,
                         )
-                    )
+
+                        allow_interrupt = (
+                            self._new_event_policy == "interrupt"
+                            and interrupt_restarts < self._max_interrupt_restarts
+                            and not has_decision
+                        )
+                        try:
+                            outcome = await self._execute_batch(
+                                executor=selected_executor,
+                                inbox_id=inbox_id,
+                                batch=batch,
+                                session_ref=active_session,
+                                caps=caps,
+                                known_ids=snapshot_ids,
+                                interrupted_flag=interrupted_flag,
+                                wake_signal=wake_signal,
+                                allow_interrupt=allow_interrupt,
+                            )
+                        except _RunInterrupted:
+                            # Never write Outbox on interrupt; requeue current & remaining batches.
+                            requeue_ids = (
+                                batch_ids
+                                + [e.event_id for e in folded_events]
+                                + [evt.event_id for _, rem in batches[batch_idx + 1 :] for evt in rem]
+                                + unscheduled_ids
+                            )
+                            self._inbox.requeue_processing(requeue_ids)
+                            completed_or_failed_ids.update(requeue_ids)
+                            interrupt_restarts += 1
+                            restarted = True
+                            break
+                        except ExecutorFailed as exc:
+                            all_failed_ids = batch_ids + [e.event_id for e in folded_events]
+                            self._inbox.mark_failed(all_failed_ids, str(exc.__cause__ or exc))
+                            completed_or_failed_ids.update(all_failed_ids)
+                            # Requeue remaining unexecuted batches so they are not stranded in processing.
+                            remaining_ids = [
+                                evt.event_id
+                                for _, rem in batches[batch_idx + 1 :]
+                                for evt in rem
+                            ] + unscheduled_ids
+                            if remaining_ids:
+                                self._inbox.requeue_processing(remaining_ids)
+                                completed_or_failed_ids.update(remaining_ids)
+                            raise
+
+                        final_corr = self._extract_correlation_key(
+                            batch + folded_events,
+                            active_session,
+                        )
+                        final_work_key = self._extract_work_key(
+                            batch + folded_events,
+                            active_session,
+                            final_corr,
+                        )
+                        final_session_id = self._apply_outcome(
+                            inbox_id,
+                            active_session,
+                            outcome,
+                            final_corr,
+                            final_work_key,
+                            selected_executor,
+                        )
+                        all_done_ids = batch_ids + [evt.event_id for evt in folded_events]
+                        if final_session_id is not None and final_session_id != active_session.session_id:
+                            self._inbox.bind_session(all_done_ids, final_session_id)
+                        self._inbox.mark_done(all_done_ids)
+                        completed_or_failed_ids.update(all_done_ids)
+                        reports.append(
+                            RunReport(
+                                inbox_id=inbox_id,
+                                session_id=final_session_id,
+                                event_ids=tuple(all_done_ids),
+                                outcome=outcome,
+                            )
+                        )
+                finally:
+                    # Any held-back or unfinished claimed events return to pending for the next pass.
+                    straggler_ids = [
+                        evt.event_id
+                        for evt in claimed
+                        if evt.event_id not in completed_or_failed_ids
+                    ]
+                    if straggler_ids:
+                        self._inbox.requeue_processing(straggler_ids)
 
                 if restarted:
                     continue
@@ -253,6 +347,60 @@ class AgentWorker:
 
         return reports
 
+    def _ensure_active_session(
+        self,
+        *,
+        inbox_id: str,
+        session_ref: SessionRef | None,
+        explicit_session_id: str | None,
+        correlation_key: str | None,
+        work_key: str | None,
+        executor_id: str,
+    ) -> SessionRef:
+        if session_ref is not None:
+            return session_ref
+        new_session = SessionRef(
+            session_id=explicit_session_id or new_id("sess"),
+            inbox_id=inbox_id,
+            correlation_key=correlation_key,
+            executor_id=executor_id,
+            status="active",
+            work_key=work_key,
+            updated_at=utc_now_iso(),
+        )
+        self._sessions.save(new_session)
+        return new_session
+
+    @staticmethod
+    def _is_close_session_batch(batch: list[Event]) -> bool:
+        return any(
+            evt.payload.get("action") == "close_session"
+            or evt.payload.get("close_session") is True
+            or evt.source == "session:close"
+            for evt in batch
+        )
+
+    def _handle_close_session(
+        self,
+        batch: list[Event],
+        session_ref: SessionRef | None,
+    ) -> str | None:
+        target = session_ref
+        if target is None:
+            for evt in batch:
+                sid = evt.payload.get("session_id") or evt.session_id
+                if isinstance(sid, str) and sid:
+                    target = self._sessions.get(sid)
+                    if target is not None:
+                        break
+        if target is None:
+            return None
+        self._sessions.close_session(target.session_id)
+        if target.work_key and self._on_worktree_reclaim is not None:
+            if self._sessions.count_active_by_work_key(target.work_key) == 0:
+                self._on_worktree_reclaim(target.work_key)
+        return target.session_id
+
     def _select_executor(
         self,
         batch: list[Event],
@@ -260,7 +408,6 @@ class AgentWorker:
     ) -> ExecutorPort:
         if self._resumes_suspended(batch, session_ref):
             assert session_ref is not None
-            # The checkpoint belongs to the executor that suspended; only it can resume.
             holder = self._suspended_holder(batch, session_ref)
             if holder is None:
                 raise ExecutorFailed(
@@ -269,11 +416,12 @@ class AgentWorker:
                 )
             held = self._executors.get(holder)
             if held is None:
-                raise ExecutorFailed(f"Executor '{holder}' holding the suspended session is not registered")
+                raise ExecutorFailed(
+                    f"Executor '{holder}' holding the suspended session is not registered"
+                )
             return held
 
         event_executor_id: str | None = None
-        # Same rule as LocalCLIExecutor: an approval resumes the ordinary events' Run.
         target_events = [e for e in batch if not self._is_approval_decision(e)] or batch
         for evt in reversed(target_events):
             raw = evt.payload.get("executor_id")
@@ -386,19 +534,24 @@ class AgentWorker:
                 return evt.correlation_key
         return session_ref.correlation_key if session_ref is not None else None
 
+    def _extract_work_key(
+        self,
+        events: list[Event],
+        session_ref: SessionRef | None,
+        correlation_key: str | None,
+    ) -> str | None:
+        for evt in reversed(events):
+            raw = evt.payload.get("work_key")
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+        if session_ref is not None and session_ref.work_key:
+            return session_ref.work_key
+        return correlation_key
+
     def _group_into_batches(
         self,
         events: list[Event],
     ) -> list[tuple[SessionRef | None, list[Event]]]:
-        # Same-key events form one batch in seq order; batches run in order of first seq.
-        # Events without session_id/correlation_key are unrelated, so each runs alone
-        # (interrupt restarts still merge them). A key's batch closes at an approval decision
-        # or at an event with a different execution target; later events of a closed key
-        # wait for the next fetch, which resolves them against the updated session.
-        # A suspended session treats any Run without the decision as a rejection, so when
-        # the snapshot holds a decision for a key, that key's first batch must carry it:
-        # incompatible events ahead of the decision are held back instead of closing the key,
-        # and so are events routed away from the executor that holds the checkpoint.
         resolved: list[tuple[Event, SessionRef | None, tuple[str, str] | None]] = []
         keys_with_decision: set[tuple[str, str]] = set()
         decision_holders: dict[tuple[str, str], str] = {}
@@ -464,10 +617,6 @@ class AgentWorker:
         assert session_ref is not None
         if session_ref.executor_id:
             return session_ref.executor_id
-        # Sessions suspended before executor binding carry no executor_id. Neither the current
-        # default nor a sole registered executor proves who wrote the checkpoint (the old CLI
-        # runtime could pick templates per event; executors can be replaced). Accept only an
-        # executor the approval names; otherwise the caller keeps checkpoint and events pending.
         for evt in batch:
             if evt.payload.get("approval_request_id") == session_ref.pending_request_id:
                 named = self._routed_executor_id(evt)
@@ -485,7 +634,6 @@ class AgentWorker:
         return tuple(event.payload.get(key) for key in _TARGET_PAYLOAD_KEYS)
 
     def _batch_target(self, batch: list[Event]) -> tuple[object, ...] | None:
-        # Approval decisions carry no target of their own and inherit the batch's.
         for evt in batch:
             if not self._is_approval_decision(evt):
                 return self._execution_target(evt)
@@ -538,7 +686,6 @@ class AgentWorker:
         exec_id = selected_executor.executor_id
         if outcome_exec_sid is not None:
             return exec_id, outcome_exec_sid
-        # Only preserve prior native session_id when the executor identity still matches.
         if session_ref is not None and session_ref.executor_id == exec_id:
             return exec_id, session_ref.executor_session_id
         return exec_id, None
@@ -546,9 +693,10 @@ class AgentWorker:
     def _apply_outcome(
         self,
         inbox_id: str,
-        session_ref: SessionRef | None,
+        session_ref: SessionRef,
         outcome: RunOutcome,
         correlation_key: str | None,
+        work_key: str | None,
         selected_executor: ExecutorPort,
     ) -> str | None:
         match outcome:
@@ -558,42 +706,21 @@ class AgentWorker:
                     session_ref,
                     exec_sid,
                 )
-                if session_ref is not None:
-                    if (
-                        session_ref.pending_request_id is not None
-                        or (correlation_key is not None and session_ref.correlation_key != correlation_key)
-                        or session_ref.executor_id != exec_id
-                        or session_ref.executor_session_id != bound_exec_sid
-                    ):
-                        self._sessions.save(
-                            SessionRef(
-                                session_id=session_ref.session_id,
-                                inbox_id=inbox_id,
-                                correlation_key=correlation_key,
-                                executor_id=exec_id,
-                                executor_session_id=bound_exec_sid,
-                                checkpoint=None,
-                                pending_request_id=None,
-                                updated_at=utc_now_iso(),
-                            )
-                        )
-                    return session_ref.session_id
-                if correlation_key is not None or bound_exec_sid is not None:
-                    new_sid = new_id("sess")
-                    self._sessions.save(
-                        SessionRef(
-                            session_id=new_sid,
-                            inbox_id=inbox_id,
-                            correlation_key=correlation_key,
-                            executor_id=exec_id,
-                            executor_session_id=bound_exec_sid,
-                            checkpoint=None,
-                            pending_request_id=None,
-                            updated_at=utc_now_iso(),
-                        )
+                self._sessions.save(
+                    SessionRef(
+                        session_id=session_ref.session_id,
+                        inbox_id=inbox_id,
+                        correlation_key=correlation_key,
+                        executor_id=exec_id,
+                        executor_session_id=bound_exec_sid,
+                        status="active",
+                        work_key=work_key,
+                        checkpoint=None,
+                        pending_request_id=None,
+                        updated_at=utc_now_iso(),
                     )
-                    return new_sid
-                return None
+                )
+                return session_ref.session_id
             case Emit(
                 messages=messages,
                 session_id=emit_session_id,
@@ -610,28 +737,24 @@ class AgentWorker:
                         content=text,
                         metadata={"kind": "emit"},
                     )
-                target_sid = emit_session_id or (
-                    session_ref.session_id
-                    if session_ref is not None
-                    else (
-                        new_id("sess")
-                        if (correlation_key is not None or bound_exec_sid is not None)
-                        else None
+                target_sid = emit_session_id or session_ref.session_id
+                if target_sid != session_ref.session_id:
+                    # Session rotation: archive old session while new session inherits correlation_key & work_key.
+                    self._sessions.archive_session(session_ref.session_id)
+                self._sessions.save(
+                    SessionRef(
+                        session_id=target_sid,
+                        inbox_id=inbox_id,
+                        correlation_key=correlation_key,
+                        executor_id=exec_id,
+                        executor_session_id=bound_exec_sid,
+                        status="active",
+                        work_key=work_key,
+                        checkpoint=None,
+                        pending_request_id=None,
+                        updated_at=utc_now_iso(),
                     )
                 )
-                if target_sid is not None:
-                    self._sessions.save(
-                        SessionRef(
-                            session_id=target_sid,
-                            inbox_id=inbox_id,
-                            correlation_key=correlation_key,
-                            executor_id=exec_id,
-                            executor_session_id=bound_exec_sid,
-                            checkpoint=None,
-                            pending_request_id=None,
-                            updated_at=utc_now_iso(),
-                        )
-                    )
                 return target_sid
             case Suspend(
                 request_id=request_id,
@@ -645,9 +768,9 @@ class AgentWorker:
                     session_ref,
                     exec_sid,
                 )
-                target_sid = suspend_session_id or (
-                    session_ref.session_id if session_ref else new_id("sess")
-                )
+                target_sid = suspend_session_id or session_ref.session_id
+                if target_sid != session_ref.session_id:
+                    self._sessions.archive_session(session_ref.session_id)
                 self._sessions.save(
                     SessionRef(
                         session_id=target_sid,
@@ -655,6 +778,8 @@ class AgentWorker:
                         correlation_key=correlation_key,
                         executor_id=exec_id,
                         executor_session_id=bound_exec_sid,
+                        status="suspended",
+                        work_key=work_key,
                         checkpoint=checkpoint,
                         pending_request_id=request_id,
                         updated_at=utc_now_iso(),

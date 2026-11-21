@@ -418,7 +418,7 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r2.status_code, 202)
             await daemon.pool.wait_until_idle(timeout_seconds=3.0)
 
-            self.assertEqual(tracker.calls[0], ("proj:hibernaut", None, "github:kun-g/hibernaut#7"))
+            self.assertEqual(tracker.calls[0], ("proj:hibernaut", first_sid, "github:kun-g/hibernaut#7"))
             self.assertEqual(
                 tracker.calls[1],
                 ("proj:hibernaut", first_sid, "github:kun-g/hibernaut#7"),

@@ -52,6 +52,27 @@ class InboxContractMixin:
         remaining = inbox.fetch_pending("u1")
         self.assertEqual([e.event_id for e in remaining], [stored2.event_id])
 
+    def test_claim_bind_requeue_and_mark_failed(self) -> None:
+        inbox = self.make_inbox()
+        e1, _ = inbox.append(Event(inbox_id="u2", source="im", external_id="c1", payload={}))
+        e2, _ = inbox.append(Event(inbox_id="u2", source="im", external_id="c2", payload={}))
+
+        claimed = inbox.claim_pending("u2")
+        self.assertEqual([e.event_id for e in claimed], [e1.event_id, e2.event_id])
+        self.assertTrue(all(e.status == "processing" and e.attempts == 1 for e in claimed))
+        self.assertEqual(inbox.fetch_pending("u2"), [])
+        self.assertEqual(len(inbox.fetch_processing("u2")), 2)
+
+        inbox.bind_session([e1.event_id], "sess_bound")
+        proc_after_bind = {e.event_id: e for e in inbox.fetch_processing("u2")}
+        self.assertEqual(proc_after_bind[e1.event_id].session_id, "sess_bound")
+
+        inbox.requeue_processing([e1.event_id])
+        self.assertEqual([e.event_id for e in inbox.fetch_pending("u2")], [e1.event_id])
+
+        inbox.mark_failed([e2.event_id], "boom")
+        self.assertEqual(inbox.fetch_processing("u2"), [])
+
 
 class TimerContractMixin:
     def make_timers(self) -> Any:
@@ -241,6 +262,42 @@ class SessionContractMixin:
         assert switched is not None
         self.assertEqual(switched.executor_id, "cursor-agent")
         self.assertIsNone(switched.executor_session_id)
+
+    def test_session_lifecycle_archive_close_and_work_key_ref_count(self) -> None:
+        store = self.make_sessions()
+        wk = "github:kun-g/hibernaut#209"
+        store.save(
+            SessionRef(
+                session_id="s_active",
+                inbox_id="proj:hibernaut",
+                correlation_key=wk,
+                work_key=wk,
+                status="active",
+            )
+        )
+        store.save(
+            SessionRef(
+                session_id="s_susp",
+                inbox_id="proj:hibernaut",
+                work_key=wk,
+                status="suspended",
+                pending_request_id="req_209",
+            )
+        )
+        self.assertEqual(store.count_active_by_work_key(wk), 2)
+
+        store.archive_session("s_active")
+        self.assertEqual(store.count_active_by_work_key(wk), 1)
+        self.assertIsNone(store.find_by_correlation_key("proj:hibernaut", wk))
+        archived = store.get("s_active")
+        assert archived is not None
+        self.assertEqual(archived.status, "archived")
+
+        store.close_session("s_susp")
+        self.assertEqual(store.count_active_by_work_key(wk), 0)
+        closed = store.get("s_susp")
+        assert closed is not None
+        self.assertEqual(closed.status, "closed")
 
 
 class TestInMemoryContracts(

@@ -282,6 +282,11 @@ def build_daemon(
         },
     )
 
+    resolved_wt_mgr = worktree_manager or OrcaWorktreeManager(
+        workspace_store=workspaces,
+        session_store=sessions,
+    )
+
     def _make_worker(inbox_id: str, worker_id: str) -> AgentWorker:
         if executors_factory is not None:
             return AgentWorker(
@@ -294,6 +299,9 @@ def build_daemon(
                 executors=executors_factory(inbox_id),
                 project_default_executor=project_default_executor,
                 global_default_executor=global_default_executor,
+                on_worktree_reclaim=lambda wk, _iid=inbox_id: resolved_wt_mgr.reclaim(
+                    wk, notify_outbox=outbox, inbox_id=_iid
+                ),
                 lock=lock,
                 sessions=sessions,
                 lease_ttl_seconds=lease_ttl_seconds,
@@ -308,6 +316,9 @@ def build_daemon(
             permissions=permissions,
             outbox=outbox,
             executor=executor,
+            on_worktree_reclaim=lambda wk, _iid=inbox_id: resolved_wt_mgr.reclaim(
+                wk, notify_outbox=outbox, inbox_id=_iid
+            ),
             lock=lock,
             sessions=sessions,
             lease_ttl_seconds=lease_ttl_seconds,
@@ -350,7 +361,7 @@ def build_daemon(
         sessions=sessions,
         workspaces=workspaces,
         inbox=inbox,
-        worktree_manager=worktree_manager or OrcaWorktreeManager(workspace_store=workspaces),
+        worktree_manager=resolved_wt_mgr,
         outbox=outbox,
         bearer_token=mcp_bearer_token,
     )
@@ -455,12 +466,15 @@ def build_daemon_from_config(
     if has_configured_executor and not demo:
         # Instantiate all configured [executors.<id>] per project so AgentWorker can sticky-route.
         executors_by_inbox: dict[str, dict[str, ExecutorPort]] = {}
+        wt_mgr_by_inbox: dict[str, OrcaWorktreeManager] = {}
         for proj in config.projects.values():
             wt_mgr = OrcaWorktreeManager(
                 workspace_store=daemon.workspaces,
+                session_store=daemon.sessions,
                 backend=proj.worktree_backend,
                 create_terminal=proj.orca_create_terminal,
             )
+            wt_mgr_by_inbox[proj.inbox_id] = wt_mgr
             executors_by_inbox[proj.inbox_id] = {
                 exec_name: LocalCLIExecutor(
                     worktree_manager=wt_mgr,
@@ -472,7 +486,10 @@ def build_daemon_from_config(
                 for exec_name in config.executors
             }
 
-        default_mgr = OrcaWorktreeManager(workspace_store=daemon.workspaces)
+        default_mgr = OrcaWorktreeManager(
+            workspace_store=daemon.workspaces,
+            session_store=daemon.sessions,
+        )
         fallback_executors: dict[str, ExecutorPort] = {
             exec_name: LocalCLIExecutor(
                 worktree_manager=default_mgr,
@@ -494,6 +511,9 @@ def build_daemon_from_config(
                 executors=executors_by_inbox.get(inbox_id, fallback_executors),
                 project_default_executor=inbox_project_executor.get(inbox_id),
                 global_default_executor=config.runtime.default_executor,
+                on_worktree_reclaim=lambda wk, _iid=inbox_id: wt_mgr_by_inbox.get(
+                    _iid, default_mgr
+                ).reclaim(wk, notify_outbox=daemon.outbox, inbox_id=_iid),
                 lock=daemon.lock,
                 sessions=daemon.sessions,
                 new_event_policy=config.runtime.new_event_policy,

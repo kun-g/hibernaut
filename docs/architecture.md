@@ -28,13 +28,13 @@
 
 | 端口 / 契约 | 职责 |
 | :--- | :--- |
-| `InboxPort` | 统一事件缓冲与事实源；按 `(inbox_id, source, external_id)` 幂等去重（重复标 `dropped`） |
+| `InboxPort` | 统一事件缓冲与事实源（4 态生命周期 `pending` / `processing` / `done` / `failed`，重复幂等标 `dropped`）；支持 `claim_pending`、`fetch_processing`、`bind_session`、`requeue_processing`、`mark_done`、`mark_failed` |
 | `TimerPort` | 持久化定时器存储（单次 `follow_up` 与周期 `schedule`） |
 | `MemoryPort` | 跨 Run 目录记忆（必载基线 `instructions.md` / `index.md` / `reported.md` + 按需 `notes/*` / `progress/*`） |
 | `PermissionPort` | 每次工具调用前置三态门禁（`allow` / `block` / `defer`） |
 | `OutboxPort` | 待发消息持久队列，解耦推理与外部通道投递 |
 | `LockPort` | 以 `inbox_id` 为主键的单活租约锁（`acquire` / `renew` / `release`），支持进程崩溃后租约到期自动接管 |
-| `SessionStorePort` | 跨 Run 会话元数据、执行器绑定（`executor_id` / `executor_session_id`）、`Suspend` 审批断点（`find_by_request_id`）及外部关联键映射（`find_by_correlation_key`，支持会话轮换重绑） |
+| `SessionStorePort` | 跨 Run 会话元数据（4 态 `active` / `suspended` / `archived` / `closed`、`work_key`）、执行器绑定（`executor_id` / `executor_session_id`）、`Suspend` 审批断点（`find_by_request_id`）、活跃引用计数（`count_active_by_work_key`）、`archive_session` / `close_session` 及外部关联键映射（`find_by_correlation_key` 仅命中 `active`/`suspended`） |
 | `ChannelPort` | 外部投递通道（`FeishuChannelAdapter`、`ConsoleChannelAdapter`、`WebhookChannelAdapter`） |
 | `ExecutorPort` | Agent 单轮推理边界（声明只读属性 `executor_id`；白盒 `WhiteboxExecutor` 或黑盒 `LocalCLIExecutor`），输入批次事件与 `RunCapabilities`，输出 `RunOutcome` |
 | `RunCapabilities` | 注入单轮 Run 的受控能力集合：`memory`、`timers`、`permissions`、`poll_folded_events()`、`is_interrupted()` |
@@ -52,7 +52,7 @@
   - `POST /webhooks/github`（`GitHubWebhookAdapter`）：HMAC-SHA256 `X-Hub-Signature-256` 验签、`X-GitHub-Delivery` 幂等键、`repo -> inbox_id` 映射、Issue/PR 自动提取 `correlation_key = f"github:{repo}#{number}"`。
   - `GitHubIssuePoller`（`adapters/channels/github_poller.py`）：无公网 Webhook 时的本机定时轮询入口（支持 `gh issue list` 或 GitHub REST API 及 label 过滤），生成 `external_id = f"github-poll:{repo}#{number}:{updated_at}"` 与完全一致的 `correlation_key = f"github:{repo}#{number}"`。
   - `POST /webhooks/feishu`（`FeishuWebhookAdapter`）：支持飞书 v2.0 `url_verification` Challenge 握手（200 OK）、`verification_token` 校验、`header.event_id` 幂等键、话题 `correlation_key` 提取与审批卡片回调恢复 `Suspend`。
-  - `MCPServerAdapter`（`adapters/channels/mcp_server.py`）：纯标准库 MCP JSON-RPC 2.0 入站控制面（`initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call`），暴露 6 个核心 Tool（`hibernaut_ingest_event`、`hibernaut_list_sessions`（含 `executor_id` / `executor_session_id`）、`hibernaut_list_events`、`hibernaut_list_workspaces`、`hibernaut_resolve_approval`、`hibernaut_reclaim_workspace`），同时支持本机 `--mcp-stdio` 行帧直连与远程 `POST /mcp` Streamable HTTP（强制 `Authorization: Bearer <HIBERNAUT_MCP_TOKEN>` 校验，未配置 token 时默认禁用返回 404）。
+  - `MCPServerAdapter`（`adapters/channels/mcp_server.py`）：纯标准库 MCP JSON-RPC 2.0 入站控制面（`initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call`），暴露 7 个核心 Tool（`hibernaut_ingest_event`、`hibernaut_list_sessions`（含 `status` / `work_key` / `executor_id` / `executor_session_id`）、`hibernaut_list_events`（含 `session_id` / `status` / `attempts` / `last_error`）、`hibernaut_list_workspaces`、`hibernaut_resolve_approval`、`hibernaut_reclaim_workspace`、`hibernaut_close_session`），同时支持本机 `--mcp-stdio` 行帧直连与远程 `POST /mcp` Streamable HTTP（强制 `Authorization: Bearer <HIBERNAUT_MCP_TOKEN>` 校验，未配置 token 时默认禁用返回 404）。
 - **L3 飞书出站通道**（`FeishuChannelAdapter`，`adapters/channels/feishu_channel.py`）：仅用标准库 `urllib.request`，基于 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 自动缓存刷新 `tenant_access_token`，发送普通文本通知与 `Suspend` 交互审批卡片；未配置凭据时自动降级为 `ConsoleChannelAdapter`。
 
 ## 4. 本机自举闭环：`OrcaWorktreeManager`、`LocalCLIExecutor` 与声明式配置
@@ -61,8 +61,8 @@
 - **工作区决策优先级**：`explicit_workdir`（只读覆盖口）→ SQLite `workspaces` 表已落盘路径（按 `correlation_key` 复用）→ 动态创建（默认 `orca worktree create`，可选 `orca terminal create`，支持切换纯 `git worktree add` 后端）。
 - **三道安全保险**：
   1. **意图占位与对账**：创建前先在 SQLite `workspaces` 表写入 `creating` 占位，崩溃重入时先对账本地目录再决定复用或清理。
-  2. **路径落盘**：分配名称时检查所有本地 `hb/` 分支，包括未挂载的分支。Orca 创建时可能再加数字后缀，执行器读取 `--json` 回执里的实际分支和路径，与主仓库的 `git worktree list --porcelain -z` 核对，确认是唯一且可用的独立工作区后登记为 `ready`。复用时用同一登记表校正 SQLite 的旧路径。执行器重试耗尽后，Worker 池记录 inbox 和异常，保留该批次为 `pending`，继续处理其他 inbox。同 inbox 下次唤醒时重试。
-  3. **三关安全回收**（`reclaim()`）：双重归属校验（`hb-` 前缀 + `workspaces` 表记录）+ 三关检查（无开着 PR / 无未提交改动 / 无未推送提交），任一不通过即保留目录并经 Outbox 告警。
+  2. **路径落盘**：分配名称时检查所有本地 `hb/` 分支，包括未挂载的分支。Orca 创建时可能再加数字后缀，执行器读取 `--json` 回执里的实际分支和路径，与主仓库的 `git worktree list --porcelain -z` 核对，确认是唯一且可用的独立工作区后登记为 `ready`。复用时用同一登记表校正 SQLite 的旧路径。执行器重试耗尽后，批次标记为 `failed` 并记录 `last_error`，Worker 池记录异常后继续处理其他 inbox。
+  3. **引用计数前置门禁 + 三关安全回收**（`reclaim()`）：先校验 `count_active_by_work_key(work_key) == 0`（若有 `active`/`suspended` 会话仍引用则拒绝回收并返回占用会话 ID），再执行双重归属校验（`hb-` 前缀 + `workspaces` 表记录）+ 三关检查（无开着 PR / 无未提交改动 / 无未推送提交），任一不通过即保留目录并经 Outbox 告警。
 - **可配置本地 CLI 执行器**（`LocalCLIExecutor`）：实现 `ExecutorPort`，内置 `claude`（默认）、`cursor-agent`、`grok`、`dsh` 模板，支持可选 `resume_args` 原生会话续接（自动从 JSON 输出提取 `executor_session_id` / `session_id`）及透传环境变量对接本地模型网关（如 `yetone/magpie`），响应 `caps.is_interrupted()` 安全终止子进程。
 - **Orca 可见执行**：模板的 `orca_agent` 指定 Orca 管理的 agent。项目使用 Orca worktree 时，执行器通过 `orca agent launch --surface terminal` 在后台标签页提交任务，按回执绑定终端。完成以每轮唯一的临时结果文件为准。中断或超时按本轮终端句柄关闭，启动回执不确定时转为 `Suspend` 供人工确认。
 - **声明式配置与禁止静默回退 Demo**（`hibernaut.example.toml` + `app/config.py` + `app/main.py --config`）：使用标准库 `tomllib` 解析，仅存静态主检出、执行器模板（全部 `[executors.<id>]` 注册进 `AgentWorker`，`[projects.<name>]` 支持可选 `executor`）与凭据环境变量名，绝不存动态 worktree 路径。以 `--config` 正式启动时严禁静默回退 `RuleBasedDemoLLM`：若未配置 `[executors]` 或缺少 `default_executor`，则向 `stderr` 打印清晰提示并以 **`ingest-only`（仅入站控制面）模式**启动，不启动消费 Worker 池，所有新事件安全保持 `pending` 等待配置修复（仅无 `--config` 或显式传 `--demo` 时才允许使用 Demo 执行器）。HTTP daemon 热加载时先组装新配置，待旧 Worker 池排空后再切换，沿用同一条 SQLite 连接及未变更的监听 socket。
@@ -81,7 +81,7 @@
 | :--- | :--- | :--- |
 | **Event Inbox** | 全局共享的物理事件表（SQLite `event_inbox`） | 全局 1 套，存放所有 `inbox_id` 的事件 |
 | **Inbox / `inbox_id`** | 逻辑并发队列（Actor Mailbox）及其一等路由键 / `worker_leases` 主键 | 同分区串行、跨分区并发；禁跨 `inbox_id` 共享同一本地代码目录 |
-| **Event** | 进入 Event Inbox 的不可变输入信封（`pending` / `done` / `dropped`） | 必属某个 `inbox_id`，可附带 `session_id` 或 `correlation_key` |
-| **`session_id`** | 隶属于某个 `inbox_id` 的跨 Run 对话转录与 `Suspend` 断点上下文单元 | 一个 `inbox_id` 下可有多个 `session_id`，可绑定 `executor_id` 与 `executor_session_id` |
+| **Event** | 进入 Event Inbox 的输入信封（4 态 `pending` / `processing` / `done` / `failed`，重复标 `dropped`；含 `attempts` / `last_error`） | 必属某个 `inbox_id`，执行前立即 `bind_session()`；抢锁先恢复孤儿 `processing` |
+| **`session_id`** | 隶属于某个 `inbox_id` 的跨 Run 对话转录与 `Suspend` 断点上下文单元（4 态 `active` / `suspended` / `archived` / `closed`） | 一个 `inbox_id` 下可有多个 `session_id`，绑定 `executor_id` / `executor_session_id` / `work_key`；轮换标 `archived`，结案标 `closed` 且引用归零触发回收 |
 | **`correlation_key`** | 外部业务实体的确定性关联键（如 `github:kun-g/hibernaut#42`、`feishu:<chat>:<thread>`） | 经 `SessionStorePort.find_by_correlation_key()` 映射到当前活跃 `session_id`，同时作为 `workspaces` 表动态 worktree 复用键 |
 | **Run / Lease** | 单次唤醒执行周期 / 以 `inbox_id` 为主键的限时互斥租约 | `Suspend` 立即释放租约；进程崩溃后租约到期自动接管 |

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
-from agent_runtime.core.ports import OutboxPort
+from agent_runtime.core.ports import OutboxPort, SessionStorePort
 
 WorktreeBackend = Literal["orca", "git"]
 
@@ -81,6 +81,7 @@ class OrcaWorktreeManager:
         self,
         *,
         workspace_store: SQLiteWorkspaceStore,
+        session_store: SessionStorePort | None = None,
         backend: WorktreeBackend = "orca",
         create_terminal: bool = False,
         runner: CommandRunner | None = None,
@@ -88,6 +89,7 @@ class OrcaWorktreeManager:
         reclaim_stale_after_seconds: float = 600.0,
     ) -> None:
         self._store = workspace_store
+        self._session_store = session_store
         self._reclaim_stale_after_seconds = reclaim_stale_after_seconds
         self._backend: WorktreeBackend = backend
         self._create_terminal = create_terminal
@@ -181,6 +183,17 @@ class OrcaWorktreeManager:
         record = self._store.get(work_key)
         if record is None:
             return ReclaimResult(reclaimed=False, reason="workspace not managed in workspaces table")
+
+        # Gate 0: refuse reclaim while any active or suspended session still references work_key.
+        if self._session_store is not None:
+            active_refs = self._session_store.count_active_by_work_key(work_key)
+            if active_refs > 0:
+                list_fn = getattr(self._session_store, "list_active_by_work_key", None)
+                occupying = list_fn(work_key) if callable(list_fn) else []
+                suffix = f" ({', '.join(occupying)})" if occupying else f" ({active_refs} active)"
+                msg = f"Skipped reclaim for '{work_key}': active/suspended session(s) still referencing worktree{suffix}"
+                self._alert(notify_outbox, inbox_id, msg)
+                return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
 
         workdir = Path(record.workdir)
         if not workdir.name.startswith("hb-"):

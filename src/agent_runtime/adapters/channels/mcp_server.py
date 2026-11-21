@@ -38,12 +38,15 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "hibernaut_list_sessions",
-        "description": "List active or suspended Hibernaut sessions.",
+        "description": "List Hibernaut sessions filtered by inbox_id or lifecycle status.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "inbox_id": {"type": "string"},
-                "status": {"type": "string", "enum": ["active", "suspended"]},
+                "status": {
+                    "type": "string",
+                    "enum": ["active", "suspended", "archived", "closed"],
+                },
             },
         },
     },
@@ -54,7 +57,10 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "inbox_id": {"type": "string"},
-                "status": {"type": "string", "enum": ["pending", "done", "dropped"]},
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "processing", "done", "failed", "dropped"],
+                },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500},
             },
         },
@@ -80,13 +86,24 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "hibernaut_reclaim_workspace",
-        "description": "Run 3-gate safety reclaim for a managed hb-* workspace.",
+        "description": "Run reference-count and 3-gate safety reclaim for a managed hb-* workspace.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "work_key": {"type": "string"},
             },
             "required": ["work_key"],
+        },
+    },
+    {
+        "name": "hibernaut_close_session",
+        "description": "Close a Hibernaut session and trigger worktree reclaim check if no active references remain.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+            },
+            "required": ["session_id"],
         },
     },
 ]
@@ -246,12 +263,16 @@ class MCPServerAdapter:
         if tool_name == "hibernaut_list_sessions":
             inbox_id = str(args["inbox_id"]) if args.get("inbox_id") is not None else None
             status = str(args["status"]) if args.get("status") is not None else None
+            if status is not None and status not in ("active", "suspended", "archived", "closed"):
+                raise ValueError(f"Unsupported session status: {status}")
             rows = self._sessions.list_sessions(inbox_id=inbox_id, status=status)
             return {
                 "sessions": [
                     {
                         "session_id": s.session_id,
                         "inbox_id": s.inbox_id,
+                        "status": s.status,
+                        "work_key": s.work_key,
                         "correlation_key": s.correlation_key,
                         "executor_id": s.executor_id,
                         "executor_session_id": s.executor_session_id,
@@ -267,7 +288,13 @@ class MCPServerAdapter:
                 raise ValueError("event inbox is not attached to MCPServerAdapter")
             inbox_id = str(args["inbox_id"]) if args.get("inbox_id") is not None else None
             status = str(args["status"]) if args.get("status") is not None else None
-            if status is not None and status not in ("pending", "done", "dropped"):
+            if status is not None and status not in (
+                "pending",
+                "processing",
+                "done",
+                "failed",
+                "dropped",
+            ):
                 raise ValueError(f"Unsupported event status: {status}")
             limit = int(args.get("limit", 50))
             events = self._inbox.list_events(inbox_id=inbox_id, status=status, limit=limit)
@@ -279,6 +306,8 @@ class MCPServerAdapter:
                         "source": e.source,
                         "external_id": e.external_id,
                         "status": e.status,
+                        "attempts": e.attempts,
+                        "last_error": e.last_error,
                         "correlation_key": e.correlation_key,
                         "session_id": e.session_id,
                         "created_at": e.occurred_at,
@@ -326,12 +355,43 @@ class MCPServerAdapter:
 
         if tool_name == "hibernaut_reclaim_workspace":
             work_key = str(args["work_key"])
-            mgr = self._worktree_manager or OrcaWorktreeManager(workspace_store=self._workspaces)
+            mgr = self._worktree_manager or OrcaWorktreeManager(
+                workspace_store=self._workspaces,
+                session_store=self._sessions,
+            )
             res = mgr.reclaim(work_key, notify_outbox=self._outbox)
             return {
                 "reclaimed": res.reclaimed,
                 "reason": res.reason,
                 "workdir": res.workdir,
+            }
+
+        if tool_name == "hibernaut_close_session":
+            session_id = str(args["session_id"])
+            existing = self._sessions.get(session_id)
+            if existing is None:
+                raise ValueError(f"Session not found: {session_id}")
+            self._sessions.close_session(session_id)
+            work_key = existing.work_key
+            active_refs = self._sessions.count_active_by_work_key(work_key) if work_key else 0
+            reclaim_payload: dict[str, Any] | None = None
+            if work_key and active_refs == 0:
+                mgr = self._worktree_manager or OrcaWorktreeManager(
+                    workspace_store=self._workspaces,
+                    session_store=self._sessions,
+                )
+                res = mgr.reclaim(work_key, notify_outbox=self._outbox, inbox_id=existing.inbox_id)
+                reclaim_payload = {
+                    "reclaimed": res.reclaimed,
+                    "reason": res.reason,
+                    "workdir": res.workdir,
+                }
+            return {
+                "session_id": session_id,
+                "status": "closed",
+                "work_key": work_key,
+                "active_refs": active_refs,
+                "reclaim": reclaim_payload,
             }
 
         raise KeyError(tool_name)

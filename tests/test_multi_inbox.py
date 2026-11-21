@@ -118,12 +118,11 @@ class TestMultiInboxConcurrentDaemon(unittest.IsolatedAsyncioTestCase):
                     daemon.handler.ingest(inbox_id=inbox, source="test", external_id="1", payload={})
                 await daemon.pool.wait_until_idle()
             self.assertIn("broken", log.output[0])
-            self.assertEqual(len(daemon.inbox.fetch_pending("broken")), 1)
-            self.assertEqual([r.inbox_id for r in daemon.pool.reports], ["healthy"])
-            probe.broken = False
-            daemon.pool.wake("broken")
-            await daemon.pool.wait_until_idle()
             self.assertEqual(daemon.inbox.fetch_pending("broken"), [])
+            failed = daemon.inbox.list_events(inbox_id="broken", status="failed")
+            self.assertEqual(len(failed), 1)
+            self.assertIn("worktree", failed[0].last_error or "")
+            self.assertEqual([r.inbox_id for r in daemon.pool.reports], ["healthy"])
         finally:
             stop.set()
             await task

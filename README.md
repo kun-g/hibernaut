@@ -13,7 +13,7 @@ Clean Architecture (L0–L3) Python runtime for **Always-on Agents** built aroun
 ```text
 src/agent_runtime/
 ├── core/                  # L0 + L1: Zero external dependencies (Python stdlib only)
-│   ├── models.py          # Event, SessionRef (correlation_key, executor_id, executor_session_id), resolve_executor_id, TimerSpec, OutboxMessage, PermissionDecision, RunOutcome, NewEventPolicy
+│   ├── models.py          # 4-state Event/SessionRef (attempts, last_error, status, work_key, correlation_key, executor binding), resolve_executor_id, TimerSpec, OutboxMessage, RunOutcome
 │   └── ports.py           # 9 L1 Ports (with ExecutorPort.executor_id) + RunCapabilities (fold / interrupt control hooks)
 ├── engine/                # L2: Depends ONLY on core/ (never imports adapters/ or app/)
 │   ├── handler.py         # EventHandler: lightweight ingest, idempotent dedup (dropped), fast ACK, async Worker wake
@@ -55,7 +55,7 @@ The HTTP daemon watches the file passed to `--config` once per second, including
 
 The HTTP endpoints handle requests on parallel threads (backlog 128); stopping or reloading the daemon waits for requests already accepted. SQLite access from those threads and the worker loop goes through one locked connection, and writes use `BEGIN IMMEDIATE`, so deduplication and leases stay atomic. A worker runs all pending events that share a session (by `session_id`, then `correlation_key`) as one batch, in order of each group's first event. Events with neither key are unrelated and run one at a time under `defer` and `fold`. A session's batch closes at an approval reply (earlier events for that session run with it) or at an event whose `explicit_workdir` or `executor` differs; later events for that session wait for the next pass. When an approval for a session is already queued, it always joins that session's first batch and runs on the executor that suspended the session; incompatible events ahead of it, including ones routed to another executor, run afterwards. `fold` never pulls events across that boundary, and `interrupt` never restarts a Run that carries an approval.
 
-Hibernaut checks local branch names when allocating a worktree, including branches without a checkout. If Orca adds a numeric suffix during creation, Hibernaut records the branch and path from the creation receipt after verifying both against the primary repository's Git worktree list. On the next wake, it repairs stale SQLite paths for registered worktrees. If an executor exhausts its retries, the daemon logs the affected inbox and keeps the batch pending. A new event in that inbox wakes it for another attempt.
+Hibernaut checks local branch names when allocating a worktree, including branches without a checkout. If Orca adds a numeric suffix during creation, Hibernaut records the branch and path from the creation receipt after verifying both against the primary repository's Git worktree list. On the next wake, it repairs stale SQLite paths for registered worktrees. On lease acquire, a worker recovers any orphaned `processing` events back to `pending`, claims pending events (`attempts += 1`), ensures an `active` `SessionRef` and binds `event_inbox.session_id` before execution, commits `done` immediately after `Silent`/`Emit`/`Suspend` side effects, requeues on `interrupt`, and marks `failed` with `last_error` once retries are exhausted. Session rotation archives the previous session (`archived`) while keeping the worktree reference count at 1; closing a session (`closed` via event or `hibernaut_close_session`) triggers worktree reclaim only once `count_active_by_work_key(work_key) == 0`.
 
 For a visible agent session, set `orca_agent = "claude"` under `[executors.claude]` and use `worktree_backend = "orca"` for the project. Restart the daemon after installing this version. Each managed run opens an Orca terminal in the background where you can watch progress and respond to permission prompts. The agent returns its `Silent`, `Emit`, or `Suspend` outcome in a per-run temporary file. Successful terminal tabs stay open. `timeout_seconds` includes time spent waiting for input. Configure agent accounts and environment in Orca. The template's `command`, `args`, and `env` apply to direct CLI runs, including Git worktrees and explicit directory overrides.
 
@@ -79,7 +79,7 @@ Use an origin you trust to supply executable code. A dirty checkout (including u
 
 ## MCP Server Integration (`stdio` & Remote `/mcp`)
 
-Hibernaut exposes 6 MCP tools (`hibernaut_ingest_event`, `hibernaut_list_sessions`, `hibernaut_list_events`, `hibernaut_list_workspaces`, `hibernaut_resolve_approval`, `hibernaut_reclaim_workspace`).
+Hibernaut exposes 7 MCP tools (`hibernaut_ingest_event`, `hibernaut_list_sessions`, `hibernaut_list_events`, `hibernaut_list_workspaces`, `hibernaut_resolve_approval`, `hibernaut_reclaim_workspace`, `hibernaut_close_session`).
 
 ### 1. Local IDE / CLI (`stdio`)
 
