@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
+from agent_runtime.core.models import (
+    Emit,
+    Event,
+    RunOutcome,
+    SessionRef,
+    Silent,
+    Suspend,
+    new_id,
+)
+from agent_runtime.core.ports import RunCapabilities
+
+
+def _empty_env() -> dict[str, str]:
+    return {}
+
+
+@dataclass(frozen=True, slots=True)
+class CLITemplate:
+    name: str
+    command: str
+    args: tuple[str, ...] = ()
+    env: dict[str, str] = field(default_factory=_empty_env)
+    timeout_seconds: float = 300.0
+
+
+DEFAULT_CLI_TEMPLATES: dict[str, CLITemplate] = {
+    "claude": CLITemplate(name="claude", command="claude", args=("-p",)),
+    "cursor-agent": CLITemplate(name="cursor-agent", command="cursor-agent", args=("-p",)),
+    "grok": CLITemplate(name="grok", command="grok", args=("-p",)),
+    "dsh": CLITemplate(name="dsh", command="dsh", args=("-c",)),
+}
+
+
+class LocalCLIExecutor:
+    def __init__(
+        self,
+        *,
+        worktree_manager: OrcaWorktreeManager,
+        inbox_checkout_map: Mapping[str, str | Path],
+        templates: Mapping[str, CLITemplate] | None = None,
+        default_executor: str = "claude",
+        interrupt_poll_interval: float = 0.05,
+    ) -> None:
+        self._worktree_manager = worktree_manager
+        self._inbox_checkout_map: dict[str, Path] = {
+            k: Path(v).resolve() for k, v in inbox_checkout_map.items()
+        }
+        merged = dict(DEFAULT_CLI_TEMPLATES)
+        if templates:
+            merged.update(templates)
+        self._templates = merged
+        self._default_executor = default_executor
+        self._interrupt_poll_interval = interrupt_poll_interval
+
+    async def execute(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+    ) -> RunOutcome:
+        if not events:
+            return Silent()
+
+        inbox_id = events[0].inbox_id
+        session_id = session.session_id if session is not None else new_id("sess")
+
+        explicit_workdir = self._extract_explicit_workdir(events)
+        work_key = (
+            events[0].correlation_key
+            or (session.correlation_key if session is not None else None)
+            or f"task:{inbox_id}:{events[0].event_id}"
+        )
+        primary_checkout = self._inbox_checkout_map.get(inbox_id)
+        if explicit_workdir is None and primary_checkout is None:
+            return Emit(
+                messages=(f"[LocalCLIExecutor] No primary checkout configured for '{inbox_id}'",),
+                session_id=session_id,
+            )
+
+        workdir = await asyncio.to_thread(
+            self._worktree_manager.resolve_workdir,
+            work_key=work_key,
+            primary_checkout=primary_checkout or Path(str(explicit_workdir)),
+            explicit_workdir=explicit_workdir,
+        )
+
+        executor_name = str(events[-1].payload.get("executor") or self._default_executor)
+        template = self._templates.get(executor_name)
+        if template is None:
+            return Emit(
+                messages=(f"[LocalCLIExecutor] Unknown CLI template '{executor_name}'",),
+                session_id=session_id,
+            )
+
+        prompt = self._build_prompt(events, session, caps)
+        env = dict(os.environ)
+        env.update(template.env)
+
+        proc = await asyncio.create_subprocess_exec(
+            template.command,
+            *template.args,
+            prompt,
+            cwd=str(workdir),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        stdout_bytes, stderr_bytes, returncode = await self._wait_with_interrupt(
+            proc,
+            caps=caps,
+            timeout_seconds=template.timeout_seconds,
+        )
+
+        stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
+        stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+        if returncode != 0:
+            detail = stderr or stdout or "unknown error"
+            return Emit(
+                messages=(f"[CLI:{template.name} exit={returncode}] {detail}",),
+                session_id=session_id,
+            )
+
+        return self._parse_outcome(stdout, session_id=session_id)
+
+    async def _wait_with_interrupt(
+        self,
+        proc: asyncio.subprocess.Process,
+        *,
+        caps: RunCapabilities,
+        timeout_seconds: float,
+    ) -> tuple[bytes, bytes, int]:
+        comm_task = asyncio.create_task(proc.communicate())
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+
+        try:
+            while not comm_task.done():
+                if caps.is_interrupted():
+                    await self._terminate_process(proc)
+                    comm_task.cancel()
+                    raise asyncio.CancelledError("CLI subprocess interrupted by new event")
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    await self._terminate_process(proc)
+                    comm_task.cancel()
+                    return b"", f"CLI timed out after {timeout_seconds}s".encode("utf-8"), 124
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        asyncio.shield(comm_task),
+                        timeout=min(self._interrupt_poll_interval, remaining),
+                    )
+                    return stdout, stderr, int(proc.returncode or 0)
+                except asyncio.TimeoutError:
+                    continue
+            stdout, stderr = await comm_task
+            return stdout, stderr, int(proc.returncode or 0)
+        except asyncio.CancelledError:
+            await self._terminate_process(proc)
+            if not comm_task.done():
+                comm_task.cancel()
+            raise
+
+    async def _terminate_process(self, proc: asyncio.subprocess.Process) -> None:
+        if proc.returncode is not None:
+            return
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=1.0)
+        except (ProcessLookupError, asyncio.TimeoutError):
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+
+    def _extract_explicit_workdir(self, events: Sequence[Event]) -> str | None:
+        for evt in reversed(events):
+            val = evt.payload.get("explicit_workdir")
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return None
+
+    def _build_prompt(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+    ) -> str:
+        baseline = caps.memory.load_baseline()
+        parts: list[str] = []
+        for name in ("instructions.md", "index.md", "reported.md"):
+            text = baseline.get(name, "").strip()
+            if text:
+                parts.append(f"## {name}\n{text}")
+        if session is not None and session.checkpoint:
+            parts.append(f"## session_checkpoint\n{session.checkpoint}")
+        serialized_events = [
+            {
+                "source": e.source,
+                "external_id": e.external_id,
+                "correlation_key": e.correlation_key,
+                "payload": e.payload,
+            }
+            for e in events
+        ]
+        parts.append(f"## events\n{json.dumps(serialized_events, ensure_ascii=False)}")
+        return "\n\n".join(parts)
+
+    def _parse_outcome(self, stdout: str, *, session_id: str) -> RunOutcome:
+        if not stdout:
+            return Silent()
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError:
+            return Emit(messages=(stdout,), session_id=session_id)
+
+        if isinstance(parsed, dict):
+            kind = str(parsed.get("outcome", "")).lower()
+            if kind == "silent":
+                return Silent()
+            if kind == "suspend":
+                return Suspend(
+                    request_id=str(parsed.get("request_id") or new_id("req")),
+                    prompt=str(parsed.get("prompt") or "需要人工确认"),
+                    session_checkpoint=str(parsed.get("session_checkpoint") or "{}"),
+                    session_id=session_id,
+                )
+            if kind == "emit":
+                msgs = parsed.get("messages")
+                if isinstance(msgs, list) and msgs:
+                    return Emit(messages=tuple(str(m) for m in msgs), session_id=session_id)
+                return Silent()
+
+        return Emit(messages=(stdout,), session_id=session_id)

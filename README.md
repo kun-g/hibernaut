@@ -1,11 +1,12 @@
 # Hibernaut
 
-Clean Architecture (L0–L3) Python runtime for **Always-on Agents** built around the **Sleep → Wake → Run → Write-back** lifecycle and **multi-`inbox_id` Actor partition concurrency**.
+Clean Architecture (L0–L3) Python runtime for **Always-on Agents** built around the **Sleep → Wake → Run → Write-back** lifecycle, **multi-`inbox_id` Actor partition concurrency**, and a **zero-dependency local self-bootstrap loop**.
 
-> Asleep by default (no tokens spent), wakes only when events or timers arrive, writes state back to durable storage, and exits cleanly with explicit `Silent | Emit | Suspend` outcomes.
+> Asleep by default (no tokens spent), wakes only when events, polled GitHub Issues, or timers arrive, runs in isolated dynamic worktrees, and exits cleanly with explicit `Silent | Emit | Suspend` outcomes.
 
 - Full up-to-date architecture & glossary: [`docs/architecture.md`](docs/architecture.md)
 - Contributor & coding-agent rules: [`AGENTS.md`](AGENTS.md)
+- Declarative config template: [`hibernaut.example.toml`](hibernaut.example.toml)
 
 ## Architecture Layers (L0–L3)
 
@@ -20,36 +21,35 @@ src/agent_runtime/
 │   ├── scheduler.py       # TimerScheduler: scans due Follow-up & Schedule timers -> appends Inbox events
 │   └── dispatcher.py      # OutboxDispatcher: paced Outbox delivery with anti-spam throttling and retries
 ├── adapters/              # L3: Volatile infrastructure implementations
-│   ├── storage_sqlite/    # SQLite WAL persistence (Inbox, Timers, Outbox, Lease Locks, Sessions + correlation_key rotation)
+│   ├── storage_sqlite/    # SQLite WAL (Inbox, Timers, Outbox, Leases, Sessions + correlation_key rotation, Workspaces)
 │   ├── memory_fs/         # FileSystemMemoryAdapter + PartitionedMemoryAdapter & WorkspacePartitionRegistry
 │   ├── permissions/       # Auto Mode classifier (allow / block / defer) + external CredentialProxyClient
 │   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
-│   └── channels/          # Multi-route HTTP server (/events, /webhooks/github, /webhooks/feishu), GitHubWebhookAdapter, FeishuWebhookAdapter, Console & outbound Webhook
+│   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + magpie env) & OrcaWorktreeManager (3 safety gates)
+│   └── channels/          # Multi-route HTTP server (/events, /webhooks/github, /webhooks/feishu), GitHubIssuePoller, FeishuChannelAdapter, Console
 └── app/
+    ├── config.py          # Stdlib tomllib loader for hibernaut.toml
     ├── bootstrap.py       # Single-inbox Composition Root
-    ├── main.py            # Multi-inbox_id AlwaysOnDaemon & AsyncWorkerPool (--policy defer|fold|interrupt)
+    ├── main.py            # Multi-inbox_id AlwaysOnDaemon & AsyncWorkerPool (--config hibernaut.toml)
     └── demo.py            # Zero-API-key end-to-end demo (Silent -> Suspend -> Human Approval -> Resume -> Emit)
 ```
 
-## Quick Start
+## Local Self-Bootstrap Quick Start
 
-Zero third-party dependencies required to run the demo, multi-inbox daemon, and full test suite (Python 3.11+ / 3.12+):
+Zero third-party dependencies required to run the local self-bootstrap daemon and full test suite (Python 3.11+ / 3.12+):
 
 ```bash
 git clone https://github.com/kun-g/hibernaut.git
 cd hibernaut
 
-# Run single-inbox end-to-end demo
+# 1. Copy and edit declarative config (primary checkout, CLI template, env var names)
+cp hibernaut.example.toml hibernaut.toml
+
+# 2. Launch full local Always-on daemon (GitHub Issue Poller + LocalCLIExecutor + Dynamic Worktree + Feishu/Console)
+PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
+
+# Or run the zero-config single-inbox demo
 PYTHONPATH=src python3 -m agent_runtime.app.demo
-
-# Run multi-inbox concurrent daemon (/events, /webhooks/github, /webhooks/feishu)
-PYTHONPATH=src python3 -m agent_runtime.app.main \
-  --workers 4 --policy defer --port 8080 \
-  --github-secret "$GITHUB_WEBHOOK_SECRET" \
-  --feishu-token "$FEISHU_VERIFICATION_TOKEN"
-
-# Run all tests (AST boundary gate + Port Contract Tests + Multi-inbox + NewEventPolicy + Webhooks E2E)
-PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 ## Anti-Corruption Gates (CI)
@@ -58,11 +58,6 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 pip install -e ".[dev]"
 
 lint-imports   # Gate 1: Static import boundary checks
-pytest -v      # Gate 2: Contract, concurrency, NewEventPolicy, correlation_key & Webhook tests
+pytest -v      # Gate 2: Contract, concurrency, NewEventPolicy, correlation_key, Webhook & Bootstrap tests
 pyright        # Gate 3: Strict static type checking on core/ and engine/
 ```
-
-## Plugging In Real Models & Channels
-
-- **Whitebox LLM**: Implement `agent_runtime.adapters.executor_whitebox.LLMBackend` (Anthropic, Gemini, or OpenAI SDK) and pass it to `build_daemon(llm=...)` or `build_runtime(llm=...)`.
-- **Blackbox Agent Runtime**: Add `adapters/executor_blackbox/` implementing `ExecutorPort` and bridge runtime hooks/MCP tools to `RunCapabilities`—zero changes required in `core/` or `engine/`.

@@ -6,6 +6,11 @@ from agent_runtime.adapters.storage_sqlite.stores import (
     SQLiteSessionStoreAdapter,
     SQLiteTimerAdapter,
 )
+from agent_runtime.adapters.storage_sqlite.workspaces import (
+    SQLiteWorkspaceStore,
+    WorkspaceRecord,
+    WorkspaceStatus,
+)
 
 __all__ = [
     "SQLiteDatabase",
@@ -14,4 +19,7 @@ __all__ = [
     "SQLiteOutboxAdapter",
     "SQLiteSessionStoreAdapter",
     "SQLiteTimerAdapter",
+    "SQLiteWorkspaceStore",
+    "WorkspaceRecord",
+    "WorkspaceStatus",
 ]

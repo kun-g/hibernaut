@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import signal
 import threading
 from collections.abc import Callable, Mapping
@@ -12,9 +13,13 @@ from typing import Any
 from agent_runtime.adapters.channels import (
     ConsoleChannelAdapter,
     FeishuWebhookAdapter,
+    GitHubIssuePoller,
     GitHubWebhookAdapter,
+    PollTarget,
+    build_feishu_or_console_channel,
     create_webhook_server,
 )
+from agent_runtime.adapters.executor_cli import LocalCLIExecutor, OrcaWorktreeManager
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
     RuleBasedDemoLLM,
@@ -29,7 +34,9 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteOutboxAdapter,
     SQLiteSessionStoreAdapter,
     SQLiteTimerAdapter,
+    SQLiteWorkspaceStore,
 )
+from agent_runtime.app.config import HibernautConfig, load_config
 from agent_runtime.core.models import NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, RunCapabilities
 from agent_runtime.engine import (
@@ -137,9 +144,12 @@ class AlwaysOnDaemon:
     outbox: SQLiteOutboxAdapter
     lock: SQLiteLeaseLockAdapter
     sessions: SQLiteSessionStoreAdapter
+    workspaces: SQLiteWorkspaceStore
     channel: ChannelPort
     github_webhook: GitHubWebhookAdapter | None = None
     feishu_webhook: FeishuWebhookAdapter | None = None
+    github_poller: GitHubIssuePoller | None = None
+    poll_interval_seconds: float = 60.0
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def register_partition(
@@ -173,18 +183,27 @@ class AlwaysOnDaemon:
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
 
-        try:
-            await asyncio.gather(
-                self.pool.run_forever(stopper),
-                self.scheduler.run_forever(
-                    interval_seconds=timer_interval_seconds,
+        loops: list[Any] = [
+            self.pool.run_forever(stopper),
+            self.scheduler.run_forever(
+                interval_seconds=timer_interval_seconds,
+                stop_event=stopper,
+            ),
+            self.dispatcher.run_forever(
+                interval_seconds=outbox_interval_seconds,
+                stop_event=stopper,
+            ),
+        ]
+        if self.github_poller is not None:
+            loops.append(
+                self.github_poller.run_forever(
+                    interval_seconds=self.poll_interval_seconds,
                     stop_event=stopper,
-                ),
-                self.dispatcher.run_forever(
-                    interval_seconds=outbox_interval_seconds,
-                    stop_event=stopper,
-                ),
+                )
             )
+
+        try:
+            await asyncio.gather(*loops)
         finally:
             if server is not None:
                 server.shutdown()
@@ -211,6 +230,8 @@ def build_daemon(
     github_repo_inbox_map: Mapping[str, str] | None = None,
     feishu_verification_token: str | None = None,
     feishu_chat_inbox_map: Mapping[str, str] | None = None,
+    poll_targets: list[PollTarget] | None = None,
+    poll_interval_seconds: float = 60.0,
 ) -> AlwaysOnDaemon:
     db = SQLiteDatabase(db_path)
     inbox = SQLiteInboxAdapter(db)
@@ -218,6 +239,7 @@ def build_daemon(
     outbox = SQLiteOutboxAdapter(db)
     lock = SQLiteLeaseLockAdapter(db)
     sessions = SQLiteSessionStoreAdapter(db)
+    workspaces = SQLiteWorkspaceStore(db)
     partitions = WorkspacePartitionRegistry(memory_root)
     permissions = AutoModePermissionAdapter()
     resolved_channel: ChannelPort = channel if channel is not None else ConsoleChannelAdapter()
@@ -273,6 +295,15 @@ def build_daemon(
         verification_token=feishu_verification_token,
         chat_inbox_map=feishu_chat_inbox_map,
     )
+    github_poller = (
+        GitHubIssuePoller(
+            handler,
+            targets=poll_targets,
+            repo_inbox_map=github_repo_inbox_map,
+        )
+        if poll_targets
+        else None
+    )
 
     return AlwaysOnDaemon(
         db=db,
@@ -286,14 +317,138 @@ def build_daemon(
         outbox=outbox,
         lock=lock,
         sessions=sessions,
+        workspaces=workspaces,
         channel=resolved_channel,
         github_webhook=github_webhook,
         feishu_webhook=feishu_webhook,
+        github_poller=github_poller,
+        poll_interval_seconds=poll_interval_seconds,
     )
+
+
+def build_daemon_from_config(
+    config: HibernautConfig,
+    *,
+    channel: ChannelPort | None = None,
+) -> AlwaysOnDaemon:
+    repo_inbox_map: dict[str, str] = {}
+    inbox_checkout_map: dict[str, str] = {}
+    inbox_chat_map: dict[str, str] = {}
+    chat_inbox_map: dict[str, str] = {}
+    poll_targets: list[PollTarget] = []
+    project_backends: dict[str, tuple[str, bool]] = {}
+
+    for proj in config.projects.values():
+        repo_inbox_map[proj.repo] = proj.inbox_id
+        inbox_checkout_map[proj.inbox_id] = proj.checkout
+        project_backends[proj.inbox_id] = (proj.worktree_backend, proj.orca_create_terminal)
+        if proj.feishu_chat_id:
+            inbox_chat_map[proj.inbox_id] = proj.feishu_chat_id
+            chat_inbox_map[proj.feishu_chat_id] = proj.inbox_id
+        poll_targets.append(
+            PollTarget(
+                repo=proj.repo,
+                inbox_id=proj.inbox_id,
+                labels=proj.poll_labels,
+            )
+        )
+
+    resolved_channel = channel or build_feishu_or_console_channel(
+        app_id_env=config.channels.feishu_app_id_env,
+        app_secret_env=config.channels.feishu_app_secret_env,
+        default_chat_id=config.channels.feishu_default_chat_id or None,
+        inbox_chat_map=inbox_chat_map,
+    )
+
+    gh_secret = os.environ.get(config.channels.github_webhook_secret_env) or None
+    feishu_token = os.environ.get(config.channels.feishu_verification_token_env) or None
+
+    # Create DB & workspace store up front so LocalCLIExecutor shares the same SQLite database.
+    daemon = build_daemon(
+        db_path=config.runtime.db_path,
+        memory_root=config.runtime.memory_root,
+        max_concurrency=config.runtime.max_concurrency,
+        channel=resolved_channel,
+        new_event_policy=config.runtime.new_event_policy,
+        github_webhook_secret=gh_secret,
+        github_repo_inbox_map=repo_inbox_map,
+        feishu_verification_token=feishu_token,
+        feishu_chat_inbox_map=chat_inbox_map,
+        poll_targets=poll_targets,
+        poll_interval_seconds=config.runtime.poll_interval_seconds,
+    )
+
+    if config.projects:
+        executors_by_inbox: dict[str, LocalCLIExecutor] = {}
+        for proj in config.projects.values():
+            wt_mgr = OrcaWorktreeManager(
+                workspace_store=daemon.workspaces,
+                backend=proj.worktree_backend,
+                create_terminal=proj.orca_create_terminal,
+            )
+            executors_by_inbox[proj.inbox_id] = LocalCLIExecutor(
+                worktree_manager=wt_mgr,
+                inbox_checkout_map=inbox_checkout_map,
+                templates=config.executors,
+                default_executor=config.runtime.default_executor,
+            )
+
+        default_mgr = OrcaWorktreeManager(workspace_store=daemon.workspaces)
+        fallback_cli = LocalCLIExecutor(
+            worktree_manager=default_mgr,
+            inbox_checkout_map=inbox_checkout_map,
+            templates=config.executors,
+            default_executor=config.runtime.default_executor,
+        )
+
+        def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
+            return AgentWorker(
+                worker_id=worker_id,
+                inbox=daemon.inbox,
+                timers=daemon.timers,
+                memory=daemon.partitions.memory_for(inbox_id),
+                permissions=AutoModePermissionAdapter(),
+                outbox=daemon.outbox,
+                executor=executors_by_inbox.get(inbox_id, fallback_cli),
+                lock=daemon.lock,
+                sessions=daemon.sessions,
+                new_event_policy=config.runtime.new_event_policy,
+            )
+
+        daemon.pool = AsyncWorkerPool(
+            worker_factory=_cli_worker_factory,
+            max_concurrency=config.runtime.max_concurrency,
+        )
+        daemon.handler = EventHandler(inbox=daemon.inbox, on_wake=daemon.pool.wake)
+        daemon.scheduler = TimerScheduler(
+            timers=daemon.timers,
+            inbox=daemon.inbox,
+            on_wake=daemon.pool.wake,
+        )
+        daemon.github_webhook = GitHubWebhookAdapter(
+            daemon.handler,
+            webhook_secret=gh_secret,
+            repo_inbox_map=repo_inbox_map,
+        )
+        daemon.feishu_webhook = FeishuWebhookAdapter(
+            daemon.handler,
+            verification_token=feishu_token,
+            chat_inbox_map=chat_inbox_map,
+        )
+        daemon.github_poller = GitHubIssuePoller(
+            daemon.handler,
+            targets=poll_targets,
+            mode=config.runtime.poll_mode,
+            github_token_env=config.channels.github_token_env,
+            repo_inbox_map=repo_inbox_map,
+        )
+
+    return daemon
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hibernaut multi-inbox Always-on Agent daemon")
+    parser.add_argument("--config", default=None, help="Path to hibernaut.toml")
     parser.add_argument("--db", default="./hibernaut.db")
     parser.add_argument("--memory-root", default="./agent_memory")
     parser.add_argument("--workers", type=int, default=4)
@@ -304,14 +459,22 @@ def main() -> None:
     parser.add_argument("--feishu-token", default=None)
     args = parser.parse_args()
 
-    daemon = build_daemon(
-        db_path=args.db,
-        memory_root=args.memory_root,
-        max_concurrency=args.workers,
-        new_event_policy=args.policy,
-        github_webhook_secret=args.github_secret,
-        feishu_verification_token=args.feishu_token,
-    )
+    if args.config:
+        cfg = load_config(args.config)
+        daemon = build_daemon_from_config(cfg)
+        host = cfg.channels.host
+        port = cfg.channels.port
+    else:
+        daemon = build_daemon(
+            db_path=args.db,
+            memory_root=args.memory_root,
+            max_concurrency=args.workers,
+            new_event_policy=args.policy,
+            github_webhook_secret=args.github_secret,
+            feishu_verification_token=args.feishu_token,
+        )
+        host = args.host
+        port = args.port
 
     async def _serve() -> None:
         stop_event = asyncio.Event()
@@ -324,8 +487,8 @@ def main() -> None:
         try:
             await daemon.run(
                 stop_event=stop_event,
-                webhook_host=args.host,
-                webhook_port=args.port,
+                webhook_host=host,
+                webhook_port=port,
             )
         finally:
             daemon.close()

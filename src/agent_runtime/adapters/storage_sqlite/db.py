@@ -72,6 +72,20 @@ CREATE INDEX IF NOT EXISTS idx_sessions_request
 
 CREATE INDEX IF NOT EXISTS idx_sessions_correlation
     ON sessions (inbox_id, correlation_key, updated_at);
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    work_key TEXT NOT NULL UNIQUE,
+    repo_checkout TEXT NOT NULL,
+    workdir TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('creating', 'ready', 'reclaiming')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspaces_repo
+    ON workspaces (repo_checkout, status);
 """
 
 
@@ -90,7 +104,6 @@ class SQLiteDatabase:
         self._conn.commit()
 
     def _ensure_migrations(self) -> None:
-        # Backward-compatible migration for existing SQLite files created before correlation_key.
         for table in ("event_inbox", "sessions"):
             cols = {
                 str(row["name"])
