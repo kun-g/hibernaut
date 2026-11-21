@@ -14,6 +14,8 @@ from tests.fakes import RecordingChannel
 
 
 class _ConcurrencyProbeExecutor:
+    executor_id = "mock-probe"
+
     def __init__(self, delay_seconds: float = 0.08) -> None:
         self._delay = delay_seconds
         self.active_inboxes: set[str] = set()

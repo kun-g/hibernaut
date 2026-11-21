@@ -9,9 +9,9 @@
 单轮 Run 四步循环：
 
 1. **An event arrives**：外部事件（用户消息、GitHub/飞书 Webhook、GitHub Issue 轮询、MCP 控制面调用、定时触发、审批回复）写入全局 Event Inbox 并快速 ACK。
-2. **A session starts**：按 4 级优先级解析会话（`approval_request_id` → 显式 `session_id` → `(inbox_id, correlation_key)` → 新建），加载跨 Run 持久化状态（基线 Memory + Session 断点/历史）。
+2. **A session starts**：按 4 级优先级解析会话（`approval_request_id` → 显式 `session_id` → `(inbox_id, correlation_key)` → 新建），加载跨 Run 持久化状态（基线 Memory + Session 断点/历史及绑定的 `executor_id` / `executor_session_id`），并按 4 级粘滞路由（`resolve_executor_id()`）选定目标 `ExecutorPort`。
 3. **The agent loop runs**：在 `PermissionPort` 门禁下执行推理、工具调用或本地 CLI 子进程，按需读取记忆与设置后续定时器。
-4. **The run writes back**：持久化新状态、记忆与 `(inbox_id, correlation_key) → session_id` 映射，产出强类型终态 `RunOutcome = Silent | Emit | Suspend` 后释放租约重新休眠。
+4. **The run writes back**：持久化新状态、记忆、`(inbox_id, correlation_key) → session_id` 映射以及执行器绑定（`selected_executor.executor_id`、`outcome.executor_session_id`），产出强类型终态 `RunOutcome = Silent | Emit | Suspend` 后释放租约重新休眠。
 
 ## 2. 整洁架构分层与依赖方向（L0–L3）
 
@@ -19,10 +19,10 @@
 
 | 层级 | 路径 | 职责定位 | 依赖规则 |
 | :--- | :--- | :--- | :--- |
-| **L0 领域契约层** | `core/models.py` | 不可变领域数据结构（含 `Event.correlation_key`、`SessionRef.correlation_key`）与强类型终态 `RunOutcome`、`NewEventPolicy` | 零外部依赖，仅 Python 标准库 |
-| **L1 核心端口层** | `core/ports.py` | 定义 9 个纯抽象 `Protocol` 端口及 `RunCapabilities` 控制钩子 | 仅依赖 Python 标准库 + L0 |
-| **L2 生命周期编排层** | `engine/` | `EventHandler`、`AgentWorker`、`TimerScheduler`、`OutboxDispatcher` | 仅依赖 L0 + L1，严禁 `import adapters/` 或 `app/` |
-| **L3 基础设施与组装层** | `adapters/` + `app/` | SQLite 存储（含 `workspaces` 表）、分区 Memory、Auto Mode + Credential Proxy、白盒执行器、`LocalCLIExecutor` + `OrcaWorktreeManager`、GitHub/飞书入站与轮询、`MCPServerAdapter`、飞书出站通道、`config.py`、`bootstrap.py`、`main.py` | 实现 L1 端口或驱动 L2 `EventHandler`，仅在 `app/` 组装注入 |
+| **L0 领域契约层** | `core/models.py` | 不可变领域数据结构（含 `Event.correlation_key`、`SessionRef.correlation_key / executor_id / executor_session_id`）、强类型终态 `RunOutcome`（仅携带 `executor_session_id`）、`NewEventPolicy` 与 4 级粘滞路由纯函数 `resolve_executor_id()` | 零外部依赖，仅 Python 标准库 |
+| **L1 核心端口层** | `core/ports.py` | 定义 9 个纯抽象 `Protocol` 端口（含 `ExecutorPort.executor_id`）及 `RunCapabilities` 控制钩子 | 仅依赖 Python 标准库 + L0 |
+| **L2 生命周期编排层** | `engine/` | `EventHandler`、`AgentWorker`（支持 `executors: Mapping[str, ExecutorPort]` 查表路由）、`TimerScheduler`、`OutboxDispatcher` | 仅依赖 L0 + L1，严禁 `import adapters/` 或 `app/` |
+| **L3 基础设施与组装层** | `adapters/` + `app/` | SQLite 存储（含 `workspaces` 表与旧库兼容迁移）、分区 Memory、Auto Mode + Credential Proxy、白盒执行器、`LocalCLIExecutor` + `OrcaWorktreeManager`、GitHub/飞书入站与轮询、`MCPServerAdapter`、飞书出站通道、`config.py`、`bootstrap.py`、`main.py` | 实现 L1 端口或驱动 L2 `EventHandler`，仅在 `app/` 组装注入 |
 
 ### L1 全部 9 个核心端口与 RunCapabilities
 
@@ -34,21 +34,25 @@
 | `PermissionPort` | 每次工具调用前置三态门禁（`allow` / `block` / `defer`） |
 | `OutboxPort` | 待发消息持久队列，解耦推理与外部通道投递 |
 | `LockPort` | 以 `inbox_id` 为主键的单活租约锁（`acquire` / `renew` / `release`），支持进程崩溃后租约到期自动接管 |
-| `SessionStorePort` | 跨 Run 会话元数据、`Suspend` 审批断点（`find_by_request_id`）及外部关联键映射（`find_by_correlation_key`，支持会话轮换重绑） |
+| `SessionStorePort` | 跨 Run 会话元数据、执行器绑定（`executor_id` / `executor_session_id`）、`Suspend` 审批断点（`find_by_request_id`）及外部关联键映射（`find_by_correlation_key`，支持会话轮换重绑） |
 | `ChannelPort` | 外部投递通道（`FeishuChannelAdapter`、`ConsoleChannelAdapter`、`WebhookChannelAdapter`） |
-| `ExecutorPort` | Agent 单轮推理边界（白盒 `WhiteboxExecutor` 或黑盒 `LocalCLIExecutor`），输入批次事件与 `RunCapabilities`，输出 `RunOutcome` |
+| `ExecutorPort` | Agent 单轮推理边界（声明只读属性 `executor_id`；白盒 `WhiteboxExecutor` 或黑盒 `LocalCLIExecutor`），输入批次事件与 `RunCapabilities`，输出 `RunOutcome` |
 | `RunCapabilities` | 注入单轮 Run 的受控能力集合：`memory`、`timers`、`permissions`、`poll_folded_events()`、`is_interrupted()` |
 
-## 3. 外部关联键 `correlation_key` 与 L3 入站/出站通道
+## 3. 外部关联键 `correlation_key`、多执行器粘滞路由与 L3 通道
 
 - **4 级会话解析优先级**（`AgentWorker._resolve_session()`）：`approval_request_id` → 显式 `session_id` → `(inbox_id, correlation_key)` → 新建 `session_id`。
 - **同键批处理与会话轮换重绑**：`_group_into_batches()` 与 `fold` 同步支持按 `correlation_key` 归组；重置开新 Session 时向 `SessionStorePort.save()` 写入同一 `(inbox_id, correlation_key)` 自动解绑旧会话并指向新活跃会话。
+- **多执行器粘滞路由与原生会话续接闭环**：
+  - `resolve_executor_id()` 按 4 级优先级决定目标执行器：① 事件显式指定 `event.payload.get("executor_id")`（允许主动切换）→ ② 已有会话的 `session.executor_id`（默认粘滞，避免后续事件不指定时静默回退 `default_executor`）→ ③ 项目级默认 `projects.<name>.executor`（可选）→ ④ 全局 `runtime.default_executor`。
+  - `AgentWorker` 持有全量注册的 `executors: Mapping[str, ExecutorPort]`，每轮查表执行后统一将 `selected_executor.executor_id` 与 `outcome.executor_session_id` 写入 `SessionStorePort`；`RunOutcome` 保持简洁不携带 `executor_id`。
+  - `LocalCLIExecutor` 仅在 `session.executor_id == template.name` 且 `session.executor_session_id` 非空并配置了 `resume_args` 时启用原生会话续接；切换执行器时自动回退全新 `args`，绝不跨执行器错传原生会话 ID。
 - **L3 入站驱动适配器**（直接调用 `EventHandler.ingest()`）：
   - `POST /events`：通用 JSON 事件接入（202 ACK）。
   - `POST /webhooks/github`（`GitHubWebhookAdapter`）：HMAC-SHA256 `X-Hub-Signature-256` 验签、`X-GitHub-Delivery` 幂等键、`repo -> inbox_id` 映射、Issue/PR 自动提取 `correlation_key = f"github:{repo}#{number}"`。
   - `GitHubIssuePoller`（`adapters/channels/github_poller.py`）：无公网 Webhook 时的本机定时轮询入口（支持 `gh issue list` 或 GitHub REST API 及 label 过滤），生成 `external_id = f"github-poll:{repo}#{number}:{updated_at}"` 与完全一致的 `correlation_key = f"github:{repo}#{number}"`。
   - `POST /webhooks/feishu`（`FeishuWebhookAdapter`）：支持飞书 v2.0 `url_verification` Challenge 握手（200 OK）、`verification_token` 校验、`header.event_id` 幂等键、话题 `correlation_key` 提取与审批卡片回调恢复 `Suspend`。
-  - `MCPServerAdapter`（`adapters/channels/mcp_server.py`）：纯标准库 MCP JSON-RPC 2.0 入站控制面（`initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call`），暴露 5 个最小核心 Tool（`hibernaut_ingest_event`、`hibernaut_list_sessions`、`hibernaut_list_workspaces`、`hibernaut_resolve_approval`、`hibernaut_reclaim_workspace`），同时支持本机 `--mcp-stdio` 行帧直连与远程 `POST /mcp` Streamable HTTP（强制 `Authorization: Bearer <HIBERNAUT_MCP_TOKEN>` 校验，未配置 token 时默认禁用返回 404）。
+  - `MCPServerAdapter`（`adapters/channels/mcp_server.py`）：纯标准库 MCP JSON-RPC 2.0 入站控制面（`initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call`），暴露 6 个核心 Tool（`hibernaut_ingest_event`、`hibernaut_list_sessions`（含 `executor_id` / `executor_session_id`）、`hibernaut_list_events`、`hibernaut_list_workspaces`、`hibernaut_resolve_approval`、`hibernaut_reclaim_workspace`），同时支持本机 `--mcp-stdio` 行帧直连与远程 `POST /mcp` Streamable HTTP（强制 `Authorization: Bearer <HIBERNAUT_MCP_TOKEN>` 校验，未配置 token 时默认禁用返回 404）。
 - **L3 飞书出站通道**（`FeishuChannelAdapter`，`adapters/channels/feishu_channel.py`）：仅用标准库 `urllib.request`，基于 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 自动缓存刷新 `tenant_access_token`，发送普通文本通知与 `Suspend` 交互审批卡片；未配置凭据时自动降级为 `ConsoleChannelAdapter`。
 
 ## 4. 本机自举闭环：`OrcaWorktreeManager`、`LocalCLIExecutor` 与声明式配置
@@ -59,8 +63,8 @@
   1. **意图占位与对账**：创建前先在 SQLite `workspaces` 表写入 `creating` 占位，崩溃重入时先对账本地目录再决定复用或清理。
   2. **路径落盘**：创建后按主仓库和分支查询 `git worktree list --porcelain -z`，确认唯一且可用的独立工作区后再标记 `ready`。复用时用同一登记表校正 SQLite 的旧路径。执行器重试耗尽后，Worker 池记录 inbox 和异常，保留该批次为 `pending`，继续处理其他 inbox。同 inbox 下次唤醒时重试。
   3. **三关安全回收**（`reclaim()`）：双重归属校验（`hb-` 前缀 + `workspaces` 表记录）+ 三关检查（无开着 PR / 无未提交改动 / 无未推送提交），任一不通过即保留目录并经 Outbox 告警。
-- **可配置本地 CLI 执行器**（`LocalCLIExecutor`）：实现 `ExecutorPort`，内置 `claude`（默认）、`cursor-agent`、`grok`、`dsh` 模板，支持透传环境变量对接本地模型网关（如 `yetone/magpie`），响应 `caps.is_interrupted()` 安全终止子进程。
-- **声明式配置**（`hibernaut.example.toml` + `app/config.py` + `app/main.py --config`）：使用标准库 `tomllib` 解析，仅存静态主检出、执行器模板与凭据环境变量名，绝不存动态 worktree 路径。HTTP daemon 热加载时先组装新配置，待旧 Worker 池排空后再切换，沿用同一条 SQLite 连接及未变更的监听 socket。
+- **可配置本地 CLI 执行器**（`LocalCLIExecutor`）：实现 `ExecutorPort`，内置 `claude`（默认）、`cursor-agent`、`grok`、`dsh` 模板，支持可选 `resume_args` 原生会话续接（自动从 JSON 输出提取 `executor_session_id` / `session_id`）及透传环境变量对接本地模型网关（如 `yetone/magpie`），响应 `caps.is_interrupted()` 安全终止子进程。
+- **声明式配置与禁止静默回退 Demo**（`hibernaut.example.toml` + `app/config.py` + `app/main.py --config`）：使用标准库 `tomllib` 解析，仅存静态主检出、执行器模板（全部 `[executors.<id>]` 注册进 `AgentWorker`，`[projects.<name>]` 支持可选 `executor`）与凭据环境变量名，绝不存动态 worktree 路径。以 `--config` 正式启动时严禁静默回退 `RuleBasedDemoLLM`：若未配置 `[executors]` 或缺少 `default_executor`，则向 `stderr` 打印清晰提示并以 **`ingest-only`（仅入站控制面）模式**启动，不启动消费 Worker 池，所有新事件安全保持 `pending` 等待配置修复（仅无 `--config` 或显式传 `--demo` 时才允许使用 Demo 执行器）。HTTP daemon 热加载时先组装新配置，待旧 Worker 池排空后再切换，沿用同一条 SQLite 连接及未变更的监听 socket。
 
 ## 5. 多 `inbox_id` Actor 分区并发与 `NewEventPolicy`
 
@@ -76,6 +80,6 @@
 | **Event Inbox** | 全局共享的物理事件表（SQLite `event_inbox`） | 全局 1 套，存放所有 `inbox_id` 的事件 |
 | **Inbox / `inbox_id`** | 逻辑并发队列（Actor Mailbox）及其一等路由键 / `worker_leases` 主键 | 同分区串行、跨分区并发；禁跨 `inbox_id` 共享同一本地代码目录 |
 | **Event** | 进入 Event Inbox 的不可变输入信封（`pending` / `done` / `dropped`） | 必属某个 `inbox_id`，可附带 `session_id` 或 `correlation_key` |
-| **`session_id`** | 隶属于某个 `inbox_id` 的跨 Run 对话转录与 `Suspend` 断点上下文单元 | 一个 `inbox_id` 下可有多个 `session_id` |
+| **`session_id`** | 隶属于某个 `inbox_id` 的跨 Run 对话转录与 `Suspend` 断点上下文单元 | 一个 `inbox_id` 下可有多个 `session_id`，可绑定 `executor_id` 与 `executor_session_id` |
 | **`correlation_key`** | 外部业务实体的确定性关联键（如 `github:kun-g/hibernaut#42`、`feishu:<chat>:<thread>`） | 经 `SessionStorePort.find_by_correlation_key()` 映射到当前活跃 `session_id`，同时作为 `workspaces` 表动态 worktree 复用键 |
 | **Run / Lease** | 单次唤醒执行周期 / 以 `inbox_id` 为主键的限时互斥租约 | `Suspend` 立即释放租约；进程崩溃后租约到期自动接管 |

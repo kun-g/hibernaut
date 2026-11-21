@@ -92,6 +92,7 @@ class TestMCPServerAdapter(unittest.IsolatedAsyncioTestCase):
             [
                 "hibernaut_ingest_event",
                 "hibernaut_list_sessions",
+                "hibernaut_list_events",
                 "hibernaut_list_workspaces",
                 "hibernaut_resolve_approval",
                 "hibernaut_reclaim_workspace",

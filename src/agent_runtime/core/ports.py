@@ -96,6 +96,9 @@ class RunCapabilities(Protocol):
 
 
 class ExecutorPort(Protocol):
+    @property
+    def executor_id(self) -> str: ...
+
     async def execute(
         self,
         events: Sequence[Event],

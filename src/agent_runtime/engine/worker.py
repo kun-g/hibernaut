@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Never, assert_never
 
@@ -14,6 +14,7 @@ from agent_runtime.core.models import (
     Silent,
     Suspend,
     new_id,
+    resolve_executor_id,
     utc_now_iso,
 )
 from agent_runtime.core.ports import (
@@ -70,22 +71,38 @@ class AgentWorker:
         memory: MemoryPort,
         permissions: PermissionPort,
         outbox: OutboxPort,
-        executor: ExecutorPort,
         lock: LockPort,
         sessions: SessionStorePort,
+        executor: ExecutorPort | None = None,
+        executors: Mapping[str, ExecutorPort] | None = None,
+        project_default_executor: str | None = None,
+        global_default_executor: str | None = None,
         lease_ttl_seconds: float = 60.0,
         max_retries: int = 2,
         new_event_policy: NewEventPolicy = "defer",
         interrupt_poll_interval_seconds: float = 0.02,
         max_interrupt_restarts: int = 10,
     ) -> None:
+        registry: dict[str, ExecutorPort] = dict(executors) if executors is not None else {}
+        if executor is not None:
+            registry.setdefault(executor.executor_id, executor)
+        if not registry:
+            raise ValueError("AgentWorker requires at least one executor")
+
+        resolved_global = (
+            global_default_executor
+            or (executor.executor_id if executor is not None else next(iter(registry.keys())))
+        )
+
         self._worker_id = worker_id
         self._inbox = inbox
         self._timers = timers
         self._memory = memory
         self._permissions = permissions
         self._outbox = outbox
-        self._executor = executor
+        self._executors = registry
+        self._project_default_executor = project_default_executor
+        self._global_default_executor = resolved_global
         self._lock = lock
         self._sessions = sessions
         self._lease_ttl_seconds = lease_ttl_seconds
@@ -124,6 +141,8 @@ class AgentWorker:
                 for session_ref, batch in batches:
                     self._lock.renew(inbox_id, self._worker_id, self._lease_ttl_seconds)
                     wake_signal.clear()
+
+                    selected_executor = self._select_executor(batch, session_ref)
 
                     consumed_ids: set[str] = {evt.event_id for evt in batch}
                     folded_events: list[Event] = []
@@ -164,6 +183,7 @@ class AgentWorker:
                     )
                     try:
                         outcome = await self._execute_batch(
+                            executor=selected_executor,
                             inbox_id=inbox_id,
                             batch=batch,
                             session_ref=session_ref,
@@ -174,8 +194,6 @@ class AgentWorker:
                             allow_interrupt=allow_interrupt,
                         )
                     except _RunInterrupted:
-                        # Do NOT apply outcome or mark_done; keep original batch pending
-                        # and merge with newly arrived events under the same lease.
                         interrupt_restarts += 1
                         restarted = True
                         break
@@ -189,6 +207,7 @@ class AgentWorker:
                         session_ref,
                         outcome,
                         batch_correlation_key,
+                        selected_executor,
                     )
                     all_done_ids = [evt.event_id for evt in batch] + [
                         evt.event_id for evt in folded_events
@@ -211,9 +230,33 @@ class AgentWorker:
 
         return reports
 
+    def _select_executor(
+        self,
+        batch: list[Event],
+        session_ref: SessionRef | None,
+    ) -> ExecutorPort:
+        event_executor_id: str | None = None
+        for evt in reversed(batch):
+            raw = evt.payload.get("executor_id")
+            if isinstance(raw, str) and raw.strip():
+                event_executor_id = raw.strip()
+                break
+
+        target_id = resolve_executor_id(
+            event_executor_id,
+            session_ref,
+            self._project_default_executor,
+            self._global_default_executor,
+        )
+        selected = self._executors.get(target_id)
+        if selected is None:
+            raise ExecutorFailed(f"Executor '{target_id}' is not registered")
+        return selected
+
     async def _execute_batch(
         self,
         *,
+        executor: ExecutorPort,
         inbox_id: str,
         batch: list[Event],
         session_ref: SessionRef | None,
@@ -224,9 +267,11 @@ class AgentWorker:
         allow_interrupt: bool,
     ) -> RunOutcome:
         if not allow_interrupt:
-            return await self._execute_with_retry(batch, session_ref, caps)
+            return await self._execute_with_retry(executor, batch, session_ref, caps)
 
-        exec_task = asyncio.create_task(self._execute_with_retry(batch, session_ref, caps))
+        exec_task = asyncio.create_task(
+            self._execute_with_retry(executor, batch, session_ref, caps)
+        )
         watcher_task = asyncio.create_task(
             self._watch_for_interrupt(
                 inbox_id=inbox_id,
@@ -339,6 +384,7 @@ class AgentWorker:
 
     async def _execute_with_retry(
         self,
+        executor: ExecutorPort,
         batch: list[Event],
         session_ref: SessionRef | None,
         caps: RunCapabilities,
@@ -346,7 +392,7 @@ class AgentWorker:
         last_exc: Exception | None = None
         for attempt in range(self._max_retries + 1):
             try:
-                return await self._executor.execute(batch, session_ref, caps)
+                return await executor.execute(batch, session_ref, caps)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -356,38 +402,64 @@ class AgentWorker:
         assert last_exc is not None
         raise ExecutorFailed(f"Executor failed after {self._max_retries + 1} attempts") from last_exc
 
+    def _resolve_executor_binding(
+        self,
+        selected_executor: ExecutorPort,
+        session_ref: SessionRef | None,
+        outcome_exec_sid: str | None,
+    ) -> tuple[str, str | None]:
+        exec_id = selected_executor.executor_id
+        if outcome_exec_sid is not None:
+            return exec_id, outcome_exec_sid
+        # Only preserve prior native session_id when the executor identity still matches.
+        if session_ref is not None and session_ref.executor_id == exec_id:
+            return exec_id, session_ref.executor_session_id
+        return exec_id, None
+
     def _apply_outcome(
         self,
         inbox_id: str,
         session_ref: SessionRef | None,
         outcome: RunOutcome,
         correlation_key: str | None,
+        selected_executor: ExecutorPort,
     ) -> str | None:
         match outcome:
-            case Silent():
+            case Silent(executor_session_id=exec_sid):
+                exec_id, bound_exec_sid = self._resolve_executor_binding(
+                    selected_executor,
+                    session_ref,
+                    exec_sid,
+                )
                 if session_ref is not None:
                     if (
                         session_ref.pending_request_id is not None
                         or (correlation_key is not None and session_ref.correlation_key != correlation_key)
+                        or session_ref.executor_id != exec_id
+                        or session_ref.executor_session_id != bound_exec_sid
                     ):
                         self._sessions.save(
                             SessionRef(
                                 session_id=session_ref.session_id,
                                 inbox_id=inbox_id,
                                 correlation_key=correlation_key,
+                                executor_id=exec_id,
+                                executor_session_id=bound_exec_sid,
                                 checkpoint=None,
                                 pending_request_id=None,
                                 updated_at=utc_now_iso(),
                             )
                         )
                     return session_ref.session_id
-                if correlation_key is not None:
+                if correlation_key is not None or bound_exec_sid is not None:
                     new_sid = new_id("sess")
                     self._sessions.save(
                         SessionRef(
                             session_id=new_sid,
                             inbox_id=inbox_id,
                             correlation_key=correlation_key,
+                            executor_id=exec_id,
+                            executor_session_id=bound_exec_sid,
                             checkpoint=None,
                             pending_request_id=None,
                             updated_at=utc_now_iso(),
@@ -395,7 +467,16 @@ class AgentWorker:
                     )
                     return new_sid
                 return None
-            case Emit(messages=messages, session_id=emit_session_id):
+            case Emit(
+                messages=messages,
+                session_id=emit_session_id,
+                executor_session_id=exec_sid,
+            ):
+                exec_id, bound_exec_sid = self._resolve_executor_binding(
+                    selected_executor,
+                    session_ref,
+                    exec_sid,
+                )
                 for text in messages:
                     self._outbox.enqueue(
                         inbox_id=inbox_id,
@@ -405,7 +486,11 @@ class AgentWorker:
                 target_sid = emit_session_id or (
                     session_ref.session_id
                     if session_ref is not None
-                    else (new_id("sess") if correlation_key is not None else None)
+                    else (
+                        new_id("sess")
+                        if (correlation_key is not None or bound_exec_sid is not None)
+                        else None
+                    )
                 )
                 if target_sid is not None:
                     self._sessions.save(
@@ -413,6 +498,8 @@ class AgentWorker:
                             session_id=target_sid,
                             inbox_id=inbox_id,
                             correlation_key=correlation_key,
+                            executor_id=exec_id,
+                            executor_session_id=bound_exec_sid,
                             checkpoint=None,
                             pending_request_id=None,
                             updated_at=utc_now_iso(),
@@ -424,7 +511,13 @@ class AgentWorker:
                 prompt=prompt,
                 session_checkpoint=checkpoint,
                 session_id=suspend_session_id,
+                executor_session_id=exec_sid,
             ):
+                exec_id, bound_exec_sid = self._resolve_executor_binding(
+                    selected_executor,
+                    session_ref,
+                    exec_sid,
+                )
                 target_sid = suspend_session_id or (
                     session_ref.session_id if session_ref else new_id("sess")
                 )
@@ -433,6 +526,8 @@ class AgentWorker:
                         session_id=target_sid,
                         inbox_id=inbox_id,
                         correlation_key=correlation_key,
+                        executor_id=exec_id,
+                        executor_session_id=bound_exec_sid,
                         checkpoint=checkpoint,
                         pending_request_id=request_id,
                         updated_at=utc_now_iso(),
@@ -449,8 +544,5 @@ class AgentWorker:
                 )
                 return target_sid
             case _ as unreachable:
-                _exhaustive(unreachable)
-
-
-def _exhaustive(value: Never) -> Never:
-    assert_never(value)
+                never_val: Never = unreachable
+                assert_never(never_val)
