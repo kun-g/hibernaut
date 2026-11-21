@@ -52,6 +52,18 @@ PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
 PYTHONPATH=src python3 -m agent_runtime.app.demo
 ```
 
+### Run with automatic updates (macOS / Linux)
+
+From a dedicated Git checkout on `main`, launch the supervisor with Python 3.11+ and Git installed:
+
+```bash
+python3 scripts/run_updating.py --port 8080
+```
+
+The supervisor checks the configured `origin/main` every 300 seconds. Use `--interval 60` for one-minute checks. Daemon options such as `--db`, `--memory-root`, `--workers`, and `--policy` are forwarded across restarts. Stop with `Ctrl+C`.
+
+Use an origin you trust to supply executable code. A dirty checkout (including untracked files), another branch, a divergent history, or a failed fetch leaves the running daemon in place. On a fast-forward, the old daemon closes ingress and drains accepted work before the supervisor applies the commit and relaunches. Clients should retry during this short interruption using the same external event ID. Keep runtime state in ignored paths or outside the checkout. The supervisor reuses those paths. If a new daemon fails to start, the supervisor exits with its status for operator recovery.
+
 ## Anti-Corruption Gates (CI)
 
 ```bash

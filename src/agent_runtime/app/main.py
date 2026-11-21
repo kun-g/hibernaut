@@ -173,43 +173,37 @@ class AlwaysOnDaemon:
         server_thread = None
 
         if webhook_host is not None and webhook_port is not None:
+            loop = asyncio.get_running_loop()
+            webhook_handler = EventHandler(self.inbox, lambda key: loop.call_soon_threadsafe(self.pool.wake, key))
             server = create_webhook_server(
-                webhook_host,
-                webhook_port,
-                self.handler,
-                github_adapter=self.github_webhook,
-                feishu_adapter=self.feishu_webhook,
+                webhook_host, webhook_port, webhook_handler,
+                github_adapter=self.github_webhook, feishu_adapter=self.feishu_webhook,
             )
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
 
-        loops: list[Any] = [
-            self.pool.run_forever(stopper),
-            self.scheduler.run_forever(
-                interval_seconds=timer_interval_seconds,
-                stop_event=stopper,
-            ),
-            self.dispatcher.run_forever(
-                interval_seconds=outbox_interval_seconds,
-                stop_event=stopper,
-            ),
-        ]
-        if self.github_poller is not None:
-            loops.append(
-                self.github_poller.run_forever(
-                    interval_seconds=self.poll_interval_seconds,
-                    stop_event=stopper,
-                )
-            )
-
-        try:
-            await asyncio.gather(*loops)
-        finally:
-            if server is not None:
-                server.shutdown()
-                server.server_close()
-            if server_thread is not None:
-                server_thread.join(timeout=2.0)
+        workers_stop = asyncio.Event()
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(self.pool.run_forever(workers_stop))
+            tasks.create_task(self.scheduler.run_forever(timer_interval_seconds, stopper))
+            tasks.create_task(self.dispatcher.run_forever(outbox_interval_seconds, stopper))
+            poll_task = None
+            if self.github_poller is not None:
+                poll_task = tasks.create_task(self.github_poller.run_forever(
+                    interval_seconds=self.poll_interval_seconds, stop_event=stopper,
+                ))
+            try:
+                await stopper.wait()
+                if poll_task is not None:
+                    await poll_task
+            finally:
+                # Keep workers available until the last accepted webhook has queued its wake.
+                if server is not None:
+                    await asyncio.to_thread(server.shutdown)
+                    server.server_close()
+                if server_thread is not None:
+                    server_thread.join()
+                workers_stop.set()
 
     def close(self) -> None:
         self.db.close()
