@@ -74,7 +74,10 @@ class LocalCLIExecutor:
         inbox_id = events[0].inbox_id
         session_id = session.session_id if session is not None else new_id("sess")
 
-        explicit_workdir = self._extract_explicit_workdir(events)
+        # The Run target (workdir, CLI template) comes from the batch's ordinary events; an
+        # approval reply resumes their Run and only supplies a target when it runs alone.
+        target_events = [e for e in events if not _is_approval(e)] or list(events)
+        explicit_workdir = self._extract_explicit_workdir(target_events)
         work_key = (
             events[0].correlation_key
             or (session.correlation_key if session is not None else None)
@@ -94,7 +97,7 @@ class LocalCLIExecutor:
             explicit_workdir=explicit_workdir,
         )
 
-        executor_name = str(events[-1].payload.get("executor") or self._default_executor)
+        executor_name = self._extract_executor(target_events) or self._default_executor
         template = self._templates.get(executor_name)
         if template is None:
             return Emit(
@@ -186,11 +189,10 @@ class LocalCLIExecutor:
                 pass
 
     def _extract_explicit_workdir(self, events: Sequence[Event]) -> str | None:
-        for evt in reversed(events):
-            val = evt.payload.get("explicit_workdir")
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-        return None
+        return _last_text(events, "explicit_workdir")
+
+    def _extract_executor(self, events: Sequence[Event]) -> str | None:
+        return _last_text(events, "executor")
 
     def _build_prompt(
         self,
@@ -244,3 +246,16 @@ class LocalCLIExecutor:
                 return Silent()
 
         return Emit(messages=(stdout,), session_id=session_id)
+
+
+def _is_approval(event: Event) -> bool:
+    request_id = event.payload.get("approval_request_id")
+    return isinstance(request_id, str) and bool(request_id)
+
+
+def _last_text(events: Sequence[Event], key: str) -> str | None:
+    for evt in reversed(events):
+        val = evt.payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None

@@ -153,6 +153,17 @@ class TestBatchGrouping(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(executor.calls, [["A1"], ["B1"], ["A2", "A3"]])
 
+    async def test_pending_approval_joins_first_batch_past_incompatible_events(self) -> None:
+        worker, inbox, executor = _build("defer")
+        inbox.append(_event("A1", session_id="chat_1", workdir="/repo/a"))
+        inbox.append(_event("A2", session_id="chat_1", workdir="/repo/b"))
+        inbox.append(_approval("A-approve", session_id="chat_1"))
+        inbox.append(_event("A3", session_id="chat_1", workdir="/repo/a"))
+
+        await worker.process_inbox(INBOX)
+
+        self.assertEqual(executor.calls, [["A1", "A-approve"], ["A2"], ["A3"]])
+
     async def test_fold_does_not_cross_approval_boundary(self) -> None:
         worker, inbox, executor = _build("fold")
         inbox.append(_approval("A-approve", session_id="chat_1"))

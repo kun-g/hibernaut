@@ -122,6 +122,39 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[APPROVED]", outcome.messages[0])
         self.assertIn("bob@example.com", outcome.messages[0])
 
+    async def test_approval_applies_when_incompatible_notes_are_queued_first(self) -> None:
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="req-email-3",
+            payload={"action": "send_email", "to": "carol@example.com", "subject": "Report"},
+        )
+        reports1 = await self.app.worker.process_inbox("u1")
+        suspend_outcome = reports1[0].outcome
+        assert isinstance(suspend_outcome, Suspend)
+        session_id = reports1[0].session_id
+
+        for ext, workdir in (("note-a", "/a"), ("note-b", "/b")):
+            self.app.handler.ingest(
+                inbox_id="u1",
+                source="im",
+                external_id=ext,
+                payload={"text": ext, "explicit_workdir": workdir},
+                session_id=session_id,
+            )
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="appr-email-3",
+            payload={"approval_request_id": suspend_outcome.request_id, "approved": True},
+        )
+        reports2 = await self.app.worker.process_inbox("u1")
+
+        first = reports2[0].outcome
+        assert isinstance(first, Emit)
+        self.assertIn("[APPROVED]", first.messages[0])
+        self.assertEqual(len(reports2), 2)
+
     async def test_auto_mode_blocks_dangerous_tool_call(self) -> None:
         self.app.handler.ingest(
             inbox_id="u1",

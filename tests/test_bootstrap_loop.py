@@ -298,6 +298,41 @@ class TestLocalCLIExecutor(unittest.IsolatedAsyncioTestCase):
         self.db.close()
         self._tmp.cleanup()
 
+    async def test_run_target_comes_from_ordinary_events_not_the_approval(self) -> None:
+        def tpl(name: str) -> CLITemplate:
+            code = f"import os; print('{name}:' + os.path.basename(os.getcwd()))"
+            return CLITemplate(name=name, command=sys.executable, args=("-I", "-c", code))
+
+        executor = LocalCLIExecutor(
+            worktree_manager=self.mgr,
+            inbox_checkout_map={},
+            templates={"claude": tpl("default"), "custom": tpl("custom"), "other": tpl("other")},
+        )
+        for name in ("a", "c"):
+            (self.root / name).mkdir()
+
+        def evt(external_id: str, **payload: str) -> Event:
+            return Event(inbox_id="proj:x", source="test", external_id=external_id, payload=dict(payload))
+
+        text = evt("t1", explicit_workdir=str(self.root / "a"), executor="custom")
+        bare_approval = evt("ap1", approval_request_id="req-1")
+        targeted_approval = evt(
+            "ap2",
+            approval_request_id="req-1",
+            explicit_workdir=str(self.root / "c"),
+            executor="other",
+        )
+        cases = [
+            ([text, bare_approval], "custom:a"),
+            ([text, targeted_approval], "custom:a"),
+            ([targeted_approval], "other:c"),
+        ]
+        for batch, expected in cases:
+            with self.subTest(batch=[e.external_id for e in batch]):
+                out = await executor.execute(batch, None, _FakeCaps())
+                assert isinstance(out, Emit)
+                self.assertEqual(out.messages, (expected,))
+
     async def test_cli_env_passthrough_outcomes_and_interrupt_termination(self) -> None:
         emit_tpl = CLITemplate(
             name="claude",

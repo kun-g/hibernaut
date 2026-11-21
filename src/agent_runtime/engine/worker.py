@@ -332,19 +332,27 @@ class AgentWorker:
         # Same-key events form one batch in seq order; batches run in order of first seq.
         # Events without session_id/correlation_key are unrelated, so each runs alone
         # (interrupt restarts still merge them). A key's batch closes at an approval decision
-        # (earlier same-key events stay with it: a suspended session treats a Run without
-        # the decision as a rejection) or at an event with a different execution target.
-        # Later events of a closed key wait for the next fetch, which resolves them against
-        # the updated session.
-        batches: list[tuple[SessionRef | None, list[Event]]] = []
-        open_batches: dict[tuple[str, str] | None, list[Event]] = {}
-        closed_keys: set[tuple[str, str] | None] = set()
+        # or at an event with a different execution target; later events of a closed key
+        # wait for the next fetch, which resolves them against the updated session.
+        # A suspended session treats any Run without the decision as a rejection, so when
+        # the snapshot holds a decision for a key, that key's first batch must carry it:
+        # incompatible events ahead of the decision are held back instead of closing the key.
+        resolved: list[tuple[Event, SessionRef | None, tuple[str, str] | None]] = []
+        keys_with_decision: set[tuple[str, str]] = set()
         for event in events:
             resolved_session = self._resolve_session(event)
             resolved_key = self._batch_key(event, resolved_session)
+            resolved.append((event, resolved_session, resolved_key))
+            if resolved_key is not None and self._is_approval_decision(event):
+                keys_with_decision.add(resolved_key)
+
+        batches: list[tuple[SessionRef | None, list[Event]]] = []
+        open_batches: dict[tuple[str, str] | None, list[Event]] = {}
+        closed_keys: set[tuple[str, str] | None] = set()
+        for event, resolved_session, resolved_key in resolved:
             if resolved_key in closed_keys:
                 continue
-            if self._is_approval_decision(event) and resolved_key is not None:
+            if resolved_key is not None and self._is_approval_decision(event):
                 closed_keys.add(resolved_key)
                 open_batch = open_batches.get(resolved_key)
                 if open_batch is not None:
@@ -358,7 +366,8 @@ class AgentWorker:
             open_batch = open_batches.get(resolved_key)
             if open_batch is not None:
                 if self._execution_target(event) != self._batch_target(open_batch):
-                    closed_keys.add(resolved_key)
+                    if resolved_key not in keys_with_decision:
+                        closed_keys.add(resolved_key)
                     continue
                 open_batch.append(event)
                 continue

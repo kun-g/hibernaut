@@ -143,6 +143,28 @@ class SQLiteWorkspaceStore:
             )
             return now if cur.rowcount == 1 else None
 
+    def renew_reclaim(self, work_key: str, *, claim: str) -> str | None:
+        now = utc_now_iso()
+        while now == claim:
+            now = utc_now_iso()
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE workspaces SET updated_at = ?
+                WHERE work_key = ? AND status = 'reclaiming' AND updated_at = ?
+                """,
+                (now, work_key, claim),
+            )
+            return now if cur.rowcount == 1 else None
+
+    def finish_reclaim(self, work_key: str, *, claim: str) -> bool:
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM workspaces WHERE work_key = ? AND status = 'reclaiming' AND updated_at = ?",
+                (work_key, claim),
+            )
+            return cur.rowcount == 1
+
     def release_reclaim(self, work_key: str, *, claim: str, status: WorkspaceStatus) -> None:
         now = utc_now_iso()
         with self._db.transaction() as conn:

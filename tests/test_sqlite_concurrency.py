@@ -253,6 +253,64 @@ class TestSQLiteThreadSafety(unittest.TestCase):
         self.assertEqual(len(removals), 1)
         db.close()
 
+    def test_slow_removal_keeps_claim_fresh_against_takeover(self) -> None:
+        db = SQLiteDatabase(self.db_path)
+        store = SQLiteWorkspaceStore(db)
+        self._ready_workspace(store)
+        in_remove = threading.Event()
+        finish_remove = threading.Event()
+        removals: list[tuple[str, ...]] = []
+
+        def runner(argv: Sequence[str], cwd: Path | None) -> CommandResult:
+            _ = cwd
+            if "remove" in argv:
+                removals.append(tuple(argv))
+                in_remove.set()
+                finish_remove.wait(timeout=5)
+            return CommandResult(0, "", "")
+
+        manager = OrcaWorktreeManager(
+            workspace_store=store,
+            backend="git",
+            runner=runner,
+            reclaim_stale_after_seconds=0.3,
+        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(manager.reclaim, "x")
+            self.assertTrue(in_remove.wait(timeout=5))
+            threading.Event().wait(0.6)  # past the stale window; heartbeat must have renewed
+            second = manager.reclaim("x")
+            finish_remove.set()
+            self.assertTrue(first.result(timeout=5).reclaimed)
+
+        self.assertFalse(second.reclaimed)
+        self.assertEqual(len(removals), 1)
+        db.close()
+
+    def test_reclaim_that_lost_its_claim_keeps_the_new_record(self) -> None:
+        db = SQLiteDatabase(self.db_path)
+        store = SQLiteWorkspaceStore(db)
+        folder = self._ready_workspace(store)
+
+        def runner(argv: Sequence[str], cwd: Path | None) -> CommandResult:
+            _ = cwd
+            if "remove" in argv:
+                # A takeover finished and the key was registered again meanwhile.
+                store.delete("x")
+                store.reserve_creating(
+                    work_key="x", repo_checkout=str(folder.parent), workdir=str(folder), branch="b2"
+                )
+            return CommandResult(0, "", "")
+
+        manager = OrcaWorktreeManager(workspace_store=store, backend="git", runner=runner)
+        result = manager.reclaim("x")
+
+        self.assertFalse(result.reclaimed)
+        record = store.get("x")
+        assert record is not None
+        self.assertEqual(record.branch, "b2")
+        db.close()
+
     def test_stale_reclaim_claim_can_be_taken_over(self) -> None:
         db = SQLiteDatabase(self.db_path)
         store = SQLiteWorkspaceStore(db)
