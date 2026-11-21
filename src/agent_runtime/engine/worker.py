@@ -445,11 +445,14 @@ class AgentWorker:
         batch: list[Event],
         session_ref: SessionRef | None,
     ) -> str | None:
-        if session_ref is None or not session_ref.pending_request_id or not session_ref.executor_id:
+        if session_ref is None or not session_ref.pending_request_id:
             return None
         for evt in batch:
             if evt.payload.get("approval_request_id") == session_ref.pending_request_id:
-                return session_ref.executor_id
+                # Sessions suspended before executor binding existed have no executor_id;
+                # that runtime ran every inbox on the global default executor. If it is not
+                # registered, _select_executor fails and the checkpoint and events stay pending.
+                return session_ref.executor_id or self._global_default_executor
         return None
 
     @staticmethod

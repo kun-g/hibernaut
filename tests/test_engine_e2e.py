@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from collections.abc import Sequence
@@ -11,6 +12,7 @@ from agent_runtime.app.bootstrap import build_runtime
 from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Silent, Suspend
 from agent_runtime.core.ports import RunCapabilities
 from agent_runtime.engine import OutboxDispatcher
+from agent_runtime.engine.worker import ExecutorFailed
 from tests.fakes import RecordingChannel
 
 
@@ -226,6 +228,78 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
         assert isinstance(outcome, Emit)
         self.assertIn("[APPROVED]", outcome.messages[0])
         self.assertEqual(other.calls, [])
+
+    async def test_legacy_suspended_session_resumes_on_the_default_executor(self) -> None:
+        # Suspend, then rewrite the sessions table to the pre-binding schema and reopen so
+        # the real migration backfills executor_id as NULL.
+        root = Path(self._tmp.name) / "legacy"
+        app = build_runtime(db_path=root / "runtime.db", memory_dir=root / "memory", channel=RecordingChannel())
+        app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="legacy-req",
+            payload={"action": "send_email", "to": "erin@example.com", "subject": "Report"},
+        )
+        reports = await app.worker.process_inbox("u1")
+        suspend_outcome = reports[0].outcome
+        assert isinstance(suspend_outcome, Suspend)
+        session_id = reports[0].session_id
+        app.close()
+        with sqlite3.connect(root / "runtime.db") as raw:
+            raw.execute("ALTER TABLE sessions DROP COLUMN executor_id")
+            raw.execute("ALTER TABLE sessions DROP COLUMN executor_session_id")
+
+        app = build_runtime(db_path=root / "runtime.db", memory_dir=root / "memory", channel=RecordingChannel())
+        self.addCleanup(app.close)
+        migrated = app.db.fetchone(
+            "SELECT executor_id, pending_request_id FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        assert migrated is not None
+        self.assertEqual(tuple(migrated), (None, suspend_outcome.request_id))
+        other = _OtherExecutor()
+        app.worker._executors["other"] = other  # pyright: ignore[reportPrivateUsage]
+        app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="legacy-switch",
+            payload={"text": "move on", "executor_id": "other"},
+            session_id=session_id,
+        )
+        app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="legacy-approve",
+            payload={"approval_request_id": suspend_outcome.request_id, "approved": True},
+        )
+        reports = await app.worker.process_inbox("u1")
+
+        first = reports[0].outcome
+        assert isinstance(first, Emit)
+        self.assertIn("[APPROVED]", first.messages[0])
+        self.assertEqual(other.calls, [["legacy-switch"]])
+
+    async def test_suspended_session_whose_holder_is_unregistered_stays_pending(self) -> None:
+        session_id, request_id, other = await self._suspend_on_whitebox("req-email-6")
+        with self.app.db.transaction() as conn:
+            conn.execute("UPDATE sessions SET executor_id = 'retired' WHERE session_id = ?", (session_id,))
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="appr-email-6",
+            payload={"approval_request_id": request_id, "approved": True, "executor_id": "other"},
+        )
+        with self.assertRaises(ExecutorFailed):
+            await self.app.worker.process_inbox("u1")
+
+        session = self.app.db.fetchone(
+            "SELECT checkpoint, pending_request_id FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        assert session is not None
+        self.assertIsNotNone(session["checkpoint"])
+        self.assertEqual(session["pending_request_id"], request_id)
+        self.assertEqual(other.calls, [])
+        pending = self.app.db.fetchall("SELECT external_id FROM event_inbox WHERE status = 'pending'")
+        self.assertEqual([r["external_id"] for r in pending], ["appr-email-6"])
 
     async def test_auto_mode_blocks_dangerous_tool_call(self) -> None:
         self.app.handler.ingest(
