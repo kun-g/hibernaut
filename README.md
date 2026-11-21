@@ -49,6 +49,8 @@ cp hibernaut.example.toml hibernaut.toml
 PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
 ```
 
+The HTTP daemon watches the file passed to `--config` once per second, including under `scripts/run_updating.py`. Save project mappings, CLI templates, worker limits or channel settings and look for `[config] Reloaded` in the console. The daemon finishes accepted work before activating the new settings, so incoming requests may briefly wait. Invalid TOML or a busy replacement port leaves the current configuration active. Changing `db_path` or `memory_root`, updating the process environment, or reconfiguring a stdio MCP session requires a restart.
+
 ### Versioning
 
 The daemon and demo print `Hibernaut <version>` at startup. To check the version directly, run `PYTHONPATH=src python3 -m agent_runtime.app.main --version`.

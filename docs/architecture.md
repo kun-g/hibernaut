@@ -60,7 +60,7 @@
   2. **路径落盘**：创建成功后回写实际路径与 `ready` 状态，返工与回收一律查表。
   3. **三关安全回收**（`reclaim()`）：双重归属校验（`hb-` 前缀 + `workspaces` 表记录）+ 三关检查（无开着 PR / 无未提交改动 / 无未推送提交），任一不通过即保留目录并经 Outbox 告警。
 - **可配置本地 CLI 执行器**（`LocalCLIExecutor`）：实现 `ExecutorPort`，内置 `claude`（默认）、`cursor-agent`、`grok`、`dsh` 模板，支持透传环境变量对接本地模型网关（如 `yetone/magpie`），响应 `caps.is_interrupted()` 安全终止子进程。
-- **声明式配置**（`hibernaut.example.toml` + `app/config.py` + `app/main.py --config`）：使用标准库 `tomllib` 解析，仅存静态主检出、执行器模板与凭据环境变量名，绝不存动态 worktree 路径。
+- **声明式配置**（`hibernaut.example.toml` + `app/config.py` + `app/main.py --config`）：使用标准库 `tomllib` 解析，仅存静态主检出、执行器模板与凭据环境变量名，绝不存动态 worktree 路径。HTTP daemon 热加载时先组装新配置，待旧 Worker 池排空后再切换，沿用同一条 SQLite 连接及未变更的监听 socket。
 
 ## 5. 多 `inbox_id` Actor 分区并发与 `NewEventPolicy`
 

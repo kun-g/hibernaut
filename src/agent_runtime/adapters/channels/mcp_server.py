@@ -5,6 +5,7 @@ import json
 from collections.abc import Mapping
 from typing import Any, TextIO
 
+from agent_runtime import __version__
 from agent_runtime.adapters.channels.http_types import WebhookResponse
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
 from agent_runtime.adapters.storage_sqlite.stores import SQLiteSessionStoreAdapter
@@ -164,7 +165,7 @@ class MCPServerAdapter:
                 {
                     "protocolVersion": _PROTOCOL_VERSION,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "hibernaut-mcp", "version": "0.1.0"},
+                    "serverInfo": {"name": "hibernaut-mcp", "version": __version__},
                 },
             )
         if method == "ping":

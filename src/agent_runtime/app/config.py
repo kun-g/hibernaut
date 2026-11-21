@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import math
+import sys
 import tomllib
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -61,6 +65,37 @@ def load_config(path: str | Path) -> HibernautConfig:
     return parse_config(raw)
 
 
+async def config_changes(path: Path, stop: asyncio.Event, interval: float = 1.0) -> AsyncIterator[HibernautConfig]:
+    previous: bytes | None = None
+    missing = False
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except TimeoutError:
+            pass
+        try:
+            contents = path.read_bytes()
+        except OSError as exc:
+            if not missing:
+                print(f"[config] Cannot read {path}: {exc.strerror}; keeping current settings.", file=sys.stderr, flush=True)
+            missing = True
+            continue
+        missing = False
+        if contents == previous:
+            continue
+        previous = contents
+        try:
+            raw = tomllib.loads(contents.decode('utf-8'))
+            if not raw:
+                raise ValueError('empty configuration')
+            config = parse_config(raw)
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+            print(f"[config] Invalid {path} ({type(exc).__name__}); keeping current settings.", file=sys.stderr, flush=True)
+            continue
+        yield config
+
+
 def parse_config(raw: dict[str, Any]) -> HibernautConfig:
     rt_raw = raw.get("runtime", {})
     policy = str(rt_raw.get("new_event_policy", "defer"))
@@ -79,6 +114,11 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
         poll_mode=cast(PollMode, poll_mode),
         poll_interval_seconds=float(rt_raw.get("poll_interval_seconds", 60.0)),
     )
+
+    if runtime.max_concurrency < 1:
+        raise ValueError("runtime.max_concurrency must be at least 1")
+    if not math.isfinite(runtime.poll_interval_seconds) or runtime.poll_interval_seconds <= 0:
+        raise ValueError("runtime.poll_interval_seconds must be finite and positive")
 
     ch_raw = raw.get("channels", {})
     channels = ChannelsConfig(

@@ -8,6 +8,7 @@ import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +21,8 @@ from agent_runtime.adapters.channels import (
     MCPServerAdapter,
     PollTarget,
     build_feishu_or_console_channel,
-    create_webhook_server,
 )
+from agent_runtime.adapters.channels.channels import webhook_request_handler
 from agent_runtime.adapters.executor_cli import LocalCLIExecutor, OrcaWorktreeManager
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
@@ -39,7 +40,7 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteTimerAdapter,
     SQLiteWorkspaceStore,
 )
-from agent_runtime.app.config import HibernautConfig, load_config
+from agent_runtime.app.config import HibernautConfig, config_changes, load_config
 from agent_runtime.core.models import NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, RunCapabilities
 from agent_runtime.engine import (
@@ -163,9 +164,18 @@ class AlwaysOnDaemon:
     ) -> None:
         self.partitions.register(inbox_id, workspace_dir=workspace_dir)
 
+    def http_handler(self) -> type[BaseHTTPRequestHandler]:
+        return webhook_request_handler(
+            self.handler,
+            github_adapter=self.github_webhook,
+            feishu_adapter=self.feishu_webhook,
+            mcp_adapter=self.mcp_server,
+        )
+
     async def run(
         self,
         *,
+        server: HTTPServer | None = None,
         stop_event: asyncio.Event | None = None,
         timer_interval_seconds: float = 5.0,
         outbox_interval_seconds: float = 1.0,
@@ -173,23 +183,11 @@ class AlwaysOnDaemon:
         webhook_port: int | None = None,
     ) -> None:
         stopper = stop_event or self._stop_event
-        server = None
+        owns_server = server is None
         server_thread = None
-
-        if webhook_host is not None and webhook_port is not None:
-            loop = asyncio.get_running_loop()
-            webhook_handler = EventHandler(
-                self.inbox,
-                lambda key: loop.call_soon_threadsafe(self.pool.wake, key),
-            )
-            server = create_webhook_server(
-                webhook_host,
-                webhook_port,
-                webhook_handler,
-                github_adapter=self.github_webhook,
-                feishu_adapter=self.feishu_webhook,
-                mcp_adapter=self.mcp_server,
-            )
+        if server is None and webhook_host is not None and webhook_port is not None:
+            server = HTTPServer((webhook_host, webhook_port), self.http_handler())
+        if server is not None:
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
 
@@ -214,7 +212,8 @@ class AlwaysOnDaemon:
                 # Keep workers available until the last accepted webhook has queued its wake.
                 if server is not None:
                     await asyncio.to_thread(server.shutdown)
-                    server.server_close()
+                    if owns_server:
+                        server.server_close()
                 if server_thread is not None:
                     server_thread.join()
                 workers_stop.set()
@@ -226,6 +225,7 @@ class AlwaysOnDaemon:
 def build_daemon(
     *,
     db_path: str | Path = "./hibernaut.db",
+    database: SQLiteDatabase | None = None,
     memory_root: str | Path = "./agent_memory",
     max_concurrency: int = 4,
     llm: LLMBackend | None = None,
@@ -243,7 +243,7 @@ def build_daemon(
     mcp_bearer_token: str | None = None,
     worktree_manager: OrcaWorktreeManager | None = None,
 ) -> AlwaysOnDaemon:
-    db = SQLiteDatabase(db_path)
+    db = database if database is not None else SQLiteDatabase(db_path)
     inbox = SQLiteInboxAdapter(db)
     timers = SQLiteTimerAdapter(db)
     outbox = SQLiteOutboxAdapter(db)
@@ -349,6 +349,7 @@ def build_daemon_from_config(
     config: HibernautConfig,
     *,
     channel: ChannelPort | None = None,
+    database: SQLiteDatabase | None = None,
 ) -> AlwaysOnDaemon:
     repo_inbox_map: dict[str, str] = {}
     inbox_checkout_map: dict[str, str] = {}
@@ -387,6 +388,7 @@ def build_daemon_from_config(
 
     daemon = build_daemon(
         db_path=config.runtime.db_path,
+        database=database,
         memory_root=config.runtime.memory_root,
         max_concurrency=config.runtime.max_concurrency,
         channel=resolved_channel,
@@ -476,6 +478,54 @@ def build_daemon_from_config(
     return daemon
 
 
+async def serve_configured(
+    path: Path, config: HibernautConfig, daemon: AlwaysOnDaemon, stop: asyncio.Event,
+) -> None:
+    server = HTTPServer((config.channels.host, config.channels.port), daemon.http_handler())
+    changes = config_changes(path, stop)
+    next_server = server
+    try:
+        while not stop.is_set():
+            drain = asyncio.Event()
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(daemon.run(server=server, stop_event=drain))
+                try:
+                    async for candidate in changes:
+                        if candidate == config:
+                            continue
+                        if (candidate.runtime.db_path, candidate.runtime.memory_root) != (
+                            config.runtime.db_path, config.runtime.memory_root,
+                        ):
+                            print('[config] Storage path changes require a restart.', file=sys.stderr, flush=True)
+                            continue
+                        address = (candidate.channels.host, candidate.channels.port)
+                        try:
+                            replacement = build_daemon_from_config(candidate, database=daemon.db)
+                            handler = replacement.http_handler()
+                            if address != (config.channels.host, config.channels.port):
+                                next_server = HTTPServer(address, handler)
+                        except (OSError, ValueError, OverflowError) as exc:
+                            print(f'[config] Cannot activate settings ({type(exc).__name__}); keeping current settings.', file=sys.stderr, flush=True)
+                            continue
+                        break
+                    else:
+                        return
+                finally:
+                    drain.set()
+            # Accepted requests finish against the old adapters before the handover.
+            if next_server is not server:
+                server.server_close()
+                server = next_server
+            server.RequestHandlerClass = handler
+            daemon, config = replacement, candidate
+            print(f'[config] Reloaded {path}', file=sys.stderr, flush=True)
+    finally:
+        await changes.aclose()
+        if next_server is not server:
+            next_server.server_close()
+        server.server_close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hibernaut multi-inbox Always-on Agent daemon")
     parser.add_argument("--config", default=None, help="Path to hibernaut.toml")
@@ -535,11 +585,10 @@ def main() -> None:
             except NotImplementedError:
                 pass
         try:
-            await daemon.run(
-                stop_event=stop_event,
-                webhook_host=host,
-                webhook_port=port,
-            )
+            if args.config:
+                await serve_configured(Path(args.config), cfg, daemon, stop_event)
+            else:
+                await daemon.run(stop_event=stop_event, webhook_host=host, webhook_port=port)
         finally:
             daemon.close()
 

@@ -52,15 +52,13 @@ class WebhookChannelAdapter:
             return None
 
 
-def create_webhook_server(
-    host: str,
-    port: int,
+def webhook_request_handler(
     handler: EventHandler,
     *,
     github_adapter: GitHubWebhookAdapter | None = None,
     feishu_adapter: FeishuWebhookAdapter | None = None,
     mcp_adapter: MCPServerAdapter | None = None,
-) -> HTTPServer:
+) -> type[BaseHTTPRequestHandler]:
     class _IngestRequestHandler(BaseHTTPRequestHandler):
         def _write_json(self, status_code: int, payload: dict[str, Any]) -> None:
             encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -115,4 +113,19 @@ def create_webhook_server(
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             _ = (format, args)
 
-    return HTTPServer((host, port), _IngestRequestHandler)
+    return _IngestRequestHandler
+
+
+def create_webhook_server(
+    host: str,
+    port: int,
+    handler: EventHandler,
+    *,
+    github_adapter: GitHubWebhookAdapter | None = None,
+    feishu_adapter: FeishuWebhookAdapter | None = None,
+    mcp_adapter: MCPServerAdapter | None = None,
+) -> HTTPServer:
+    return HTTPServer((host, port), webhook_request_handler(
+        handler, github_adapter=github_adapter, feishu_adapter=feishu_adapter,
+        mcp_adapter=mcp_adapter,
+    ))
