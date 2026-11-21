@@ -113,6 +113,8 @@ class TestOrcaWorktreeManager(unittest.TestCase):
 
     def test_explicit_override_creating_reconcile_and_orca_create(self) -> None:
         commands: list[list[str]] = []
+        created = self.root / "Orca worktrees" / "hb-issue-42"
+        registered: dict[str, Path] = {}
 
         def fake_runner(cmd: Any, cwd: Path | None) -> CommandResult:
             _ = cwd
@@ -121,10 +123,13 @@ class TestOrcaWorktreeManager(unittest.TestCase):
             if cmd_list[:2] == ["git", "rev-parse"]:
                 return CommandResult(0, "abc1234\n", "")
             if cmd_list[:3] == ["orca", "worktree", "create"]:
-                created = self.root / "hb-issue-42"
-                created.mkdir(exist_ok=True)
+                created.mkdir(parents=True)
                 (created / ".git").write_text("gitdir: ...", encoding="utf-8")
-                return CommandResult(0, f"{created}\n", "")
+                registered["hb/issue-42"] = created
+                return CommandResult(0, "Created successfully\n", "")
+            if cmd_list == ["git", "worktree", "list", "--porcelain", "-z"]:
+                listing = "".join(f"worktree {p}\0branch refs/heads/{b}\0\0" for b, p in registered.items())
+                return CommandResult(0, listing, "")
             return CommandResult(0, "", "")
 
         mgr = OrcaWorktreeManager(workspace_store=self.store, backend="orca", runner=fake_runner)
@@ -143,7 +148,7 @@ class TestOrcaWorktreeManager(unittest.TestCase):
             work_key="github:kun-g/hibernaut#42",
             primary_checkout=self.primary,
         )
-        self.assertEqual(created_dir.name, "hb-issue-42")
+        self.assertEqual(created_dir, created.resolve())
         rec = self.store.get("github:kun-g/hibernaut#42")
         self.assertIsNotNone(rec)
         assert rec is not None
@@ -152,16 +157,22 @@ class TestOrcaWorktreeManager(unittest.TestCase):
 
         # Priority 2: subsequent call reuses persisted ready path without invoking orca again.
         cmd_count_before = len(commands)
+        self.store.mark_ready(rec.work_key, workdir=str(self.root / created.name), branch=rec.branch)
         reused = mgr.resolve_workdir(
             work_key="github:kun-g/hibernaut#42",
             primary_checkout=self.primary,
         )
         self.assertEqual(reused, created_dir)
-        self.assertEqual(len(commands), cmd_count_before)
+        self.assertEqual(commands[cmd_count_before:], [["git", "worktree", "list", "--porcelain", "-z"]])
+        self.assertEqual(self.store.get(rec.work_key).workdir, str(created_dir))
+        del registered[rec.branch]
+        with self.assertRaisesRegex(RuntimeError, "No registered worktree"):
+            mgr.resolve_workdir(work_key=rec.work_key, primary_checkout=self.primary)
 
         # Safety 1 reconciliation: interrupted 'creating' record with valid local .git -> promoted to ready.
         reconcile_dir = self.root / "hb-issue-99"
         reconcile_dir.mkdir()
+        registered["hb/issue-99"] = reconcile_dir
         (reconcile_dir / ".git").write_text("gitdir: ...", encoding="utf-8")
         self.store.reserve_creating(
             work_key="github:kun-g/hibernaut#99",
@@ -173,10 +184,19 @@ class TestOrcaWorktreeManager(unittest.TestCase):
             work_key="github:kun-g/hibernaut#99",
             primary_checkout=self.primary,
         )
-        self.assertEqual(reconciled, reconcile_dir)
+        self.assertEqual(reconciled, reconcile_dir.resolve())
         rec99 = self.store.get("github:kun-g/hibernaut#99")
         assert rec99 is not None
         self.assertEqual(rec99.status, "ready")
+
+    def test_success_without_registered_branch_keeps_creating_intent(self) -> None:
+        mgr = OrcaWorktreeManager(workspace_store=self.store, runner=lambda *_: CommandResult(0, "", ""))
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "Expected one local linked worktree"):
+                mgr.resolve_workdir(work_key="issue:7", primary_checkout=self.primary)
+            record = self.store.get("issue:7")
+            assert record is not None
+            self.assertEqual((record.status, record.branch), ("creating", "hb/issue-7"))
 
     def test_reclaim_dual_ownership_and_three_safety_gates(self) -> None:
         outbox = InMemoryOutbox()

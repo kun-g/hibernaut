@@ -52,6 +52,10 @@ class RunReport:
     outcome: RunOutcome
 
 
+class ExecutorFailed(RuntimeError):
+    pass
+
+
 class _RunInterrupted(Exception):
     pass
 
@@ -350,7 +354,7 @@ class AgentWorker:
                 if attempt < self._max_retries:
                     await asyncio.sleep(0.01 * (attempt + 1))
         assert last_exc is not None
-        raise last_exc
+        raise ExecutorFailed(f"Executor failed after {self._max_retries + 1} attempts") from last_exc
 
     def _apply_outcome(
         self,

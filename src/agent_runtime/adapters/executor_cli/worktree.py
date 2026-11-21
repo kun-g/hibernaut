@@ -105,61 +105,56 @@ class OrcaWorktreeManager:
         primary = Path(primary_checkout).resolve()
         existing = self._store.get(work_key)
 
-        # Priority 2: reuse persisted ready workspace, or reconcile an interrupted 'creating' row.
+        branches = self._registered_worktrees(primary)
         if existing is not None:
-            existing_path = Path(existing.workdir)
-            if existing.status == "ready" and existing_path.is_dir():
-                return existing_path
-            if existing.status == "creating":
-                if existing_path.is_dir() and (existing_path / ".git").exists():
-                    self._store.mark_ready(
-                        work_key,
-                        workdir=str(existing_path),
-                        branch=existing.branch,
-                    )
-                    return existing_path
-                self._store.delete(work_key)
+            if Path(existing.repo_checkout).resolve() != primary or existing.status == "reclaiming":
+                raise RuntimeError(f"Cannot reuse workspace {work_key!r} in {primary}: {existing}")
+            if existing.branch in branches:
+                actual = self._worktree_path(branches, primary, existing.branch)
+                if existing.status != "ready" or str(actual) != existing.workdir:
+                    self._store.mark_ready(work_key, workdir=str(actual), branch=existing.branch)
+                return actual
+            if existing.status == "ready":
+                raise RuntimeError(f"No registered worktree for {existing.branch!r} in {primary}")
 
         # Priority 3: dynamic creation with Safety 1 (creating intent) + Safety 2 (path persistence).
         self._runner(["git", "fetch", "origin"], primary)
         base_commit = self._resolve_base_commit(primary)
 
         base_dir = self._worktree_base_dir if self._worktree_base_dir is not None else primary.parent
-        existing_names = {Path(r.workdir).name for r in self._store.list_by_repo(str(primary))}
-        if base_dir.is_dir():
-            existing_names.update(p.name for p in base_dir.iterdir() if p.is_dir())
-
-        dir_name, branch_name = derive_worktree_names(
-            work_key,
-            self._store.next_task_seq(),
-            existing_names,
-        )
-        expected_workdir = (base_dir / dir_name).resolve()
-
-        self._store.reserve_creating(
-            work_key=work_key,
-            repo_checkout=str(primary),
-            workdir=str(expected_workdir),
-            branch=branch_name,
-        )
+        if existing is None:
+            existing_names = {Path(r.workdir).name for r in self._store.list_by_repo(str(primary))}
+            existing_names.update(name.replace("hb/", "hb-", 1) for name in branches if name.startswith("hb/"))
+            if base_dir.is_dir():
+                existing_names.update(p.name for p in base_dir.iterdir() if p.is_dir())
+            dir_name, branch_name = derive_worktree_names(work_key, self._store.next_task_seq(), existing_names)
+            expected_workdir = (base_dir / dir_name).resolve()
+            self._store.reserve_creating(
+                work_key=work_key, repo_checkout=str(primary), workdir=str(expected_workdir), branch=branch_name,
+            )
+        else:
+            expected_workdir = Path(existing.workdir)
+            dir_name, branch_name = expected_workdir.name, existing.branch
 
         if self._backend == "orca":
-            actual_workdir = self._create_via_orca(
+            self._create_via_orca(
                 primary=primary,
                 dir_name=dir_name,
                 base_commit=base_commit,
                 branch_name=branch_name,
-                fallback_path=expected_workdir,
             )
         else:
-            actual_workdir = self._create_via_git(
+            self._create_via_git(
                 primary=primary,
                 expected_workdir=expected_workdir,
                 base_commit=base_commit,
                 branch_name=branch_name,
             )
 
+        actual_workdir = self._worktree_path(self._registered_worktrees(primary), primary, branch_name)
         self._store.mark_ready(work_key, workdir=str(actual_workdir), branch=branch_name)
+        if self._backend == "orca" and self._create_terminal:
+            self._runner(["orca", "terminal", "create", "--workdir", str(actual_workdir)], primary)
         return actual_workdir
 
     def reclaim(
@@ -243,8 +238,7 @@ class OrcaWorktreeManager:
         dir_name: str,
         base_commit: str,
         branch_name: str,
-        fallback_path: Path,
-    ) -> Path:
+    ) -> None:
         cmd = [
             "orca",
             "worktree",
@@ -264,10 +258,6 @@ class OrcaWorktreeManager:
         res = self._runner(cmd, primary)
         if res.returncode != 0:
             raise RuntimeError(f"orca worktree create failed: {res.stderr.strip()}")
-        actual = self._parse_created_path(res.stdout, fallback_path)
-        if self._create_terminal:
-            self._runner(["orca", "terminal", "create", "--workdir", str(actual)], primary)
-        return actual
 
     def _create_via_git(
         self,
@@ -276,19 +266,32 @@ class OrcaWorktreeManager:
         expected_workdir: Path,
         base_commit: str,
         branch_name: str,
-    ) -> Path:
+    ) -> None:
         cmd = ["git", "worktree", "add", "-b", branch_name, str(expected_workdir), base_commit]
         res = self._runner(cmd, primary)
         if res.returncode != 0:
             raise RuntimeError(f"git worktree add failed: {res.stderr.strip()}")
-        return expected_workdir
 
-    def _parse_created_path(self, stdout: str, fallback: Path) -> Path:
-        for line in reversed(stdout.splitlines()):
-            candidate = line.strip()
-            if candidate.startswith("/") or candidate.startswith("~"):
-                return Path(candidate).expanduser().resolve()
-        return fallback
+    def _registered_worktrees(self, primary: Path) -> dict[str, list[Path]]:
+        result = self._runner(["git", "worktree", "list", "--porcelain", "-z"], primary)
+        if result.returncode != 0:
+            raise RuntimeError(f"Cannot list worktrees in {primary}: {result.stderr.strip()}")
+        branches: dict[str, list[Path]] = {}
+        for record in result.stdout.split("\0\0"):
+            fields = dict(field.split(" ", 1) for field in record.split("\0") if " " in field)
+            ref = fields.get("branch", "")
+            if ref.startswith("refs/heads/") and "worktree" in fields:
+                branches.setdefault(ref.removeprefix("refs/heads/"), []).append(Path(fields["worktree"]))
+        return branches
+
+    @staticmethod
+    def _worktree_path(branches: dict[str, list[Path]], primary: Path, branch: str) -> Path:
+        paths = branches.get(branch, [])
+        if len(paths) == 1:
+            path = paths[0].resolve()
+            if path != primary and (path / ".git").is_file():
+                return path
+        raise RuntimeError(f"Expected one local linked worktree for {branch!r} in {primary}, found {paths}")
 
     def _alert(
         self,

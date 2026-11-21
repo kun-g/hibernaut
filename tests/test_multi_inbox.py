@@ -96,6 +96,37 @@ class TestMultiInboxConcurrentDaemon(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
+    async def test_executor_failure_isolated_and_pending_batch_can_resume(self) -> None:
+        class Probe(_ConcurrencyProbeExecutor):
+            broken = True
+
+            async def execute(self, events, session, caps):
+                if self.broken and events[0].inbox_id == "broken":
+                    raise FileNotFoundError("worktree")
+                return Emit(messages=("ok",))
+
+        probe = Probe()
+        daemon = build_daemon(db_path=":memory:", memory_root=self.root, max_concurrency=1,
+                              executor_factory=lambda _: probe)
+        stop = asyncio.Event()
+        task = asyncio.create_task(daemon.pool.run_forever(stop))
+        try:
+            with self.assertLogs("agent_runtime.app.main", level="ERROR") as log:
+                for inbox in ("broken", "healthy"):
+                    daemon.handler.ingest(inbox_id=inbox, source="test", external_id="1", payload={})
+                await daemon.pool.wait_until_idle()
+            self.assertIn("broken", log.output[0])
+            self.assertEqual(len(daemon.inbox.fetch_pending("broken")), 1)
+            self.assertEqual([r.inbox_id for r in daemon.pool.reports], ["healthy"])
+            probe.broken = False
+            daemon.pool.wake("broken")
+            await daemon.pool.wait_until_idle()
+            self.assertEqual(daemon.inbox.fetch_pending("broken"), [])
+        finally:
+            stop.set()
+            await task
+            daemon.close()
+
     async def test_cross_inbox_parallel_and_same_inbox_serial(self) -> None:
         probe = _ConcurrencyProbeExecutor(delay_seconds=0.08)
         channel = RecordingChannel()

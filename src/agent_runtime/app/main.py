@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import signal
 import sys
@@ -50,6 +51,7 @@ from agent_runtime.engine import (
     RunReport,
     TimerScheduler,
 )
+from agent_runtime.engine.worker import ExecutorFailed
 
 
 class AsyncWorkerPool:
@@ -109,6 +111,8 @@ class AsyncWorkerPool:
             try:
                 batch_reports = await worker.process_inbox(inbox_id)
                 self.reports.extend(batch_reports)
+            except ExecutorFailed:
+                logging.getLogger(__name__).exception("Executor failed for inbox %s; batch remains pending", inbox_id)
             finally:
                 self._active.pop(inbox_id, None)
                 self._queue.task_done()
