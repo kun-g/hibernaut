@@ -42,7 +42,7 @@
 ## 3. 外部关联键 `correlation_key`、多执行器粘滞路由与 L3 通道
 
 - **4 级会话解析优先级**（`AgentWorker._resolve_session()`）：`approval_request_id` → 显式 `session_id` → `(inbox_id, correlation_key)` → 新建 `session_id`。
-- **同键批处理与会话轮换重绑**：`_group_into_batches()` 与 `fold` 同步支持按 `correlation_key` 归组；重置开新 Session 时向 `SessionStorePort.save()` 写入同一 `(inbox_id, correlation_key)` 自动解绑旧会话并指向新活跃会话。
+- **同键批处理与会话轮换重绑**：`_group_into_batches()` 按解析后的键（`session_id` → `correlation_key`）稳定分组，同键全部 `pending` 事件并入一批（批内保持 `seq` 顺序），批次按各组首条事件的 `seq` 执行。无键事件彼此无关，`defer`/`fold` 下各自单独成批且不被 `fold` 注入，仅 `interrupt` 重启时合并。本键当前批次遇到两种情况会结束：带 `approval_request_id` 的审批事件（同键更早的事件与它同批，挂起会话会把不含审批结果的 Run 视为拒绝），或执行目标（payload 的 `executor_id`、`explicit_workdir`、`executor`）与本批不同的事件。同键后续事件留到下一轮重新解析会话后再执行。快照里某键有待处理的审批时，该键的第一批必须带上审批：审批前执行目标不兼容的事件暂缓到审批之后，不提前结束批次。`AgentWorker._select_executor()` 选择执行器、`LocalCLIExecutor` 选择工作目录和模板，都取自批内普通事件，只有审批单独成批时才用审批自带的目标。审批命中挂起会话的 `pending_request_id` 时，该批固定交给会话绑定的 `executor_id`（持有断点的执行器）处理；执行器绑定上线前挂起的旧会话没有 `executor_id`，当前默认执行器不能证明归属（旧版 CLI 已可按事件选模板），只接受审批事件显式指定的 `executor_id`（唯一注册的执行器也可能是替代者，不作为依据）；无法判定或持有者未注册时本批报 `ExecutorFailed`，不确认事件、不清断点，补写 `sessions.executor_id` 后原审批即可恢复；审批待处理期间，同会话里指定其他 `executor_id` 的普通事件留到审批之后执行。`fold` 只注入同键、同执行目标的事件，遇到同键审批事件即停止，含审批的批次不注入；`interrupt` 以本轮调度快照判断新事件，含审批的批次不可中断（避免重复执行已批准的工具）；重置开新 Session 时向 `SessionStorePort.save()` 写入同一 `(inbox_id, correlation_key)` 自动解绑旧会话并指向新活跃会话。
 - **多执行器粘滞路由与原生会话续接闭环**：
   - `resolve_executor_id()` 按 4 级优先级决定目标执行器：① 事件显式指定 `event.payload.get("executor_id")`（允许主动切换）→ ② 已有会话的 `session.executor_id`（默认粘滞，避免后续事件不指定时静默回退 `default_executor`）→ ③ 项目级默认 `projects.<name>.executor`（可选）→ ④ 全局 `runtime.default_executor`。
   - `AgentWorker` 持有全量注册的 `executors: Mapping[str, ExecutorPort]`，每轮查表执行后统一将 `selected_executor.executor_id` 与 `outcome.executor_session_id` 写入 `SessionStorePort`；`RunOutcome` 保持简洁不携带 `executor_id`。
@@ -70,6 +70,7 @@
 ## 5. 多 `inbox_id` Actor 分区并发与 `NewEventPolicy`
 
 - **多 `inbox_id` 并发**：`AsyncWorkerPool` 跨 `inbox_id` 并行、同 `inbox_id` 单活互斥（`worker_leases` 主键即 `inbox_id`）、`Suspend` 立即放锁；`WorkspacePartitionRegistry` 强制禁止不同 `inbox_id` 挂载同一本地代码目录，全局 `global/instructions.md` 只读共享。
+- **HTTP 入站与 SQLite 并发**：`WebhookHTTPServer`（`ThreadingHTTPServer`，`request_queue_size=128`）每请求一线程；`shutdown()` 等待在途请求全部写完 Inbox 后返回，Worker 停止与配置热加载据此排空。`SQLiteDatabase` 只有一条连接，所有语句经同一把可重入锁串行；写操作走 `transaction()`（`BEGIN IMMEDIATE`），去重、租约等先读后写在线程间和共享同一文件的进程间保持原子；租约时钟在拿到写锁后读取，等锁时间不计入 TTL；`mark_done()` 按 SQLite 参数上限分段更新；文件库开启 WAL 与 `busy_timeout`。回收 worktree 时，`claim_for_reclaim()` 以读到的 `updated_at` 做比较并交换：进行中的 `reclaiming` 认领是排他的，只有超过 `reclaim_stale_after_seconds`（默认 600 秒，认领方已崩溃）的认领才可被接管；删除期间心跳线程定期续期认领（遇到临时的 `SQLITE_BUSY`/`SQLITE_LOCKED` 缩短间隔重试，不退出），慢删除不会被当作过期而被接管；删除成功后 `finish_reclaim()` 同样按认领做比较并交换，认领已失效时不删除被他人重新登记的记录；删除失败时 `release_reclaim()` 恢复原状态，可直接重试。
 - **`NewEventPolicy` 三策略**：`defer`（默认，推迟到下一轮）、`fold`（回合间隙通过 `poll_folded_events()` 增量注入同会话/同关联键事件并统一 `mark_done()`）、`interrupt`（安全取消当前 Run/CLI 子进程，绝不向 Outbox 写半成品，原批次保持 `pending` 与新事件同租约合并重启）。
 
 ## 6. 三道防腐化门禁与核心词汇表（Glossary）

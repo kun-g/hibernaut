@@ -21,6 +21,7 @@ from agent_runtime.adapters.channels import (
     GitHubWebhookAdapter,
     MCPServerAdapter,
     PollTarget,
+    WebhookHTTPServer,
     build_feishu_or_console_channel,
 )
 from agent_runtime.adapters.channels.channels import webhook_request_handler
@@ -194,7 +195,7 @@ class AlwaysOnDaemon:
         owns_server = server is None
         server_thread = None
         if server is None and webhook_host is not None and webhook_port is not None:
-            server = HTTPServer((webhook_host, webhook_port), self.http_handler())
+            server = WebhookHTTPServer((webhook_host, webhook_port), self.http_handler())
         if server is not None:
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
@@ -548,7 +549,7 @@ async def serve_configured(
     *,
     demo: bool = False,
 ) -> None:
-    server = HTTPServer((config.channels.host, config.channels.port), daemon.http_handler())
+    server = WebhookHTTPServer((config.channels.host, config.channels.port), daemon.http_handler())
     changes = config_changes(path, stop)
     next_server = server
     try:
@@ -579,7 +580,7 @@ async def serve_configured(
                             )
                             handler = replacement.http_handler()
                             if address != (config.channels.host, config.channels.port):
-                                next_server = HTTPServer(address, handler)
+                                next_server = WebhookHTTPServer(address, handler)
                         except (OSError, ValueError, OverflowError) as exc:
                             print(
                                 f"[config] Cannot activate settings ({type(exc).__name__}); "

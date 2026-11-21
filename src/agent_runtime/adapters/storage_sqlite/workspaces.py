@@ -39,18 +39,18 @@ class SQLiteWorkspaceStore:
         )
 
     def get(self, work_key: str) -> WorkspaceRecord | None:
-        row = self._db.conn.execute(
+        row = self._db.fetchone(
             """
             SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at
             FROM workspaces
             WHERE work_key = ?
             """,
             (work_key,),
-        ).fetchone()
+        )
         return self._row_to_record(row) if row is not None else None
 
     def list_by_repo(self, repo_checkout: str) -> list[WorkspaceRecord]:
-        rows = self._db.conn.execute(
+        rows = self._db.fetchall(
             """
             SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at
             FROM workspaces
@@ -58,21 +58,21 @@ class SQLiteWorkspaceStore:
             ORDER BY seq ASC
             """,
             (repo_checkout,),
-        ).fetchall()
+        )
         return [self._row_to_record(row) for row in rows]
 
     def list_all(self) -> list[WorkspaceRecord]:
-        rows = self._db.conn.execute(
+        rows = self._db.fetchall(
             """
             SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at
             FROM workspaces
             ORDER BY seq ASC
             """
-        ).fetchall()
+        )
         return [self._row_to_record(row) for row in rows]
 
     def next_task_seq(self) -> int:
-        row = self._db.conn.execute("SELECT COALESCE(MAX(seq), 0) AS max_seq FROM workspaces").fetchone()
+        row = self._db.fetchone("SELECT COALESCE(MAX(seq), 0) AS max_seq FROM workspaces")
         return int(row["max_seq"]) + 1 if row is not None else 1
 
     def reserve_creating(
@@ -84,8 +84,8 @@ class SQLiteWorkspaceStore:
         branch: str,
     ) -> WorkspaceRecord:
         now = utc_now_iso()
-        with self._db.conn:
-            self._db.conn.execute(
+        with self._db.transaction() as conn:
+            conn.execute(
                 """
                 INSERT INTO workspaces (
                     work_key, repo_checkout, workdir, branch, status, created_at, updated_at
@@ -106,8 +106,8 @@ class SQLiteWorkspaceStore:
 
     def mark_ready(self, work_key: str, *, workdir: str, branch: str) -> WorkspaceRecord:
         now = utc_now_iso()
-        with self._db.conn:
-            self._db.conn.execute(
+        with self._db.transaction() as conn:
+            conn.execute(
                 """
                 UPDATE workspaces
                 SET workdir = ?, branch = ?, status = 'ready', updated_at = ?
@@ -119,14 +119,63 @@ class SQLiteWorkspaceStore:
         assert rec is not None
         return rec
 
-    def mark_reclaiming(self, work_key: str) -> None:
+    def claim_for_reclaim(
+        self,
+        work_key: str,
+        *,
+        seen_updated_at: str,
+        stale_before: str,
+    ) -> str | None:
+        # Compare-and-set on the version the caller read. A live 'reclaiming' claim is
+        # exclusive; only one older than stale_before (its owner crashed) may be taken over.
+        # Returns the claim token (new updated_at) or None when another caller holds it.
         now = utc_now_iso()
-        with self._db.conn:
-            self._db.conn.execute(
-                "UPDATE workspaces SET status = 'reclaiming', updated_at = ? WHERE work_key = ?",
-                (now, work_key),
+        while now == seen_updated_at:
+            now = utc_now_iso()
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE workspaces SET status = 'reclaiming', updated_at = ?
+                WHERE work_key = ? AND updated_at = ?
+                  AND (status != 'reclaiming' OR updated_at < ?)
+                """,
+                (now, work_key, seen_updated_at, stale_before),
+            )
+            return now if cur.rowcount == 1 else None
+
+    def renew_reclaim(self, work_key: str, *, claim: str) -> str | None:
+        now = utc_now_iso()
+        while now == claim:
+            now = utc_now_iso()
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE workspaces SET updated_at = ?
+                WHERE work_key = ? AND status = 'reclaiming' AND updated_at = ?
+                """,
+                (now, work_key, claim),
+            )
+            return now if cur.rowcount == 1 else None
+
+    def finish_reclaim(self, work_key: str, *, claim: str) -> bool:
+        with self._db.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM workspaces WHERE work_key = ? AND status = 'reclaiming' AND updated_at = ?",
+                (work_key, claim),
+            )
+            return cur.rowcount == 1
+
+    def release_reclaim(self, work_key: str, *, claim: str, status: WorkspaceStatus) -> None:
+        now = utc_now_iso()
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE workspaces SET status = ?, updated_at = ?
+                WHERE work_key = ? AND status = 'reclaiming' AND updated_at = ?
+                """,
+                (status, now, work_key, claim),
             )
 
     def delete(self, work_key: str) -> None:
-        with self._db.conn:
-            self._db.conn.execute("DELETE FROM workspaces WHERE work_key = ?", (work_key,))
+        with self._db.transaction() as conn:
+            conn.execute("DELETE FROM workspaces WHERE work_key = ?", (work_key,))

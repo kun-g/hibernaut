@@ -552,7 +552,7 @@ class TestExecutorSessionBindingAndIngestOnly(unittest.IsolatedAsyncioTestCase):
         try:
             cols = {
                 str(r["name"])
-                for r in db.conn.execute("PRAGMA table_info(sessions)").fetchall()
+                for r in db.fetchall("PRAGMA table_info(sessions)")
             }
             self.assertIn("executor_id", cols)
             self.assertIn("executor_session_id", cols)

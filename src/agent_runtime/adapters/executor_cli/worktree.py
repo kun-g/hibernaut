@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import subprocess
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -82,8 +85,10 @@ class OrcaWorktreeManager:
         create_terminal: bool = False,
         runner: CommandRunner | None = None,
         worktree_base_dir: str | Path | None = None,
+        reclaim_stale_after_seconds: float = 600.0,
     ) -> None:
         self._store = workspace_store
+        self._reclaim_stale_after_seconds = reclaim_stale_after_seconds
         self._backend: WorktreeBackend = backend
         self._create_terminal = create_terminal
         self._runner: CommandRunner = runner or _default_runner
@@ -208,18 +213,47 @@ class OrcaWorktreeManager:
                 self._alert(notify_outbox, inbox_id, msg)
                 return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
 
-        self._store.mark_reclaiming(work_key)
+        stale_before = (
+            datetime.now(timezone.utc) - timedelta(seconds=self._reclaim_stale_after_seconds)
+        ).isoformat()
+        claim = self._store.claim_for_reclaim(
+            work_key,
+            seen_updated_at=record.updated_at,
+            stale_before=stale_before,
+        )
+        if claim is None:
+            return ReclaimResult(
+                reclaimed=False,
+                reason="workspace changed or is being reclaimed by another caller",
+                workdir=record.workdir,
+            )
         primary = Path(record.repo_checkout)
-        if self._backend == "orca":
-            rm_res = self._runner(["orca", "worktree", "remove", str(workdir)], primary)
-        else:
-            rm_res = self._runner(["git", "worktree", "remove", str(workdir)], primary)
+        heartbeat = _ClaimHeartbeat(
+            self._store,
+            work_key,
+            claim,
+            interval_seconds=self._reclaim_stale_after_seconds / 3,
+        )
+        try:
+            if self._backend == "orca":
+                rm_res = self._runner(["orca", "worktree", "remove", str(workdir)], primary)
+            else:
+                rm_res = self._runner(["git", "worktree", "remove", str(workdir)], primary)
+        except BaseException:
+            self._store.release_reclaim(work_key, claim=heartbeat.stop(), status=record.status)
+            raise
+        claim = heartbeat.stop()
         if rm_res.returncode != 0:
+            self._store.release_reclaim(work_key, claim=claim, status=record.status)
             msg = f"Failed to remove worktree '{workdir}': {rm_res.stderr.strip()}"
             self._alert(notify_outbox, inbox_id, msg)
             return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
 
-        self._store.delete(work_key)
+        # Only the claim holder may drop the record; a takeover may have re-registered the key.
+        if not self._store.finish_reclaim(work_key, claim=claim):
+            msg = f"Reclaim of '{workdir}' lost its claim; record left to its new owner"
+            self._alert(notify_outbox, inbox_id, msg)
+            return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
         return ReclaimResult(reclaimed=True, reason="reclaimed", workdir=record.workdir)
 
     def _resolve_base_commit(self, primary: Path) -> str:
@@ -301,3 +335,48 @@ class OrcaWorktreeManager:
     ) -> None:
         if outbox is not None and inbox_id:
             outbox.enqueue(inbox_id, message, metadata={"kind": "reclaim_alert"})
+
+
+_TRANSIENT_SQLITE_ERRORS = {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+
+
+class _ClaimHeartbeat:
+    # Keeps a reclaim claim fresh while a slow removal runs, so no caller treats a live
+    # claim as stale and removes the same path concurrently.
+    def __init__(
+        self,
+        store: SQLiteWorkspaceStore,
+        work_key: str,
+        claim: str,
+        *,
+        interval_seconds: float,
+    ) -> None:
+        self._store = store
+        self._work_key = work_key
+        self._claim = claim
+        self._interval = interval_seconds
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        delay = self._interval
+        while not self._stopped.wait(delay):
+            try:
+                renewed = self._store.renew_reclaim(self._work_key, claim=self._claim)
+            except sqlite3.OperationalError as exc:
+                # A transient lock must not end the heartbeat; retry soon, well inside
+                # the stale window, so the live claim is not taken over.
+                if getattr(exc, "sqlite_errorcode", None) not in _TRANSIENT_SQLITE_ERRORS:
+                    raise
+                delay = self._interval / 4
+                continue
+            if renewed is None:
+                return
+            self._claim = renewed
+            delay = self._interval
+
+    def stop(self) -> str:
+        self._stopped.set()
+        self._thread.join()
+        return self._claim

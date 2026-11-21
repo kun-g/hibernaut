@@ -61,6 +61,11 @@ class _RunInterrupted(Exception):
     pass
 
 
+# Payload keys that pick where/how an executor runs (e.g. LocalCLIExecutor's workdir and CLI
+# template). Events that disagree on them must not share a Run.
+_TARGET_PAYLOAD_KEYS = ("executor_id", "explicit_workdir", "executor")
+
+
 class AgentWorker:
     def __init__(
         self,
@@ -137,6 +142,10 @@ class AgentWorker:
                     break
 
                 restarted = False
+                # Interrupt judges "new" against the whole scheduling snapshot, so events this
+                # pass deliberately runs later (other keys, held-back same-key events) never
+                # interrupt the current batch; only arrivals after the fetch do.
+                snapshot_ids = {evt.event_id for evt in pending}
                 batches = self._group_into_batches(pending)
                 for session_ref, batch in batches:
                     self._lock.renew(inbox_id, self._worker_id, self._lease_ttl_seconds)
@@ -147,6 +156,8 @@ class AgentWorker:
                     consumed_ids: set[str] = {evt.event_id for evt in batch}
                     folded_events: list[Event] = []
                     target_batch_key = self._batch_key(batch[0], session_ref)
+                    has_decision = any(self._is_approval_decision(evt) for evt in batch)
+                    batch_target = self._batch_target(batch)
                     interrupted_flag = asyncio.Event()
 
                     def _poll_folded(
@@ -154,19 +165,28 @@ class AgentWorker:
                         _consumed: set[str] = consumed_ids,
                         _folded: list[Event] = folded_events,
                         _target_key: tuple[str, str] | None = target_batch_key,
+                        _has_decision: bool = has_decision,
+                        _batch_target: tuple[object, ...] | None = batch_target,
                     ) -> list[Event]:
-                        if self._new_event_policy != "fold":
+                        # Never fold across an approval boundary or into a different
+                        # execution target; those events run in a later pass.
+                        if self._new_event_policy != "fold" or _target_key is None or _has_decision:
                             return []
                         newly_folded: list[Event] = []
                         for candidate in self._inbox.fetch_pending(_inbox_id):
                             if candidate.event_id in _consumed:
                                 continue
                             cand_session = self._resolve_session(candidate)
-                            cand_key = self._batch_key(candidate, cand_session)
-                            if cand_key == _target_key:
-                                _consumed.add(candidate.event_id)
-                                _folded.append(candidate)
-                                newly_folded.append(candidate)
+                            if self._batch_key(candidate, cand_session) != _target_key:
+                                continue
+                            if self._is_approval_decision(candidate) or (
+                                _batch_target is not None
+                                and self._execution_target(candidate) != _batch_target
+                            ):
+                                break
+                            _consumed.add(candidate.event_id)
+                            _folded.append(candidate)
+                            newly_folded.append(candidate)
                         return newly_folded
 
                     caps: RunCapabilities = _ScopedCapabilities(
@@ -177,9 +197,12 @@ class AgentWorker:
                         _is_interrupted=interrupted_flag.is_set,
                     )
 
+                    # A decision Run executes the approved tool before the LLM turn; restarting
+                    # it would execute the tool again.
                     allow_interrupt = (
                         self._new_event_policy == "interrupt"
                         and interrupt_restarts < self._max_interrupt_restarts
+                        and not has_decision
                     )
                     try:
                         outcome = await self._execute_batch(
@@ -188,7 +211,7 @@ class AgentWorker:
                             batch=batch,
                             session_ref=session_ref,
                             caps=caps,
-                            known_ids=consumed_ids,
+                            known_ids=snapshot_ids,
                             interrupted_flag=interrupted_flag,
                             wake_signal=wake_signal,
                             allow_interrupt=allow_interrupt,
@@ -235,8 +258,24 @@ class AgentWorker:
         batch: list[Event],
         session_ref: SessionRef | None,
     ) -> ExecutorPort:
+        if self._resumes_suspended(batch, session_ref):
+            assert session_ref is not None
+            # The checkpoint belongs to the executor that suspended; only it can resume.
+            holder = self._suspended_holder(batch, session_ref)
+            if holder is None:
+                raise ExecutorFailed(
+                    f"Suspended session '{session_ref.session_id}' predates executor binding and "
+                    "its executor cannot be determined; set sessions.executor_id to resume it"
+                )
+            held = self._executors.get(holder)
+            if held is None:
+                raise ExecutorFailed(f"Executor '{holder}' holding the suspended session is not registered")
+            return held
+
         event_executor_id: str | None = None
-        for evt in reversed(batch):
+        # Same rule as LocalCLIExecutor: an approval resumes the ordinary events' Run.
+        target_events = [e for e in batch if not self._is_approval_decision(e)] or batch
+        for evt in reversed(target_events):
             raw = evt.payload.get("executor_id")
             if isinstance(raw, str) and raw.strip():
                 event_executor_id = raw.strip()
@@ -351,23 +390,111 @@ class AgentWorker:
         self,
         events: list[Event],
     ) -> list[tuple[SessionRef | None, list[Event]]]:
-        batches: list[tuple[SessionRef | None, list[Event]]] = []
+        # Same-key events form one batch in seq order; batches run in order of first seq.
+        # Events without session_id/correlation_key are unrelated, so each runs alone
+        # (interrupt restarts still merge them). A key's batch closes at an approval decision
+        # or at an event with a different execution target; later events of a closed key
+        # wait for the next fetch, which resolves them against the updated session.
+        # A suspended session treats any Run without the decision as a rejection, so when
+        # the snapshot holds a decision for a key, that key's first batch must carry it:
+        # incompatible events ahead of the decision are held back instead of closing the key,
+        # and so are events routed away from the executor that holds the checkpoint.
+        resolved: list[tuple[Event, SessionRef | None, tuple[str, str] | None]] = []
+        keys_with_decision: set[tuple[str, str]] = set()
+        decision_holders: dict[tuple[str, str], str] = {}
         for event in events:
             resolved_session = self._resolve_session(event)
             resolved_key = self._batch_key(event, resolved_session)
+            resolved.append((event, resolved_session, resolved_key))
+            if resolved_key is not None and self._is_approval_decision(event):
+                keys_with_decision.add(resolved_key)
+                holder = self._suspended_holder([event], resolved_session)
+                if holder is not None:
+                    decision_holders.setdefault(resolved_key, holder)
 
-            if batches:
-                prev_session, prev_events = batches[-1]
-                prev_key = self._batch_key(prev_events[-1], prev_session)
-                if resolved_key is not None and resolved_key == prev_key:
-                    prev_events.append(event)
+        batches: list[tuple[SessionRef | None, list[Event]]] = []
+        open_batches: dict[tuple[str, str] | None, list[Event]] = {}
+        closed_keys: set[tuple[str, str] | None] = set()
+        for event, resolved_session, resolved_key in resolved:
+            if resolved_key in closed_keys:
+                continue
+            if resolved_key is not None and self._is_approval_decision(event):
+                closed_keys.add(resolved_key)
+                open_batch = open_batches.get(resolved_key)
+                if open_batch is not None:
+                    open_batch.append(event)
+                else:
+                    batches.append((resolved_session, [event]))
+                continue
+            if resolved_key is None and self._new_event_policy != "interrupt":
+                batches.append((resolved_session, [event]))
+                continue
+            holder = decision_holders.get(resolved_key) if resolved_key is not None else None
+            routed_to = self._routed_executor_id(event)
+            if holder is not None and routed_to is not None and routed_to != holder:
+                continue
+            open_batch = open_batches.get(resolved_key)
+            if open_batch is not None:
+                if self._execution_target(event) != self._batch_target(open_batch):
+                    if resolved_key not in keys_with_decision:
+                        closed_keys.add(resolved_key)
                     continue
-                if resolved_key is None and prev_key is None and self._new_event_policy == "interrupt":
-                    prev_events.append(event)
-                    continue
-
-            batches.append((resolved_session, [event]))
+                open_batch.append(event)
+                continue
+            new_batch = [event]
+            open_batches[resolved_key] = new_batch
+            batches.append((resolved_session, new_batch))
         return batches
+
+    @staticmethod
+    def _resumes_suspended(batch: list[Event], session_ref: SessionRef | None) -> bool:
+        if session_ref is None or not session_ref.pending_request_id:
+            return False
+        return any(
+            evt.payload.get("approval_request_id") == session_ref.pending_request_id for evt in batch
+        )
+
+    def _suspended_holder(
+        self,
+        batch: list[Event],
+        session_ref: SessionRef | None,
+    ) -> str | None:
+        if not self._resumes_suspended(batch, session_ref):
+            return None
+        assert session_ref is not None
+        if session_ref.executor_id:
+            return session_ref.executor_id
+        # Sessions suspended before executor binding carry no executor_id. Neither the current
+        # default nor a sole registered executor proves who wrote the checkpoint (the old CLI
+        # runtime could pick templates per event; executors can be replaced). Accept only an
+        # executor the approval names; otherwise the caller keeps checkpoint and events pending.
+        for evt in batch:
+            if evt.payload.get("approval_request_id") == session_ref.pending_request_id:
+                named = self._routed_executor_id(evt)
+                if named is not None:
+                    return named
+        return None
+
+    @staticmethod
+    def _routed_executor_id(event: Event) -> str | None:
+        raw = event.payload.get("executor_id")
+        return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+    @staticmethod
+    def _execution_target(event: Event) -> tuple[object, ...]:
+        return tuple(event.payload.get(key) for key in _TARGET_PAYLOAD_KEYS)
+
+    def _batch_target(self, batch: list[Event]) -> tuple[object, ...] | None:
+        # Approval decisions carry no target of their own and inherit the batch's.
+        for evt in batch:
+            if not self._is_approval_decision(evt):
+                return self._execution_target(evt)
+        return None
+
+    @staticmethod
+    def _is_approval_decision(event: Event) -> bool:
+        request_id = event.payload.get("approval_request_id")
+        return isinstance(request_id, str) and bool(request_id)
 
     def _resolve_session(self, event: Event) -> SessionRef | None:
         # 4-level priority: approval_request_id -> explicit session_id -> (inbox_id, correlation_key) -> new.

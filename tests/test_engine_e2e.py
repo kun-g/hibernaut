@@ -2,14 +2,35 @@
 
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 
-from agent_runtime.app.bootstrap import build_runtime
-from agent_runtime.core.models import Emit, Silent, Suspend
+from agent_runtime.app.bootstrap import AgentRuntimeApp, build_runtime
+from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Silent, Suspend
+from agent_runtime.core.ports import RunCapabilities
 from agent_runtime.engine import OutboxDispatcher
+from agent_runtime.engine.worker import ExecutorFailed
 from tests.fakes import RecordingChannel
+
+
+class _OtherExecutor:
+    executor_id = "other"
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    async def execute(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+    ) -> RunOutcome:
+        _ = (session, caps)
+        self.calls.append([evt.external_id for evt in events])
+        return Silent()
 
 
 class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
@@ -88,6 +109,261 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
 
         await self.app.dispatcher.dispatch_once()
         self.assertEqual(len(self.channel.sent), 2)
+
+    async def test_approval_still_applies_when_same_session_note_is_queued_first(self) -> None:
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="req-email-2",
+            payload={"action": "send_email", "to": "bob@example.com", "subject": "Report"},
+        )
+        reports1 = await self.app.worker.process_inbox("u1")
+        suspend_outcome = reports1[0].outcome
+        assert isinstance(suspend_outcome, Suspend)
+        session_id = reports1[0].session_id
+
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="note-2",
+            payload={"text": "any update?"},
+            session_id=session_id,
+        )
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="appr-email-2",
+            payload={"approval_request_id": suspend_outcome.request_id, "approved": True},
+        )
+        reports2 = await self.app.worker.process_inbox("u1")
+
+        self.assertEqual(len(reports2), 1)
+        outcome = reports2[0].outcome
+        assert isinstance(outcome, Emit)
+        self.assertIn("[APPROVED]", outcome.messages[0])
+        self.assertIn("bob@example.com", outcome.messages[0])
+
+    async def test_approval_applies_when_incompatible_notes_are_queued_first(self) -> None:
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="req-email-3",
+            payload={"action": "send_email", "to": "carol@example.com", "subject": "Report"},
+        )
+        reports1 = await self.app.worker.process_inbox("u1")
+        suspend_outcome = reports1[0].outcome
+        assert isinstance(suspend_outcome, Suspend)
+        session_id = reports1[0].session_id
+
+        for ext, workdir in (("note-a", "/a"), ("note-b", "/b")):
+            self.app.handler.ingest(
+                inbox_id="u1",
+                source="im",
+                external_id=ext,
+                payload={"text": ext, "explicit_workdir": workdir},
+                session_id=session_id,
+            )
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="appr-email-3",
+            payload={"approval_request_id": suspend_outcome.request_id, "approved": True},
+        )
+        reports2 = await self.app.worker.process_inbox("u1")
+
+        first = reports2[0].outcome
+        assert isinstance(first, Emit)
+        self.assertIn("[APPROVED]", first.messages[0])
+        self.assertEqual(len(reports2), 2)
+
+    async def _suspend_on_whitebox(self, external_id: str) -> tuple[str, str, _OtherExecutor]:
+        other = _OtherExecutor()
+        self.app.worker._executors["other"] = other  # pyright: ignore[reportPrivateUsage]
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id=external_id,
+            payload={"action": "send_email", "to": "dave@example.com", "subject": "Report"},
+        )
+        reports = await self.app.worker.process_inbox("u1")
+        suspend_outcome = reports[0].outcome
+        assert isinstance(suspend_outcome, Suspend)
+        session_id = reports[0].session_id
+        assert session_id is not None
+        return session_id, suspend_outcome.request_id, other
+
+    async def test_approval_resumes_on_the_executor_holding_the_checkpoint(self) -> None:
+        session_id, request_id, other = await self._suspend_on_whitebox("req-email-4")
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="switch-note",
+            payload={"text": "move on", "executor_id": "other"},
+            session_id=session_id,
+        )
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="appr-email-4",
+            payload={"approval_request_id": request_id, "approved": True},
+        )
+        reports = await self.app.worker.process_inbox("u1")
+
+        first = reports[0].outcome
+        assert isinstance(first, Emit)
+        self.assertIn("[APPROVED]", first.messages[0])
+        self.assertEqual(other.calls, [["switch-note"]])
+
+    async def test_approval_routed_elsewhere_still_resumes_the_holder(self) -> None:
+        _, request_id, other = await self._suspend_on_whitebox("req-email-5")
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="appr-email-5",
+            payload={"approval_request_id": request_id, "approved": True, "executor_id": "other"},
+        )
+        reports = await self.app.worker.process_inbox("u1")
+
+        outcome = reports[0].outcome
+        assert isinstance(outcome, Emit)
+        self.assertIn("[APPROVED]", outcome.messages[0])
+        self.assertEqual(other.calls, [])
+
+    async def _legacy_suspended_app(self) -> tuple[AgentRuntimeApp, str, str, _OtherExecutor]:
+        # Suspend on whitebox, rewrite sessions to the pre-binding schema and reopen so the
+        # real migration backfills executor_id as NULL; then make "other" the new default.
+        root = Path(self._tmp.name) / "legacy"
+        app = build_runtime(db_path=root / "runtime.db", memory_dir=root / "memory", channel=RecordingChannel())
+        app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="legacy-req",
+            payload={"action": "send_email", "to": "erin@example.com", "subject": "Report"},
+        )
+        reports = await app.worker.process_inbox("u1")
+        suspend_outcome = reports[0].outcome
+        assert isinstance(suspend_outcome, Suspend)
+        session_id = reports[0].session_id
+        assert session_id is not None
+        app.close()
+        with sqlite3.connect(root / "runtime.db") as raw:
+            raw.execute("ALTER TABLE sessions DROP COLUMN executor_id")
+            raw.execute("ALTER TABLE sessions DROP COLUMN executor_session_id")
+
+        app = build_runtime(db_path=root / "runtime.db", memory_dir=root / "memory", channel=RecordingChannel())
+        self.addCleanup(app.close)
+        migrated = app.db.fetchone(
+            "SELECT executor_id, pending_request_id FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        assert migrated is not None
+        self.assertEqual(tuple(migrated), (None, suspend_outcome.request_id))
+        other = _OtherExecutor()
+        app.worker._executors["other"] = other  # pyright: ignore[reportPrivateUsage]
+        app.worker._global_default_executor = "other"  # pyright: ignore[reportPrivateUsage]
+        return app, session_id, suspend_outcome.request_id, other
+
+    async def test_legacy_suspended_session_resumes_on_the_executor_the_approval_names(self) -> None:
+        app, session_id, request_id, other = await self._legacy_suspended_app()
+        app.handler.ingest(
+            inbox_id="u1",
+            source="im",
+            external_id="legacy-switch",
+            payload={"text": "move on", "executor_id": "other"},
+            session_id=session_id,
+        )
+        app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="legacy-approve",
+            payload={"approval_request_id": request_id, "approved": True, "executor_id": "whitebox"},
+        )
+        reports = await app.worker.process_inbox("u1")
+
+        first = reports[0].outcome
+        assert isinstance(first, Emit)
+        self.assertIn("[APPROVED]", first.messages[0])
+        self.assertEqual(other.calls, [["legacy-switch"]])
+
+    async def test_legacy_suspended_session_without_known_executor_waits_for_binding(self) -> None:
+        app, session_id, request_id, other = await self._legacy_suspended_app()
+        app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="legacy-approve",
+            payload={"approval_request_id": request_id, "approved": True},
+        )
+        with self.assertRaises(ExecutorFailed):
+            await app.worker.process_inbox("u1")
+
+        self.assertEqual(other.calls, [])
+        session = app.db.fetchone(
+            "SELECT checkpoint, pending_request_id FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        assert session is not None
+        self.assertIsNotNone(session["checkpoint"])
+        self.assertEqual(session["pending_request_id"], request_id)
+
+        # Recovery: once the binding is filled in, the original approval completes.
+        with app.db.transaction() as conn:
+            conn.execute("UPDATE sessions SET executor_id = 'whitebox' WHERE session_id = ?", (session_id,))
+        reports = await app.worker.process_inbox("u1")
+        outcome = reports[0].outcome
+        assert isinstance(outcome, Emit)
+        self.assertIn("[APPROVED]", outcome.messages[0])
+        self.assertEqual(other.calls, [])
+
+    async def test_legacy_session_is_not_resumed_by_a_sole_replacement_executor(self) -> None:
+        app, session_id, request_id, other = await self._legacy_suspended_app()
+        registry = app.worker._executors  # pyright: ignore[reportPrivateUsage]
+        whitebox = registry.pop("whitebox")
+        app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="legacy-approve",
+            payload={"approval_request_id": request_id, "approved": True},
+        )
+        with self.assertRaises(ExecutorFailed):
+            await app.worker.process_inbox("u1")
+
+        self.assertEqual(other.calls, [])
+        session = app.db.fetchone(
+            "SELECT checkpoint, pending_request_id FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        assert session is not None
+        self.assertIsNotNone(session["checkpoint"])
+        self.assertEqual(session["pending_request_id"], request_id)
+
+        registry["whitebox"] = whitebox
+        with app.db.transaction() as conn:
+            conn.execute("UPDATE sessions SET executor_id = 'whitebox' WHERE session_id = ?", (session_id,))
+        reports = await app.worker.process_inbox("u1")
+        outcome = reports[0].outcome
+        assert isinstance(outcome, Emit)
+        self.assertIn("[APPROVED]", outcome.messages[0])
+        self.assertEqual(other.calls, [])
+
+    async def test_suspended_session_whose_holder_is_unregistered_stays_pending(self) -> None:
+        session_id, request_id, other = await self._suspend_on_whitebox("req-email-6")
+        with self.app.db.transaction() as conn:
+            conn.execute("UPDATE sessions SET executor_id = 'retired' WHERE session_id = ?", (session_id,))
+        self.app.handler.ingest(
+            inbox_id="u1",
+            source="approval_ui",
+            external_id="appr-email-6",
+            payload={"approval_request_id": request_id, "approved": True, "executor_id": "other"},
+        )
+        with self.assertRaises(ExecutorFailed):
+            await self.app.worker.process_inbox("u1")
+
+        session = self.app.db.fetchone(
+            "SELECT checkpoint, pending_request_id FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        assert session is not None
+        self.assertIsNotNone(session["checkpoint"])
+        self.assertEqual(session["pending_request_id"], request_id)
+        self.assertEqual(other.calls, [])
+        pending = self.app.db.fetchall("SELECT external_id FROM event_inbox WHERE status = 'pending'")
+        self.assertEqual([r["external_id"] for r in pending], ["appr-email-6"])
 
     async def test_auto_mode_blocks_dangerous_tool_call(self) -> None:
         self.app.handler.ingest(
