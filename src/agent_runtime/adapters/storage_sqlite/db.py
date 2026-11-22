@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS event_inbox (
     session_id TEXT,
     correlation_key TEXT,
     status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'done', 'failed', 'dropped')),
+    -- Storage-internal diagnostics (claim count, failure reason); not part of the L0 Event.
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT
 );
@@ -74,7 +75,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     work_key TEXT,
     checkpoint TEXT,
     pending_request_id TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    parent_session_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_request
@@ -228,7 +230,7 @@ class SQLiteDatabase:
         }
         if "correlation_key" not in session_cols:
             conn.execute("ALTER TABLE sessions ADD COLUMN correlation_key TEXT")
-        for col in ("executor_id", "executor_session_id", "work_key"):
+        for col in ("executor_id", "executor_session_id", "work_key", "parent_session_id"):
             if col not in session_cols:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
         if "status" not in session_cols:
@@ -250,6 +252,12 @@ class SQLiteDatabase:
             """
             CREATE INDEX IF NOT EXISTS idx_sessions_work_key
                 ON sessions (work_key, status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_sessions_parent
+                ON sessions (parent_session_id, updated_at)
             """
         )
 

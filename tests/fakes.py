@@ -7,11 +7,13 @@ from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
+from agent_runtime.adapters.storage_sqlite import EventDiagnostics
 from agent_runtime.core.models import (
     Event,
     OutboxMessage,
     PermissionDecision,
     SessionRef,
+    SessionStatus,
     TimerKind,
     TimerSpec,
     new_id,
@@ -25,6 +27,8 @@ class InMemoryInbox:
     def __init__(self) -> None:
         self._events: list[Event] = []
         self._seen_keys: set[tuple[str, str, str]] = set()
+        self._attempts: dict[str, int] = {}
+        self._errors: dict[str, str] = {}
 
     def append(self, event: Event) -> tuple[Event, bool]:
         dedup_key = (event.inbox_id, event.source, event.external_id)
@@ -56,7 +60,8 @@ class InMemoryInbox:
         updated: list[Event] = []
         for evt in self._events:
             if evt.inbox_id == inbox_id and evt.status == "pending":
-                nxt = replace(evt, status="processing", attempts=evt.attempts + 1)
+                nxt = replace(evt, status="processing")
+                self._attempts[evt.event_id] = self._attempts.get(evt.event_id, 0) + 1
                 claimed.append(nxt)
                 updated.append(nxt)
             else:
@@ -89,10 +94,23 @@ class InMemoryInbox:
 
     def mark_failed(self, event_ids: Sequence[str], error: str) -> None:
         target = set(event_ids)
+        for event_id in target:
+            self._errors[event_id] = error
         self._events = [
-            replace(evt, status="failed", last_error=error) if evt.event_id in target else evt
+            replace(evt, status="failed") if evt.event_id in target else evt
             for evt in self._events
         ]
+
+    def diagnostics(self, event_ids: Sequence[str]) -> dict[str, EventDiagnostics]:
+        known = {evt.event_id for evt in self._events}
+        return {
+            event_id: EventDiagnostics(
+                attempts=self._attempts.get(event_id, 0),
+                last_error=self._errors.get(event_id),
+            )
+            for event_id in event_ids
+            if event_id in known
+        }
 
     def all_events(self) -> list[Event]:
         return list(self._events)
@@ -263,6 +281,23 @@ class InMemorySessionStore:
             for s in self._sessions.values()
             if s.work_key == work_key and s.status in ("active", "suspended")
         )
+
+    def list_sessions(
+        self,
+        *,
+        inbox_id: str | None = None,
+        status: SessionStatus | None = None,
+        parent_session_id: str | None = None,
+    ) -> list[SessionRef]:
+        rows = [
+            s
+            for s in self._sessions.values()
+            if (not inbox_id or s.inbox_id == inbox_id)
+            and (not status or s.status == status)
+            and (not parent_session_id or s.parent_session_id == parent_session_id)
+        ]
+        rows.sort(key=lambda s: s.updated_at, reverse=True)
+        return rows
 
     def archive_session(self, session_id: str) -> None:
         existing = self._sessions.get(session_id)

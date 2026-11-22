@@ -192,7 +192,13 @@ class AgentWorker:
                             raise
 
                         batch_correlation_key = self._extract_correlation_key(batch, session_ref)
-                        batch_work_key = self._extract_work_key(batch, session_ref, batch_correlation_key)
+                        batch_parent_sid = self._extract_parent_session_id(batch, session_ref)
+                        batch_work_key = self._extract_work_key(
+                            batch,
+                            session_ref,
+                            batch_correlation_key,
+                            batch_parent_sid,
+                        )
 
                         # Create & persist active SessionRef BEFORE execute(), then bind events immediately.
                         explicit_sid = next((e.session_id for e in batch if e.session_id), None)
@@ -203,6 +209,7 @@ class AgentWorker:
                             correlation_key=batch_correlation_key,
                             work_key=batch_work_key,
                             executor_id=selected_executor.executor_id,
+                            parent_session_id=batch_parent_sid,
                         )
                         self._inbox.bind_session(batch_ids, active_session.session_id)
 
@@ -307,6 +314,7 @@ class AgentWorker:
                             batch + folded_events,
                             active_session,
                             final_corr,
+                            active_session.parent_session_id,
                         )
                         final_session_id = self._apply_outcome(
                             inbox_id,
@@ -356,9 +364,11 @@ class AgentWorker:
         correlation_key: str | None,
         work_key: str | None,
         executor_id: str,
+        parent_session_id: str | None,
     ) -> SessionRef:
         if session_ref is not None:
             return session_ref
+        # Persisting the child before execute() makes count_active_by_work_key include it at once.
         new_session = SessionRef(
             session_id=explicit_session_id or new_id("sess"),
             inbox_id=inbox_id,
@@ -367,6 +377,7 @@ class AgentWorker:
             status="active",
             work_key=work_key,
             updated_at=utc_now_iso(),
+            parent_session_id=parent_session_id,
         )
         self._sessions.save(new_session)
         return new_session
@@ -534,11 +545,25 @@ class AgentWorker:
                 return evt.correlation_key
         return session_ref.correlation_key if session_ref is not None else None
 
+    @staticmethod
+    def _extract_parent_session_id(
+        events: list[Event],
+        session_ref: SessionRef | None,
+    ) -> str | None:
+        if session_ref is not None:
+            return session_ref.parent_session_id
+        for evt in events:
+            raw = evt.payload.get("parent_session_id")
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+        return None
+
     def _extract_work_key(
         self,
         events: list[Event],
         session_ref: SessionRef | None,
         correlation_key: str | None,
+        parent_session_id: str | None,
     ) -> str | None:
         for evt in reversed(events):
             raw = evt.payload.get("work_key")
@@ -546,6 +571,11 @@ class AgentWorker:
                 return raw.strip()
         if session_ref is not None and session_ref.work_key:
             return session_ref.work_key
+        if parent_session_id is not None:
+            # A delegated child reuses the parent's worktree instead of opening its own.
+            parent = self._sessions.get(parent_session_id)
+            if parent is not None and parent.work_key:
+                return parent.work_key
         return correlation_key
 
     def _group_into_batches(
@@ -718,6 +748,7 @@ class AgentWorker:
                         checkpoint=None,
                         pending_request_id=None,
                         updated_at=utc_now_iso(),
+                        parent_session_id=session_ref.parent_session_id,
                     )
                 )
                 return session_ref.session_id
@@ -753,6 +784,7 @@ class AgentWorker:
                         checkpoint=None,
                         pending_request_id=None,
                         updated_at=utc_now_iso(),
+                        parent_session_id=session_ref.parent_session_id,
                     )
                 )
                 return target_sid
@@ -785,6 +817,7 @@ class AgentWorker:
                         checkpoint=checkpoint,
                         pending_request_id=request_id,
                         updated_at=utc_now_iso(),
+                        parent_session_id=session_ref.parent_session_id,
                     )
                 )
                 if repeated:
