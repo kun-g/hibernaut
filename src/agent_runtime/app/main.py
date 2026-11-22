@@ -47,7 +47,12 @@ from agent_runtime.adapters.executor_cli import (
     Reviewer,
     SDEExecutor,
 )
-from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, default_transcript_roots
+from agent_runtime.adapters.executor_cli.orca import (
+    OrcaCommandTerminal,
+    OrcaVisibleRunner,
+    TerminalUnavailable,
+    default_transcript_roots,
+)
 from agent_runtime.adapters.executor_cli.peer import DeveloperPeerResolver, registry_dirs
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
@@ -704,6 +709,7 @@ def build_daemon_from_config(
         # Role executors are rebuilt with each config reload, so the next run uses the new profile and launcher.
         terminal_bindings = SQLiteTerminalBindingStore(daemon.db)
         terminal_runner = OrcaVisibleRunner(bindings=terminal_bindings)
+        cli_terminal = OrcaCommandTerminal()
         # An independently dispatched review finds its developer only through bindings this runtime recorded.
         developer_peers = DeveloperPeerResolver(
             sessions=daemon.sessions,
@@ -740,7 +746,11 @@ def build_daemon_from_config(
                 if name in reviewers:
                     return reviewers[name]
                 template = templates.get(name)
-                return CLIReviewer(template=template) if template is not None else None
+                if template is None:
+                    return None
+                # A CLI review that asks for a terminal runs as a subprocess where the project has none.
+                return CLIReviewer(template=template,
+                                   terminal=cli_terminal if no_terminal is None else TerminalUnavailable(no_terminal))
 
             built: dict[str, ExecutorPort] = dict(reviewers)
             for name, role in config.roles.items():
