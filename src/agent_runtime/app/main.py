@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import signal
+import ssl
 import sys
 import threading
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
@@ -12,6 +13,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from agent_runtime import __version__
 from agent_runtime.adapters.channels import (
@@ -30,6 +32,7 @@ from agent_runtime.adapters.channels import (
 )
 from agent_runtime.adapters.channels.channels import webhook_request_handler
 from agent_runtime.adapters.channels.switchboard_bridge import SwitchboardChannelAdapter, SwitchboardInboundBridge
+from agent_runtime.adapters.channels.switchboard_relay import SwitchboardBus, SwitchboardRelayLink
 from agent_runtime.adapters.delivery import DeliveryConfig, PRDelivery
 from agent_runtime.adapters.executor_cli import (
     CODER_REVIEWER_ROLE,
@@ -82,6 +85,12 @@ from switchboard.app import EnvCredentialBroker, Switchboard, build_switchboard
 from switchboard.config import load_config as load_switchboard_config
 
 SWITCHBOARD_SECRET_PREFIX = "SWITCHBOARD_"
+SWITCHBOARD_RELAY_TOKEN_ENV = "SWITCHBOARD_RELAY_TOKEN"
+SWITCHBOARD_MCP_TOKEN_ENV = "SWITCHBOARD_MCP_TOKEN"
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# in_process: the whole Switchboard runs here. relay (Stage B): a link to a remote hub.
+SwitchboardHandle = Switchboard | SwitchboardRelayLink
 
 
 class AsyncWorkerPool:
@@ -535,7 +544,7 @@ def build_daemon_from_config(
     database: SQLiteDatabase | None = None,
     demo: bool = False,
     gdrive_client: DriveClientProtocol | None = None,
-    switchboard: Switchboard | None = None,
+    switchboard: SwitchboardHandle | None = None,
 ) -> AlwaysOnDaemon:
     # Every inbox -> project lookup goes through the router, so pattern-matched inboxes get their project's settings
     # and an inbox matching two projects raises AmbiguousProjectMatch instead of picking one.
@@ -563,7 +572,7 @@ def build_daemon_from_config(
     )
     if switchboard is not None:
         # Replies with an origin go out through the Switchboard gateway; session-less notices keep the old channel.
-        resolved_channel = SwitchboardChannelAdapter(switchboard.bus.publish, fallback=resolved_channel)
+        resolved_channel = SwitchboardChannelAdapter(switchboard_bus(switchboard).publish, fallback=resolved_channel)
 
     gh_secret = os.environ.get(config.channels.github_webhook_secret_env) or None
     feishu_token = os.environ.get(config.channels.feishu_verification_token_env) or None
@@ -833,20 +842,65 @@ def take_switchboard_secrets(environ: MutableMapping[str, str] | None = None) ->
     return {name: env.pop(name) for name in [n for n in env if n.startswith(SWITCHBOARD_SECRET_PREFIX)]}
 
 
-def start_switchboard(link: SwitchboardLinkConfig) -> Switchboard | None:
+def switchboard_bus(handle: SwitchboardHandle) -> SwitchboardBus:
+    return handle.bus if isinstance(handle, Switchboard) else handle
+
+
+def start_switchboard(
+    link: SwitchboardLinkConfig,
+    *,
+    environ: MutableMapping[str, str] | None = None,
+) -> SwitchboardHandle | None:
     if not link.enabled:
         return None
+    credentials = EnvCredentialBroker(take_switchboard_secrets(environ))
+    if link.mode == "relay":
+        return open_switchboard_relay(link, credentials)
     assert link.config_path is not None
-    board = build_switchboard(load_switchboard_config(link.config_path), credentials=EnvCredentialBroker(take_switchboard_secrets()))
+    board = build_switchboard(load_switchboard_config(link.config_path), credentials=credentials)
     board.start()
     print(f"[hibernaut] [switchboard] in-process switchboard listening on {board.http.base_url}", file=sys.stderr, flush=True)
     return board
 
 
-def attach_switchboard(daemon: AlwaysOnDaemon, board: Switchboard, consumer_id: str) -> SwitchboardInboundBridge:
+def open_switchboard_relay(link: SwitchboardLinkConfig, credentials: EnvCredentialBroker) -> SwitchboardRelayLink:
+    assert link.relay_url is not None and link.mcp_url is not None
+    missing = [
+        name
+        for name, channel in ((SWITCHBOARD_RELAY_TOKEN_ENV, "relay"), (SWITCHBOARD_MCP_TOKEN_ENV, "mcp"))
+        if not credentials.issue_ephemeral(channel)
+    ]
+    if missing:
+        raise ValueError(f'switchboard.mode = "relay" needs {" and ".join(missing)} in the environment')
+    for url in (link.relay_url, link.mcp_url):
+        parsed = urlparse(url)
+        if parsed.scheme in ("ws", "http") and parsed.hostname not in _LOOPBACK_HOSTS:
+            print(
+                f"[hibernaut] [switchboard] WARNING: {url} is not TLS; the relay and MCP tokens travel in clear text.",
+                file=sys.stderr,
+                flush=True,
+            )
+    context = ssl.create_default_context(cafile=link.ca_file) if link.ca_file else None
+    # The agent connects when build_daemon_from_config subscribes, so no push arrives before ingest is wired.
+    relay = SwitchboardRelayLink(
+        relay_url=link.relay_url,
+        mcp_url=link.mcp_url,
+        consumer_id=link.consumer_id,
+        credentials=credentials,
+        ssl_context=context,
+    )
+    print(
+        f"[hibernaut] [switchboard] relay mode: receiving from {link.relay_url}, reporting to {link.mcp_url}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return relay
+
+
+def attach_switchboard(daemon: AlwaysOnDaemon, board: SwitchboardHandle, consumer_id: str) -> SwitchboardInboundBridge:
     # Subscribing again replaces the previous handler, so a config reload re-points delivery at the new daemon.
     bridge = SwitchboardInboundBridge(daemon.handler)
-    board.bus.subscribe(consumer_id, bridge.handle_canonical_event)
+    switchboard_bus(board).subscribe(consumer_id, bridge.handle_canonical_event)
     daemon.switchboard_bridge = bridge
     return bridge
 
@@ -858,7 +912,7 @@ async def serve_configured(
     stop: asyncio.Event,
     *,
     demo: bool = False,
-    switchboard: Switchboard | None = None,
+    switchboard: SwitchboardHandle | None = None,
     reload_interval: float = 1.0,
     outbox_interval_seconds: float = 1.0,
 ) -> None:
@@ -963,10 +1017,11 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=banner)
     args = parser.parse_args()
 
-    board: Switchboard | None = None
+    board: SwitchboardHandle | None = None
     if args.config:
         cfg = load_config(args.config)
-        # The stdio MCP companion runs beside a daemon that already owns the Switchboard port.
+        # The stdio MCP companion runs beside a daemon that already owns the Switchboard port or relay
+        # connection; a second relay agent with the same consumer_id would supersede the daemon's.
         board = None if args.mcp_stdio else start_switchboard(cfg.switchboard)
         daemon = build_daemon_from_config(cfg, demo=args.demo, switchboard=board)
         host = cfg.channels.host

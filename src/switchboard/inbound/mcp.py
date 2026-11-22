@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, Final, cast
 
 from switchboard import __version__
-from switchboard.envelope import CanonicalEvent, EventType, Source, new_ulid, utc_now, format_utc
+from switchboard.envelope import CanonicalEvent, EventType, Source, format_utc, new_ulid, normalize_utc, utc_now
 from switchboard.inbound._util import lower_headers, obj, parse_json_object, reject, text
 from switchboard.pipeline import Clock, InboundPipeline, describe_ingest
 from switchboard.ports import AdapterParseResult, CredentialBrokerPort
@@ -70,6 +70,33 @@ TOOLS: Final[list[dict[str, Any]]] = [
                 "comment": {"type": "string"},
             },
             "required": ["approval_request_id", "decision", "correlation_key", "actor"],
+        },
+    },
+    {
+        "name": "report_execution",
+        "description": "Report a Hibernaut node's run outcome as execution.reported (emit, suspend, error or done); "
+        "repeated reports with one external_id are dropped.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "external_id": {"type": "string"},
+                "scope": {"type": "string"},
+                "correlation_key": {"type": "string"},
+                "subject": {"type": "string"},
+                "body": {"type": "string"},
+                "actor": {"type": "string"},
+                "occurred_at": {"type": "string"},
+                "metadata": {
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string"},
+                        "session_id": {"type": "string"},
+                        "outcome_kind": {"type": "string", "enum": ["emit", "suspend", "error", "done"]},
+                    },
+                    "required": ["run_id", "session_id", "outcome_kind"],
+                },
+            },
+            "required": ["external_id", "scope", "correlation_key", "subject", "metadata"],
         },
     },
     {
@@ -161,6 +188,8 @@ class MCPInboundAdapter:
             return self._post_message(args)
         if name == "decide_approval":
             return self._decide_approval(args)
+        if name == "report_execution":
+            return self._report_execution(args)
         if name == "replay_delivery":
             return self._replay_delivery(args)
         raise ToolError(f"unknown tool {name!r}")
@@ -230,6 +259,23 @@ class MCPInboundAdapter:
                     "session_id": text(args.get("session_id")),
                     "channel": "mcp",
                 },
+            )
+        )
+
+    # No default_scope fallback: the report belongs to the node's inbox, and a missing scope fails validation.
+    def _report_execution(self, args: dict[str, Any]) -> dict[str, Any]:
+        return self._ingest(
+            CanonicalEvent(
+                source="hibernaut",
+                event_type="execution.reported",
+                external_id=text(args.get("external_id")),
+                occurred_at=normalize_utc(text(args.get("occurred_at")) or None, self._clock()),
+                scope=text(args.get("scope")),
+                correlation_key=text(args.get("correlation_key")) or None,
+                actor=text(args.get("actor")) or "hibernaut",
+                subject=text(args.get("subject")),
+                body=text(args.get("body")),
+                metadata=dict(obj(args.get("metadata"))),
             )
         )
 

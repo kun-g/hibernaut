@@ -408,7 +408,7 @@ export SWITCHBOARD_GITHUB_TOKEN=... SWITCHBOARD_FEISHU_TOKEN=...   # outbound AP
 PYTHONPATH=src python3 -m switchboard.app --config switchboard.toml
 ```
 
-Secrets are read through `CredentialBrokerPort`; the default `EnvCredentialBroker` reads the variables above and nothing goes in the TOML file. Endpoints on one port: `POST /webhooks/github`, `POST /webhooks/feishu`, `POST /mcp` (tools `submit_work`, `post_message`, `decide_approval`, `replay_delivery`) and `GET /healthz`.
+Secrets are read through `CredentialBrokerPort`; the default `EnvCredentialBroker` reads the variables above and nothing goes in the TOML file. Endpoints on one port: `POST /webhooks/github`, `POST /webhooks/feishu`, `POST /mcp` (tools `submit_work`, `post_message`, `decide_approval`, `report_execution`, `replay_delivery`) and `GET /healthz`.
 
 - A GitHub redelivery with a new `X-GitHub-Delivery` is still a duplicate: events are deduplicated by business fingerprint (`issue:{repo}#{num}:{action}:{updated_at}`, `pr:...`, `comment:{id}`).
 - A consumer that still fails after the last retry (one retry per `retry_backoff_seconds` entry, default 5/15/45/135/405 s) goes to `dead_letter` and an alert is sent to `[delivery] dead_letter_alert_channel/target`; later events for the same consumer and scope wait, other scopes and consumers continue. Replay with the MCP tool `replay_delivery`.
@@ -453,12 +453,35 @@ Off by default. To run Switchboard in the Hibernaut process, add to `hibernaut.t
 ```toml
 [switchboard]
 enabled = true
-mode = "in_process"                  # the only mode today; "relay" is reserved for Stage B
+mode = "in_process"                  # or "relay" (Stage B, below)
 config_path = "switchboard.toml"     # relative to hibernaut.toml
 consumer_id = "hibernaut"
 ```
 
 Hibernaut then starts the Switchboard endpoints from `switchboard.toml` beside its own, subscribes as `consumer_id`, and turns `conversation.message`, `work.ready`, `approval.decided` and `work.closed` deliveries into `event_inbox` events (`source = "sb:<source>"`, deduplicated by the Switchboard `event_id`). Emit and Suspend replies that know their `correlation_key` and session go out as `execution.reported` through the Switchboard gateway (GitHub comments, Feishu approval cards); messages without an origin, such as worktree reclaim alerts, still use the Feishu/console channel. `work.closed` closes the matching session and reclaims its worktree when no active session still uses it. The `SWITCHBOARD_*` variables are moved out of the process environment at startup, so executor subprocesses do not inherit them. Changing `[switchboard]` needs a restart. The existing GitHub, Feishu, MCP and Drive channels keep working alongside it.
+
+### Connecting Hibernaut to a remote Switchboard (Stage B)
+
+With `mode = "relay"` Hibernaut does not run a Switchboard itself. It connects out to a public hub, so it works behind NAT or on a laptop that sleeps:
+
+```toml
+[switchboard]
+enabled = true
+mode = "relay"
+relay_url = "wss://switchboard.example.com/ws/relay"
+mcp_url = "https://switchboard.example.com/mcp"
+consumer_id = "hibernaut"
+# ca_file = "private-ca.pem"   # relative to hibernaut.toml
+```
+
+```bash
+export SWITCHBOARD_RELAY_TOKEN=...   # the hub's SWITCHBOARD_RELAY_WEBHOOK_SECRET
+export SWITCHBOARD_MCP_TOKEN=...     # the hub's SWITCHBOARD_MCP_WEBHOOK_SECRET
+```
+
+- Events for `consumer_id` arrive over the relay WebSocket and are stored in `event_inbox` exactly as in Stage A; the ack is sent only after they are stored, and events queued while the node was offline are pushed when it reconnects.
+- Replies go back as `execution.reported` through the hub's MCP tool `report_execution`, which deduplicates by `external_id` and fans out to `taskboard` and the outbound gateway. A failed call stays in the Outbox and is retried.
+- Both tokens are required at startup and are moved out of the process environment. A plain `ws://` or `http://` URL to a non-loopback host prints a warning, because the tokens would travel unencrypted.
 
 ## Anti-Corruption Gates (CI)
 
