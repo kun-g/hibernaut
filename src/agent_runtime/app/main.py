@@ -472,6 +472,7 @@ def build_daemon(
     gdrive_poll_interval_seconds: float = 30.0,
     gdrive_default_inbox_id: str = "default",
     outbox_dir: str | Path | None = None,
+    outbox_display_base: str | Path | None = None,
     approval_events_url: str = "http://127.0.0.1:8080/events",
 ) -> AlwaysOnDaemon:
     db = database if database is not None else SQLiteDatabase(db_path)
@@ -560,7 +561,9 @@ def build_daemon(
         resolved_channel = gdrive_writer
     if outbox_dir is not None:
         # Outermost: the file is written first, then every existing channel gets the message unchanged.
-        resolved_channel = FileOutboxChannel(outbox_dir, resolved_channel, events_url=approval_events_url)
+        resolved_channel = FileOutboxChannel(
+            outbox_dir, resolved_channel, events_url=approval_events_url, display_base=outbox_display_base
+        )
 
     def _on_reports(reports: list[RunReport]) -> None:
         if gdrive_writer is None:
@@ -753,6 +756,7 @@ def build_daemon_from_config(
         gdrive_poll_interval_seconds=config.gdrive.poll_interval_seconds,
         gdrive_default_inbox_id=config.gdrive.default_inbox_id,
         outbox_dir=config.channels.outbox_dir or None,
+        outbox_display_base=config.config_dir or None,
         approval_events_url=local_events_url(config.channels.host, config.channels.port),
     )
 

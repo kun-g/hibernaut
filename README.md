@@ -72,7 +72,7 @@ curl -s localhost:8080/events -H 'Content-Type: application/json' -d @docs/dispa
 | `[projects.<name>]` | 仓库、检出路径、服务的 `inbox_id`（字符串或正则数组）、默认 `executor`、worktree 与终端后端 |
 | `[projects.<name>.delivery]` | PR 交付：开 PR、自动合并、版本文件、检查命令、是否要求评审和 CI |
 | `[gdrive]` | Drive 任务队列，部署见 [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md) |
-| `[switchboard]` | 同进程运行 Switchboard 或经 Relay 连接远程 Switchboard |
+| `[switchboard]` | 同进程运行 Switchboard 或经 Relay 连接远程 Switchboard；公网 VPS 容器部署见 [`deploy/switchboard/`](deploy/switchboard/README.md) |
 
 ## 运行
 
@@ -99,6 +99,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 | [`AGENTS.md`](AGENTS.md) | 开发规范与提交门禁 |
 | [`docs/dispatch/`](docs/dispatch) | 派单模板：SDE 任务（`/events`、Drive）、独立评审 |
 | [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md) | Drive 队列凭据代理的安装与维护 |
+| [`deploy/switchboard/`](deploy/switchboard/README.md) | Switchboard 公网 VPS 容器部署（Docker Compose + Caddy 自动 TLS）、Hibernaut 配对、冒烟验收、灰度切流与回滚 |
 | [`docs/adr/`](docs/adr) | 架构决策记录 |
 
 ## 开发

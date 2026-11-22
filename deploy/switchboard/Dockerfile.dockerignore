@@ -1,0 +1,5 @@
+# BuildKit reads this for deploy/switchboard/Dockerfile. The context is the repo root,
+# so send only Switchboard's sources (keeps .env, *.db and .venv out of the build).
+*
+!src/switchboard/
+**/__pycache__

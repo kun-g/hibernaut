@@ -209,6 +209,8 @@ class HibernautConfig:
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     gdrive: GDriveConfig = field(default_factory=GDriveConfig)
     switchboard: SwitchboardLinkConfig = field(default_factory=SwitchboardLinkConfig)
+    # The directory relative paths were resolved against (the config file's); "" when parsed without one.
+    config_dir: str = ""
 
 
 def _resolve_path(raw: str, base_dir: Path | None) -> str:
@@ -520,4 +522,5 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         projects=projects,
         gdrive=gdrive,
         switchboard=parse_switchboard_link(raw.get("switchboard"), base_dir=base_dir),
+        config_dir=str(base_dir) if base_dir is not None else "",
     )
