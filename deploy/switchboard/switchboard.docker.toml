@@ -1,0 +1,47 @@
+# Container baseline for deploy/switchboard. Copy to switchboard.toml next to docker-compose.yml.
+# Secrets never go here: they come from .env (SWITCHBOARD_* variables, see .env.example).
+# Paths are inside the container; /data is the switchboard_data volume.
+
+[http]
+host = "0.0.0.0"  # reachable only on the compose network; Caddy is the public entry
+port = 8790
+max_body_bytes = 1048576
+
+[sqlite]
+path = "/data/switchboard.db"
+busy_timeout_ms = 5000
+
+[routing]
+default_scope = "user:main"
+unmatched_policy = "fallback"  # or "reject"
+
+[routing.github_repos]
+"kun-g/hibernaut" = "proj:hibernaut"
+
+[routing.feishu_chats]
+# "oc_xxx" = "proj:hibernaut"
+
+[feishu]
+group_require_mention = true
+# bot_open_id = "ou_xxx"
+
+[delivery]
+retry_backoff_seconds = [5, 15, 45, 135, 405]
+# dead_letter_alert_channel = "feishu"
+# dead_letter_alert_target = "oc_xxx"
+
+[outbound]
+rate_limit_per_target_rpm = 30
+max_retry_attempts = 5
+approval_channel = "feishu"
+# approval_target = "oc_xxx"
+
+[relay]
+enabled = true
+path = "/ws/relay"
+auth_timeout_sec = 5
+heartbeat_sec = 20
+ack_timeout_sec = 15
+max_in_flight = 8
+transport = "hybrid"
+# Leave listen_host / listen_port unset: the relay shares port 8790, the only port Caddy forwards to.

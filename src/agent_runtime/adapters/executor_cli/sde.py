@@ -23,7 +23,12 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     role_system_prompt,
     run_claude_code,
 )
-from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, terminal_title
+from agent_runtime.adapters.executor_cli.orca import (
+    OrcaVisibleRunner,
+    TerminalUnavailable,
+    close_terminals,
+    terminal_title,
+)
 from agent_runtime.adapters.executor_cli.peer import PEER_TOOLS, SUBAGENT_TOOLS
 from agent_runtime.adapters.executor_cli.process import is_approval, join_text, last_text, target_events
 from agent_runtime.adapters.executor_cli.project_guidance import (
@@ -193,6 +198,8 @@ class _State:
     nudged: bool = False
     # Inbox that owns the task's worktree; empty in checkpoints from before it was recorded.
     inbox_id: str = ""
+    # Orca terminals a CLI reviewer left open for reading; closed with the delivery when close_terminal is on.
+    review_terminals: list[str] = field(default_factory=_no_history)
 
     def dump(self) -> str:
         return json.dumps({_CHECKPOINT_KEY: {f: getattr(self, f) for f in self.__slots__}}, ensure_ascii=False)
@@ -603,6 +610,7 @@ class SDEExecutor:
                 f"round {len(state.history) + 1} {review['verdict']}"
                 + (f" ({len(blocking)} blocking)" if blocking else "")
             )
+            state.review_terminals += [str(h) for h in review.get("cli_terminals", ())]
             state.last_review = reviewer.format_review(review)
             state.reviewed_snapshot = snapshot
             state.blocking = blocking
@@ -749,6 +757,26 @@ class SDEExecutor:
         return self._deliver(session_id, native, state, record, exit_note=exit_note)
 
     async def _exit_terminal(self, session_id: str, native: str | None, state: _State, record: DeliveryRecord) -> str:
+        notes = [await self._exit_dev_terminal(session_id, native, state, record),
+                 await self._close_review_terminals(state, record)]
+        return "\n".join(n for n in notes if n)
+
+    async def _close_review_terminals(self, state: _State, record: DeliveryRecord) -> str:
+        # A CLI reviewer's finished terminals only hold output to read; they close on the same delivery evidence as
+        # the developer's terminal, but a question or a live peer of the developer session does not keep them.
+        delivery = self._delivery
+        if delivery is None or not state.review_terminals or not delivery.config.close_terminal:
+            return ""
+        holds = delivery.unverified(record)
+        if holds:
+            return f"Review terminals: kept {', '.join(state.review_terminals)} ({'; '.join(holds)})"
+        result = await close_terminals(state.review_terminals, Path(state.workdir))
+        state.review_terminals = []
+        return f"Review terminals: {result}"
+
+    async def _exit_dev_terminal(
+        self, session_id: str, native: str | None, state: _State, record: DeliveryRecord
+    ) -> str:
         # The terminal closes only on target evidence and only once SHA, PR URL and the resumable session are stored;
         # a human question or a live reviewer keeps it. Closing it never reclaims the worktree.
         delivery, terminal = self._delivery, self._terminal

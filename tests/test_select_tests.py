@@ -14,6 +14,11 @@ class TestSelectTests(unittest.TestCase):
         self.assertNotIn("tests/test_guidance_catalog.py", res.tests)
         self.assertNotIn("tests/test_pr_delivery.py", res.tests)
 
+    def test_switchboard_deploy_kit_change_selects_its_test(self) -> None:
+        res = select_tests(["deploy/switchboard/Dockerfile"])
+        self.assertFalse(res.full_suite)
+        self.assertEqual(res.tests, ("tests/test_switchboard_deploy.py",))
+
     def test_delivery_and_channel_changes_stay_scoped_to_affected_tests(self) -> None:
         delivery = select_tests(["src/agent_runtime/adapters/delivery/pr_delivery.py"])
         self.assertFalse(delivery.full_suite)

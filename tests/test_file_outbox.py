@@ -225,8 +225,70 @@ class TestWiring(unittest.IsolatedAsyncioTestCase):
             await daemon.channel.send(INBOX, "line one\nline two", meta)
         (path,) = _md(self.root / "outbox")
         (line,) = out.getvalue().splitlines()
-        self.assertRegex(line, rf"^\[OUTBOX\] \d{{4}}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{{3}} 失败 \| Fix login \| {re.escape(str(path))}$")
+        self.assertRegex(line, rf"^\[OUTBOX\] \d{{4}}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{{3}} 失败 \| Fix login \| {re.escape(f'outbox/{path.name}')}$")
         self.assertNotIn("line one", out.getvalue())
+
+    async def test_loaded_config_shows_the_path_relative_to_the_config_file(self) -> None:
+        cfg_dir = self.root / "conf"
+        cfg_dir.mkdir()
+        cfg_path = cfg_dir / "hibernaut.toml"
+        cfg_path.write_text(
+            f'[runtime]\ndb_path = "{self.root / "hb.db"}"\nmemory_root = "{self.root / "mem"}"\n'
+            '[channels]\noutbox_dir = "outbox"\n'
+        )
+        with patch.dict(os.environ, {"FEISHU_APP_ID": "", "FEISHU_APP_SECRET": ""}):
+            daemon = build_daemon_from_config(load_config(cfg_path), demo=True)
+        self.addCleanup(daemon.close)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            await daemon.channel.send(INBOX, "body", {"kind": "emit"})
+        (path,) = _md(cfg_dir / "outbox")
+        self.assertTrue(out.getvalue().rstrip("\n").endswith(f" | outbox/{path.name}"), out.getvalue())
+
+
+class TestSummaryPath(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.conf = self.root / "conf"
+        self.home = self.root / "home"
+        self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}))
+
+    async def _summary_path(self, directory: Path, **kwargs: Any) -> tuple[Path, str]:
+        channel, lines = _channel(directory, **kwargs)
+        await channel.send(INBOX, "body", {"kind": "emit"})
+        (path,) = _md(directory)
+        (line,) = lines
+        return path, line.rsplit(" | ", 1)[1]
+
+    async def test_inside_the_config_dir_is_relative(self) -> None:
+        path, shown = await self._summary_path(self.conf / "outbox", display_base=self.conf)
+        self.assertEqual(shown, f"outbox/{path.name}")
+
+    async def test_dotdot_out_of_the_config_dir_is_not_relative(self) -> None:
+        path, shown = await self._summary_path(self.conf / ".." / "home" / "box", display_base=self.conf)
+        self.assertEqual(shown, f"~/box/{path.name}")
+
+    async def test_outside_the_config_dir_under_home_uses_tilde(self) -> None:
+        path, shown = await self._summary_path(self.home / "hb-outbox", display_base=self.conf)
+        self.assertEqual(shown, f"~/hb-outbox/{path.name}")
+
+    async def test_outside_the_config_dir_and_home_is_absolute(self) -> None:
+        path, shown = await self._summary_path(self.root / "elsewhere", display_base=self.conf)
+        self.assertEqual(shown, str(path))
+
+    async def test_without_a_base_stays_absolute(self) -> None:
+        path, shown = await self._summary_path(self.home / "hb-outbox")
+        self.assertEqual(shown, str(path))
+
+    async def test_file_content_and_name_do_not_change(self) -> None:
+        stamp = datetime(2026, 11, 22, 19, 31, 29, 358000)
+        plain_dir, based_dir = self.root / "plain", self.conf / "outbox"
+        plain, _ = _channel(plain_dir, clock=lambda: stamp)
+        based, _ = _channel(based_dir, clock=lambda: stamp, display_base=self.conf)
+        for channel in (plain, based):
+            await channel.send(INBOX, "body", {"kind": "emit"})
+        (a,), (b,) = _md(plain_dir), _md(based_dir)
+        self.assertEqual((a.name, a.read_text()), (b.name, b.read_text()))
 
 
 class _ScriptedExecutor:

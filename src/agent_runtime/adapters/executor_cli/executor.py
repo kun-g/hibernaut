@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout, last_text, supervise, target_events
@@ -36,7 +38,11 @@ class CLITemplate:
     env: dict[str, str] = field(default_factory=_empty_env)
     timeout_seconds: float = 300.0
     orca_agent: str | None = None
+    # Only CLIReviewer reads it: "orca" runs the review in a visible Orca terminal of the worktree.
+    terminal: Literal["none", "orca"] = "none"
 
+
+CLI_TERMINALS: tuple[Literal["none", "orca"], ...] = ("none", "orca")
 
 DEFAULT_CLI_TEMPLATES: dict[str, CLITemplate] = {
     "claude": CLITemplate(name="claude", command="claude", args=("-p",)),
@@ -46,14 +52,24 @@ DEFAULT_CLI_TEMPLATES: dict[str, CLITemplate] = {
 }
 
 
-def render_cli_args(args: Sequence[str], *, prompt: str, executor_session_id: str = "") -> list[str]:
-    # {prompt} is substituted in place; without one the prompt is the last argument.
+_PLACEHOLDER = re.compile(r"\{(prompt|executor_session_id|review_schema)\}")
+
+
+def render_cli_args(
+    args: Sequence[str], *, prompt: str, executor_session_id: str = "", review_schema: str | None = None,
+) -> list[str]:
+    # {prompt} is substituted in place; without one the prompt is the last argument. One pass per token, so a
+    # placeholder quoted inside the prompt stays as written. {review_schema} is filled only for a review; any
+    # other run passes it through literally.
+    values = {"prompt": prompt, "executor_session_id": executor_session_id}
+    if review_schema is not None:
+        values["review_schema"] = review_schema
     rendered: list[str] = []
     prompt_inserted = False
     for token in args:
         if "{prompt}" in token:
             prompt_inserted = True
-        rendered.append(token.replace("{prompt}", prompt).replace("{executor_session_id}", executor_session_id))
+        rendered.append(_PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), token))
     if not prompt_inserted:
         rendered.append(prompt)
     return rendered
