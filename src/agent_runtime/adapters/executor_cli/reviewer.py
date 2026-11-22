@@ -19,7 +19,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     role_system_prompt,
     run_claude_code,
 )
-from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, terminal_title
+from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, terminal_title
 from agent_runtime.adapters.executor_cli.peer import PEER_TOOLS, DeveloperPeerResolver, PeerLookup
 from agent_runtime.adapters.executor_cli.process import join_text, last_text, target_events
 from agent_runtime.adapters.executor_cli.project_guidance import (
@@ -81,7 +81,7 @@ _ROLE_ARGS = (
     "--json-schema", json.dumps(REVIEW_SCHEMA),
 )
 # Interactive: no file-writing tool at all; the result goes back through the launcher's handoff tool.
-_VISIBLE_ROLE_ARGS = (
+_INTERACTIVE_ROLE_ARGS = (
     "--allowedTools", ",".join(_READ_ONLY_TOOLS),
     "--disallowedTools", ",".join(_WRITE_TOOLS),
 )
@@ -115,7 +115,7 @@ def review_label(subject: str) -> str:
 
 
 def review_title(reviewer: str, subject: str) -> str:
-    # The visible reviewer's session name, which is also its SendMessage address.
+    # The interactive reviewer's session name, which is also its SendMessage address.
     return terminal_title(reviewer, CODER_REVIEWER_ROLE, review_label(subject))
 
 
@@ -157,7 +157,7 @@ class ReviewRequest:
     selection: Selection = Selection()
     # Earlier findings plus the diff since that review; empty on a first review.
     previous_round: str = ""
-    # What the review is for, shown in the visible terminal's title.
+    # What the review is for, shown in the interactive terminal's title.
     label: str = ""
     # The developer task this review was dispatched for, and the verified channel to its conversation.
     subject: str = ""
@@ -172,16 +172,17 @@ class CoderReviewerExecutor:
         workspaces: SQLiteWorkspaceStore,
         tasks: SQLiteTaskMetadataStore,
         interrupt_poll_interval: float = 0.05,
-        visible: OrcaVisibleRunner | None = None,
+        terminal: OrcaVisibleRunner | TerminalUnavailable | None = None,
         peers: DeveloperPeerResolver | None = None,
     ) -> None:
         self._profile = profile
         self._workspaces = workspaces
         self._tasks = tasks
         self._interrupt_poll_interval = interrupt_poll_interval
-        # Set in Orca worktree deployments: every review runs in its own visible terminal.
-        self._visible = visible
-        # Visible reviews dispatched for a developer task talk to that developer through native SendMessage.
+        # None: non-interactive. A runner: every review runs in its own terminal. Unavailable: the role is
+        # interactive but this inbox has no terminal backend, so reviews stop with the reason.
+        self._terminal = terminal
+        # Interactive reviews dispatched for a developer task talk to that developer through native SendMessage.
         self._peers = peers
 
     @property
@@ -200,8 +201,9 @@ class CoderReviewerExecutor:
     ) -> RunOutcome:
         session_id = session.session_id if session is not None else new_id("sess")
         try:
+            self._require_terminal()
             request = await asyncio.to_thread(self._review_input, events, session)
-            if self._visible is not None and self._peers is not None and request.subject:
+            if isinstance(self._terminal, OrcaVisibleRunner) and self._peers is not None and request.subject:
                 lookup = await asyncio.to_thread(
                     self._peers.resolve, inbox_id=events[0].inbox_id, review_of=request.subject,
                     workdir=request.workdir,
@@ -238,8 +240,17 @@ class CoderReviewerExecutor:
             },
         )
 
+    def _require_terminal(self) -> None:
+        # Interactive reviews never fall back to a background run.
+        if isinstance(self._terminal, TerminalUnavailable):
+            raise ReviewAborted(
+                f"interactive review not started: {self._terminal.reason}; set terminal_backend = \"orca\" on the "
+                f"project or interactive = false on executors.{self._profile.name}"
+            )
+
     async def review(self, request: ReviewRequest, caps: RunCapabilities) -> dict[str, Any]:
         # Callers run check_launch() first; raises ReviewAborted or ClaudeCodeError when no verdict is reached.
+        self._require_terminal()
         p = self._profile
         env = child_env(p, os.environ)
         system = role_system_prompt(p, role=CODER_REVIEWER_ROLE, contract=_REVIEW_CONTRACT)
@@ -247,16 +258,17 @@ class CoderReviewerExecutor:
         guidance = await asyncio.to_thread(_review_guidance, request, changed)
         before = await asyncio.to_thread(worktree_fingerprint, request.workdir)
         extra: dict[str, str] = {}
-        if self._visible is not None:
+        terminal = self._terminal
+        if isinstance(terminal, OrcaVisibleRunner):
             # A fresh conversation every time: a re-review gets the earlier findings in its prompt, not its context.
             peer = request.peer.peer if request.peer is not None else None
-            reply = await self._visible.converse(
+            reply = await terminal.converse(
                 p,
                 title=terminal_title(p.name, CODER_REVIEWER_ROLE, request.label or request.workdir.name),
                 workdir=request.workdir,
                 prompt=self._prompt(request, guidance, evidence),
                 schema=REVIEW_SCHEMA,
-                role_args=(*(_peer_role_args() if peer is not None else _VISIBLE_ROLE_ARGS), "--append-system-prompt", system),
+                role_args=(*(_peer_role_args() if peer is not None else _INTERACTIVE_ROLE_ARGS), "--append-system-prompt", system),
                 is_interrupted=caps.is_interrupted,
             )
             raw: object = reply.data

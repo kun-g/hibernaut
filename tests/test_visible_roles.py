@@ -21,7 +21,7 @@ from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteSessionStoreAdapter, SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
-from agent_runtime.app.config import load_config, parse_config
+from agent_runtime.app.config import load_config
 from agent_runtime.app.main import build_daemon_from_config, serve_configured
 from agent_runtime.core.models import Emit, SessionRef, Suspend
 from tests.fakes import InMemoryPermission
@@ -100,6 +100,10 @@ class FakeOrcaTerminals:
         return (self.root / f"{handle}.screen").read_text(errors="replace")
 
 
+# Default for the case helpers: the case's own Orca runner.
+_RUNNER = object()
+
+
 def arg(call: dict, flag: str) -> str:
     return call["argv"][call["argv"].index(flag) + 1]
 
@@ -136,23 +140,23 @@ class VisibleCase(unittest.IsolatedAsyncioTestCase):
     def launcher(self):
         return ClaudeCodeLauncher(name="fake", command=fake_command(self.root))
 
-    def reviewer(self, visible=True):
+    def reviewer(self, terminal=_RUNNER):
         return CoderReviewerExecutor(
             profile=ClaudeCodeProfile(name="coder-reviewer", launcher=self.launcher(), model="claude-sonnet-5-5",
                                       effort="medium"),
-            workspaces=self.workspaces, tasks=self.tasks, visible=self.runner if visible else None,
+            workspaces=self.workspaces, tasks=self.tasks, terminal=self.runner if terminal is _RUNNER else terminal,
         )
 
-    def sde(self, review=True, timeout=30.0, **overrides):
+    def sde(self, review=True, timeout=30.0, terminal=_RUNNER, reviewer_terminal=_RUNNER, **overrides):
         overrides.setdefault("launcher", self.launcher())
         return SDEExecutor(
             profile=ClaudeCodeProfile(name="sde", timeout_seconds=timeout, **overrides),
             options=SDEOptions(review=review),
-            reviewer=self.reviewer() if review else None,
+            reviewer=self.reviewer(reviewer_terminal) if review else None,
             worktree_manager=OrcaWorktreeManager(workspace_store=self.workspaces,
                                                  session_store=SQLiteSessionStoreAdapter(self.db), backend="git"),
             inbox_checkout_map={}, tasks=self.tasks,
-            visible=self.runner,
+            terminal=self.runner if terminal is _RUNNER else terminal,
         )
 
     def calls(self, role=None, mode=None):
@@ -381,7 +385,7 @@ class TestVisibleReviewer(VisibleCase):
         self.set_plan(reviewer=[PASS])
         review = event({"executor_id": "coder-reviewer", "text": "divide must reject zero", "review_of": "task:1",
                         "base_ref": "main"})
-        outcome = await self.reviewer(visible=False).execute([review], None, self.caps)
+        outcome = await self.reviewer(terminal=None).execute([review], None, self.caps)
         self.assertIn("verdict=pass", outcome.messages[0])
         self.assertEqual(self.orca.calls, [])
         self.assertEqual([c["mode"] for c in self.calls("reviewer")], ["print"])
@@ -453,17 +457,6 @@ class TestHandoffServer(unittest.TestCase):
         self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
         reply = self.rpc("resources/list")
         self.assertEqual((reply["id"], reply["error"]["code"]), (self.ids, -32601))
-
-
-class TestVisibleConfig(unittest.TestCase):
-    def test_visible_is_a_role_setting_defaulting_to_true(self):
-        cfg = parse_config({"executors": {
-            "sde": {"role": "sde", "visible": False}, "coder-reviewer": {"role": "coder-reviewer"},
-        }})
-        self.assertFalse(cfg.roles["sde"].visible)
-        self.assertTrue(cfg.roles["coder-reviewer"].visible)
-        with self.assertRaisesRegex(ValueError, "executors.coder-reviewer: visible must be true or false"):
-            parse_config({"executors": {"coder-reviewer": {"role": "coder-reviewer", "visible": "yes"}}})
 
 
 class TestVisibleRolesThroughEvents(unittest.TestCase):

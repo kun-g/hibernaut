@@ -393,7 +393,7 @@ class TestDispatchAndHotReload(unittest.TestCase):
                 f"[channels]\nport = {port}\n"
                 + launcher_table("sg-a") + launcher_table("sg-b")
                 + '[executors.claude]\ncommand = "false"\n'
-                f'[executors.coder-reviewer]\nrole = "coder-reviewer"\nlauncher = "{launcher}"\n'
+                f'[executors.coder-reviewer]\nrole = "coder-reviewer"\nlauncher = "{launcher}"\ninteractive = false\n'
                 f'model = "{model}"\neffort = "{effort}"\n'
             )
 

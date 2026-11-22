@@ -531,8 +531,8 @@ class TestSDEDispatchAndHotReload(unittest.TestCase):
                 + launcher_table("sg-a", True) + launcher_table("sg-b", False)
                 + f'[projects.demo]\ninbox_id = "proj:demo"\nrepo = "o/demo"\ncheckout = "{repo}"\n'
                 'worktree_backend = "git"\n'
-                f'[executors.coder-reviewer]\nrole = "coder-reviewer"\nlauncher = "sg-a"\n'
-                f'[executors.sde]\nrole = "sde"\nharness = "{harness}"\nlauncher = "{launcher}"\n'
+                f'[executors.coder-reviewer]\nrole = "coder-reviewer"\nlauncher = "sg-a"\ninteractive = false\n'
+                f'[executors.sde]\nrole = "sde"\nharness = "{harness}"\nlauncher = "{launcher}"\ninteractive = false\n'
                 f'billing = "{billing}"\nmodel = "{model}"\neffort = "{effort}"\nreview = {str(review).lower()}\n'
             )
 

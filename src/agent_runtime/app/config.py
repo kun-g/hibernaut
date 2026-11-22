@@ -49,6 +49,10 @@ class ChannelsConfig:
     mcp_token_env: str = "HIBERNAUT_MCP_TOKEN"
 
 
+TerminalBackend = Literal["orca", "none"]
+TERMINAL_BACKENDS: tuple[TerminalBackend, ...] = ("orca", "none")
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectConfig:
     name: str
@@ -57,14 +61,16 @@ class ProjectConfig:
     checkout: str
     poll_labels: tuple[str, ...] = ()
     worktree_backend: WorktreeBackend = "orca"
+    # Where interactive role sessions open; "none" makes interactive roles stop with the reason instead.
+    terminal_backend: TerminalBackend = "orca"
     orca_create_terminal: bool = False
     feishu_chat_id: str = ""
     executor: str | None = None
 
 
 ROLES = (CODER_REVIEWER_ROLE, SDE_ROLE)
-# Deployment mode shared by every role executor.
-ROLE_DEPLOYMENT_KEYS = frozenset({"visible"})
+# Deployment mode shared by every role executor; visible is the old name of interactive.
+ROLE_DEPLOYMENT_KEYS = frozenset({"interactive", "visible"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,8 +78,19 @@ class RoleConfig:
     role: str
     profile: ClaudeCodeProfile
     sde: SDEOptions | None = None
-    # In projects with worktree_backend = "orca", runs open a visible, interactive Orca terminal; false keeps them headless.
-    visible: bool = True
+    # True: every run needs a session a person can join, opened by the project's terminal_backend; without one the
+    # run stops with the reason. False: runs are non-interactive.
+    interactive: bool = True
+
+
+def _interactive(name: str, item: dict[str, Any]) -> bool:
+    if "interactive" in item and "visible" in item:
+        raise ValueError(f"executors.{name}: both interactive and visible are set; visible is the old name, keep only interactive")
+    key = "interactive" if "interactive" in item else "visible"
+    value = item.get(key, True)
+    if not isinstance(value, bool):
+        raise ValueError(f"executors.{name}: {key} must be true or false")
+    return value
 
 
 def _sde_options(name: str, item: dict[str, Any]) -> SDEOptions:
@@ -240,10 +257,8 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
                 extra_keys=extra, base_dir=base_dir,
             )
             options = _sde_options(str(name), item) if role == SDE_ROLE else None
-            visible = item.get("visible", True)
-            if not isinstance(visible, bool):
-                raise ValueError(f"executors.{name}: visible must be true or false")
-            roles[str(name)] = RoleConfig(role=str(role), profile=profile, sde=options, visible=visible)
+            roles[str(name)] = RoleConfig(role=str(role), profile=profile, sde=options,
+                                          interactive=_interactive(str(name), item))
             continue
         env_raw = item.get("env", {})
         resume_raw = item.get("resume_args")
@@ -281,6 +296,11 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         backend = str(item.get("worktree_backend", "orca"))
         if backend not in ("orca", "git"):
             raise ValueError(f"Unsupported worktree_backend for '{name}': {backend}")
+        terminal = item.get("terminal_backend", "orca" if backend == "orca" else "none")
+        if terminal not in TERMINAL_BACKENDS:
+            raise ValueError(
+                f"Unsupported terminal_backend for '{name}': {terminal!r} (supported: {', '.join(TERMINAL_BACKENDS)})"
+            )
         proj_exec_raw = item.get("executor")
         proj_exec = str(proj_exec_raw).strip() if proj_exec_raw is not None else None
         projects[str(name)] = ProjectConfig(
@@ -290,6 +310,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             checkout=str(item["checkout"]),
             poll_labels=tuple(str(lbl) for lbl in item.get("poll_labels", ())),
             worktree_backend=cast(Literal["orca", "git"], backend),
+            terminal_backend=terminal,
             orca_create_terminal=bool(item.get("orca_create_terminal", False)),
             feishu_chat_id=str(item.get("feishu_chat_id", "")),
             executor=proj_exec or None,
