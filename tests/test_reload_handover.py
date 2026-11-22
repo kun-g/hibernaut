@@ -198,6 +198,32 @@ class TestReloadKeepsServing(unittest.IsolatedAsyncioTestCase):
                          [("block-1", "1"), ("follow-up", "3")])
         await self.wait_for(lambda: [c for c, _ in self.outbox(BLOCKED)][1:] == ["block-1 by gen 1", "follow-up by gen 3"])
 
+    async def test_an_event_from_a_request_begun_before_leaving_ingest_only_still_runs(self):
+        self.path.write_text(
+            f'[runtime]\ndb_path = "{self.db_path}"\nmemory_root = "{self.root / "mem"}"\n'
+            f'[channels]\nhost = "127.0.0.1"\nport = {self.port}\n'
+        )
+        config = load_config(self.path)
+        ingest_only = build_daemon_from_config(config)
+        self.assertTrue(ingest_only.ingest_only)
+        self.addCleanup(ingest_only.close)
+        self.stop = asyncio.Event()
+        self.serving = asyncio.create_task(
+            serve_configured(self.path, config, ingest_only, self.stop, reload_interval=0.02,
+                             outbox_interval_seconds=0.02)
+        )
+        self.addAsyncCleanup(self.shutdown)
+        await self.wait_for(lambda: self.post(OTHER, "early")[0] == 202)
+
+        await self.reload(2)
+        await self.wait_for(lambda: ("early", "2") in self.runs())
+        # A request dispatched to the ingest-only handler class before the swap appends its event only now,
+        # after the new pool's startup scan of pending inboxes.
+        late = ingest_only.handler.ingest(inbox_id=BLOCKED, source="webhook", external_id="late",
+                                          payload={"text": "late", "explicit_workdir": str(self.workdir)})
+        await self.wait_for(lambda: self.event_status(late.event_id) == "done", timeout=5)
+        self.assertEqual([r for r in self.runs() if r[0] == "late"], [("late", "2")])
+
     async def test_stop_after_a_reload_waits_for_the_blocked_run_and_keeps_its_result(self):
         await self.start()
         blocked_id = await self.start_blocked_run()

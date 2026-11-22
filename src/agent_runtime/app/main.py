@@ -303,6 +303,7 @@ class AlwaysOnDaemon:
         webhook_port: int | None = None,
     ) -> None:
         stopper = stop_event or self._stop_event
+        self.pool.bind(asyncio.get_running_loop())
         owns_server = server is None
         server_thread = None
         if server is None and webhook_host is not None and webhook_port is not None:
@@ -514,9 +515,9 @@ def build_daemon(
         on_run_reports=_on_reports if gdrive_writer is not None else None,
         on_inbox_failed=_on_failed if gdrive_writer is not None else None,
     )
-    wake_cb = None if ingest_only else pool.wake
-    handler = EventHandler(inbox=inbox, on_wake=wake_cb)
-    scheduler = TimerScheduler(timers=timers, inbox=inbox, on_wake=wake_cb)
+    # An ingest-only pool never runs but still collects wakes, so a config reload can hand them to a running pool.
+    handler = EventHandler(inbox=inbox, on_wake=pool.wake)
+    scheduler = TimerScheduler(timers=timers, inbox=inbox, on_wake=pool.wake)
     dispatcher = OutboxDispatcher(
         outbox=outbox,
         channel=resolved_channel,
@@ -1065,7 +1066,6 @@ class _Generation:
     services: asyncio.Task[None]
     services_stop: asyncio.Event
     pool_stop: asyncio.Event
-    pool_running: bool
 
     @classmethod
     def start(
@@ -1077,21 +1077,21 @@ class _Generation:
     ) -> _Generation:
         services_stop = asyncio.Event()
         pool_stop = asyncio.Event()
+        daemon.pool.bind(asyncio.get_running_loop())
         if not daemon.ingest_only:
-            daemon.pool.bind(asyncio.get_running_loop())
             tasks.create_task(daemon.pool.run_forever(pool_stop))
         services = tasks.create_task(
             daemon.run_services(services_stop, outbox_interval_seconds=outbox_interval_seconds)
         )
-        return cls(daemon, services, services_stop, pool_stop, not daemon.ingest_only)
+        return cls(daemon, services, services_stop, pool_stop)
 
     async def stop_services(self) -> None:
         self.services_stop.set()
         await self.services
 
     def retire_pool(self, handoff: Callable[[str], None]) -> None:
-        if self.pool_running:
-            self.daemon.pool.retire(handoff)
+        # Ingest-only pools are retired too: requests begun on their handler may append (and wake) after the swap.
+        self.daemon.pool.retire(handoff)
 
 
 def _serve_in_thread(server: WebhookHTTPServer) -> threading.Thread:
