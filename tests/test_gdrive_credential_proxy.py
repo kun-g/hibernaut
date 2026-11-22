@@ -375,5 +375,155 @@ class DriveProxyInstallerTests(unittest.TestCase):
         self.assertNotIn("TEST-KEY-MATERIAL", out)
 
 
+@unittest.skipUnless(shutil.which("bash"), "bash is needed for the installer")
+class DriveProxyUpgradeTests(unittest.TestCase):
+    PREFIX = "/opt/hibernaut-drive-proxy"
+    ETC = "/etc/hibernaut-drive-proxy"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="gdrive_proxy_upgrade_")
+        self.tmp = Path(self._tmp.name)
+        self.fs = self.tmp / "fs"
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        self._stub_id(exists=True)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _stub_id(self, *, exists: bool) -> None:
+        stub = self.bin / "id"
+        stub.write_text("#!/bin/sh\necho 400\nexit 0\n" if exists else "#!/bin/sh\nexit 1\n")
+        stub.chmod(0o755)
+
+    def _install_files(self, platform: str, *, https_proxy: str = "") -> None:
+        etc = self.fs / self.ETC.lstrip("/")
+        etc.mkdir(parents=True)
+        for name in ("sa.json", "client.token", "config.toml"):
+            (etc / name).write_text("UNREADABLE-SECRET-MATERIAL")
+        launcher = self.fs / self.PREFIX.lstrip("/") / "bin" / "hibernaut-drive-proxy"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/usr/local/bin/python3.12 -I\nimport sys\n")
+        if platform == "linux":
+            unit = self.fs / "etc/systemd/system/hibernaut-drive-proxy.service"
+            unit.parent.mkdir(parents=True)
+            env = f"Environment=HTTPS_PROXY={https_proxy}\n" if https_proxy else ""
+            unit.write_text(f"[Service]\nUser=hb-drive-proxy\n{env}Restart=on-failure\n")
+        else:
+            plist = self.fs / "Library/LaunchDaemons/ai.hibernaut.drive-proxy.plist"
+            plist.parent.mkdir(parents=True)
+            env = (f"  <key>EnvironmentVariables</key><dict><key>HTTPS_PROXY</key><string>{https_proxy}</string></dict>\n"
+                   if https_proxy else "")
+            plist.write_text(f"<plist version=\"1.0\"><dict>\n{env}</dict></plist>\n")
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(INSTALLER), *args],
+            env={**os.environ, "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
+                 "HB_DRIVE_PROXY_DRY_RUN_ROOT": str(self.fs)},
+            capture_output=True, text=True, timeout=60,
+        )
+
+    def _upgrade(self, platform: str, *extra: str) -> list[str]:
+        proc = self._run("--upgrade", "--dry-run", "--platform", platform, *extra)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("UNREADABLE-SECRET-MATERIAL", proc.stdout + proc.stderr)
+        self.assertNotIn("sa.json", proc.stdout)
+        self.assertNotIn("client.token", proc.stdout)
+        return [line for line in proc.stdout.splitlines() if line.startswith("+ ")]
+
+    def _assert_only_code_launcher_restart_and_check(self, commands: list[str], restart: str) -> None:
+        self.assertTrue(commands)
+        for cmd in commands:
+            if cmd.endswith("--check"):
+                self.assertIn(f"--config {self.ETC}/config.toml --check", cmd)
+                continue
+            if cmd == restart:
+                continue
+            self.assertIn(self.PREFIX, cmd)
+            self.assertNotIn("/etc/", cmd)
+            self.assertNotIn("useradd", cmd)
+            self.assertNotIn("dscl", cmd)
+
+    def test_linux_upgrade_replaces_code_and_launcher_checks_then_restarts(self) -> None:
+        self._install_files("linux", https_proxy="http://127.0.0.1:7890")
+        commands = self._upgrade("linux")
+        restart = "+ systemctl restart hibernaut-drive-proxy"
+        self._assert_only_code_launcher_restart_and_check(commands, restart)
+        joined = "\n".join(commands)
+        self.assertIn(f"+ cp -R {REPO_ROOT / 'src' / 'agent_runtime'} {self.PREFIX}/src.new/agent_runtime", joined)
+        self.assertIn(f"chown -R root:root {self.PREFIX}/src.new", joined)
+        self.assertIn(f"/usr/local/bin/python3.12 -I -c", joined)
+        self.assertIn(f"+ mv -f {self.PREFIX}/bin/hibernaut-drive-proxy.new {self.PREFIX}/bin/hibernaut-drive-proxy", joined)
+        check = next(c for c in commands if c.endswith("--check"))
+        self.assertIn("HTTPS_PROXY=http://127.0.0.1:7890", check)
+        self.assertIn("+ sudo -u hb-drive-proxy", check)
+        # The check runs on the new code before the service is restarted onto it.
+        self.assertLess(commands.index(check), commands.index(restart))
+        self.assertEqual(commands[-1], restart)
+        self.assertNotIn("daemon-reload", joined)
+
+    def test_macos_upgrade_kickstarts_the_launch_daemon(self) -> None:
+        self._install_files("macos")
+        commands = self._upgrade("macos")
+        restart = "+ launchctl kickstart -k system/ai.hibernaut.drive-proxy"
+        self._assert_only_code_launcher_restart_and_check(commands, restart)
+        joined = "\n".join(commands)
+        self.assertIn(f"chown -R root:wheel {self.PREFIX}/src.new", joined)
+        self.assertNotIn("bootstrap", joined)
+        self.assertNotIn("HTTPS_PROXY", joined)
+        self.assertEqual(commands[-1], restart)
+
+    def test_macos_upgrade_reuses_the_daemon_https_proxy(self) -> None:
+        self._install_files("macos", https_proxy="http://127.0.0.1:7890")
+        check = next(c for c in self._upgrade("macos") if c.endswith("--check"))
+        self.assertIn("HTTPS_PROXY=http://127.0.0.1:7890", check)
+
+    def test_upgrade_python_option_overrides_the_launcher(self) -> None:
+        self._install_files("linux")
+        joined = "\n".join(self._upgrade("linux", "--python", "/usr/bin/python3"))
+        self.assertIn("/usr/bin/python3 -I -c", joined)
+        self.assertNotIn("python3.12", joined)
+
+    def test_upgrade_no_check_skips_the_queue_check(self) -> None:
+        self._install_files("linux")
+        commands = self._upgrade("linux", "--no-check")
+        self.assertFalse([c for c in commands if "--check" in c])
+        self.assertEqual(commands[-1], "+ systemctl restart hibernaut-drive-proxy")
+
+    def test_upgrade_refuses_without_an_installation(self) -> None:
+        self._install_files("linux")
+        (self.fs / self.ETC.lstrip("/") / "config.toml").unlink()
+        proc = self._run("--upgrade", "--dry-run", "--platform", "linux")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(f"{self.ETC}/config.toml", proc.stderr)
+        self.assertIn("--key PATH --root-folder-id ID --hb-user USER", proc.stderr)
+        self.assertNotIn("+ ", proc.stdout)
+
+    def test_upgrade_refuses_without_the_service_user_or_unit(self) -> None:
+        self._stub_id(exists=False)
+        proc = self._run("--upgrade", "--dry-run", "--platform", "macos")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("service user _hbdriveproxy", proc.stderr)
+        self.assertIn("/Library/LaunchDaemons/ai.hibernaut.drive-proxy.plist", proc.stderr)
+        self.assertNotIn("+ ", proc.stdout)
+
+    def test_upgrade_refuses_install_options(self) -> None:
+        self._install_files("linux")
+        cases = [
+            ("--key", str(self.tmp / "sa.json")),
+            ("--root-folder-id", "root-q"),
+            ("--hb-user", "hbuser"),
+            ("--port", "9100"),
+            ("--https-proxy", "http://127.0.0.1:7890"),
+        ]
+        for option, value in cases:
+            with self.subTest(option=option):
+                proc = self._run("--upgrade", "--dry-run", "--platform", "linux", option, value)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(f"cannot take {option}", proc.stderr)
+                self.assertNotIn("+ ", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
