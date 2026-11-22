@@ -528,6 +528,8 @@ class SDEExecutor:
                 is_interrupted=caps.is_interrupted,
                 session_id=session_id,
                 native=native,
+                schema_name="sde-report",
+                inbox_id=state.inbox_id or None,
             )
             state.terminal = reply.handle
             return _validate_report(reply.data), reply.native_session_id
@@ -619,7 +621,8 @@ class SDEExecutor:
                     ReviewRequest(workdir=workdir, requirements=state.requirements,
                                   test_evidence=state.test_evidence, base_ref=state.base_ref,
                                   pin=pin, selection=selection, previous_round=previous,
-                                  label=f"review of {subject} round {len(state.history) + 1}"),
+                                  label=f"review of {subject} round {len(state.history) + 1}",
+                                  inbox_id=state.inbox_id),
                     caps,
                 )
             except (ReviewAborted, ClaudeCodeError, ValueError) as exc:

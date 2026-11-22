@@ -57,7 +57,7 @@ class FakeTerminal(OrcaVisibleRunner):
         self.prompts, self.released = [], []
 
     async def converse(self, profile, *, title, workdir, prompt, schema, role_args, is_interrupted,
-                       session_id=None, native=None):
+                       session_id=None, native=None, schema_name="result", inbox_id=None):
         planned = self.steps.pop(0) if len(self.steps) > 1 else self.steps[0]
         self.prompts.append(prompt)
         for rel, text in planned.get("write", {}).items():

@@ -107,11 +107,39 @@ CREATE TABLE IF NOT EXISTS terminal_bindings (
     handle TEXT,
     incarnation_id TEXT,
     native_session_id TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    peer_name TEXT,
+    peer_pid INTEGER,
+    peer_socket TEXT,
+    peer_attempt TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_terminal_bindings_native
     ON terminal_bindings (executor_id, native_session_id);
+
+-- How far Hibernaut has read each ccpeer receiver log (inbox.jsonl, control.jsonl), as a byte offset.
+CREATE TABLE IF NOT EXISTS peer_cursors (
+    receiver TEXT NOT NULL,
+    log TEXT NOT NULL,
+    offset INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (receiver, log)
+);
+
+-- Records read from a receiver's logs; msg_id dedupes, consumed_at marks the ones a conversation has handled.
+CREATE TABLE IF NOT EXISTS peer_messages (
+    msg_id TEXT PRIMARY KEY,
+    receiver TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    from_addr TEXT,
+    body TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    ts REAL NOT NULL,
+    consumed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_messages_open
+    ON peer_messages (receiver, kind, consumed_at, ts);
 
 -- Per-task facts that outlive one session and are read by other executors (keyed like workspaces).
 CREATE TABLE IF NOT EXISTS task_metadata (
@@ -177,6 +205,14 @@ class SQLiteDatabase:
 
     @staticmethod
     def _ensure_migrations(conn: sqlite3.Connection) -> None:
+        binding_cols = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(terminal_bindings)").fetchall()
+        }
+        for col, kind in (("peer_name", "TEXT"), ("peer_pid", "INTEGER"), ("peer_socket", "TEXT"),
+                          ("peer_attempt", "TEXT")):
+            if col not in binding_cols:
+                conn.execute(f"ALTER TABLE terminal_bindings ADD COLUMN {col} {kind}")
         inbox_cols = {
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(event_inbox)").fetchall()

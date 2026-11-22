@@ -191,6 +191,8 @@ class ReviewRequest:
     # The developer task this review was dispatched for, and the verified channel to its conversation.
     subject: str = ""
     peer: PeerLookup | None = None
+    # The inbox a notice about this review's session goes to (a held peer message); "" sends none.
+    inbox_id: str = ""
 
 
 class Reviewer(Protocol):
@@ -258,6 +260,7 @@ class CoderReviewerExecutor:
                     workdir=request.workdir,
                 )
                 request = dataclasses.replace(request, peer=lookup)
+            request = dataclasses.replace(request, inbox_id=events[0].inbox_id)
             decision = self.check_launch(caps, request.workdir)
             if decision.action == "block":
                 return self._emit(session_id, decision.reason, status="refused")
@@ -318,6 +321,8 @@ class CoderReviewerExecutor:
                 schema=REVIEW_SCHEMA,
                 role_args=(*(_peer_role_args() if peer is not None else _INTERACTIVE_ROLE_ARGS), "--append-system-prompt", system),
                 is_interrupted=caps.is_interrupted,
+                schema_name="code-review",
+                inbox_id=request.inbox_id or None,
             )
             raw: object = reply.data
             extra = {"terminal": reply.handle, "native_session_id": reply.native_session_id}

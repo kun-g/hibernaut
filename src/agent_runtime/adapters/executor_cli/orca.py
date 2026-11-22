@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from agent_runtime.adapters.executor_cli.claude_code import (
     PROBE_ROLE_ARGS,
@@ -27,10 +27,19 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     harness_args,
     interactive_args,
 )
+from agent_runtime.adapters.executor_cli.peer_handoff import (
+    PeerHandoff,
+    parse_result,
+    resend_message,
+    task_message,
+)
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore, TerminalBinding
 from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Silent, Suspend, new_id
 from agent_runtime.core.ports import RunCapabilities
+
+if TYPE_CHECKING:
+    from ccpeer import Session
 
 _log = logging.getLogger(__name__)
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -43,6 +52,10 @@ CLI_TERMINAL_SCRIPT = Path(__file__).with_name("cli_terminal.py")
 HANDOFF_SCRIPT = Path(__file__).with_name("handoff_mcp.py")
 HANDOFF_SERVER = "hibernaut_handoff"
 HANDOFF_TOOLS = (f"mcp__{HANDOFF_SERVER}__get_task", f"mcp__{HANDOFF_SERVER}__submit_result")
+# A peer-handoff session replies with SendMessage and must start under ~/.claude, where the receiver is registered.
+PEER_HANDOFF_TOOLS = ("SendMessage",)
+PEER_UNSET_ENV = ("CLAUDE_CONFIG_DIR",)
+_EXIT_TIMEOUT_SECONDS = 30.0
 _PROBE_TIMEOUT_SECONDS = 120
 _WRAPPER_DEADLINE_MARGIN_SECONDS = 60
 # One lease file per gate terminal: the gate ends its agent once the file is gone, and Hibernaut removes it whenever it
@@ -199,6 +212,29 @@ def with_handoff(role_args: Sequence[str], root: Path) -> list[str]:
     return [*args, "--mcp-config", json.dumps({"mcpServers": {HANDOFF_SERVER: server}})]
 
 
+def with_peer_handoff(role_args: Sequence[str]) -> list[str]:
+    args = list(role_args)
+    if "--allowedTools" in args:
+        i = args.index("--allowedTools") + 1
+        have = args[i].split(",")
+        args[i] = ",".join((*have, *(t for t in PEER_HANDOFF_TOOLS if t not in have)))
+    else:
+        args += ["--allowedTools", ",".join(PEER_HANDOFF_TOOLS)]
+    return args
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class TerminalUnavailable:
     # An interactive role with no terminal backend for this inbox: its runs stop with this reason, never headless.
@@ -219,12 +255,24 @@ class OrcaVisibleRunner:
         poll_interval: float = 0.25,
         handoff_root: Path | None = None,
         liveness_interval: float = 5.0,
+        peer: PeerHandoff | None = None,
+        notify: Callable[[str, str], None] | None = None,
     ) -> None:
         self._bindings = bindings
         self._roots = list(transcript_roots) if transcript_roots is not None else None
         self._poll_interval = poll_interval
         self._handoff_root = handoff_root or Path(tempfile.gettempdir()) / "hibernaut-handoff"
         self._liveness_interval = liveness_interval
+        # With peer set, role conversations get their tasks and return results as peer messages (handoff = "peer");
+        # without it, through the launcher's handoff MCP server.
+        self._peer = peer
+        # Writes a notice for a person to the Outbox of an inbox (a held peer message waits for approval).
+        self._notify = notify
+        self._exit_timeout = peer.config.exit_timeout if peer is not None else _EXIT_TIMEOUT_SECONDS
+
+    @property
+    def handoff(self) -> str:
+        return "peer" if self._peer is not None else "mcp"
 
     async def converse(
         self,
@@ -238,6 +286,8 @@ class OrcaVisibleRunner:
         is_interrupted: Callable[[], bool],
         session_id: str | None = None,
         native: str | None = None,
+        schema_name: str = "result",
+        inbox_id: str | None = None,
     ) -> RoleReply:
         # One turn of a role conversation in a visible Orca terminal. With session_id the conversation bound to
         # that session continues (live terminal, else --resume); without it every call starts a fresh one.
@@ -251,6 +301,18 @@ class OrcaVisibleRunner:
             native = native or (binding.native_session_id if binding is not None else None)
         else:
             native = None
+        if self._peer is not None:
+            return await self._converse_peer(
+                self._peer, profile, title=title, workdir=workdir, prompt=prompt, schema=schema,
+                schema_name=schema_name, role_args=role_args, is_interrupted=is_interrupted, session_id=session_id,
+                native=native, binding=binding, inbox_id=inbox_id,
+            )
+        if binding is not None and binding.handle and binding.peer_socket:
+            # A peer-handoff session has no handoff MCP server to fetch a turn from; it is ended and resumed with one.
+            await _close_quietly(binding.handle, workdir)
+            binding = dataclasses.replace(binding, handle=None, incarnation_id=None, peer_name=None, peer_pid=None,
+                                          peer_socket=None, peer_attempt=None)
+            self._save(binding)
         root = self._handoff_root / (_SAFE_NAME_RE.sub("_", session_id) if session_id else uuid.uuid4().hex)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root = Path(os.path.realpath(root))
@@ -303,6 +365,204 @@ class OrcaVisibleRunner:
                     self._save(dataclasses.replace(binding, handle=None, incarnation_id=None, native_session_id=native))
                 await _close_quietly(handle, workdir)
 
+    async def _converse_peer(
+        self,
+        peer: PeerHandoff,
+        profile: ClaudeCodeProfile,
+        *,
+        title: str,
+        workdir: Path,
+        prompt: str,
+        schema: Mapping[str, Any],
+        schema_name: str,
+        role_args: Sequence[str],
+        is_interrupted: Callable[[], bool],
+        session_id: str | None,
+        native: str | None,
+        binding: TerminalBinding | None,
+        inbox_id: str | None,
+    ) -> RoleReply:
+        # The task goes to the session as a peer message and the result comes back through the receiver's inbox, so
+        # nothing the session needs lives in a directory this process owns.
+        await asyncio.to_thread(peer.receiver)
+        task_id = session_id or new_id("task")
+        attempt = new_id("att")
+        self._handoff_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        turn = Path(tempfile.mkdtemp(prefix="turn-", dir=self._handoff_root))
+        handle: str | None = None
+        completed = False
+        deadline = asyncio.timeout(profile.timeout_seconds)
+        try:
+            async with deadline:
+                target: Session | None = None
+                if binding is not None and binding.handle and await self._live(binding, ROLE_AGENT, workdir):
+                    native = binding.native_session_id or native
+                    if native:
+                        target = await asyncio.to_thread(peer.find, native, workdir)
+                    if target is None:
+                        # A live terminal whose session cannot be messaged is ended, so a resume never runs beside it.
+                        await _close_quietly(binding.handle, workdir)
+                        binding = dataclasses.replace(binding, handle=None, incarnation_id=None)
+                        self._save(binding)
+                    else:
+                        handle = binding.handle
+                if target is None:
+                    fresh = native is None
+                    native = native or str(uuid.uuid4())
+                    continuation = ("--session-id", native) if fresh else ("--resume", native)
+                    args = [*with_peer_handoff(role_args), *continuation, "--name", title]
+                    launched = time.time() - 1
+                    handle, incarnation = await self._start(profile, title, workdir, turn, args, None,
+                                                            unset_extra=PEER_UNSET_ENV)
+                    if session_id is not None:
+                        binding = TerminalBinding(session_id=session_id, executor_id=profile.name, agent=ROLE_AGENT,
+                                                  workdir=str(workdir), handle=handle, incarnation_id=incarnation,
+                                                  native_session_id=native)
+                        self._save(binding)
+                    await self._await_gate(turn / "gate-status.json", handle, workdir, is_interrupted)
+                    target = await self._await_registration(peer, native, title, launched, handle, workdir,
+                                                            is_interrupted)
+                    # Recorded as the session answers, in case the harness gave the resumed conversation a new ID.
+                    native = target.session_id or native
+                if binding is not None:
+                    binding = dataclasses.replace(binding, native_session_id=native, peer_name=target.name,
+                                                  peer_pid=target.pid,
+                                                  peer_socket=target.socket_path, peer_attempt=attempt)
+                    self._save(binding)
+                assert handle is not None and native is not None
+                since = time.time() - 1
+                body = task_message(prompt, task_id=task_id, attempt_id=attempt, reply_to=peer.name,
+                                    schema_name=schema_name, schema=schema)
+                sent = [await asyncio.to_thread(peer.send, target, body)]
+                data = await self._await_peer_result(peer, target, sent, since, schema, task_id, attempt, handle,
+                                                     workdir, is_interrupted, inbox_id)
+                completed = True
+                return RoleReply(data=data, native_session_id=native, handle=handle)
+        except TimeoutError as exc:
+            if not deadline.expired():
+                raise ClaudeCodeError(f"Orca did not answer in {workdir}: {exc}") from exc
+            raise ClaudeCodeError(
+                f"timed out after {profile.timeout_seconds}s in Orca terminal {handle or '(not started)'}"
+            ) from exc
+        except _ORCA_ERRORS as exc:
+            raise ClaudeCodeError(f"Orca terminal {handle or '(not started)'} in {workdir}: {type(exc).__name__} {exc}") from exc
+        finally:
+            shutil.rmtree(turn, ignore_errors=True)
+            if handle and not completed:
+                if binding is not None:
+                    self._save(dataclasses.replace(binding, handle=None, incarnation_id=None, native_session_id=native,
+                                                   peer_pid=None, peer_socket=None))
+                await _close_quietly(handle, workdir)
+
+    async def _await_registration(
+        self, peer: PeerHandoff, native: str, name: str, launched: float, handle: str, workdir: Path,
+        is_interrupted: Callable[[], bool],
+    ) -> Session:
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + peer.config.register_timeout
+        next_check = loop.time() + self._liveness_interval
+        while True:
+            if is_interrupted():
+                raise asyncio.CancelledError("visible run interrupted by a new event")
+            found = await asyncio.to_thread(peer.find, native, workdir, name=name, since=launched)
+            if found is not None:
+                return found
+            now = loop.time()
+            if now >= give_up:
+                raise ClaudeCodeError(
+                    f"Claude Code session {native} in Orca terminal {handle} did not register for peer messages "
+                    f"within {peer.config.register_timeout:g}s (looked in "
+                    f"{', '.join(str(d) for d in peer.config.config_dirs)})"
+                )
+            if now >= next_check:
+                if not await _terminal_alive(handle, workdir):
+                    raise ClaudeCodeError(f"Orca terminal {handle} exited before its session registered")
+                next_check = now + self._liveness_interval
+            await asyncio.sleep(self._poll_interval)
+
+    async def _await_peer_result(
+        self,
+        peer: PeerHandoff,
+        target: Session,
+        sent: list[str],
+        since: float,
+        schema: Mapping[str, Any],
+        task_id: str,
+        attempt: str,
+        handle: str,
+        workdir: Path,
+        is_interrupted: Callable[[], bool],
+        inbox_id: str | None,
+    ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        next_check = loop.time() + self._liveness_interval
+        resends = 0
+        gone = False
+        while True:
+            if is_interrupted():
+                raise asyncio.CancelledError("visible run interrupted by a new event")
+            await asyncio.to_thread(peer.ingest)
+            for receipt in await asyncio.to_thread(peer.receipts, sent, target, since):
+                self._held(receipt.record, target, handle, inbox_id)
+            for reply in await asyncio.to_thread(peer.replies, target, since):
+                data, error = parse_result(reply.body, schema, task_id=task_id, attempt_id=attempt)
+                if data is not None:
+                    return data
+                resends += 1
+                _log.warning("Peer result %s from %s rejected (%d): %s", reply.msg_id, target.label(), resends, error)
+                left = peer.config.max_resends - resends
+                if left < 0:
+                    raise ClaudeCodeError(
+                        f"session {target.name or target.session_id} sent {resends} result messages that were not "
+                        f"accepted (limit {peer.config.max_resends} resends); the last: {error}"
+                    )
+                notice = resend_message(error, task_id=task_id, attempt_id=attempt, reply_to=peer.name, tries_left=left)
+                sent.append(await asyncio.to_thread(peer.send, target, notice))
+            if gone:
+                raise ClaudeCodeError(f"Orca terminal {handle} exited before it returned its result")
+            if loop.time() >= next_check:
+                # One more read after the terminal is gone: the result may have landed just before it ended.
+                gone = not await _terminal_alive(handle, workdir)
+                next_check = loop.time() + self._liveness_interval
+                if gone:
+                    continue
+            await asyncio.sleep(self._poll_interval)
+
+    def _held(self, record: Mapping[str, Any], target: Session, handle: str, inbox_id: str | None) -> None:
+        action = str(record.get("action") or record.get("status") or "control")
+        text = (
+            f"[hibernaut] Claude Code session {target.name or target.session_id} (pid {target.pid}) answered a "
+            f"Hibernaut message with a '{action}' receipt (message {record.get('orig_msg_id') or '?'}). If it is held "
+            f"for approval, approve it in Orca terminal {handle}; the turn waits until the session gets it."
+        )
+        _log.warning("%s", text)
+        if self._notify is not None and inbox_id is not None:
+            try:
+                self._notify(inbox_id, text)
+            except Exception:
+                _log.exception("Could not write the held-message notice to the Outbox")
+
+    async def _exit_session(self, binding: TerminalBinding, workdir: Path) -> bool:
+        # Asks Claude Code to quit the way a person would, then waits for the terminal and its process to end.
+        assert binding.handle is not None
+        try:
+            await _orca("terminal", "send", "--terminal", binding.handle, "--text", "/exit", "--enter",
+                        "--wait-submit", _SUBMIT_WAIT_SECONDS, cwd=workdir)
+        except _ORCA_ERRORS as exc:
+            _log.info("Could not send /exit to %s: %s", binding.handle, exc)
+            return False
+        loop = asyncio.get_running_loop()
+        give_up = loop.time() + self._exit_timeout
+        while loop.time() < give_up:
+            try:
+                listed = await _terminal_alive(binding.handle, workdir)
+            except _ORCA_ERRORS:
+                listed = True
+            if not listed and not _pid_alive(binding.peer_pid):
+                return True
+            await asyncio.sleep(self._poll_interval)
+        return False
+
     async def release(self, session_id: str, workdir: Path) -> str:
         # Ends the visible terminal of a conversation whose work is delivered. The binding keeps the native ID, so a
         # later event resumes the conversation with --resume; the worktree is untouched.
@@ -310,6 +570,11 @@ class OrcaVisibleRunner:
         if binding is None or not binding.handle:
             return "no live terminal is bound to this session"
         workdir = Path(os.path.realpath(workdir))
+        if binding.peer_socket and await self._exit_session(binding, workdir):
+            _drop_lease(binding.handle)
+            self._save(dataclasses.replace(binding, handle=None, incarnation_id=None, peer_pid=None, peer_socket=None,
+                                           peer_attempt=None))
+            return f"exited {binding.handle} (Claude Code ended on /exit)"
         _drop_lease(binding.handle)
         try:
             await _orca("terminal", "close", "--terminal", binding.handle, cwd=workdir)
@@ -321,10 +586,12 @@ class OrcaVisibleRunner:
         return f"closed {binding.handle}"
 
     async def _start(
-        self, profile: ClaudeCodeProfile, title: str, workdir: Path, turn: Path, args: Sequence[str], instruction: str
+        self, profile: ClaudeCodeProfile, title: str, workdir: Path, turn: Path, args: Sequence[str],
+        instruction: str | None, *, unset_extra: Sequence[str] = (),
     ) -> tuple[str, str | None]:
         launcher = profile.launcher
         unset, values = env_overrides(profile)
+        unset = (*unset, *(k for k in unset_extra if k not in unset))
         spec = {
             "title": title,
             "profile": {"name": profile.name, "launcher": launcher.name, "launcher_command": launcher.command,
@@ -335,8 +602,9 @@ class OrcaVisibleRunner:
             "probe": [launcher.command, *harness_args(profile, permission_mode="dontAsk", role_args=PROBE_ROLE_ARGS)],
             "probe_timeout": _PROBE_TIMEOUT_SECONDS,
             # `--` ends the options: --allowedTools and --mcp-config take several values and would swallow it.
-            "exec": [launcher.command, *interactive_args(profile, permission_mode="dontAsk", role_args=args), "--",
-                     instruction],
+            # Without an instruction the session starts idle and gets its task as a peer message.
+            "exec": [launcher.command, *interactive_args(profile, permission_mode="dontAsk", role_args=args),
+                     *(("--", instruction) if instruction is not None else ())],
             "status": str(turn / "gate-status.json"),
         }
         lease = _new_lease()

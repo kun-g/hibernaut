@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import math
+import re
 import sys
 import tomllib
 import warnings
@@ -20,6 +21,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     parse_profile,
 )
 from agent_runtime.adapters.executor_cli.executor import CLI_TERMINALS, DEFAULT_CLI_TEMPLATES, CLITemplate
+from agent_runtime.adapters.executor_cli.peer_handoff import PeerHandoffConfig
 from agent_runtime.adapters.executor_cli.reviewer import CODE_REVIEWER_ROLE
 from agent_runtime.adapters.executor_cli.role_skills import ROLE_ALIASES, canonical_role
 from agent_runtime.adapters.executor_cli.sde import SDE_OPTION_KEYS, SDE_ROLE, SDEOptions
@@ -53,6 +55,8 @@ class ChannelsConfig:
 
 TerminalBackend = Literal["orca", "none"]
 TERMINAL_BACKENDS: tuple[TerminalBackend, ...] = ("orca", "none")
+Handoff = Literal["mcp", "peer"]
+HANDOFFS: tuple[Handoff, ...] = ("mcp", "peer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +70,9 @@ class ProjectConfig:
     # Where interactive role sessions open; "none" makes interactive roles stop with the reason instead.
     terminal_backend: TerminalBackend = "orca"
     orca_create_terminal: bool = False
+    # How interactive Claude Code role sessions get their task and return the result: "mcp" (the launcher's
+    # hibernaut_handoff server) or "peer" (peer messages through the [peer] receiver).
+    handoff: Handoff = "mcp"
     executor: str | None = None
     # Hibernaut's PR delivery step for finished SDE tasks; None ends a task with local commits.
     delivery: DeliveryConfig | None = None
@@ -205,6 +212,7 @@ class HibernautConfig:
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     gdrive: GDriveConfig = field(default_factory=GDriveConfig)
     switchboard: SwitchboardLinkConfig = field(default_factory=SwitchboardLinkConfig)
+    peer: PeerHandoffConfig = field(default_factory=PeerHandoffConfig)
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
 
@@ -232,6 +240,51 @@ def _switchboard_url(section: dict[str, Any], key: str, schemes: tuple[str, ...]
     if parsed.scheme not in schemes or not parsed.hostname:
         raise ValueError(f"switchboard.{key} must be a {' or '.join(s + '://' for s in schemes)} URL")
     return raw
+
+
+_PEER_KEYS = frozenset({"receiver", "state_dir", "config_dirs", "max_resends", "register_timeout_seconds",
+                        "exit_timeout_seconds"})
+
+
+def parse_peer(raw: Any, *, base_dir: Path | None = None) -> PeerHandoffConfig:
+    if raw is None:
+        return PeerHandoffConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("[peer] must be a table")
+    item = cast(dict[str, Any], raw)
+    unknown = sorted(set(item) - _PEER_KEYS)
+    if unknown:
+        raise ValueError(f"[peer] has unknown keys: {', '.join(unknown)}")
+    defaults = PeerHandoffConfig()
+    receiver = item.get("receiver", defaults.receiver)
+    if not isinstance(receiver, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", receiver):
+        raise ValueError("peer.receiver must be a ccpeer receiver name (letters, digits, '_' and '-')")
+    state_raw = item.get("state_dir")
+    if state_raw is not None and (not isinstance(state_raw, str) or not state_raw.strip()):
+        raise ValueError("peer.state_dir must be a path string")
+    dirs_raw = item.get("config_dirs")
+    if dirs_raw is not None and (not isinstance(dirs_raw, list) or not dirs_raw
+                                 or not all(isinstance(d, str) and d.strip() for d in cast(list[object], dirs_raw))):
+        raise ValueError("peer.config_dirs must be a non-empty list of paths")
+
+    def number(key: str, default: float) -> float:
+        value = item.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"peer.{key} must be a positive number")
+        return float(value)
+
+    resends = item.get("max_resends", defaults.max_resends)
+    if isinstance(resends, bool) or not isinstance(resends, int) or resends < 0:
+        raise ValueError("peer.max_resends must be a non-negative integer")
+    return PeerHandoffConfig(
+        receiver=receiver,
+        state_dir=Path(_resolve_path(state_raw.strip(), base_dir)) if isinstance(state_raw, str) else None,
+        config_dirs=(tuple(Path(_resolve_path(str(d).strip(), base_dir)) for d in cast(list[object], dirs_raw))
+                     if dirs_raw is not None else defaults.config_dirs),
+        max_resends=resends,
+        register_timeout=number("register_timeout_seconds", defaults.register_timeout),
+        exit_timeout=number("exit_timeout_seconds", defaults.exit_timeout),
+    )
 
 
 def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> SwitchboardLinkConfig:
@@ -444,6 +497,9 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             raise ValueError(
                 f"Unsupported terminal_backend for '{name}': {terminal!r} (supported: {', '.join(TERMINAL_BACKENDS)})"
             )
+        handoff = item.get("handoff", "mcp")
+        if handoff not in HANDOFFS:
+            raise ValueError(f"Unsupported handoff for '{name}': {handoff!r} (supported: {', '.join(HANDOFFS)})")
         proj_exec_raw = item.get("executor")
         proj_exec = str(proj_exec_raw).strip() if proj_exec_raw is not None else None
         repo = str(item["repo"])
@@ -462,6 +518,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             worktree_backend=cast(Literal["orca", "git"], backend),
             terminal_backend=terminal,
             orca_create_terminal=bool(item.get("orca_create_terminal", False)),
+            handoff=cast(Handoff, handoff),
             executor=proj_exec or None,
             delivery=delivery,
         )
@@ -524,5 +581,6 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         projects=projects,
         gdrive=gdrive,
         switchboard=parse_switchboard_link(raw.get("switchboard"), base_dir=base_dir),
+        peer=parse_peer(raw.get("peer"), base_dir=base_dir),
         config_dir=str(base_dir) if base_dir is not None else "",
     )

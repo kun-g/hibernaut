@@ -91,3 +91,61 @@ class TestConfigReload(unittest.TestCase):
             finally:
                 proc.terminate()
                 proc.wait(timeout=10)
+
+    def test_reload_to_a_peer_project_without_a_receiver_keeps_serving(self):
+        # The receiver check rejects the new settings like any other unusable config: the running daemon stays.
+        repo = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / 'hibernaut.toml'
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', 0))
+                port = sock.getsockname()[1]
+            base = f'[runtime]\ndb_path = ":memory:"\n[channels]\nport = {port}\nmcp_enabled = true\n'
+            path.write_text(base)
+            log = root / 'daemon.log'
+            with log.open('w') as stream:
+                proc = subprocess.Popen(
+                    [sys.executable, str(repo / 'scripts/run_updating.py'), '--config', str(path),
+                     '--interval', '3600', '--config-poll-interval', '0.02'],
+                    cwd=root, stdout=stream, stderr=stream,
+                    env={**os.environ, 'HIBERNAUT_MCP_TOKEN': 'reload-test'},
+                )
+
+            def ping():
+                conn = http.client.HTTPConnection('127.0.0.1', port, timeout=2)
+                try:
+                    conn.request('POST', '/mcp', json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'ping'}),
+                                 {'Authorization': 'Bearer reload-test', 'Content-Type': 'application/json'})
+                    return conn.getresponse().status
+                finally:
+                    conn.close()
+
+            def wait_for(check):
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    self.assertIsNone(proc.poll(), log.read_text())
+                    try:
+                        if check():
+                            return
+                    except ConnectionRefusedError:
+                        pass
+                    time.sleep(.01)
+                self.fail(log.read_text())
+
+            try:
+                wait_for(lambda: ping() == 200)
+                path.write_text(
+                    base.replace('[runtime]\n', '[runtime]\ndefault_executor = "sde"\n')
+                    + '[executors.sde]\nrole = "sde"\nreview = false\n'
+                    + f'[peer]\nstate_dir = "{root / "no-receiver"}"\n'
+                    + f'[projects.local]\nrepo = "fixture/test"\ncheckout = "{root}"\ninbox_id = "proj:local"\n'
+                    + 'worktree_backend = "git"\nterminal_backend = "orca"\nhandoff = "peer"\n'
+                )
+                wait_for(lambda: 'Cannot activate settings (ValueError)' in log.read_text())
+                time.sleep(0.2)
+                self.assertIsNone(proc.poll(), log.read_text())
+                self.assertEqual(ping(), 200)
+            finally:
+                proc.terminate()
+                proc.wait(timeout=10)
