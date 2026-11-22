@@ -183,6 +183,10 @@ def run_interactive():
 model = argv[argv.index("--model") + 1]
 source = os.environ.get("FAKE_API_KEY_SOURCE") or ("ANTHROPIC_API_KEY" if "ANTHROPIC_API_KEY" in os.environ else "none")
 session_id = argv[argv.index("--resume") + 1] if "--resume" in argv else f"fake-{role}-{os.getpid()}"
+if probe and os.environ.get("FAKE_PROBE_PIDFILE"):
+    # A probe that never reports, to close its terminal during the session check.
+    Path(os.environ["FAKE_PROBE_PIDFILE"]).write_text(str(os.getpid()))
+    time.sleep(60)
 if probe:
     emit({"type": "system", "subtype": "init", "apiKeySource": source, "model": os.environ.get("FAKE_MODEL", model)})
     time.sleep(60)  # a probe is stopped at init; outliving the check would stall the test

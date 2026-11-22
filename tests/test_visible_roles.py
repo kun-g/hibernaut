@@ -32,12 +32,18 @@ from tests.test_sde_executor import BUGGY, EVIDENCE, FIXED, PASS, PROXY, dev, ev
 class FakeOrcaTerminals:
     """Orca CLI double that runs each terminal's --command in a real shell, the way Orca types it into a login
     shell, so the gate, the billing probe and the interactive agent all really run. `terminal send` types a
-    line into the running process; `terminal list` holds only terminals whose process is still running."""
+    line into the running process; `terminal list` holds only terminals whose process is still running.
+    `terminal close` sends SIGTERM to the terminal's own process only (real Orca signals the whole tree), so a
+    test sees what the wrapper ends by itself, then SIGKILL after a grace period. With `lose_closes` set, close
+    reports success and drops the terminal from the list without signalling anything, as Orca sometimes does."""
+
+    CLOSE_GRACE_SECONDS = 5.0
 
     def __init__(self, root: Path) -> None:
         self.root = root
         self.terminals: dict[str, dict] = {}
         self.calls: list[tuple[str, ...]] = []
+        self.lose_closes = False
 
     def _info(self, handle: str) -> dict:
         term = self.terminals[handle]
@@ -63,7 +69,8 @@ class FakeOrcaTerminals:
             return {"terminal": {"handle": handle, "incarnationId": self.terminals[handle]["incarnation"],
                                  "title": flags["--title"]}}
         if verb == "terminal list":
-            return {"terminals": [self._info(h) for h, t in self.terminals.items() if t["proc"].returncode is None]}
+            return {"terminals": [self._info(h) for h, t in self.terminals.items()
+                                  if t["proc"].returncode is None and not t.get("lost")]}
         handle = flags.get("--terminal", "")
         term = self.terminals.get(handle)
         if verb == "terminal show":
@@ -76,9 +83,24 @@ class FakeOrcaTerminals:
             await term["proc"].stdin.drain()
             return {"send": {"handle": handle, "accepted": True, "prompt": {"processIncarnation": term["incarnation"]}}}
         if verb == "terminal close":
-            await self.kill(handle)
-            return {"close": {"handle": handle}}
+            # Orca may drop a terminal whose command ended and then refuses its handle.
+            if term is None or term["proc"].returncode is not None:
+                raise RuntimeError('{"ok": false, "error": {"code": "terminal_handle_stale"}}')
+            if self.lose_closes:
+                term["lost"] = True
+            else:
+                await self.close(handle)
+            return {"close": {"handle": handle, "ptyKilled": True}}
         raise AssertionError(f"unexpected orca call {args}")
+
+    async def close(self, handle: str) -> None:
+        proc = self.terminals[handle]["proc"]
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=self.CLOSE_GRACE_SECONDS)
+            except TimeoutError:
+                await self.kill(handle)
 
     async def kill(self, handle: str) -> None:
         proc = self.terminals[handle]["proc"]

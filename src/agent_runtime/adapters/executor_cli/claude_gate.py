@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,17 @@ def _report(path: Path, body: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+async def _probe(argv: list[str], env: dict[str, str], timeout: float) -> dict[str, Any]:
+    # A closed terminal (SIGHUP/SIGTERM) cancels the probe, so probe_init kills the harness it started instead of
+    # leaving it behind this process.
+    task = asyncio.current_task()
+    assert task is not None
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        loop.add_signal_handler(sig, task.cancel)
+    return await probe_init(argv, cwd=Path.cwd(), env=env, timeout_seconds=timeout)
+
+
 def main(spec_path: str) -> int:
     spec: dict[str, Any] = json.loads(Path(spec_path).read_text(encoding="utf-8"))
     status = Path(spec["status"])
@@ -44,8 +56,11 @@ def main(spec_path: str) -> int:
         credential_proxy_url=p["credential_proxy_url"],
     )
     try:
-        init = asyncio.run(probe_init(spec["probe"], cwd=Path.cwd(), env=env, timeout_seconds=spec["probe_timeout"]))
+        init = asyncio.run(_probe(spec["probe"], env, spec["probe_timeout"]))
         check_init(profile, init)
+    except asyncio.CancelledError:
+        print(f"[hibernaut] {spec['title']}: terminal closed during the session check", file=sys.stderr, flush=True)
+        return 1
     except ClaudeCodeError as exc:
         _report(status, {"ok": False, "error": str(exc)})
         print(f"[hibernaut] {profile.name}: {exc}", file=sys.stderr, flush=True)

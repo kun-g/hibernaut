@@ -443,8 +443,9 @@ class TestCLIReviewerTerminal(TerminalCase):
         screen = self.orca.screen(handle)
         self.assertIn(json.dumps(PASS), screen)
         self.assertIn("reading calc.py", screen)
-        # The finished terminal stays open for reading; the run's files are removed.
-        self.assertTrue(self.alive(handle))
+        # The terminal ends with the CLI, without Hibernaut closing it; the run's files are removed.
+        await self.orca.terminals[handle]["proc"].wait()
+        self.assertEqual(self.orca.terminals[handle]["proc"].returncode, 0)
         self.assertNotIn("terminal close", self.orca.verbs())
         self.assertEqual(list(self.runs.iterdir()), [])
         self.assertEqual(review["cli_terminals"], [handle])
@@ -618,12 +619,13 @@ class TestSDEClosesReviewTerminals(TestSDEWithCLIReviewer):
         outcome = await self.executor(self.delivery(close_terminal=True)).execute([self.event()], None, self.caps)
         assert isinstance(outcome, Emit), outcome
         first, second = self.orca.terminals
+        # Both ended with their CLI; closing a terminal that is already gone counts as closed, not as a failure.
         self.assertIn(f"Review terminals: closed {first}, {second}", outcome.messages[0])
         for handle in (first, second):
             self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
             self.assertIsNotNone(self.orca.terminals[handle]["proc"].returncode)
 
-    async def test_review_terminals_stay_when_closing_is_off(self):
+    async def test_review_terminals_are_not_closed_when_closing_is_off(self):
         self.set_dev(({"calc.py": "x = 1\n"}, "divide fixed"))
         self.cli.set(json.dumps(PASS))
         outcome = await self.executor(self.delivery()).execute([self.event()], None, self.caps)
@@ -631,4 +633,5 @@ class TestSDEClosesReviewTerminals(TestSDEWithCLIReviewer):
         (handle,) = self.orca.terminals
         self.assertNotIn("terminal close", self.orca.verbs())
         self.assertIn(f"[grok] verdict=pass (cli={cli_command(self.root)} terminal=orca)", outcome.messages[0])
-        self.assertIsNone(self.orca.terminals[handle]["proc"].returncode)
+        # It ended with the CLI all the same.
+        self.assertEqual(await self.orca.terminals[handle]["proc"].wait(), 0)

@@ -44,6 +44,7 @@ HANDOFF_SCRIPT = Path(__file__).with_name("handoff_mcp.py")
 HANDOFF_SERVER = "hibernaut_handoff"
 HANDOFF_TOOLS = (f"mcp__{HANDOFF_SERVER}__get_task", f"mcp__{HANDOFF_SERVER}__submit_result")
 _PROBE_TIMEOUT_SECONDS = 120
+_WRAPPER_DEADLINE_MARGIN_SECONDS = 60
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
 _ORCA_ERRORS = (OSError, TimeoutError, ValueError, RuntimeError, KeyError)
 
@@ -618,9 +619,14 @@ class OrcaVisibleRunner:
 
 
 async def _close_quietly(handle: str, workdir: Path) -> bool:
+    # A terminal whose command already ended (a finished CLI run ends its own) counts as closed.
     try:
         await _orca("terminal", "close", "--terminal", handle, cwd=workdir)
-    except (OSError, TimeoutError, ValueError, RuntimeError):
+    except _ORCA_ERRORS:
+        with contextlib.suppress(*_ORCA_ERRORS):
+            if not await _terminal_alive(handle, workdir):
+                _log.info("Orca terminal %s had already ended", handle)
+                return True
         _log.exception("Could not close Orca terminal %s", handle)
         return False
     return True
@@ -710,7 +716,7 @@ class TerminalRun:
 
 class OrcaCommandTerminal:
     # Runs one non-interactive command in a visible Orca terminal of the worktree. The terminal shows the output as
-    # it comes; the result is read only from files the wrapper writes, never from the screen.
+    # it comes and ends with the command; the result is read only from files the wrapper writes, never from the screen.
     def __init__(self, *, root: Path | None = None, poll_interval: float = 0.25, liveness_interval: float = 5.0) -> None:
         self._root = root or Path(tempfile.gettempdir()) / "hibernaut-cli-terminal"
         self._poll_interval = poll_interval
@@ -733,7 +739,9 @@ class OrcaCommandTerminal:
         run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=self._root))
         files = {name: str(run_dir / name) for name in ("stdout", "stderr", "exit.json")}
         # The argv holds the prompt; it reaches the wrapper through this private file, not the command line.
-        spec = {"title": title, "cwd": str(workdir), "argv": list(argv), "env": dict(env), **files}
+        # The wrapper's own deadline outlasts this one, so it only fires when Hibernaut is no longer waiting.
+        spec = {"title": title, "cwd": str(workdir), "argv": list(argv), "env": dict(env),
+                "timeout_seconds": timeout_seconds + _WRAPPER_DEADLINE_MARGIN_SECONDS, **files}
         spec_path = run_dir / "spec.json"
         fd = os.open(spec_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
