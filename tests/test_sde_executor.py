@@ -564,8 +564,6 @@ class TestSDEDispatchAndHotReload(unittest.TestCase):
         write_config("sg-a", "subscription", "claude-opus-5-5", "high", True)
         self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(log), "FAKE_PLAN": str(plan)}))
         stderr = self.enterContext(patch("sys.stderr", new_callable=_Capture))
-        # The project's GitHub poller is not under test; keep it off the network.
-        self.enterContext(patch("agent_runtime.adapters.channels.github_poller.GitHubIssuePoller.poll_once", return_value=0))
 
         def post(n):
             body = {

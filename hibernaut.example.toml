@@ -7,14 +7,10 @@ memory_root = "./agent_memory"
 max_concurrency = 4
 new_event_policy = "defer"   # defer | fold | interrupt
 default_executor = "claude"
-poll_mode = "gh"             # gh | api
-poll_interval_seconds = 60.0
 
 [channels]
 host = "127.0.0.1"
 port = 8080
-github_webhook_secret_env = "GITHUB_WEBHOOK_SECRET"
-github_token_env = "GITHUB_TOKEN"
 feishu_app_id_env = "FEISHU_APP_ID"
 feishu_app_secret_env = "FEISHU_APP_SECRET"
 feishu_verification_token_env = "FEISHU_VERIFICATION_TOKEN"
@@ -119,14 +115,12 @@ timeout_seconds = 300.0
 
 [projects.hibernaut]
 # 字符串：一个精确 inbox_id（原有写法，不当正则）。数组：每项直接是正则，须整串匹配（fullmatch），不用加 "re:"（旧写法仍可用）；
-# 不含正则语法的项是精确 ID（字面的点写成 "\\."）。第一个精确 ID 是主 inbox，GitHub 与飞书入站投递到它，表达式不作投递地址。
+# 不含正则语法的项是精确 ID（字面的点写成 "\\."）。第一个精确 ID 是主 inbox，飞书按群映射到它。Switchboard 的仓库路由应指向本项目服务的 inbox。
 # 服务多个 inbox 的项目，每个写任务都在该 inbox 自己的 hb-* worktree 里运行。
 # inbox_id = ["proj:hibernaut", "proj:hibernaut:.+"]
 inbox_id = "proj:hibernaut"
 repo = "kun-g/hibernaut"
 checkout = "/absolute/path/to/your/hibernaut"
-poll_labels = ["hibernaut"]
-# github_poll = false        # Issue 经 Switchboard Webhook 送达时关掉轮询；poll_labels = [] 不是关闭，而是轮询全部 Issue
 worktree_backend = "orca"    # orca | git
 terminal_backend = "orca"    # orca | none；交互角色会话的后端，与 worktree_backend 独立。默认：orca 项目为 orca，git 项目为 none
 orca_create_terminal = false    # agent launch opens its own terminal
@@ -179,6 +173,7 @@ gh_command = "gh"
 # done_folder_id = ""
 # failed_folder_id = ""
 
+# GitHub webhooks go to Switchboard. Configure repository routes and [github] require_label in switchboard.toml.
 # Stage A: run Switchboard in this process (off by default). Tokens come only from SWITCHBOARD_* env vars,
 # which are moved out of the process environment at startup so executor subprocesses do not inherit them.
 # [switchboard]

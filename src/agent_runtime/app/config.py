@@ -5,13 +5,13 @@ import dataclasses
 import math
 import sys
 import tomllib
+import warnings
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
-from agent_runtime.adapters.channels.github_poller import PollMode
 from agent_runtime.adapters.delivery import DeliveryConfig, parse_delivery
 from agent_runtime.adapters.executor_cli.claude_code import (
     ClaudeCodeLauncher,
@@ -36,16 +36,12 @@ class RuntimeConfig:
     max_concurrency: int = 4
     new_event_policy: NewEventPolicy = "defer"
     default_executor: str = "claude"
-    poll_mode: PollMode = "gh"
-    poll_interval_seconds: float = 60.0
 
 
 @dataclass(frozen=True, slots=True)
 class ChannelsConfig:
     host: str = "127.0.0.1"
     port: int = 8080
-    github_webhook_secret_env: str = "GITHUB_WEBHOOK_SECRET"
-    github_token_env: str = "GITHUB_TOKEN"
     feishu_app_id_env: str = "FEISHU_APP_ID"
     feishu_app_secret_env: str = "FEISHU_APP_SECRET"
     feishu_verification_token_env: str = "FEISHU_VERIFICATION_TOKEN"
@@ -63,13 +59,10 @@ TERMINAL_BACKENDS: tuple[TerminalBackend, ...] = ("orca", "none")
 @dataclass(frozen=True, slots=True)
 class ProjectConfig:
     name: str
-    # The primary inbox: the first literal of inbox_id. GitHub and Feishu ingress for this project deliver here.
+    # The first literal of inbox_id is the primary inbox for project mappings.
     inbox_id: str
     repo: str
     checkout: str
-    poll_labels: tuple[str, ...] = ()
-    # False when issues arrive by webhook (Switchboard); an empty poll_labels would poll every issue instead.
-    github_poll: bool = True
     worktree_backend: WorktreeBackend = "orca"
     # Where interactive role sessions open; "none" makes interactive roles stop with the reason instead.
     terminal_backend: TerminalBackend = "orca"
@@ -277,11 +270,14 @@ def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> Switchb
     )
 
 
-def _bool(item: dict[str, Any], key: str, default: bool, *, where: str) -> bool:
-    value = item.get(key, default)
-    if not isinstance(value, bool):
-        raise ValueError(f"{where}.{key} must be true or false")
-    return value
+def _warn_obsolete(section: dict[str, Any], scope: str, *keys: str) -> None:
+    for key in keys:
+        if key in section:
+            warnings.warn(
+                f"{scope}.{key} is obsolete and ignored. Configure GitHub ingress in Switchboard.",
+                UserWarning,
+                stacklevel=3,
+            )
 
 
 def load_config(path: str | Path) -> HibernautConfig:
@@ -339,9 +335,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
     policy = str(rt_raw.get("new_event_policy", "defer"))
     if policy not in ("defer", "fold", "interrupt"):
         raise ValueError(f"Unsupported new_event_policy: {policy}")
-    poll_mode = str(rt_raw.get("poll_mode", "gh"))
-    if poll_mode not in ("gh", "api"):
-        raise ValueError(f"Unsupported poll_mode: {poll_mode}")
+    _warn_obsolete(rt_raw, "runtime", "poll_mode", "poll_interval_seconds")
 
     runtime = RuntimeConfig(
         db_path=str(rt_raw.get("db_path", "./hibernaut.db")),
@@ -349,23 +343,16 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         max_concurrency=int(rt_raw.get("max_concurrency", 4)),
         new_event_policy=cast(NewEventPolicy, policy),
         default_executor=str(rt_raw.get("default_executor", "claude")),
-        poll_mode=cast(PollMode, poll_mode),
-        poll_interval_seconds=float(rt_raw.get("poll_interval_seconds", 60.0)),
     )
 
     if runtime.max_concurrency < 1:
         raise ValueError("runtime.max_concurrency must be at least 1")
-    if not math.isfinite(runtime.poll_interval_seconds) or runtime.poll_interval_seconds <= 0:
-        raise ValueError("runtime.poll_interval_seconds must be finite and positive")
 
     ch_raw = raw.get("channels", {})
+    _warn_obsolete(ch_raw, "channels", "github_webhook_secret_env", "github_token_env")
     channels = ChannelsConfig(
         host=str(ch_raw.get("host", "127.0.0.1")),
         port=int(ch_raw.get("port", 8080)),
-        github_webhook_secret_env=str(
-            ch_raw.get("github_webhook_secret_env", "GITHUB_WEBHOOK_SECRET")
-        ),
-        github_token_env=str(ch_raw.get("github_token_env", "GITHUB_TOKEN")),
         feishu_app_id_env=str(ch_raw.get("feishu_app_id_env", "FEISHU_APP_ID")),
         feishu_app_secret_env=str(ch_raw.get("feishu_app_secret_env", "FEISHU_APP_SECRET")),
         feishu_verification_token_env=str(
@@ -444,6 +431,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
 
     projects: dict[str, ProjectConfig] = {}
     for name, item in raw.get("projects", {}).items():
+        _warn_obsolete(item, f"projects.{name}", "github_poll", "poll_labels")
         backend = str(item.get("worktree_backend", "orca"))
         if backend not in ("orca", "git"):
             raise ValueError(f"Unsupported worktree_backend for '{name}': {backend}")
@@ -467,8 +455,6 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             rules=rules,
             repo=repo,
             checkout=str(item["checkout"]),
-            poll_labels=tuple(str(lbl) for lbl in item.get("poll_labels", ())),
-            github_poll=_bool(item, "github_poll", True, where=f"projects.{name}"),
             worktree_backend=cast(Literal["orca", "git"], backend),
             terminal_backend=terminal,
             orca_create_terminal=bool(item.get("orca_create_terminal", False)),

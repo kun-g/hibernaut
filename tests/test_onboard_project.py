@@ -60,7 +60,7 @@ class OnboardTests(unittest.TestCase):
         project = load_config(self.config).projects["new-tool"]
         self.assertEqual(project.inbox_id, "proj:new-tool")
         self.assertEqual(project.repo, "kun-g/New-Tool")
-        self.assertFalse(project.github_poll)
+        self.assertNotIn("github_poll", self.config.read_text())
         assert project.delivery is not None
         self.assertFalse(project.delivery.auto_merge)
 

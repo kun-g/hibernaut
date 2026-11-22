@@ -24,10 +24,7 @@ from agent_runtime.adapters.channels import (
     DriveTaskPoller,
     FeishuWebhookAdapter,
     FileOutboxChannel,
-    GitHubIssuePoller,
-    GitHubWebhookAdapter,
     MCPServerAdapter,
-    PollTarget,
     ProxiedDriveClient,
     WebhookHTTPServer,
     build_feishu_or_console_channel,
@@ -278,14 +275,11 @@ class AlwaysOnDaemon:
     sessions: SQLiteSessionStoreAdapter
     workspaces: SQLiteWorkspaceStore
     channel: ChannelPort
-    github_webhook: GitHubWebhookAdapter | None = None
     feishu_webhook: FeishuWebhookAdapter | None = None
-    github_poller: GitHubIssuePoller | None = None
     gdrive_poller: DriveTaskPoller | None = None
     gdrive_result_writer: DriveResultWriter | None = None
     mcp_server: MCPServerAdapter | None = None
     switchboard_bridge: SwitchboardInboundBridge | None = None
-    poll_interval_seconds: float = 60.0
     gdrive_poll_interval_seconds: float = 30.0
     ingest_only: bool = False
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -300,7 +294,6 @@ class AlwaysOnDaemon:
     def http_handler(self) -> type[BaseHTTPRequestHandler]:
         return webhook_request_handler(
             self.handler,
-            github_adapter=self.github_webhook,
             feishu_adapter=self.feishu_webhook,
             mcp_adapter=self.mcp_server,
         )
@@ -367,13 +360,6 @@ class AlwaysOnDaemon:
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(self.scheduler.run_forever(timer_interval_seconds, stop_event))
             tasks.create_task(self.dispatcher.run_forever(outbox_interval_seconds, stop_event))
-            if self.github_poller is not None:
-                tasks.create_task(
-                    self.github_poller.run_forever(
-                        interval_seconds=self.poll_interval_seconds,
-                        stop_event=stop_event,
-                    )
-                )
             if self.gdrive_poller is not None:
                 tasks.create_task(
                     self.gdrive_poller.run_forever(
@@ -471,12 +457,8 @@ def build_daemon(
     min_outbox_interval_seconds: float = 0.0,
     lease_ttl_seconds: float = 60.0,
     new_event_policy: NewEventPolicy = "defer",
-    github_webhook_secret: str | None = None,
-    github_repo_inbox_map: Mapping[str, str] | None = None,
     feishu_verification_token: str | None = None,
     feishu_chat_inbox_map: Mapping[str, str] | None = None,
-    poll_targets: list[PollTarget] | None = None,
-    poll_interval_seconds: float = 60.0,
     mcp_bearer_token: str | None = None,
     worktree_manager: OrcaWorktreeManager | None = None,
     ingest_only: bool = False,
@@ -609,24 +591,10 @@ def build_daemon(
         channel=resolved_channel,
         min_interval_seconds=min_outbox_interval_seconds,
     )
-    github_webhook = GitHubWebhookAdapter(
-        handler,
-        webhook_secret=github_webhook_secret,
-        repo_inbox_map=github_repo_inbox_map,
-    )
     feishu_webhook = FeishuWebhookAdapter(
         handler,
         verification_token=feishu_verification_token,
         chat_inbox_map=feishu_chat_inbox_map,
-    )
-    github_poller = (
-        GitHubIssuePoller(
-            handler,
-            targets=poll_targets,
-            repo_inbox_map=github_repo_inbox_map,
-        )
-        if poll_targets
-        else None
     )
     mcp_server = MCPServerAdapter(
         handler=handler,
@@ -652,9 +620,7 @@ def build_daemon(
         sessions=sessions,
         workspaces=workspaces,
         channel=resolved_channel,
-        github_webhook=github_webhook,
         feishu_webhook=feishu_webhook,
-        github_poller=github_poller,
         gdrive_poller=(
             DriveTaskPoller(
                 handler,
@@ -671,7 +637,6 @@ def build_daemon(
         ),
         gdrive_result_writer=gdrive_writer,
         mcp_server=mcp_server,
-        poll_interval_seconds=poll_interval_seconds,
         gdrive_poll_interval_seconds=gdrive_poll_interval_seconds,
         ingest_only=ingest_only,
     )
@@ -689,20 +654,13 @@ def build_daemon_from_config(
     # Every inbox -> project lookup goes through the router, so pattern-matched inboxes get their project's settings
     # and an inbox matching two projects raises AmbiguousProjectMatch instead of picking one.
     router = ProjectRouter(config.projects.values())
-    repo_inbox_map: dict[str, str] = {}
     chat_inbox_map: dict[str, str] = {}
-    poll_targets: list[PollTarget] = []
     inbox_checkout_map = router.inbox_map(lambda p: p.checkout)
     inbox_chat_map = router.inbox_map(lambda p: p.feishu_chat_id or None)
 
     for proj in config.projects.values():
-        # Ingress that names no inbox (GitHub repo, Feishu chat) delivers to the primary inbox; one poll per project.
-        repo_inbox_map[proj.repo] = proj.inbox_id
         if proj.feishu_chat_id:
             chat_inbox_map[proj.feishu_chat_id] = proj.inbox_id
-        target = PollTarget(repo=proj.repo, inbox_id=proj.inbox_id, labels=proj.poll_labels)
-        if proj.github_poll and target not in poll_targets:
-            poll_targets.append(target)
 
     resolved_channel = channel or build_feishu_or_console_channel(
         app_id_env=config.channels.feishu_app_id_env,
@@ -715,7 +673,6 @@ def build_daemon_from_config(
         # Replies with an origin go out through the Switchboard gateway; session-less notices keep the old channel.
         resolved_channel = SwitchboardChannelAdapter(switchboard_bus(switchboard).publish, fallback=resolved_channel)
 
-    gh_secret = os.environ.get(config.channels.github_webhook_secret_env) or None
     feishu_token = os.environ.get(config.channels.feishu_verification_token_env) or None
     mcp_token = (
         (os.environ.get(config.channels.mcp_token_env) or None)
@@ -756,12 +713,8 @@ def build_daemon_from_config(
         max_concurrency=config.runtime.max_concurrency,
         channel=resolved_channel,
         new_event_policy=config.runtime.new_event_policy,
-        github_webhook_secret=gh_secret,
-        github_repo_inbox_map=repo_inbox_map,
         feishu_verification_token=feishu_token,
         feishu_chat_inbox_map=chat_inbox_map,
-        poll_targets=poll_targets,
-        poll_interval_seconds=config.runtime.poll_interval_seconds,
         mcp_bearer_token=mcp_token,
         ingest_only=ingest_only,
         gdrive_client=resolved_gdrive_client,
@@ -951,11 +904,6 @@ def build_daemon_from_config(
             inbox=daemon.inbox,
             on_wake=daemon.pool.wake,
         )
-        daemon.github_webhook = GitHubWebhookAdapter(
-            daemon.handler,
-            webhook_secret=gh_secret,
-            repo_inbox_map=repo_inbox_map,
-        )
         daemon.feishu_webhook = FeishuWebhookAdapter(
             daemon.handler,
             verification_token=feishu_token,
@@ -970,15 +918,6 @@ def build_daemon_from_config(
             outbox=daemon.outbox,
             bearer_token=mcp_token,
             worktree_manager_for=_manager_for,
-        )
-
-    if poll_targets:
-        daemon.github_poller = GitHubIssuePoller(
-            daemon.handler,
-            targets=poll_targets,
-            mode=config.runtime.poll_mode,
-            github_token_env=config.channels.github_token_env,
-            repo_inbox_map=repo_inbox_map,
         )
 
     if resolved_gdrive_client is not None:
@@ -1235,7 +1174,6 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--policy", choices=("defer", "fold", "interrupt"), default="defer")
-    parser.add_argument("--github-secret", default=None)
     parser.add_argument("--feishu-token", default=None)
     parser.add_argument("--mcp-token", default=None)
     parser.add_argument("--config-poll-interval", type=float, default=1.0)
@@ -1259,7 +1197,6 @@ def main() -> None:
             memory_root=args.memory_root,
             max_concurrency=args.workers,
             new_event_policy=args.policy,
-            github_webhook_secret=args.github_secret,
             feishu_verification_token=args.feishu_token,
             mcp_bearer_token=args.mcp_token,
         )

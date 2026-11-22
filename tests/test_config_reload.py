@@ -22,9 +22,6 @@ class TestConfigReload(unittest.TestCase):
             base = f'[runtime]\ndb_path = ":memory:"\n[channels]\nport = {port}\n'
             enabled = base + 'mcp_enabled = true\n'
             path.write_text(enabled)
-            gh = root / 'gh'
-            gh.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> poll-args\nprintf "[]\\n"\n')
-            gh.chmod(0o700)
             log = root / 'daemon.log'
             with log.open('w') as stream:
                 proc = subprocess.Popen(
@@ -36,8 +33,7 @@ class TestConfigReload(unittest.TestCase):
                         '--config-poll-interval', '0.02',
                     ],
                     cwd=root, stdout=stream, stderr=stream,
-                    env={**os.environ, 'PATH': f'{root}{os.pathsep}{os.environ["PATH"]}',
-                         'HIBERNAUT_MCP_TOKEN': 'reload-test'},
+                    env={**os.environ, 'HIBERNAUT_MCP_TOKEN': 'reload-test', 'FEISHU_VERIFICATION_TOKEN': 'reload-test'},
                 )
             headers = {'Authorization': 'Bearer reload-test', 'Content-Type': 'application/json'}
 
@@ -81,9 +77,12 @@ class TestConfigReload(unittest.TestCase):
                 path.write_text(enabled)
                 wait_for(lambda: request() == 200)
                 self.assertTrue(post('/events', event)[1]['duplicate'])
-                path.write_text(enabled + f'\n[projects.local]\nrepo="fixture/test"\ncheckout="{root}"\npoll_labels=["changed"]\n')
-                poll_args = root / 'poll-args'
-                wait_for(lambda: poll_args.is_file() and '--label changed' in poll_args.read_text())
+                message = {'header': {'event_id': 'reload-message', 'token': 'reload-test'},
+                           'event': {'message': {'chat_id': 'oc_local'}}}
+                self.assertEqual(post('/webhooks/feishu', message)[1]['inbox_id'], 'feishu:oc_local')
+                path.write_text(enabled + f'\n[projects.local]\nrepo="fixture/test"\ncheckout="{root}"\n'
+                                'inbox_id="proj:local"\nfeishu_chat_id="oc_local"\n')
+                wait_for(lambda: post('/webhooks/feishu', message)[1]['inbox_id'] == 'proj:local')
                 with socket.socket() as occupied:
                     occupied.bind(('127.0.0.1', 0))
                     occupied.listen()
