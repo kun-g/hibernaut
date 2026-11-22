@@ -364,6 +364,20 @@ class ReclaimCase(DeliveryCase):
 
 
 class TestReclaimEvidence(ReclaimCase, unittest.TestCase):
+    def test_orca_removal_targets_the_registered_path(self):
+        calls = []
+
+        def runner(cmd, cwd):
+            if cmd[0] == "orca":
+                calls.append((cmd, cwd))
+                return CommandResult(0, "", "")
+            return self.runner(cmd, cwd)
+
+        manager = OrcaWorktreeManager(workspace_store=self.workspaces, session_store=self.sessions,
+                                      backend="orca", runner=runner)
+        self.assertTrue(manager.reclaim("task:9").reclaimed)
+        self.assertEqual(calls, [(["orca", "worktree", "rm", "--worktree", f"path:{self.wt}"], self.primary)])
+
     def test_local_only_commit_keeps_the_worktree(self):
         self.commit()
         result = self.manager().reclaim("task:9")
