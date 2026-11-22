@@ -10,7 +10,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
-from agent_runtime.adapters.channels.feishu_channel import FeishuChannelAdapter
 from agent_runtime.adapters.executor_cli import OrcaWorktreeManager, WorkspaceIsolationError
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions, _State
@@ -165,14 +164,14 @@ class TestInboxIdConfig(unittest.TestCase):
     def test_direct_patterns_leave_configured_delivery_addresses_alone(self):
         cfg = parse_config({
             "gdrive": {"default_inbox_id": "proj:hibernaut:drive"},
-            "projects": {"hibernaut": {"repo": "kun-g/hibernaut", "checkout": "/tmp/h", "feishu_chat_id": "oc_h",
+            "projects": {"hibernaut": {"repo": "kun-g/hibernaut", "checkout": "/tmp/h",
                                        "inbox_id": ["proj:hibernaut:.+", "proj:hibernaut"]}},
         })
         self.assertEqual(cfg.gdrive.default_inbox_id, "proj:hibernaut:drive")
         self.assertEqual(cfg.projects["hibernaut"].inbox_id, "proj:hibernaut")
-        chats = ProjectRouter(cfg.projects.values()).inbox_map(lambda p: p.feishu_chat_id or None)
-        self.assertEqual(list(chats), ["proj:hibernaut"])
-        self.assertEqual(chats.get("proj:hibernaut:drive"), "oc_h")
+        checkouts = ProjectRouter(cfg.projects.values()).inbox_map(lambda p: p.checkout)
+        self.assertEqual(list(checkouts), ["proj:hibernaut"])
+        self.assertEqual(checkouts.get(cfg.gdrive.default_inbox_id), "/tmp/h")
 
     def test_loading_a_file_that_assigns_one_literal_to_two_projects_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,15 +207,12 @@ class TestInboxIdConfig(unittest.TestCase):
         self.assertEqual([p.name for p in router.matching("proj:b")], ["b"])
 
     def test_pattern_inboxes_get_their_projects_settings_through_inbox_maps(self):
-        cfg = self.parse(hibernaut={"inbox_id": ["proj:hibernaut", "proj:hibernaut:.+"], "feishu_chat_id": "oc_h"},
+        cfg = self.parse(hibernaut={"inbox_id": ["proj:hibernaut", "proj:hibernaut:.+"], "executor": "sde"},
                          other={"inbox_id": "proj:other"})
-        router = ProjectRouter(cfg.projects.values())
-        chats = router.inbox_map(lambda p: p.feishu_chat_id or None)
-        self.assertEqual(chats.get("proj:hibernaut:drive"), "oc_h")
-        self.assertIsNone(chats.get("proj:other"))
-        self.assertEqual(list(chats), ["proj:hibernaut"])
-        channel = FeishuChannelAdapter(app_id="a", app_secret="s", inbox_chat_map=chats)
-        self.assertEqual(channel._resolve_chat_id("proj:hibernaut:drive"), "oc_h")
+        executors = ProjectRouter(cfg.projects.values()).inbox_map(lambda p: p.executor)
+        self.assertEqual(executors.get("proj:hibernaut:drive"), "sde")
+        self.assertIsNone(executors.get("proj:other"))
+        self.assertEqual(list(executors), ["proj:hibernaut"])
 
 
 class _DispatchCase(unittest.IsolatedAsyncioTestCase):

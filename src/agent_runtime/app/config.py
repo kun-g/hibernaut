@@ -45,10 +45,6 @@ class RuntimeConfig:
 class ChannelsConfig:
     host: str = "127.0.0.1"
     port: int = 8080
-    feishu_app_id_env: str = "FEISHU_APP_ID"
-    feishu_app_secret_env: str = "FEISHU_APP_SECRET"
-    feishu_verification_token_env: str = "FEISHU_VERIFICATION_TOKEN"
-    feishu_default_chat_id: str = ""
     mcp_enabled: bool = False
     mcp_token_env: str = "HIBERNAUT_MCP_TOKEN"
     # Directory for the file Outbox (one Markdown file per delivered message); "" leaves it off.
@@ -70,7 +66,6 @@ class ProjectConfig:
     # Where interactive role sessions open; "none" makes interactive roles stop with the reason instead.
     terminal_backend: TerminalBackend = "orca"
     orca_create_terminal: bool = False
-    feishu_chat_id: str = ""
     executor: str | None = None
     # Hibernaut's PR delivery step for finished SDE tasks; None ends a task with local commits.
     delivery: DeliveryConfig | None = None
@@ -273,11 +268,11 @@ def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> Switchb
     )
 
 
-def _warn_obsolete(section: dict[str, Any], scope: str, *keys: str) -> None:
+def _warn_obsolete(section: dict[str, Any], scope: str, service: str, *keys: str) -> None:
     for key in keys:
         if key in section:
             warnings.warn(
-                f"{scope}.{key} is obsolete and ignored. Configure GitHub ingress in Switchboard.",
+                f"{scope}.{key} is obsolete and ignored. Configure {service} in Switchboard.",
                 UserWarning,
                 stacklevel=3,
             )
@@ -338,7 +333,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
     policy = str(rt_raw.get("new_event_policy", "defer"))
     if policy not in ("defer", "fold", "interrupt"):
         raise ValueError(f"Unsupported new_event_policy: {policy}")
-    _warn_obsolete(rt_raw, "runtime", "poll_mode", "poll_interval_seconds")
+    _warn_obsolete(rt_raw, "runtime", "GitHub ingress", "poll_mode", "poll_interval_seconds")
 
     runtime = RuntimeConfig(
         db_path=str(rt_raw.get("db_path", "./hibernaut.db")),
@@ -358,16 +353,12 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         raise ValueError("runtime.worktree_sweep_interval_seconds must be finite and not negative (0 turns it off)")
 
     ch_raw = raw.get("channels", {})
-    _warn_obsolete(ch_raw, "channels", "github_webhook_secret_env", "github_token_env")
+    _warn_obsolete(ch_raw, "channels", "GitHub ingress", "github_webhook_secret_env", "github_token_env")
+    _warn_obsolete(ch_raw, "channels", "Feishu", "feishu_app_id_env", "feishu_app_secret_env",
+                   "feishu_verification_token_env", "feishu_default_chat_id")
     channels = ChannelsConfig(
         host=str(ch_raw.get("host", "127.0.0.1")),
         port=int(ch_raw.get("port", 8080)),
-        feishu_app_id_env=str(ch_raw.get("feishu_app_id_env", "FEISHU_APP_ID")),
-        feishu_app_secret_env=str(ch_raw.get("feishu_app_secret_env", "FEISHU_APP_SECRET")),
-        feishu_verification_token_env=str(
-            ch_raw.get("feishu_verification_token_env", "FEISHU_VERIFICATION_TOKEN")
-        ),
-        feishu_default_chat_id=str(ch_raw.get("feishu_default_chat_id", "")),
         mcp_enabled=bool(ch_raw.get("mcp_enabled", False)),
         mcp_token_env=str(ch_raw.get("mcp_token_env", "HIBERNAUT_MCP_TOKEN")),
         outbox_dir=_outbox_dir(ch_raw.get("outbox_dir"), base_dir),
@@ -440,7 +431,8 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
 
     projects: dict[str, ProjectConfig] = {}
     for name, item in raw.get("projects", {}).items():
-        _warn_obsolete(item, f"projects.{name}", "github_poll", "poll_labels")
+        _warn_obsolete(item, f"projects.{name}", "GitHub ingress", "github_poll", "poll_labels")
+        _warn_obsolete(item, f"projects.{name}", "Feishu", "feishu_chat_id")
         backend = str(item.get("worktree_backend", "orca"))
         if backend not in ("orca", "git"):
             raise ValueError(f"Unsupported worktree_backend for '{name}': {backend}")
@@ -467,7 +459,6 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             worktree_backend=cast(Literal["orca", "git"], backend),
             terminal_backend=terminal,
             orca_create_terminal=bool(item.get("orca_create_terminal", False)),
-            feishu_chat_id=str(item.get("feishu_chat_id", "")),
             executor=proj_exec or None,
             delivery=delivery,
         )

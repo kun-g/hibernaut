@@ -66,7 +66,7 @@ def report_arguments(event: CanonicalEvent) -> dict[str, Any]:
     return {
         "external_id": event.external_id,
         "scope": event.scope,
-        "correlation_key": event.correlation_key or "",
+        **({"correlation_key": event.correlation_key} if event.correlation_key else {}),
         "subject": event.subject,
         "body": event.body,
         "actor": event.actor or "",

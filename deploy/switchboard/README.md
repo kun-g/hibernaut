@@ -195,7 +195,7 @@ export SWITCHBOARD_MCP_TOKEN=<VPS .env 里的 SWITCHBOARD_MCP_WEBHOOK_SECRET>
 
 ## 灰度切流
 
-GitHub Webhook 只能投到 Switchboard。Hibernaut 通过 Relay 接收公网 Hub 的事件，飞书与 MCP 也可继续走原有的本地入口。
+GitHub 和飞书 Webhook 均投到 Switchboard。Hibernaut 通过 Relay 接收公网 Hub 的事件，MCP 可继续走本地入口。
 
 1. 部署 VPS 并完成冒烟验收 1–5。此时还没有外部事件发到 VPS。
 2. 本机 Hibernaut 改为 `mode = "relay"`（见上文）并重启。确认启动日志无报错、没有明文告警；用冒烟第 6 步确认 `delivery_log` 中 `hibernaut` 的投递为 `acked`、没有积压的 `pending` / `retry`。
@@ -204,8 +204,8 @@ GitHub Webhook 只能投到 Switchboard。Hibernaut 通过 Relay 接收公网 Hu
 
 ## 回滚
 
-- **单个入口**：GitHub Webhook 可切回此前可用的 Switchboard 监听地址。飞书事件订阅可切回 Hibernaut 的本地 Webhook。
-- **Hibernaut 侧**：`hibernaut.toml` 的 `[switchboard]` 改回原来的 `mode = "in_process"` 并设置原有 `config_path`，重启 Hibernaut，同时把 GitHub Webhook 切到该 Switchboard。`enabled = false` 会暂停 GitHub 入站。切换前先确认 VPS 上没有发给 `hibernaut` 的 `pending` 投递，否则这些事件要等重新连上才会推送。
+- **单个入口**：GitHub Webhook 可切回此前可用的 Switchboard 监听地址。飞书事件订阅和卡片回调也需切到可用的 Switchboard。
+- **Hibernaut 侧**：`hibernaut.toml` 的 `[switchboard]` 改回原来的 `mode = "in_process"` 并设置原有 `config_path`，重启 Hibernaut，同时把 GitHub 与飞书 Webhook 切到该 Switchboard。`enabled = false` 会暂停这两个渠道。切换前先确认 VPS 上没有发给 `hibernaut` 的 `pending` 投递，否则这些事件要等重新连上才会推送。
 - **VPS 版本**：升级前先备份数据卷，回滚时检出上一个版本重新构建：
 
   ```bash

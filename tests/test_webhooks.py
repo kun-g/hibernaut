@@ -10,65 +10,12 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from agent_runtime.adapters.channels import (
-    FeishuWebhookAdapter,
-    WebhookHTTPServer,
-    create_webhook_server,
-)
+from agent_runtime.adapters.channels import WebhookHTTPServer, create_webhook_server
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteInboxAdapter
 from agent_runtime.app.main import build_daemon
 from agent_runtime.core.models import Emit, Event, Suspend
 from agent_runtime.engine.handler import EventHandler
 from tests.fakes import InMemoryInbox, RecordingChannel
-
-
-class TestFeishuWebhookAdapter(unittest.TestCase):
-    def test_url_verification_token_check_and_thread_correlation_key(self) -> None:
-        inbox = InMemoryInbox()
-        handler = EventHandler(inbox=inbox)
-        adapter = FeishuWebhookAdapter(
-            handler,
-            verification_token="feishu-secret-tok",
-            chat_inbox_map={"oc_chat_1": "proj:hibernaut"},
-        )
-
-        # Bad token -> 401
-        bad = adapter.handle(
-            json.dumps({"type": "url_verification", "token": "wrong", "challenge": "abc"}).encode()
-        )
-        self.assertEqual(bad.status_code, 401)
-
-        # Valid Challenge handshake -> 200 OK with challenge echoed
-        ok_challenge = adapter.handle(
-            json.dumps(
-                {"type": "url_verification", "token": "feishu-secret-tok", "challenge": "xyz-999"}
-            ).encode()
-        )
-        self.assertEqual(ok_challenge.status_code, 200)
-        self.assertEqual(ok_challenge.body, {"challenge": "xyz-999"})
-
-        # Feishu v2.0 thread reply -> maps chat_id + thread_id into correlation_key
-        msg_payload = {
-            "schema": "2.0",
-            "header": {
-                "event_id": "feishu-evt-1",
-                "event_type": "im.message.receive_v1",
-                "token": "feishu-secret-tok",
-            },
-            "event": {
-                "message": {
-                    "chat_id": "oc_chat_1",
-                    "message_id": "om_msg_2",
-                    "root_id": "om_root_1",
-                    "thread_id": "omt_thread_7",
-                    "content": '{"text":"hello"}',
-                }
-            },
-        }
-        resp = adapter.handle(json.dumps(msg_payload).encode("utf-8"))
-        self.assertEqual(resp.status_code, 202)
-        self.assertEqual(resp.body["inbox_id"], "proj:hibernaut")
-        self.assertEqual(resp.body["correlation_key"], "feishu:oc_chat_1:omt_thread_7")
 
 
 class _GatedInbox(InMemoryInbox):
@@ -160,22 +107,15 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    async def test_http_events_suspend_and_feishu_resumes(self) -> None:
+    async def test_http_events_suspend_and_resume(self) -> None:
         channel = RecordingChannel()
         daemon = build_daemon(
             db_path=self.root / "wh.db",
             memory_root=self.root / "mem_wh",
             max_concurrency=2,
             channel=channel,
-            feishu_verification_token="fs-tok",
-            feishu_chat_inbox_map={"oc_ops": "proj:ops"},
         )
-        server = create_webhook_server(
-            "127.0.0.1",
-            0,
-            daemon.handler,
-            feishu_adapter=daemon.feishu_webhook,
-        )
+        server = create_webhook_server("127.0.0.1", 0, daemon.handler)
         port = server.server_address[1]
         server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         server_thread.start()
@@ -224,28 +164,12 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
             assert isinstance(suspend_reports[0].outcome, Suspend)
             req_id = suspend_reports[0].outcome.request_id
 
-            # 2. Feishu interactive approval card callback via /webhooks/feishu resumes Suspend!
-            feishu_card = json.dumps(
-                {
-                    "schema": "2.0",
-                    "header": {
-                        "event_id": "card-evt-1",
-                        "event_type": "card.action.trigger",
-                        "token": "fs-tok",
-                    },
-                    "event": {
-                        "context": {"open_chat_id": "oc_ops", "open_message_id": "om_card_1"},
-                        "action": {
-                            "value": {
-                                "approval_request_id": req_id,
-                                "approved": True,
-                            }
-                        },
-                    },
-                }
-            ).encode("utf-8")
-            fs_status, _ = await asyncio.to_thread(_post, "/webhooks/feishu", feishu_card)
-            self.assertEqual(fs_status, 202)
+            approval = json.dumps({
+                "inbox_id": "proj:ops", "external_id": "ops-approval-1",
+                "payload": {"approval_request_id": req_id, "approved": True},
+            }).encode("utf-8")
+            status, _ = await asyncio.to_thread(_post, "/events", approval)
+            self.assertEqual(status, 202)
             await daemon.pool.wait_until_idle(timeout_seconds=3.0)
             await daemon.dispatcher.dispatch_once()
 
@@ -254,7 +178,7 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
             assert isinstance(emit_reports[0].outcome, Emit)
             self.assertIn("release@example.com", emit_reports[0].outcome.messages[0])
 
-            for path in ("/webhooks/github", "/webhooks/unknown"):
+            for path in ("/webhooks/github", "/webhooks/feishu", "/webhooks/unknown"):
                 with self.subTest(path=path):
                     status, _ = await asyncio.to_thread(_post, path, b"{}")
                     self.assertEqual(status, 404)

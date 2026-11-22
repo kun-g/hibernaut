@@ -33,7 +33,7 @@ class TestConfigReload(unittest.TestCase):
                         '--config-poll-interval', '0.02',
                     ],
                     cwd=root, stdout=stream, stderr=stream,
-                    env={**os.environ, 'HIBERNAUT_MCP_TOKEN': 'reload-test', 'FEISHU_VERIFICATION_TOKEN': 'reload-test'},
+                    env={**os.environ, 'HIBERNAUT_MCP_TOKEN': 'reload-test'},
                 )
             headers = {'Authorization': 'Bearer reload-test', 'Content-Type': 'application/json'}
 
@@ -77,12 +77,11 @@ class TestConfigReload(unittest.TestCase):
                 path.write_text(enabled)
                 wait_for(lambda: request() == 200)
                 self.assertTrue(post('/events', event)[1]['duplicate'])
-                message = {'header': {'event_id': 'reload-message', 'token': 'reload-test'},
-                           'event': {'message': {'chat_id': 'oc_local'}}}
-                self.assertEqual(post('/webhooks/feishu', message)[1]['inbox_id'], 'feishu:oc_local')
                 path.write_text(enabled + f'\n[projects.local]\nrepo="fixture/test"\ncheckout="{root}"\n'
                                 'inbox_id="proj:local"\nfeishu_chat_id="oc_local"\n')
-                wait_for(lambda: post('/webhooks/feishu', message)[1]['inbox_id'] == 'proj:local')
+                wait_for(lambda: 'projects.local.feishu_chat_id is obsolete and ignored' in log.read_text())
+                self.assertEqual(post('/webhooks/feishu', {})[0], 404)
+                self.assertEqual(request(), 200)
                 with socket.socket() as occupied:
                     occupied.bind(('127.0.0.1', 0))
                     occupied.listen()
