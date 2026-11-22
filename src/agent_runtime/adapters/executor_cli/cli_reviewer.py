@@ -22,6 +22,7 @@ from agent_runtime.adapters.executor_cli.process import ProcessTimeout, supervis
 from agent_runtime.adapters.executor_cli.reviewer import (
     CODE_REVIEWER_ROLE,
     REVIEW_LAUNCH_TOOL,
+    REVIEW_SCHEMA,
     ReviewAborted,
     ReviewRequest,
     plain_review_contract,
@@ -36,6 +37,7 @@ from agent_runtime.core.ports import RunCapabilities
 
 _FENCE = re.compile(r"```[ \t]*(?:json)?[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
 _MAX_STDERR_CHARS = 500
+_COMPACT_SCHEMA = json.dumps(REVIEW_SCHEMA, separators=(",", ":"))
 _log = logging.getLogger(__name__)
 
 
@@ -138,7 +140,8 @@ class CLIReviewer:
         try:
             run = await terminal.run(
                 title=terminal_title(t.name, CODE_REVIEWER_ROLE, subject), workdir=workdir,
-                argv=[t.command, *render_cli_args(t.args, prompt=prompt)], env=t.env,
+                argv=[t.command, *render_cli_args(t.args, prompt=prompt, review_schema=_COMPACT_SCHEMA)],
+                env=t.env,
                 timeout_seconds=t.timeout_seconds, is_interrupted=caps.is_interrupted,
             )
         except ProcessTimeout as exc:
@@ -154,7 +157,7 @@ class CLIReviewer:
         t = self._template
         try:
             proc = await asyncio.create_subprocess_exec(
-                t.command, *render_cli_args(t.args, prompt=prompt),
+                t.command, *render_cli_args(t.args, prompt=prompt, review_schema=_COMPACT_SCHEMA),
                 cwd=str(workdir), env={**os.environ, **t.env},
                 stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
@@ -190,22 +193,25 @@ class CLIReviewer:
 
 
 def extract_verdict(stdout: str) -> object:
-    # Accepts a bare JSON object, a ```json block, or a {"result": "<text holding either>"} envelope.
+    # Accepts a bare JSON object, a ```json block, or an envelope: {"structured_output" | "structuredOutput": {...}}
+    # (the object wins) or {"result" | "text": "<text holding either>"} (grok --json-schema prints the latter pair).
     text = stdout.strip()
     if not text:
         raise ReviewAborted("the reviewer printed nothing")
     found = _json_in(text)
     if isinstance(found, dict) and "verdict" not in found:
         envelope = cast(dict[str, Any], found)
-        structured = envelope.get("structured_output")
-        if isinstance(structured, dict):
-            return cast(dict[str, Any], structured)
-        result = envelope.get("result")
-        if isinstance(result, str):
-            inner = _json_in(result.strip())
-            if inner is None:
-                raise ReviewAborted("the reviewer's result envelope holds no JSON object")
-            return inner
+        for key in ("structured_output", "structuredOutput"):
+            structured = envelope.get(key)
+            if isinstance(structured, dict):
+                return cast(dict[str, Any], structured)
+        for key in ("result", "text"):
+            body = envelope.get(key)
+            if isinstance(body, str):
+                inner = _json_in(body.strip())
+                if inner is None:
+                    raise ReviewAborted(f"the reviewer's {key} envelope holds no JSON object")
+                return inner
     if found is None:
         raise ReviewAborted("the reviewer's output is neither a JSON object nor a ```json block")
     return found

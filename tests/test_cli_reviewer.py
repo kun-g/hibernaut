@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -14,7 +15,9 @@ from agent_runtime.adapters.executor_cli import orca as orca_module
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.orca import OrcaCommandTerminal, TerminalUnavailable, terminal_title
 from agent_runtime.adapters.executor_cli.project_guidance import pin_head
-from agent_runtime.adapters.executor_cli.reviewer import ReviewAborted, ReviewRequest
+from agent_runtime.adapters.executor_cli.cli_reviewer import extract_verdict
+from agent_runtime.adapters.executor_cli.executor import LocalCLIExecutor, render_cli_args
+from agent_runtime.adapters.executor_cli.reviewer import REVIEW_SCHEMA, ReviewAborted, ReviewRequest, validate_review
 from agent_runtime.adapters.executor_cli.role_skills import builtin_skill
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter
@@ -198,6 +201,55 @@ class TestCLIReviewer(unittest.IsolatedAsyncioTestCase):
                 review = await self.reviewer().review(self.request(), self.caps)
                 self.assertEqual(review["verdict"], "changes_requested")
                 self.assertEqual(review["blocking"][0]["location"], "calc.py:2")
+
+    async def test_a_grok_json_schema_envelope_is_unwrapped(self):
+        # grok 1.0.92 with --json-schema: the verdict sits in structuredOutput and, as a JSON string, in text.
+        grok = {"text": json.dumps(PASS), "stopReason": "end_turn", "sessionId": "01a20300-937a-76d0-ab50-7f96ab2aff6a",
+                "thought": "...", "usage": {"input_tokens": 16667, "output_tokens": 767}, "num_turns": 1,
+                "total_cost_usd": 0.0146, "structuredOutput": PASS}
+        text_only = {k: v for k, v in grok.items() if k != "structuredOutput"}
+        cases = {
+            "structuredOutput wins over text": ({**grok, "text": json.dumps(CHANGES_REQUESTED)}, "pass"),
+            "text only, bare JSON": (text_only, "pass"),
+            "text only, fenced block": ({**text_only, "text": f"Done.\n```json\n{json.dumps(CHANGES_REQUESTED)}\n```"},
+                                        "changes_requested"),
+        }
+        for name, (envelope, verdict) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(validate_review(extract_verdict(json.dumps(envelope)))["verdict"], verdict)
+                self.cli.set(json.dumps(envelope, indent=2))
+                review = await self.reviewer().review(self.request(), self.caps)
+                self.assertEqual(review["verdict"], verdict)
+        with self.assertRaisesRegex(ReviewAborted, "text envelope holds no JSON object"):
+            extract_verdict(json.dumps({**text_only, "text": "I could not finish."}))
+
+    async def test_the_review_schema_placeholder_is_the_compact_schema(self):
+        self.cli.set(json.dumps({"text": json.dumps(PASS), "structuredOutput": PASS}))
+        reviewer = self.reviewer(args=("-p", "{prompt}", "--permission-mode", "plan", "--json-schema", "{review_schema}"))
+        # A prompt that quotes a placeholder keeps it: substitution never rescans inserted text.
+        review = await reviewer.review(self.request(previous_round="quoted {review_schema} and {prompt}"), self.caps)
+        self.assertEqual(review["verdict"], "pass")
+        argv = self.cli.calls()[0]["argv"]
+        self.assertEqual(argv[0], "-p")
+        self.assertEqual(argv[2:5], ["--permission-mode", "plan", "--json-schema"])
+        self.assertEqual(json.loads(argv[5]), REVIEW_SCHEMA)
+        self.assertEqual(argv[5], json.dumps(REVIEW_SCHEMA, separators=(",", ":")))
+        self.assertIn("quoted {review_schema} and {prompt}", argv[1])
+
+    def test_outside_a_review_the_review_schema_placeholder_stays_literal(self):
+        args = ("-p", "{prompt}", "--json-schema", "{review_schema}", "--resume", "{executor_session_id}")
+        self.assertEqual(render_cli_args(args, prompt="hi {executor_session_id}", executor_session_id="s1"),
+                         ["-p", "hi {executor_session_id}", "--json-schema", "{review_schema}", "--resume", "s1"])
+        local = LocalCLIExecutor(worktree_manager=Mock(), inbox_checkout_map={})
+        template = CLITemplate(name="grok", command="grok", args=args[:4])
+        rendered = local._render_cli_args(template, prompt="task", session=None)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(rendered, ["-p", "task", "--json-schema", "{review_schema}"])
+
+    def test_the_example_grok_reviewer_passes_the_review_schema(self):
+        raw = tomllib.loads((Path(__file__).resolve().parents[1] / "hibernaut.example.toml").read_text(encoding="utf-8"))
+        template = parse_config(raw).executors["grok-reviewer"]
+        self.assertEqual((template.command, template.args),
+                         ("grok", ("-p", "{prompt}", "--permission-mode", "plan", "--json-schema", "{review_schema}")))
 
     async def test_a_malformed_answer_is_retried_once_with_the_error(self):
         contradictory = {"verdict": "pass", "summary": "s", "blocking": CHANGES_REQUESTED["blocking"]}
@@ -400,6 +452,15 @@ class TestCLIReviewerTerminal(TerminalCase):
         self.assertEqual(lines[0], f"[grok] verdict=pass (cli={cli_command(self.root)} terminal=orca)")
         self.assertEqual(lines[1], f"Orca terminal: {handle}")
         self.assertEqual(lines[2], "Summary: zero is rejected")
+
+    async def test_the_review_schema_placeholder_is_filled_in_the_terminal_too(self):
+        self.cli.set({"stdout": json.dumps({"text": json.dumps(PASS), "structuredOutput": PASS})})
+        reviewer = self.reviewer(args=("-p", "{prompt}", "--json-schema", "{review_schema}"))
+        review = await reviewer.review(self.request(), self.caps)
+        self.assertEqual(review["verdict"], "pass")
+        (call,) = self.cli.calls()
+        self.assertEqual(call["argv"][2], "--json-schema")
+        self.assertEqual(json.loads(call["argv"][3]), REVIEW_SCHEMA)
 
     async def test_a_format_retry_runs_in_a_new_terminal(self):
         self.cli.set("Looks good to me!", f"```json\n{json.dumps(CHANGES_REQUESTED)}\n```")
