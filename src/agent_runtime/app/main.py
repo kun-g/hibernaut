@@ -53,7 +53,13 @@ from agent_runtime.adapters.executor_cli.orca import (
     TerminalUnavailable,
     default_transcript_roots,
 )
+from agent_runtime.adapters.executor_cli.reclaim_sweep import (
+    DEFAULT_SWEEP_INTERVAL_SECONDS,
+    SweepTarget,
+    WorktreeReclaimSweeper,
+)
 from agent_runtime.adapters.executor_cli.worktree import ReclaimResult
+from agent_runtime.adapters.storage_sqlite.workspaces import WorkspaceRecord
 from agent_runtime.adapters.executor_cli.peer import DeveloperPeerResolver, registry_dirs
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
@@ -285,6 +291,8 @@ class AlwaysOnDaemon:
     gdrive_result_writer: DriveResultWriter | None = None
     mcp_server: MCPServerAdapter | None = None
     switchboard_bridge: SwitchboardInboundBridge | None = None
+    worktree_sweeper: WorktreeReclaimSweeper | None = None
+    worktree_sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS
     poll_interval_seconds: float = 60.0
     gdrive_poll_interval_seconds: float = 30.0
     ingest_only: bool = False
@@ -339,6 +347,7 @@ class AlwaysOnDaemon:
                     services_stop,
                     timer_interval_seconds=timer_interval_seconds,
                     outbox_interval_seconds=outbox_interval_seconds,
+                    halt=stopper,
                 )
             )
             try:
@@ -362,11 +371,22 @@ class AlwaysOnDaemon:
         *,
         timer_interval_seconds: float = 5.0,
         outbox_interval_seconds: float = 1.0,
+        halt: asyncio.Event | None = None,
     ) -> None:
         # Everything but HTTP ingress and the worker pool; each loop finishes its current tick once stop_event is set.
+        # halt is the process's first stop signal: the worktree sweep starts no new round from then on, while the
+        # other services keep running through the drain.
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(self.scheduler.run_forever(timer_interval_seconds, stop_event))
             tasks.create_task(self.dispatcher.run_forever(outbox_interval_seconds, stop_event))
+            if self.worktree_sweeper is not None:
+                tasks.create_task(
+                    self.worktree_sweeper.run_forever(
+                        interval_seconds=self.worktree_sweep_interval_seconds,
+                        stop_event=stop_event,
+                        halt=halt,
+                    )
+                )
             if self.github_poller is not None:
                 tasks.create_task(
                     self.github_poller.run_forever(
@@ -900,6 +920,21 @@ def build_daemon_from_config(
                 project = next((p for p in config.projects.values() if Path(p.checkout).resolve() == checkout), None)
             return wt_mgr_by_project[project.name] if project is not None else default_mgr
 
+        def _sweep_target(record: WorkspaceRecord) -> SweepTarget | None:
+            # Only worktrees under a configured project's checkout; anything else is left to a person.
+            checkout = Path(record.repo_checkout).resolve()
+            project = next((p for p in config.projects.values() if Path(p.checkout).resolve() == checkout), None)
+            if project is None:
+                return None
+            return SweepTarget(manager=wt_mgr_by_project[project.name], delivery=project.delivery,
+                               inbox_id=record.inbox_id or project.inbox_id)
+
+        if config.runtime.worktree_sweep_interval_seconds > 0:
+            daemon.worktree_sweeper = WorktreeReclaimSweeper(
+                workspaces=daemon.workspaces, deliveries=deliveries, outbox=daemon.outbox, target_for=_sweep_target,
+            )
+            daemon.worktree_sweep_interval_seconds = config.runtime.worktree_sweep_interval_seconds
+
         # One per config generation, so a held event is logged once each time it enters the wait.
         unmatched_hold = UnmatchedProjectHold(daemon.sessions)
 
@@ -1088,7 +1123,7 @@ async def serve_configured(
     changes = config_changes(path, stop, interval=reload_interval)
 
     async with asyncio.TaskGroup() as tasks:
-        generation = _Generation.start(daemon, tasks, outbox_interval_seconds=outbox_interval_seconds)
+        generation = _Generation.start(daemon, tasks, outbox_interval_seconds=outbox_interval_seconds, halt=stop)
         # Every generation whose pool may still hold Runs: the current one and those retired by reloads.
         generations = [generation]
         server_thread = _serve_in_thread(server)
@@ -1141,7 +1176,8 @@ async def serve_configured(
                 previous = generation
                 # Stop the old services first so two dispatchers never send the same Outbox row.
                 await previous.stop_services()
-                generation = _Generation.start(replacement, tasks, outbox_interval_seconds=outbox_interval_seconds)
+                generation = _Generation.start(replacement, tasks, outbox_interval_seconds=outbox_interval_seconds,
+                                               halt=stop)
                 generations = [g for g in generations if g.runs is not None and not g.runs.done()] + [generation]
                 # From here every wake reaching the old pool, from its in-flight requests or released leases,
                 # is forwarded to the new one.
@@ -1185,13 +1221,14 @@ class _Generation:
         tasks: asyncio.TaskGroup,
         *,
         outbox_interval_seconds: float,
+        halt: asyncio.Event | None = None,
     ) -> _Generation:
         services_stop = asyncio.Event()
         pool_stop = asyncio.Event()
         daemon.pool.bind(asyncio.get_running_loop())
         runs = None if daemon.ingest_only else tasks.create_task(daemon.pool.run_forever(pool_stop))
         services = tasks.create_task(
-            daemon.run_services(services_stop, outbox_interval_seconds=outbox_interval_seconds)
+            daemon.run_services(services_stop, outbox_interval_seconds=outbox_interval_seconds, halt=halt)
         )
         return cls(daemon, services, services_stop, pool_stop, runs)
 
