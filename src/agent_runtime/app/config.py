@@ -19,7 +19,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     parse_launchers,
     parse_profile,
 )
-from agent_runtime.adapters.executor_cli.executor import DEFAULT_CLI_TEMPLATES, CLITemplate
+from agent_runtime.adapters.executor_cli.executor import CLI_TERMINALS, DEFAULT_CLI_TEMPLATES, CLITemplate
 from agent_runtime.adapters.executor_cli.reviewer import CODE_REVIEWER_ROLE
 from agent_runtime.adapters.executor_cli.role_skills import ROLE_ALIASES, canonical_role
 from agent_runtime.adapters.executor_cli.sde import SDE_OPTION_KEYS, SDE_ROLE, SDEOptions
@@ -406,6 +406,11 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         timeout = float(item.get("timeout_seconds", 300.0))
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError(f"Invalid timeout_seconds for '{name}'")
+        cli_terminal = item.get("terminal", "none")
+        if cli_terminal not in CLI_TERMINALS:
+            raise ValueError(
+                f"executors.{name}: unsupported terminal {cli_terminal!r} (supported: {', '.join(CLI_TERMINALS)})"
+            )
         executors[str(name)] = CLITemplate(
             name=str(name),
             command=str(item["command"]),
@@ -416,6 +421,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             env={str(k): str(v) for k, v in env_raw.items()},
             timeout_seconds=timeout,
             orca_agent=orca_agent,
+            terminal=cli_terminal,
         )
 
     for name, role_cfg in list(roles.items()):

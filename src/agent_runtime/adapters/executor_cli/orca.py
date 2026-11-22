@@ -27,6 +27,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     harness_args,
     interactive_args,
 )
+from agent_runtime.adapters.executor_cli.process import ProcessTimeout
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore, TerminalBinding
 from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Silent, Suspend, new_id
 from agent_runtime.core.ports import RunCapabilities
@@ -38,6 +39,7 @@ _SUBMIT_WAIT_SECONDS = "10"
 _RESUME_READY_MS = "60000"
 ROLE_AGENT = "claude"
 GATE_SCRIPT = Path(__file__).with_name("claude_gate.py")
+CLI_TERMINAL_SCRIPT = Path(__file__).with_name("cli_terminal.py")
 HANDOFF_SCRIPT = Path(__file__).with_name("handoff_mcp.py")
 HANDOFF_SERVER = "hibernaut_handoff"
 HANDOFF_TOOLS = (f"mcp__{HANDOFF_SERVER}__get_task", f"mcp__{HANDOFF_SERVER}__submit_result")
@@ -336,49 +338,16 @@ class OrcaVisibleRunner:
             json.dump(spec, stream)
         # `exec` lets the terminal end with the agent, so a crashed or exited agent is seen as a closed terminal.
         command = shlex.join(["exec", sys.executable, "-I", str(GATE_SCRIPT), str(spec_path)])
-        create = asyncio.create_task(_orca("terminal", "create", "--worktree", f"path:{workdir}", "--title", title,
-                                           "--command", command, cwd=workdir))
-        try:
-            created = (await asyncio.shield(create)).get("terminal", {})
-        except asyncio.CancelledError:
-            # Cancellation may race the create receipt. Recover its handle so the terminal is closed, not leaked.
-            with contextlib.suppress(*_ORCA_ERRORS):
-                late = (await create).get("terminal", {}).get("handle")
-                if isinstance(late, str):
-                    await _close_quietly(late, workdir)
-            raise
-        handle = created.get("handle")
-        if not isinstance(handle, str):
-            raise ValueError("Orca returned no terminal handle")
-        incarnation = created.get("incarnationId")
-        return handle, incarnation if isinstance(incarnation, str) else None
-
-    async def _alive(self, handle: str, workdir: Path) -> bool:
-        listed = (await _orca("terminal", "list", "--worktree", f"path:{workdir}", "--limit", "500",
-                              cwd=workdir)).get("terminals", [])
-        return any(isinstance(t, dict) and cast(dict[str, Any], t).get("handle") == handle
-                   for t in cast(list[object], listed))
+        return await _create_terminal(workdir, title, command)
 
     async def _poll(
         self, read: Callable[[], Any], handle: str, workdir: Path, is_interrupted: Callable[[], bool], waiting_for: str
     ) -> Any:
-        loop = asyncio.get_running_loop()
-        next_check = loop.time() + self._liveness_interval
-        while True:
-            if is_interrupted():
-                raise asyncio.CancelledError("visible run interrupted by a new event")
-            value = read()
-            if value is not None:
-                return value
-            if loop.time() >= next_check:
-                if not await self._alive(handle, workdir):
-                    # The file may have landed just before the agent exited.
-                    value = read()
-                    if value is not None:
-                        return value
-                    raise ClaudeCodeError(f"Orca terminal {handle} exited before {waiting_for}")
-                next_check = loop.time() + self._liveness_interval
-            await asyncio.sleep(self._poll_interval)
+        try:
+            return await _await_file(read, handle, workdir, is_interrupted,
+                                     poll_interval=self._poll_interval, liveness_interval=self._liveness_interval)
+        except _TerminalGone:
+            raise ClaudeCodeError(f"Orca terminal {handle} exited before {waiting_for}") from None
 
     async def _await_gate(self, path: Path, handle: str, workdir: Path, is_interrupted: Callable[[], bool]) -> None:
         def read() -> dict[str, Any] | None:
@@ -648,8 +617,164 @@ class OrcaVisibleRunner:
             raise ValueError(f"terminal {binding.handle} changed process before delivery was confirmed")
 
 
-async def _close_quietly(handle: str, workdir: Path) -> None:
+async def _close_quietly(handle: str, workdir: Path) -> bool:
     try:
         await _orca("terminal", "close", "--terminal", handle, cwd=workdir)
     except (OSError, TimeoutError, ValueError, RuntimeError):
         _log.exception("Could not close Orca terminal %s", handle)
+        return False
+    return True
+
+
+async def close_terminals(handles: Sequence[str], workdir: Path) -> str:
+    workdir = Path(os.path.realpath(workdir))
+    closed = [h for h in handles if await _close_quietly(h, workdir)]
+    failed = [h for h in handles if h not in closed]
+    parts = [f"closed {', '.join(closed)}"] if closed else []
+    if failed:
+        parts.append(f"could not close {', '.join(failed)}")
+    return "; ".join(parts)
+
+
+async def _create_terminal(workdir: Path, title: str, command: str) -> tuple[str, str | None]:
+    create = asyncio.create_task(_orca("terminal", "create", "--worktree", f"path:{workdir}", "--title", title,
+                                       "--command", command, cwd=workdir))
+    try:
+        created = (await asyncio.shield(create)).get("terminal", {})
+    except asyncio.CancelledError:
+        # Cancellation may race the create receipt. Recover its handle so the terminal is closed, not leaked.
+        with contextlib.suppress(*_ORCA_ERRORS):
+            late = (await create).get("terminal", {}).get("handle")
+            if isinstance(late, str):
+                await _close_quietly(late, workdir)
+        raise
+    handle = created.get("handle")
+    if not isinstance(handle, str):
+        raise ValueError("Orca returned no terminal handle")
+    incarnation = created.get("incarnationId")
+    return handle, incarnation if isinstance(incarnation, str) else None
+
+
+async def _terminal_alive(handle: str, workdir: Path) -> bool:
+    listed = (await _orca("terminal", "list", "--worktree", f"path:{workdir}", "--limit", "500",
+                          cwd=workdir)).get("terminals", [])
+    return any(isinstance(t, dict) and cast(dict[str, Any], t).get("handle") == handle
+               for t in cast(list[object], listed))
+
+
+class _TerminalGone(Exception):
+    pass
+
+
+async def _await_file(
+    read: Callable[[], Any], handle: str, workdir: Path, is_interrupted: Callable[[], bool], *,
+    poll_interval: float, liveness_interval: float,
+) -> Any:
+    # Polls read() until it returns a value; raises _TerminalGone when the terminal ended without one.
+    loop = asyncio.get_running_loop()
+    next_check = loop.time() + liveness_interval
+    while True:
+        if is_interrupted():
+            raise asyncio.CancelledError("visible run interrupted by a new event")
+        value = read()
+        if value is not None:
+            return value
+        if loop.time() >= next_check:
+            if not await _terminal_alive(handle, workdir):
+                # The file may have landed just before the terminal ended.
+                value = read()
+                if value is not None:
+                    return value
+                raise _TerminalGone(handle)
+            next_check = loop.time() + liveness_interval
+        await asyncio.sleep(poll_interval)
+
+
+class TerminalStartFailed(Exception):
+    pass
+
+
+class TerminalRunFailed(Exception):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalRun:
+    handle: str
+    stdout: bytes
+    stderr: bytes
+    # None when the command could not start; error then says why.
+    exit_code: int | None
+    error: str = ""
+
+
+class OrcaCommandTerminal:
+    # Runs one non-interactive command in a visible Orca terminal of the worktree. The terminal shows the output as
+    # it comes; the result is read only from files the wrapper writes, never from the screen.
+    def __init__(self, *, root: Path | None = None, poll_interval: float = 0.25, liveness_interval: float = 5.0) -> None:
+        self._root = root or Path(tempfile.gettempdir()) / "hibernaut-cli-terminal"
+        self._poll_interval = poll_interval
+        self._liveness_interval = liveness_interval
+
+    async def run(
+        self,
+        *,
+        title: str,
+        workdir: Path,
+        argv: Sequence[str],
+        env: Mapping[str, str],
+        timeout_seconds: float,
+        is_interrupted: Callable[[], bool],
+    ) -> TerminalRun:
+        # Raises TerminalStartFailed when no terminal opened (nothing ran), ProcessTimeout on the deadline,
+        # TerminalRunFailed when the terminal ended early or Orca failed, CancelledError on interrupt.
+        workdir = Path(os.path.realpath(workdir))
+        self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=self._root))
+        files = {name: str(run_dir / name) for name in ("stdout", "stderr", "exit.json")}
+        # The argv holds the prompt; it reaches the wrapper through this private file, not the command line.
+        spec = {"title": title, "cwd": str(workdir), "argv": list(argv), "env": dict(env), **files}
+        spec_path = run_dir / "spec.json"
+        fd = os.open(spec_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(spec, stream)
+        command = shlex.join(["exec", sys.executable, "-I", str(CLI_TERMINAL_SCRIPT), str(spec_path)])
+        handle: str | None = None
+        finished = False
+        deadline = asyncio.timeout(timeout_seconds)
+        try:
+            try:
+                handle, _ = await _create_terminal(workdir, title, command)
+            except _ORCA_ERRORS as exc:
+                raise TerminalStartFailed(f"{type(exc).__name__} {exc}".strip()) from exc
+            exit_path = Path(files["exit.json"])
+
+            def read() -> dict[str, Any] | None:
+                raw = _read_json(exit_path)
+                return cast(dict[str, Any], json.loads(raw)) if raw is not None else None
+
+            try:
+                async with deadline:
+                    status = await _await_file(read, handle, workdir, is_interrupted, poll_interval=self._poll_interval,
+                                               liveness_interval=self._liveness_interval)
+            except _TerminalGone:
+                raise TerminalRunFailed(f"Orca terminal {handle} was closed before '{argv[0]}' finished") from None
+            except TimeoutError as exc:
+                if deadline.expired():
+                    raise ProcessTimeout(f"timed out after {timeout_seconds:g}s in Orca terminal {handle}") from exc
+                raise TerminalRunFailed(f"Orca terminal {handle}: TimeoutError {exc}") from exc
+            except _ORCA_ERRORS as exc:
+                raise TerminalRunFailed(f"Orca terminal {handle}: {type(exc).__name__} {exc}") from exc
+            finished = True
+            code = status.get("exit")
+            return TerminalRun(
+                handle=handle,
+                stdout=Path(files["stdout"]).read_bytes() if os.path.exists(files["stdout"]) else b"",
+                stderr=Path(files["stderr"]).read_bytes() if os.path.exists(files["stderr"]) else b"",
+                exit_code=code if isinstance(code, int) else None,
+                error=str(status.get("error") or ""),
+            )
+        finally:
+            if handle and not finished:
+                await _close_quietly(handle, workdir)
+            shutil.rmtree(run_dir, ignore_errors=True)
