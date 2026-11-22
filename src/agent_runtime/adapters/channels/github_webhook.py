@@ -4,8 +4,9 @@ import hashlib
 import hmac
 import json
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
+from agent_runtime.adapters.channels.github_issue import task_fields
 from agent_runtime.adapters.channels.http_types import WebhookResponse
 from agent_runtime.engine.handler import EventHandler
 
@@ -60,13 +61,18 @@ class GitHubWebhookAdapter:
         )
         inbox_id = self._repo_inbox_map.get(repo_full_name, f"proj:{repo_full_name}")
         correlation_key = self._extract_correlation_key(event_type, repo_full_name, body)
+        payload = body
+        issue = body.get("issue")
+        # Only an issues event is a task; an issue_comment keeps GitHub's shape so it never restates the issue.
+        if event_type == "issues" and isinstance(issue, dict):
+            payload = {**body, **task_fields(cast(dict[str, Any], issue))}
 
         result = self._handler.ingest(
             inbox_id=inbox_id,
             source=f"github:{event_type}",
             external_id=delivery_id,
             correlation_key=correlation_key,
-            payload=body,
+            payload=payload,
         )
         return WebhookResponse(
             status_code=202,
