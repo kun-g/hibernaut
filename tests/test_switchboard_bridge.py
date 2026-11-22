@@ -420,7 +420,7 @@ class ConfigSwitchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_config(self._raw(switchboard={"enabled": True}))
         with self.assertRaises(ValueError):
-            parse_config(self._raw(switchboard={"enabled": False, "mode": "relay"}))
+            parse_config(self._raw(switchboard={"enabled": False, "mode": "carrier-pigeon"}))
 
     def test_enabled_starts_in_process_switchboard_and_wires_both_directions(self) -> None:
         sb_toml = self.root / "switchboard.toml"
