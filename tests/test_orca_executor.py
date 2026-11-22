@@ -104,6 +104,32 @@ class FakeOrca:
         return [" ".join(c[:2]) for c in self.calls]
 
 
+class TestBindingMigration(unittest.TestCase):
+    def test_sessions_that_ran_before_bindings_existed_get_a_marker(self):
+        from agent_runtime.adapters.storage_sqlite import SQLiteSessionStoreAdapter
+
+        path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "hb.db"
+        db = SQLiteDatabase(path)
+        sessions = SQLiteSessionStoreAdapter(db)
+        sessions.save(SessionRef(session_id="old", inbox_id="i", executor_id="claude"))
+        sessions.save(SessionRef(session_id="unrouted", inbox_id="i"))
+        with db.transaction() as conn:
+            conn.execute("DROP TABLE terminal_bindings")
+        db.close()
+        db = SQLiteDatabase(path)
+        self.addCleanup(db.close)
+        store = SQLiteTerminalBindingStore(db)
+        marker = store.get("old")
+        self.assertEqual((marker.executor_id, marker.handle, marker.native_session_id), ("claude", None, None))
+        self.assertIsNone(store.get("unrouted"))
+        sessions = SQLiteSessionStoreAdapter(db)
+        sessions.save(SessionRef(session_id="new", inbox_id="i", executor_id="claude"))
+        db.close()
+        db = SQLiteDatabase(path)
+        self.addCleanup(db.close)
+        self.assertIsNone(SQLiteTerminalBindingStore(db).get("new"))
+
+
 class TestVisibleContinuation(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -174,7 +200,14 @@ class TestVisibleContinuation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.messages, (f"turn 2 of {first.executor_session_id}",))
         self.assertEqual(self.orca.verbs()[-1], "terminal send")
 
+    async def test_new_session_already_assigned_to_the_executor_launches(self):
+        # The worker saves the executor on a session before its first Run.
+        outcome = await self.run_task(self.session(None))
+        self.assertIn("turn 1 of", outcome.messages[0])
+        self.assertEqual(self.orca.verbs()[0], "agent launch")
+
     async def test_unknown_binding_is_reported_and_starts_nothing(self):
+        self.bindings.save(TerminalBinding(session_id="s1", executor_id="claude", agent="", workdir=""))
         outcome = await self.run_task(self.session(None))
         assert isinstance(outcome, Suspend)
         self.assertIn("Cannot confirm the agent conversation bound to session s1", outcome.prompt)

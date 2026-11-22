@@ -178,9 +178,11 @@ class OrcaVisibleRunner:
                 binding = self._bindings.find_by_native(executor_id, session.executor_session_id)
             if binding is not None and binding.executor_id != executor_id:
                 binding = None
-        if binding is None and not prior:
+        # The worker records the executor on a session before its first Run, so only a missing binding
+        # (sessions from before bindings existed carry a marker row) identifies a new conversation.
+        if binding is None and not (prior and session is not None and session.executor_session_id):
             return _Plan("launch")
-        if binding is not None and binding.workdir != str(workdir):
+        if binding is not None and binding.workdir and binding.workdir != str(workdir):
             raise ContinuationUnconfirmed(
                 f"the bound conversation ran in {binding.workdir} but this Run resolved {workdir}"
             )

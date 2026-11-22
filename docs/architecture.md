@@ -72,10 +72,10 @@
   - **计费**：见共用适配器；`subscription` 用启动器自己的登录，`init` 报告任何付费来源即在会话开始时终止；`api` 只经外置凭据代理，未配置 `[credential_proxy]` 时解析即报错。`init` 报告的模型与配置全名不符同样终止。
   - **输出**：`--json-schema` 约束结构化结论，`verdict = pass | changes_requested`；阻塞项必含 `location`（文件:行）、`trigger`、`impact`，结论与阻塞项数量矛盾视为无效。结果作为一条 `Emit` 写入 Outbox；每次评审都是新会话（`--no-session-persistence`，不回填 `executor_session_id`），开发者修复后重新派单即为独立复审。权限门禁工具名 `coder_reviewer.launch`。
 - **Orca 可见执行**：模板的 `orca_agent` 指定 Orca 管理的 agent。项目使用 Orca worktree 时，同一 Hibernaut 会话的后续事件回到已绑定的对话（`OrcaVisibleRunner`，`adapters/executor_cli/orca.py`）。绑定存在 SQLite `terminal_bindings` 表（键为 `session_id`，记录 `executor_id`、`agent`、`workdir`、终端 `handle`、进程 `incarnation_id` 与原生会话 ID），原生会话 ID 同时写入 `sessions.executor_session_id`，会话换了 `session_id` 也能按它找回绑定。每轮按顺序选择：
-  1. **新开**：会话为空或执行器已切换时 `orca agent launch --surface terminal` 在后台标签页提交，按回执记录终端句柄与 `incarnationId`。
+  1. **新开**：会话没有本执行器的绑定（且未带原生会话 ID）时 `orca agent launch --surface terminal` 在后台标签页提交，按回执记录终端句柄与 `incarnationId`。
   2. **复用**：绑定终端仍在 `orca terminal list` 中、`incarnationId` 与 `agentIdentity` 都一致时，用 `orca terminal send --enter` 投递到原对话（`terminal show` 的 `orphaned` 只表示尚无可见窗格，不作存活依据；同句柄换了进程视为另一个对话）。
   3. **恢复**：终端已关闭但有原生会话 ID 时，`orca terminal create --command "<command> --resume <id>"` 新开终端，等 `tui-idle` 并确认 `agentIdentity` 后再投递。
-  4. **无法确认**：会话属于本执行器却既无存活终端也无原生会话 ID、工作目录变了、恢复没能启动 agent 或终端拒收时，什么都不发送，返回 `Suspend`（检查点 `{"orca_continuation": "unconfirmed"}`）说明原因；批准后才新开对话，拒绝则跳过本轮。
+  4. **无法确认**：会话有绑定却既无存活终端也无原生会话 ID、工作目录变了、恢复没能启动 agent 或终端拒收时，什么都不发送，返回 `Suspend`（检查点 `{"orca_continuation": "unconfirmed"}`）说明原因；批准后才新开对话，拒绝则跳过本轮。建表迁移时，已有执行器的旧会话各补一条无终端、无原生 ID 的绑定，因此升级前跑过的会话走这一步而不会被当成新会话。
   原生会话 ID 不靠 agent 自报：每轮结果文件所在的临时目录名唯一且写在投递的 prompt 里，执行器在 Claude Code 转录目录（模板 `env.CLAUDE_CONFIG_DIR`、daemon 的 `CLAUDE_CONFIG_DIR` / `ORCA_CLAUDE_CONFIG_DIR`、`~/.claude` 下的 `projects/*/<uuid>.jsonl`）里找含该标记的会话，恰好一个（或与已绑定 ID 相同）才确认，否则不写入并记警告。完成以每轮唯一的临时结果文件为准。投递后中断或超时则先确认原生会话 ID、再关闭本轮终端，下一轮走恢复；启动回执或投递回执不确定时转为 `Suspend` 供人工确认，不重复投递。
 - **声明式配置与禁止静默回退 Demo**（`hibernaut.example.toml` + `app/config.py` + `app/main.py --config`）：使用标准库 `tomllib` 解析，仅存静态主检出、执行器模板（全部 `[executors.<id>]` 注册进 `AgentWorker`，`[projects.<name>]` 支持可选 `executor`）与凭据环境变量名，绝不存动态 worktree 路径。以 `--config` 正式启动时严禁静默回退 `RuleBasedDemoLLM`：若未配置 `[executors]` 或缺少 `default_executor`，则向 `stderr` 打印清晰提示并以 **`ingest-only`（仅入站控制面）模式**启动，不启动消费 Worker 池，所有新事件安全保持 `pending` 等待配置修复（仅无 `--config` 或显式传 `--demo` 时才允许使用 Demo 执行器）。HTTP daemon 热加载时先组装新配置，待旧 Worker 池排空后再切换，沿用同一条 SQLite 连接及未变更的监听 socket。
 

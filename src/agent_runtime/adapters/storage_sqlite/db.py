@@ -131,9 +131,21 @@ class SQLiteDatabase:
         if self._db_path != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
+        bindings_existed = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'terminal_bindings'"
+        ).fetchone() is not None
         self._conn.executescript(SCHEMA_SQL)
         with self.transaction() as conn:
             self._ensure_migrations(conn)
+            if not bindings_existed:
+                # Sessions that already ran before bindings were recorded get a marker with no terminal,
+                # so the visible runner reports them instead of mistaking them for new conversations.
+                conn.execute(
+                    "INSERT OR IGNORE INTO terminal_bindings "
+                    "(session_id, executor_id, agent, workdir, handle, incarnation_id, native_session_id, updated_at) "
+                    "SELECT session_id, executor_id, '', '', NULL, NULL, NULL, updated_at FROM sessions "
+                    "WHERE executor_id IS NOT NULL"
+                )
 
     @staticmethod
     def _ensure_migrations(conn: sqlite3.Connection) -> None:
