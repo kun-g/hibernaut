@@ -131,7 +131,7 @@
 - **`session_id`**：委派出的子会话另记 `parent_session_id`；轮换标 `archived`（新会话继承 `parent_session_id`），结案标 `closed` 且引用归零触发回收。
 - **`correlation_key`**：同时作为 `workspaces` 表动态 worktree 复用键。
 
-## 7. Switchboard（Phase 1）：外部事件归一化交换机
+## 7. Switchboard（Phase 1 + Phase 2 Relay）：外部事件归一化交换机
 
 `src/switchboard/` 是与 `agent_runtime` 并列的独立包（过渡期单仓多包）。`.importlinter` 的 `switchboard-zero-business-deps` 契约禁止它导入 `taskboard`、`agent_runtime`、`runner`、`memory_hub`，`tests/test_switchboard_core.py` 另用 AST 检查它只依赖标准库与自身。
 
@@ -140,10 +140,26 @@
 - **去重键是业务指纹**：`inbound_events` 的 `UNIQUE(source, external_id)`。GitHub 用 `issue:{repo}#{num}:{action}:{updated_at}` / `pr:...` / `comment:{id}`（PR review 为 `review:{id}`，review comment 为 `review_comment:{id}`），不用 `X-GitHub-Delivery`，所以 Redeliver 换新 UUID 仍判重；飞书卡片审批用 `approval:{approval_request_id}`（不含 decision），二次点击（即使改点拒绝）被丢弃并返回首个决定的只读卡片。
 - **入站管道**（`pipeline.InboundPipeline`）：校验信封 → 同一事务内 `INSERT OR IGNORE` 入 `inbound_events` 并按路由表写 `delivery_log` → 唤醒投递线程。401（验签失败）、400（缺字段/信封不合法）、413（超过 `max_body_bytes`）只写旁路审计与 stderr，不落表。`AuditSinkPort` 异常降级为 stderr，不中断主链路。
 - **声明式路由**（`router.py`）：`work.opened/updated → taskboard`；`work.closed → taskboard + hibernaut`；`work.ready / conversation.message / approval.decided → hibernaut`；`execution.reported → taskboard + switchboard.outbound`。scope 由 `[routing]` 的 `github_repos` / `feishu_chats` 映射，未命中按 `unmatched_policy` 回落 `default_scope` 或忽略。
-- **投递**（`DeliveryWorker` + `InProcessTransport`，预留 `ConsumerTransport` 供 Phase 2 RelayHub）：同 `(consumer_id, scope)` 严格队头保序，队头处于 `retry`/`dead_letter` 时只阻塞该队列。`nack`/`timeout`/异常按 `retry_backoff_seconds`（默认 5/15/45/135/405 秒）退避，重试次数等于退避表长度，最后一次重试仍失败（默认共 6 次尝试）转 `dead_letter`，并经出站网关向 `dead_letter_alert_channel/target` 发告警；`offline` 保持 `pending` 且不计次数。`replay_delivery(event_id, consumer_id)` 只接受 `dead_letter`/`retry`，重置为 `pending, attempts=0, next_retry_at=now`。
+- **投递**（`DeliveryWorker` + `ConsumerTransport`：Phase 1 的 `InProcessTransport`、Phase 2 的 `WebSocketRelayTransport`，或二者组合的 `CompositeTransport`）：同 `(consumer_id, scope)` 严格队头保序，队头处于 `retry`/`dead_letter` 时只阻塞该队列。`nack`/`timeout`/异常按 `retry_backoff_seconds`（默认 5/15/45/135/405 秒）退避，重试次数等于退避表长度，最后一次重试仍失败（默认共 6 次尝试）转 `dead_letter`，并经出站网关向 `dead_letter_alert_channel/target` 发告警；`offline` 保持 `pending` 且不计次数。`replay_delivery(event_id, consumer_id)` 只接受 `dead_letter`/`retry`，重置为 `pending, attempts=0, next_retry_at=now`。
 - **出站网关**（`outbound/gateway.py`）：`outbound_messages` 的 `UNIQUE(idempotency_key)` 防重发；每个 `(channel, target)` 一个令牌桶（`rate_limit_per_target_rpm`），限流只推迟不计次数；可重试失败（5xx/429/网络）退避，超过 `max_retry_attempts` 或 4xx 标 `failed`。`execution.reported` 自动转换：`suspend` → `approval_channel`（默认飞书 `approval_target`）审批卡，按钮 value 打包 `approval_request_id/decision/correlation_key/scope/session_id`；其余回复到 `correlation_key` 的来源（GitHub Issue/PR 评论，支持 `add_labels`/`remove_labels`；飞书单聊或话题回复）。渠道插件经 `CredentialBrokerPort.issue_ephemeral()` 取短期令牌，HTTP client 可注入。
 - **SQLite**（`store_sqlite.py`）：WAL、`busy_timeout=5000`、`foreign_keys=ON`；一条连接在一把进程内锁下串行，写入用 `BEGIN IMMEDIATE`。三张表 `inbound_events`、`delivery_log`、`outbound_messages` 及索引 `idx_inbound_corr`、`idx_delivery_sched`、`idx_delivery_order`、`idx_outbound_sched`。
 - **HTTP**（`http_server.py`）：单端口 `ThreadingHTTPServer` 挂 `/webhooks/github`、`/webhooks/feishu`、`/mcp`、`/healthz`；按 `Content-Length` 先拒超限请求，入库后立即返回，不等下游。组装根是 `switchboard/app.py`（`python -m switchboard.app --config switchboard.toml`）。
+
+### 7.1 Phase 2：RelayHub 与 Relay Agent 长连接推送
+
+私网或本机（如合盖休眠的 Mac）上的消费方无法被公网回调，改由消费方主动外连 `wss://<host>/ws/relay`，Switchboard 经这条长连接推送事件。仍只用标准库：RFC 6455 握手与帧编解码在 `relay_protocol.py` 里手写，TLS 用标准库 `ssl`（Agent 侧）或由前置反代终结（Hub 侧）。
+
+- **帧协议**（`relay_protocol.py`）：WebSocket 只走文本帧，每帧是一个带 `type` 与 ISO-8601 UTC `ts` 的 JSON 对象：`hello`（Agent → Hub：`consumer_id`、`token`、`agent_version`）、`welcome`（Hub → Agent：`consumer_id`、`conn_epoch`、`heartbeat_sec`、`ack_timeout_sec`）、`push`（`conn_epoch` + 完整 `CanonicalEvent`）、`ack` / `nack`（`conn_epoch`、`event_id`，`nack` 另带 `error`、`retryable`）、`ping` / `pong`（`conn_epoch`）。自定义 Close Code：4001 鉴权失败或首帧超时，4009 被同 `consumer_id` 的新连接取代。客户端帧必须掩码，控制帧不超过 125 字节，单消息上限沿用 `[http] max_body_bytes`。
+- **鉴权**（`relay_hub.RelayHub`）：建连后 `auth_timeout_sec`（默认 5 秒）内必须收到 `hello`；Token 与 `CredentialBrokerPort.get_webhook_secret("relay")` 常量时间比较，未配置密钥一律拒绝。超时、首帧不是 `hello` 或 Token 不符都以 Close 4001 关闭，并经 `AuditSinkPort` 记 `relay/auth_timeout` 或 `relay/auth_failed`（不含 Token）。Agent 侧 Token 经 `CredentialBrokerPort.issue_ephemeral("relay")` 申领。
+- **`conn_epoch` 防脑裂**：同一 `consumer_id` 每次握手成功在一把锁内递增 `conn_epoch` 并替换在线路由表，`welcome` 发出前该连接不接收任何推送或心跳。旧连接的未确认推送按 `offline` 交还 Worker（回 `pending`、不计次数），随后以 Close 4009 关闭；旧连接在 2 秒宽限期内发来的帧、以及新连接上携带旧 `conn_epoch` 的 `ack` / `nack` 一律丢弃并记 `relay/stale_frame`。
+- **`WebSocketRelayTransport`**（实现 `ConsumerTransport`）：消费方不在线返回 `offline`；同一 `(scope, consumer_id)` 最多 1 条在途（队头保序），单连接在途上限 `max_in_flight`（默认 8），不同 scope 可并行；窗口占满等到 `ack_timeout_sec` 仍无空位时按 `offline` 返回（推送未发出，不算一次尝试）。推送后 `ack_timeout_sec`（默认 15 秒）内无 `ack` 判 `timeout`，记 `relay/ack_timeout` 并立即补发一次 `ping` 做健康检查。同一 `event_id` 的迟到 `ack` 可以结算下一次重试，因为事件确已被处理（At-Least-Once）。
+- **心跳与离线摘除**：Hub 每 `heartbeat_sec`（默认 20 秒）向每条连接发 `ping`；任意入站帧都算存活，连续 2 次心跳间隔无入站（默认 40 秒）即摘除在线表（`relay/heartbeat_timeout`），未确认推送按 `offline` 回退 `pending` 等待重连。
+- **离线不等于故障**：`offline` 保持 `pending`，不增加 `attempts`、不消耗死信重试额度；只有在线时的 `nack` / `timeout` 才进入 `retry_backoff_seconds` 退避与死信流程（含出站告警）。
+- **重连零延迟补推**：`welcome` 发出后 Hub 回调 `on_consumer_connected(consumer_id)`，组装根把它接到 `DeliveryWorker.reset_offline_pending()`：`SwitchboardStore.reset_offline_pending(consumer_id, now)` 把该消费方因离线延后的 `pending` 行的 `next_retry_at` 置为现在（`retry` 行保持在线失败的退避），然后唤醒 Worker 按 `(scope, created_at)` 队头保序补推。若推送失败与重连同时发生，Worker 在写入离线延后之后会再执行一次重置。
+- **Worker 并发**：每轮取出的待投递项各自是不同 `(consumer_id, scope)` 的队头，`[delivery] max_parallel` 个线程并发投递不破坏保序；未配置时 `in_process` 为 1（与 Phase 1 相同），`relay` / `hybrid` 为 `2 × max_in_flight`。
+- **传输模式**（`[relay] transport`）：`in_process`（默认，Phase 1 行为）；`relay`：除内置 `switchboard.outbound` 外的消费方全部走长连接；`hybrid`：有进程内处理函数（内置或 `bus.subscribe`）的消费方走 `InProcessTransport`，其余（如 `hibernaut`、`taskboard`）走 `WebSocketRelayTransport`（`pipeline.CompositeTransport`）。`transport` 不是 `in_process` 时必须 `enabled = true`。
+- **挂载**：默认与 `[http]` 同端口，`GET <path>` 带 `Upgrade: websocket` 时升级（不带返回 426）；配置 `listen_port`（可选 `listen_host`）则另起一个只服务该路径的监听。
+- **Relay Agent**（`relay_agent.RelayAgent`，CLI `python -m switchboard.relay_agent`）：外连 `ws://` / `wss://` 后立即发 `hello`；收到 `push` 在线程池（默认 8）里调用注入的 `ConsumerHandler`，处理函数返回（即本地落盘完成）后才回 `ack`，返回 `nack` / `timeout` / `offline` 或抛异常则回 `nack(retryable=true)`；自动回应 `ping`；`3 × heartbeat_sec` 无任何入站帧视为半开连接主动断开。断线后按 1 → 2 → 4 → 8 → 16 → 30 秒（封顶）±20% 随机抖动退避重连，成功握手后退避归零；收到 4009 说明另一个同 `consumer_id` 的 Agent 接管，不再重连。
 
 ## 8. 架构决策记录（ADR）
 

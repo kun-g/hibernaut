@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import sys
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from switchboard.addressing import address_target
 from switchboard.config import DeliveryConfig
@@ -19,6 +20,7 @@ from switchboard.envelope import (
 from switchboard.ports import (
     AuditSinkPort,
     ConsumerHandler,
+    ConsumerTransport,
     DeliverOutcome,
     IngestResult,
     NoopAuditSink,
@@ -131,6 +133,10 @@ class InProcessTransport:
         with self._lock:
             self._handlers.pop(consumer_id, None)
 
+    def has(self, consumer_id: str) -> bool:
+        with self._lock:
+            return consumer_id in self._handlers
+
     def deliver(self, consumer_id: str, event: CanonicalEvent) -> DeliverOutcome:
         with self._lock:
             handler = self._handlers.get(consumer_id)
@@ -145,17 +151,42 @@ class InProcessTransport:
         return DeliverOutcome(status=status or "acked")
 
 
+# relay: every consumer goes over the relay except the built-in local ones (the outbound
+# gateway). hybrid: a consumer with an in-process handler stays local, the rest go remote.
+class CompositeTransport:
+    def __init__(
+        self,
+        local: InProcessTransport,
+        remote: ConsumerTransport,
+        *,
+        mode: Literal["relay", "hybrid"],
+        local_consumers: Collection[str] = (),
+    ) -> None:
+        self._local = local
+        self._remote = remote
+        self._mode = mode
+        self._local_consumers = frozenset(local_consumers)
+
+    def deliver(self, consumer_id: str, event: CanonicalEvent) -> DeliverOutcome:
+        if consumer_id in self._local_consumers or (
+            self._mode == "hybrid" and self._local.has(consumer_id)
+        ):
+            return self._local.deliver(consumer_id, event)
+        return self._remote.deliver(consumer_id, event)
+
+
 class DeliveryWorker:
     def __init__(
         self,
         store: SwitchboardStore,
-        transport: InProcessTransport,
+        transport: ConsumerTransport,
         *,
         config: DeliveryConfig | None = None,
         gateway: OutboundGatewayPort | None = None,
         audit: AuditSinkPort | None = None,
         clock: Clock = utc_now,
         idle_poll_seconds: float = 1.0,
+        max_parallel: int = 1,
     ) -> None:
         self._store = store
         self._transport = transport
@@ -164,9 +195,13 @@ class DeliveryWorker:
         self._audit: AuditSinkPort = audit or NoopAuditSink()
         self._clock = clock
         self._idle_poll_seconds = idle_poll_seconds
+        self._max_parallel = max(1, max_parallel)
+        self._pool: ThreadPoolExecutor | None = None
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._reset_lock = threading.Lock()
+        self._reset_generation: dict[str, int] = {}
 
     def wake(self) -> None:
         self._wake.set()
@@ -184,6 +219,21 @@ class DeliveryWorker:
         if self._thread is not None:
             self._thread.join(timeout)
             self._thread = None
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = None
+
+    # Called when a relay consumer (re)connects: its offline-deferred rows become due now.
+    def reset_offline_pending(self, consumer_id: str) -> int:
+        with self._reset_lock:
+            self._reset_generation[consumer_id] = self._reset_generation.get(consumer_id, 0) + 1
+        count = self._store.reset_offline_pending(consumer_id, self._clock())
+        self.wake()
+        return count
+
+    def _generation(self, consumer_id: str) -> int:
+        with self._reset_lock:
+            return self._reset_generation.get(consumer_id, 0)
 
     def replay_delivery(self, event_id: str, consumer_id: str) -> DeliveryRow:
         row = self._store.replay_delivery(event_id, consumer_id, self._clock())
@@ -197,9 +247,18 @@ class DeliveryWorker:
             due = self._store.due_deliveries(self._clock())
             if not due:
                 break
-            for item in due:
-                self._deliver(item)
-                delivered += 1
+            # Each due item heads a distinct (consumer_id, scope) queue, so running them
+            # concurrently keeps per-scope order.
+            if self._max_parallel == 1 or len(due) == 1:
+                for item in due:
+                    self._deliver(item)
+            else:
+                if self._pool is None:
+                    self._pool = ThreadPoolExecutor(
+                        self._max_parallel, thread_name_prefix="switchboard-deliver"
+                    )
+                list(self._pool.map(self._deliver, due))
+            delivered += len(due)
         return delivered
 
     def _loop(self) -> None:
@@ -220,11 +279,13 @@ class DeliveryWorker:
 
     def _deliver(self, item: DueDelivery) -> None:
         row = item.row
-        now = self._clock()
+        generation = self._generation(row.consumer_id)
         try:
             outcome = self._transport.deliver(row.consumer_id, item.event)
         except Exception as exc:  # noqa: BLE001
             outcome = DeliverOutcome(status="nack", error=repr(exc))
+        # Read after delivery: a relay push can wait up to ack_timeout_sec.
+        now = self._clock()
 
         if outcome.status == "acked":
             self._store.update_delivery(
@@ -242,7 +303,7 @@ class DeliveryWorker:
             return
 
         if outcome.status == "offline":
-            # Phase 2 relay consumers may be disconnected; that is not a failed attempt.
+            # A disconnected relay consumer is not a failed attempt.
             self._store.update_delivery(
                 row.event_id,
                 row.consumer_id,
@@ -252,6 +313,11 @@ class DeliveryWorker:
                 last_error=row.last_error,
                 now=now,
             )
+            # The consumer reconnected while this push was failing; its reset ran before
+            # the deferral above, so apply it again.
+            if self._generation(row.consumer_id) != generation:
+                self._store.reset_offline_pending(row.consumer_id, now)
+                self.wake()
             return
 
         attempts = row.attempts + 1

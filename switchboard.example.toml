@@ -1,7 +1,8 @@
-# Switchboard Phase 1 config. Secrets never go here: the default EnvCredentialBroker reads
+# Switchboard config. Secrets never go here: the default EnvCredentialBroker reads
 # SWITCHBOARD_GITHUB_WEBHOOK_SECRET, SWITCHBOARD_FEISHU_WEBHOOK_SECRET (verification token),
 # SWITCHBOARD_MCP_WEBHOOK_SECRET (bearer token), SWITCHBOARD_GITHUB_TOKEN and
-# SWITCHBOARD_FEISHU_TOKEN (tenant access token) from the environment.
+# SWITCHBOARD_FEISHU_TOKEN (tenant access token) from the environment, plus
+# SWITCHBOARD_RELAY_WEBHOOK_SECRET (the token relay agents must present) when [relay] is enabled.
 
 [http]
 host = "127.0.0.1"
@@ -36,3 +37,14 @@ rate_limit_per_target_rpm = 30
 max_retry_attempts = 5
 approval_channel = "feishu"
 # approval_target = "oc_xxx"
+
+[relay]
+enabled = false
+path = "/ws/relay"
+auth_timeout_sec = 5
+heartbeat_sec = 20
+ack_timeout_sec = 15
+max_in_flight = 8
+transport = "in_process"  # or "relay" / "hybrid" (both need enabled = true)
+# listen_host = "0.0.0.0"  # set listen_port to serve the relay on its own port
+# listen_port = 8791

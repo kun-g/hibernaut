@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
 
 from switchboard.pipeline import InboundPipeline, describe_ingest
 from switchboard.ports import InboundAdapter, IngestAwareAdapter
+from switchboard.relay_protocol import HandshakeError, WebSocketConnection, server_handshake_headers
+
+# Takes over an upgraded connection and returns when it ends; runs on the request thread.
+UpgradeHandler = Callable[[WebSocketConnection, str], None]
 
 
 class _Server(ThreadingHTTPServer):
@@ -20,10 +25,12 @@ class _Server(ThreadingHTTPServer):
         pipeline: InboundPipeline,
         routes: Mapping[str, InboundAdapter],
         max_body_bytes: int,
+        upgrades: Mapping[str, UpgradeHandler],
     ) -> None:
         self.pipeline = pipeline
         self.routes = dict(routes)
         self.max_body_bytes = max_body_bytes
+        self.upgrades = dict(upgrades)
         super().__init__(address, _Handler)
 
 
@@ -34,10 +41,39 @@ class _Handler(BaseHTTPRequestHandler):
         return None
 
     def do_GET(self) -> None:
-        if self._path() == "/healthz":
+        path = self._path()
+        if path == "/healthz":
             self._reply(200, {"status": "ok"})
             return
+        upgrade = self._srv().upgrades.get(path)
+        if upgrade is not None:
+            self._upgrade(upgrade)
+            return
         self._reply(404, {"error": "not found"})
+
+    def _upgrade(self, upgrade: UpgradeHandler) -> None:
+        headers = {key: value for key, value in self.headers.items()}
+        if self.headers.get("Upgrade", "").strip().lower() != "websocket":
+            self._reply(426, {"error": "WebSocket upgrade required"})
+            return
+        try:
+            response_headers = server_handshake_headers(headers)
+        except HandshakeError as exc:
+            self._reply(400, {"error": str(exc)})
+            return
+        self.send_response(101, "Switching Protocols")
+        for name, value in response_headers:
+            self.send_header(name, value)
+        self.end_headers()
+        self.close_connection = True
+        # rfile may already hold the client's first frame, so frames are read through it.
+        ws = WebSocketConnection(
+            cast(socket.socket, self.connection),
+            self.rfile.read,
+            client_side=False,
+            max_message_bytes=self._srv().max_body_bytes,
+        )
+        upgrade(ws, f"{self.client_address[0]}:{self.client_address[1]}")
 
     def do_POST(self) -> None:
         path = self._path()
@@ -118,8 +154,9 @@ class SwitchboardHTTPServer:
         host: str = "127.0.0.1",
         port: int = 0,
         max_body_bytes: int = 1_048_576,
+        upgrades: Mapping[str, UpgradeHandler] | None = None,
     ) -> None:
-        self._server = _Server((host, port), pipeline, routes, max_body_bytes)
+        self._server = _Server((host, port), pipeline, routes, max_body_bytes, upgrades or {})
         self._thread: threading.Thread | None = None
 
     @property

@@ -272,6 +272,19 @@ class SwitchboardStore:
                 ),
             )
 
+    # Only 'pending' rows: offline deferrals. Online failures ('retry') keep their backoff.
+    def reset_offline_pending(self, consumer_id: str, now: datetime) -> int:
+        stamp = format_utc(now)
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE delivery_log SET next_retry_at = ?, updated_at = ?
+                WHERE consumer_id = ? AND status = 'pending' AND next_retry_at > ?
+                """,
+                (stamp, stamp, consumer_id, stamp),
+            )
+            return cursor.rowcount
+
     def replay_delivery(self, event_id: str, consumer_id: str, now: datetime) -> DeliveryRow:
         stamp = format_utc(now)
         with self._lock:

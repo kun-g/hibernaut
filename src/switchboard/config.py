@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 UnmatchedPolicy = Literal["fallback", "reject"]
+TransportMode = Literal["in_process", "relay", "hybrid"]
+TRANSPORT_MODES: tuple[TransportMode, ...] = ("in_process", "relay", "hybrid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +44,22 @@ class DeliveryConfig:
     retry_backoff_seconds: tuple[float, ...] = (5, 15, 45, 135, 405)
     dead_letter_alert_channel: str | None = None
     dead_letter_alert_target: str | None = None
+    # None: 1 for in_process (Phase 1 behaviour), 2 * relay.max_in_flight otherwise.
+    max_parallel: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RelayConfig:
+    enabled: bool = False
+    path: str = "/ws/relay"
+    auth_timeout_sec: float = 5
+    heartbeat_sec: float = 20
+    ack_timeout_sec: float = 15
+    max_in_flight: int = 8
+    transport: TransportMode = "in_process"
+    # None: the relay endpoint shares the [http] port.
+    listen_host: str | None = None
+    listen_port: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +80,7 @@ class SwitchboardConfig:
     feishu: FeishuConfig = field(default_factory=FeishuConfig)
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     outbound: OutboundConfig = field(default_factory=OutboundConfig)
+    relay: RelayConfig = field(default_factory=RelayConfig)
 
 
 _HTTP = HttpConfig()
@@ -70,6 +89,7 @@ _ROUTING = RoutingConfig()
 _FEISHU = FeishuConfig()
 _DELIVERY = DeliveryConfig()
 _OUTBOUND = OutboundConfig()
+_RELAY = RelayConfig()
 
 
 class ConfigError(ValueError):
@@ -95,6 +115,9 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
 
     delivery_backoff = _backoff(delivery, "delivery")
     outbound_backoff = _backoff(outbound, "outbound")
+    max_parallel = delivery.get("max_parallel")
+    if max_parallel is not None and int(max_parallel) < 1:
+        raise ConfigError("delivery.max_parallel must be at least 1")
     return SwitchboardConfig(
         http=HttpConfig(
             host=str(http.get("host", _HTTP.host)),
@@ -120,6 +143,7 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
             retry_backoff_seconds=delivery_backoff or _DELIVERY.retry_backoff_seconds,
             dead_letter_alert_channel=_optional(delivery.get("dead_letter_alert_channel")),
             dead_letter_alert_target=_optional(delivery.get("dead_letter_alert_target")),
+            max_parallel=None if max_parallel is None else int(max_parallel),
         ),
         outbound=OutboundConfig(
             rate_limit_per_target_rpm=int(
@@ -133,6 +157,41 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
             approval_target=_optional(outbound.get("approval_target")),
             github_api_base=str(outbound.get("github_api_base", _OUTBOUND.github_api_base)),
         ),
+        relay=_relay(_section(raw, "relay")),
+    )
+
+
+def _relay(relay: Mapping[str, Any]) -> RelayConfig:
+    transport = str(relay.get("transport", _RELAY.transport))
+    if transport not in TRANSPORT_MODES:
+        raise ConfigError(f"relay.transport must be one of {list(TRANSPORT_MODES)}")
+    enabled = bool(relay.get("enabled", _RELAY.enabled))
+    if transport != "in_process" and not enabled:
+        raise ConfigError(f"relay.transport = {transport!r} needs relay.enabled = true")
+    path = str(relay.get("path", _RELAY.path))
+    if not path.startswith("/"):
+        raise ConfigError("relay.path must start with '/'")
+    seconds = {
+        name: float(relay.get(name, getattr(_RELAY, name)))
+        for name in ("auth_timeout_sec", "heartbeat_sec", "ack_timeout_sec")
+    }
+    for name, value in seconds.items():
+        if value <= 0:
+            raise ConfigError(f"relay.{name} must be positive")
+    max_in_flight = int(relay.get("max_in_flight", _RELAY.max_in_flight))
+    if max_in_flight < 1:
+        raise ConfigError("relay.max_in_flight must be at least 1")
+    listen_port = relay.get("listen_port")
+    return RelayConfig(
+        enabled=enabled,
+        path=path,
+        auth_timeout_sec=seconds["auth_timeout_sec"],
+        heartbeat_sec=seconds["heartbeat_sec"],
+        ack_timeout_sec=seconds["ack_timeout_sec"],
+        max_in_flight=max_in_flight,
+        transport=transport,
+        listen_host=_optional(relay.get("listen_host")),
+        listen_port=None if listen_port is None else int(listen_port),
     )
 
 

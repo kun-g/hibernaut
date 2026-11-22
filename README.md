@@ -395,7 +395,7 @@ Hibernaut never holds the service account key. An external credential proxy, run
 - `service_account_key_env` is no longer accepted: the config fails with a message pointing to the proxy. `HIBERNAUT_GDRIVE_SA_KEY` is ignored.
 - A proxy refusal or Drive error reaches the poller as `DriveProxyError` with the HTTP status and reason; the poll logs it and retries on the next interval.
 
-## Switchboard (Phase 1)
+## Switchboard
 
 `src/switchboard/` is a separate package in this repository: a passive exchange that normalizes inbound GitHub webhooks, Feishu events and card callbacks, and MCP tool calls into one `CanonicalEvent` envelope, stores them in its own SQLite database, delivers them to consumers (`taskboard`, `hibernaut`, `switchboard.outbound`) and sends replies through one outbound gateway. It imports nothing from `agent_runtime`, `taskboard`, `runner` or `memory_hub` (enforced by `.importlinter`), and it has no pollers or timers: external cron jobs call the MCP tool `submit_work` with `source="timer"`.
 
@@ -413,7 +413,36 @@ Secrets are read through `CredentialBrokerPort`; the default `EnvCredentialBroke
 - A GitHub redelivery with a new `X-GitHub-Delivery` is still a duplicate: events are deduplicated by business fingerprint (`issue:{repo}#{num}:{action}:{updated_at}`, `pr:...`, `comment:{id}`).
 - A consumer that still fails after the last retry (one retry per `retry_backoff_seconds` entry, default 5/15/45/135/405 s) goes to `dead_letter` and an alert is sent to `[delivery] dead_letter_alert_channel/target`; later events for the same consumer and scope wait, other scopes and consumers continue. Replay with the MCP tool `replay_delivery`.
 - An `execution.reported` event with outcome `suspend` becomes a Feishu approval card at `[outbound] approval_target`. The button click returns a read-only card at once and is recorded as `approval.decided` with the original `correlation_key` (for example `github:kun-g/hibernaut#42`); a second click on the same request is dropped.
-- Phase 1 delivers in-process only. Consumers register with `board.bus.subscribe(consumer_id, handler)`; an unregistered consumer counts as offline and its deliveries stay pending.
+- With the default `[relay] transport = "in_process"`, consumers register with `board.bus.subscribe(consumer_id, handler)`; an unregistered consumer counts as offline and its deliveries stay pending.
+
+### Relay: pushing to consumers behind NAT or asleep
+
+A consumer on a private network or a laptop connects out to the Switchboard over WebSocket and receives its events there:
+
+```toml
+[relay]
+enabled = true
+transport = "hybrid"   # local consumers in-process, the rest (hibernaut, taskboard) over the relay
+# heartbeat_sec = 20, ack_timeout_sec = 15, auth_timeout_sec = 5, max_in_flight = 8, path = "/ws/relay"
+# listen_port = 8791   # optional: serve the relay on its own port instead of the [http] port
+```
+
+```bash
+# Switchboard side: the token relay agents must present
+export SWITCHBOARD_RELAY_WEBHOOK_SECRET=...
+PYTHONPATH=src python3 -m switchboard.app --config switchboard.toml
+
+# Consumer side: prints each event as a JSON line and acks it, or pass --handler pkg.module:function
+export SWITCHBOARD_RELAY_TOKEN=...
+PYTHONPATH=src python3 -m switchboard.relay_agent --url wss://switchboard.example.com/ws/relay --consumer-id hibernaut
+```
+
+Terminate TLS at a reverse proxy in front of the Switchboard (it must pass `Upgrade` / `Connection` headers); the agent speaks `wss://` with the standard `ssl` module (`--ca-file` for a private CA). To embed the agent in a consumer process, use `switchboard.relay_agent.RelayAgent(url, consumer_id, handler, credentials).start()`; the handler is called once the event arrives and the ack is sent only after it returns, so return only once the event is stored.
+
+- While a consumer is offline (for example a closed laptop) its deliveries stay `pending` and do not use up retries. When it reconnects, the backlog is pushed at once, in order within each scope.
+- Only failures while connected count as attempts: a `nack`, an exception in the handler, or no ack within `ack_timeout_sec`. These back off and dead-letter as above.
+- A second agent with the same `consumer_id` takes over; the old connection is closed with code 4009 and its late acks are ignored. A bad token or no `hello` within `auth_timeout_sec` closes with 4001.
+- The agent reconnects after 1, 2, 4, 8, 16 and then every 30 seconds (±20%); the hub drops a connection after two missed heartbeats and pushes the unacknowledged events again after the reconnect, so a handler can see an event more than once.
 
 See `docs/architecture.md` section 7 for the full design.
 
