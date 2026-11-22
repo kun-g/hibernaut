@@ -14,7 +14,7 @@
 
 ## 2. 核心词汇表与并发红线
 
-完整术语定义见 [`docs/architecture.md`](docs/architecture.md) 与 Google Drive [《Always-on Agent 核心词汇表（Glossary）》](https://docs.google.com/document/d/1JU8HWE_kbY0T7kHNs5E87KhbH6SL-U3OWPpmvrv5nps/edit?usp=drivesdk&ouid=111695824259514941899)，核心区分如下：
+术语以 [`docs/glossary.md`](docs/glossary.md) 为唯一基准（新增或修改术语只改该文件），核心区分如下：
 
 | 术语 | 精确定义 | 作用域 / 约束 |
 | :--- | :--- | :--- |
