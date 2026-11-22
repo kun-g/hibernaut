@@ -94,7 +94,7 @@ _ROLE_ARGS = (
     "--json-schema", json.dumps(SDE_SCHEMA),
 )
 
-_STANDALONE_DELIVERY = "- Before finishing, bump the project's version when the repository tracks one, commit on the current branch, push the branch, and open a pull request (or push updates to the branch's existing open pull request). Never force-push (no --force, --force-with-lease, -f, or +refspec)."
+_STANDALONE_DELIVERY = "- Before finishing, bump the project's version when the repository tracks one, commit on the current branch, push the branch, and open a pull request (or push updates to the branch's existing open pull request). When merging a pull request, delete the source branch (pass `--delete-branch`; if a git worktree blocks local branch deletion, ensure the remote branch is deleted without touching other worktrees). Never force-push (no --force, --force-with-lease, -f, or +refspec)."
 _MANAGED_DELIVERY = "- Commit on this branch. Hibernaut controls versioning and publication; do not bump, push, open or merge a PR yourself."
 
 # Program-owned contract; the development method itself comes from the role skill.

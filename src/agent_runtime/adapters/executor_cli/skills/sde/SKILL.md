@@ -22,6 +22,7 @@ If the role contract assigns publication to Hibernaut, commit the reviewed work 
 - Locate the repository's version definition (follow the project guidance or README when specified; otherwise inspect standard project files such as `src/*/__init__.py`, `pyproject.toml`, `package.json`, `Cargo.toml`, or `VERSION`). If the repository tracks a version, bump it according to the project's versioning rules (default SemVer: patch for fixes, minor for compatible features, major for breaking changes). On a rework round where this branch already bumped the version, keep that bump unless the change scope grew.
 - Re-run the repository's full checks after bumping the version so the final commit is verified.
 - Commit on the current branch, push with a normal push (never force-push), and open a pull request with `gh pr create` (if an open pull request already exists for this branch, pushing updates it).
+- When merging a pull request, pass `--delete-branch` to `gh pr merge` so the source branch is deleted. In a git worktree, if `gh` cannot switch branches or delete the local branch, verify the pull request is merged and delete the remote branch (`git push origin --delete <branch>`) if it still exists, without touching other worktrees.
 
 Report test_evidence with each test's command and raw output, failing first and then passing, followed by the
 full-check results. The summary says what changed and where, the version bump, and the pull request URL.
