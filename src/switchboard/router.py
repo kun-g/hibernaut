@@ -37,7 +37,13 @@ class ScopeResolver:
         self._github = {repo.lower(): scope for repo, scope in config.github_repos.items()}
 
     def github(self, repo: str) -> str | None:
-        return self._resolve(self._github.get(repo.lower()))
+        repo = repo.lower()
+        matched = self._github.get(repo)
+        owner, _, name = repo.partition("/")
+        template = self._config.github_owners.get(owner)
+        if matched is None and template is not None and name:
+            matched = template.replace("{repo}", name)
+        return self._resolve(matched)
 
     def feishu(self, chat_id: str) -> str | None:
         return self._resolve(self._config.feishu_chats.get(chat_id))

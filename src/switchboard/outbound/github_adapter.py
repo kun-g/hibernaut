@@ -6,6 +6,7 @@ from typing import Any, cast
 from urllib.parse import quote
 
 from switchboard.addressing import GITHUB_OUTBOUND_MARKER
+from switchboard.github_app import GitHubAppError, GitHubTokenSource
 from switchboard.http_client import HttpClient, HttpResponse
 from switchboard.ports import CredentialBrokerPort, OutboundMessage, SendResult
 
@@ -17,17 +18,27 @@ class GitHubOutboundAdapter:
         credentials: CredentialBrokerPort,
         *,
         api_base: str = "https://api.github.com",
+        tokens: GitHubTokenSource | None = None,
     ) -> None:
         self._http = http
         self._credentials = credentials
         self._api_base = api_base.rstrip("/")
+        # None: the static SWITCHBOARD_GITHUB_TOKEN from the credential broker.
+        self._tokens = tokens
 
     def send(self, msg: OutboundMessage) -> SendResult:
         repo = msg.target.get("repo")
         number = msg.target.get("number")
         if not repo or number is None:
             return SendResult(ok=False, error="github target needs repo and number", retryable=False)
-        token = self._credentials.issue_ephemeral("github")
+        try:
+            token = (
+                self._tokens.token_for(str(repo))
+                if self._tokens is not None
+                else self._credentials.issue_ephemeral("github")
+            )
+        except GitHubAppError as exc:
+            return SendResult(ok=False, error=f"github credential: {exc}", retryable=exc.retryable)
         if not token:
             return SendResult(ok=False, error="github credential unavailable", retryable=True)
         headers = {

@@ -31,6 +31,8 @@ class RoutingConfig:
     default_scope: str = "user:main"
     unmatched_policy: UnmatchedPolicy = "fallback"
     github_repos: Mapping[str, str] = field(default_factory=lambda: {})
+    # owner -> scope template; "{repo}" becomes the lower-cased repository name. github_repos wins.
+    github_owners: Mapping[str, str] = field(default_factory=lambda: {})
     feishu_chats: Mapping[str, str] = field(default_factory=lambda: {})
     # Replaces the default consumers of the listed event types only.
     event_consumers: Mapping[str, tuple[str, ...]] = field(default_factory=lambda: {})
@@ -80,6 +82,8 @@ class OutboundConfig:
     approval_channel: str = "feishu"
     approval_target: str | None = None
     github_api_base: str = "https://api.github.com"
+    # Accounts the GitHub App may mint comment tokens for; only used when the App credentials are set.
+    github_app_owners: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +147,7 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
             default_scope=str(routing.get("default_scope", _ROUTING.default_scope)),
             unmatched_policy=policy,
             github_repos={k.lower(): str(v) for k, v in _table(routing, "github_repos").items()},
+            github_owners={k.lower(): str(v) for k, v in _table(routing, "github_owners").items()},
             feishu_chats={k: str(v) for k, v in _table(routing, "feishu_chats").items()},
             event_consumers=_event_consumers(_table(routing, "event_consumers")),
         ),
@@ -169,9 +174,17 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
             approval_channel=str(outbound.get("approval_channel", _OUTBOUND.approval_channel)),
             approval_target=_optional(outbound.get("approval_target")),
             github_api_base=str(outbound.get("github_api_base", _OUTBOUND.github_api_base)),
+            github_app_owners=_strings(outbound, "github_app_owners"),
         ),
         relay=_relay(_section(raw, "relay")),
     )
+
+
+def _strings(section: Mapping[str, Any], name: str) -> tuple[str, ...]:
+    value = section.get(name, [])
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in cast(list[Any], value)):
+        raise ConfigError(f"{name} must be a list of non-empty strings")
+    return tuple(v.strip() for v in cast(list[str], value))
 
 
 def _event_consumers(table: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:

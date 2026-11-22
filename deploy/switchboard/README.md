@@ -108,9 +108,17 @@ chmod 600 .env
 3. 在 Domains 里给 compose 的 `switchboard` 服务绑域名：Service Name 选 `switchboard`，Container Port 填 `8790`，打开 HTTPS，证书选 Let's Encrypt。
 4. Deploy。服务日志出现 `[switchboard] relay endpoint ... (transport=hybrid)` 后，按下文「冒烟验收」检查；其中第 5 步的端口检查同样适用，第 6 步的 `docker compose exec` 改在 Dokploy 的容器终端里执行。
 
+**改配置不重建的坑**：compose 察觉不到 `configs.content` 的变化，只改 `switchboard.toml` 再部署时容器不会重建，新配置不生效。给服务加一个随配置变化的 label，例如 `labels: ["switchboard.config-sha=<toml 的哈希>"]`，每次改 toml 同步改它。`labels` 必须写成列表：写成映射时 Dokploy 不再注入它的 Traefik label，域名会返回 404。
+
 **证书坑**：Traefik 只在路由首次加载时申请证书。DNS 记录如果晚于部署才建好，证书申请会失败并一直用默认自签证书；DNS 生效后要改一下域名配置（比如把 HTTPS 关掉再打开）并重新部署，才会重新申请。
 
 **升级**：改 `build.context` 里的 commit 后重新部署。回滚同理，改回上一个可用的 commit；新版本改过表结构时，要连同数据卷一起恢复到升级前的备份（见下文「回滚」）。
+
+## 用 GitHub App 收事件和回写评论
+
+- **收事件**：在 GitHub App 的设置里打开 Webhook，URL 填 `https://<域名>/webhooks/github`，Secret 用 `SWITCHBOARD_GITHUB_WEBHOOK_SECRET`，订阅 Issues、Issue comment、Pull request、Pull request review、Pull request review comment。App 装到哪些账号，哪些仓库的事件就会发来，所以 `[routing] unmatched_policy` 要设为 `"reject"`；`[routing.github_owners]` 让某个账号下的新仓库自动路由到 `proj:<仓库名>`，不用再逐个改 `github_repos`。
+- **回写评论**：`.env` 填 `SWITCHBOARD_GITHUB_APP_ID` 和 `SWITCHBOARD_GITHUB_APP_PRIVATE_KEY`（PEM 整体 base64 成一行），`[outbound] github_app_owners` 列出允许签令牌的账号。Switchboard 每次按仓库签一个只含 Issues、Pull requests 写权限、只覆盖该仓库的安装令牌（缓存到过期前 10 分钟），评论作者是 App 的 bot；名单外的仓库直接拒绝，不调 GitHub。启动日志出现 `[switchboard] GitHub comments as App <id> for <owners>`。私钥能给 App 的所有安装签令牌，只放在 Switchboard 的环境变量里。
+- **接入新仓库**：本机在 Hibernaut 检出里执行 `python3 scripts/onboard_project.py <owner>/<repo>`，它克隆仓库到 Hibernaut 检出旁边、建 `hibernaut` 标签、在 `hibernaut.toml` 追加 `[projects.<repo>]`（`github_poll = false`，PR 交付、不自动合并；`--auto-merge` 改为自动合并），守护进程热加载后生效。重复执行不改动已有内容，`--dry-run` 只打印将做的事。
 
 ## 本机 Hibernaut 配对
 

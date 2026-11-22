@@ -701,7 +701,7 @@ def build_daemon_from_config(
         if proj.feishu_chat_id:
             chat_inbox_map[proj.feishu_chat_id] = proj.inbox_id
         target = PollTarget(repo=proj.repo, inbox_id=proj.inbox_id, labels=proj.poll_labels)
-        if target not in poll_targets:
+        if proj.github_poll and target not in poll_targets:
             poll_targets.append(target)
 
     resolved_channel = channel or build_feishu_or_console_channel(

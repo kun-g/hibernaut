@@ -68,6 +68,8 @@ class ProjectConfig:
     repo: str
     checkout: str
     poll_labels: tuple[str, ...] = ()
+    # False when issues arrive by webhook (Switchboard); an empty poll_labels would poll every issue instead.
+    github_poll: bool = True
     worktree_backend: WorktreeBackend = "orca"
     # Where interactive role sessions open; "none" makes interactive roles stop with the reason instead.
     terminal_backend: TerminalBackend = "orca"
@@ -275,6 +277,13 @@ def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> Switchb
     )
 
 
+def _bool(item: dict[str, Any], key: str, default: bool, *, where: str) -> bool:
+    value = item.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{where}.{key} must be true or false")
+    return value
+
+
 def load_config(path: str | Path) -> HibernautConfig:
     raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
     return parse_config(raw, base_dir=Path(path).resolve().parent)
@@ -459,6 +468,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             repo=repo,
             checkout=str(item["checkout"]),
             poll_labels=tuple(str(lbl) for lbl in item.get("poll_labels", ())),
+            github_poll=_bool(item, "github_poll", True, where=f"projects.{name}"),
             worktree_backend=cast(Literal["orca", "git"], backend),
             terminal_backend=terminal,
             orca_create_terminal=bool(item.get("orca_create_terminal", False)),
