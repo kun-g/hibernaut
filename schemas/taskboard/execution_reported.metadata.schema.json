@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionReportedMetadata",
+  "type": "object",
+  "required": ["outcome_kind", "trace_id", "hop_count"],
+  "properties": {
+    "outcome_kind": {
+      "type": "string",
+      "enum": ["emit", "suspend", "error", "done"]
+    },
+    "trace_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "hop_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "task_action": {
+      "type": "string",
+      "enum": ["claim", "update_stage", "complete", "release"]
+    },
+    "stage": {
+      "type": "string"
+    },
+    "assignee": {
+      "type": "string",
+      "pattern": "^(agent|human):[a-z0-9.:_-]+$"
+    },
+    "notify_kind": {
+      "type": "string",
+      "enum": ["human_todo", "upstream_cancelled", "dependency_invalidated"]
+    },
+    "target_assignee": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "artifact_ref": {
+      "type": "string"
+    },
+    "reply_target": {
+      "type": "string"
+    }
+  }
+}

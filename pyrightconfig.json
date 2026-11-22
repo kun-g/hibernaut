@@ -3,7 +3,8 @@
     "src/agent_runtime/core",
     "src/agent_runtime/engine",
     "src/switchboard",
-    "src/ccpeer"
+    "src/ccpeer",
+    "src/taskboard"
   ],
   "extraPaths": [
     "src"

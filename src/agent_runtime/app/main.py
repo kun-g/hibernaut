@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from agent_runtime import __version__
 from agent_runtime.adapters.channels import (
     ConsoleChannelAdapter,
+    DriveAttachmentStore,
     DriveClientProtocol,
     DriveResultWriter,
     DriveTaskPoller,
@@ -485,6 +486,8 @@ def build_daemon(
     gdrive_in_progress_folder_id: str | None = None,
     gdrive_done_folder_id: str | None = None,
     gdrive_failed_folder_id: str | None = None,
+    gdrive_attachments_folder_id: str | None = None,
+    gdrive_attachments_dir: str | Path | None = None,
     gdrive_poll_interval_seconds: float = 30.0,
     gdrive_default_inbox_id: str = "default",
     outbox_dir: str | Path | None = None,
@@ -576,6 +579,12 @@ def build_daemon(
             in_progress_folder_id=gdrive_in_progress_folder_id or None,
             done_folder_id=gdrive_done_folder_id or None,
             failed_folder_id=gdrive_failed_folder_id or None,
+            attachments_folder_id=gdrive_attachments_folder_id or None,
+            attachments=(
+                DriveAttachmentStore(gdrive_client, gdrive_attachments_dir)
+                if gdrive_attachments_dir is not None
+                else None
+            ),
         )
         resolved_channel = gdrive_writer
     if outbox_dir is not None:
@@ -732,6 +741,11 @@ def build_daemon_from_config(
         gdrive_in_progress_folder_id=config.gdrive.in_progress_folder_id or None,
         gdrive_done_folder_id=config.gdrive.done_folder_id or None,
         gdrive_failed_folder_id=config.gdrive.failed_folder_id or None,
+        gdrive_attachments_folder_id=config.gdrive.attachments_folder_id or None,
+        gdrive_attachments_dir=(
+            config.gdrive.attachments_dir
+            or Path(config.runtime.db_path).expanduser().resolve().parent / "attachments"
+        ),
         gdrive_poll_interval_seconds=config.gdrive.poll_interval_seconds,
         gdrive_default_inbox_id=config.gdrive.default_inbox_id,
         outbox_dir=config.channels.outbox_dir or None,

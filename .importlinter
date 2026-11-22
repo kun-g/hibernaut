@@ -3,6 +3,7 @@ root_packages =
     agent_runtime
     switchboard
     ccpeer
+    taskboard
 include_external_packages = True
 
 [importlinter:contract:clean-layers]
@@ -53,3 +54,37 @@ forbidden_modules =
     switchboard
     runner
     memory_hub
+
+[importlinter:contract:taskboard-no-runtime-deps]
+name = Taskboard must not depend on execution runtime or memory/broker internals
+type = forbidden
+source_modules =
+    taskboard
+forbidden_modules =
+    agent_runtime
+    runner
+    hibernaut
+    broker
+    memory
+    memory_hub
+
+[importlinter:contract:taskboard-clean-layers]
+name = Taskboard Clean Architecture L3 -> L2 -> L1 -> L0 unidirectional layers
+type = layers
+layers =
+    taskboard.adapters
+    taskboard.engine
+    taskboard.ports
+    taskboard.core
+
+[importlinter:contract:taskboard-core-pure]
+name = Taskboard L0 core must not depend on switchboard or sqlite3
+type = forbidden
+source_modules =
+    taskboard.core
+forbidden_modules =
+    sqlite3
+    switchboard
+    taskboard.adapters
+    taskboard.engine
+    taskboard.ports

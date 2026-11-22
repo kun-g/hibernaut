@@ -66,6 +66,10 @@ class _Item:
     parents: list[str]
     content: str = ""
     modified_time: str = "2026-11-22T03:00:00Z"
+    # Binary media content; None serves `content` as UTF-8.
+    blob: bytes | None = None
+    # What a Google Doc exports as text/markdown; None exports `content`.
+    markdown: str | None = None
 
 
 @dataclass
@@ -74,6 +78,10 @@ class FakeGoogleDrive:
     items: dict[str, _Item] = field(default_factory=dict)
     requests: list[tuple[str, str]] = field(default_factory=list)
     token_requests: int = 0
+    # Non-zero: exporting a Google Doc as text/markdown fails with this HTTP status.
+    markdown_export_status: int = 0
+    # Non-zero: every Google Doc export fails with this HTTP status.
+    export_status: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def add_folder(self, folder_id: str, name: str, parent: str) -> None:
@@ -90,6 +98,12 @@ class FakeGoogleDrive:
         modified_time: str = "2026-11-22T03:00:00Z",
     ) -> None:
         self.items[file_id] = _Item(file_id, name, mime_type, [parent], content, modified_time)
+
+    def add_blob(self, file_id: str, name: str, blob: bytes, parent: str, *, mime_type: str = "application/zip") -> None:
+        self.items[file_id] = _Item(file_id, name, mime_type, [parent], blob=blob)
+
+    def add_doc(self, file_id: str, name: str, *, plain: str, markdown: str, parent: str) -> None:
+        self.items[file_id] = _Item(file_id, name, DOC_MIME, [parent], plain, markdown=markdown)
 
     def parents(self, file_id: str) -> list[str]:
         return list(self.items[file_id].parents)
@@ -133,14 +147,17 @@ class FakeGoogleDrive:
                 return True
 
             def _meta(self, item: _Item) -> dict[str, Any]:
-                return {
+                meta: dict[str, Any] = {
                     "id": item.file_id,
                     "name": item.name,
                     "mimeType": item.mime_type,
                     "modifiedTime": item.modified_time,
                     "parents": list(item.parents),
-                    "size": str(len(item.content.encode("utf-8"))),
                 }
+                # Like Drive: Google Docs and folders carry no size.
+                if item.mime_type not in (DOC_MIME, FOLDER_MIME):
+                    meta["size"] = str(len(item.blob if item.blob is not None else item.content.encode("utf-8")))
+                return meta
 
             def _body(self) -> bytes:
                 return self.rfile.read(int(self.headers.get("Content-Length") or 0))
@@ -174,7 +191,13 @@ class FakeGoogleDrive:
                             for it in drive.items.values()
                             if parent in it.parents and (it.mime_type == FOLDER_MIME) == want_folders
                         ]
-                        self._json(200, {"files": files})
+                        # Paged like Drive: at most pageSize per response, the rest behind nextPageToken.
+                        size = int(query.get("pageSize", ["100"])[0])
+                        start = int(query.get("pageToken", ["0"])[0])
+                        page: dict[str, Any] = {"files": files[start : start + size]}
+                        if start + size < len(files):
+                            page["nextPageToken"] = str(start + size)
+                        self._json(200, page)
                         return
                     parts = parsed.path.split("/")
                     if len(parts) >= 5 and parts[:4] == ["", "drive", "v3", "files"]:
@@ -183,9 +206,26 @@ class FakeGoogleDrive:
                             self._json(404, {"error": "notFound"})
                             return
                         if len(parts) == 6 and parts[5] == "export":
-                            self._reply(200, item.content.encode("utf-8"), "text/plain")
+                            export_mime = query.get("mimeType", [""])[0]
+                            if drive.export_status:
+                                self._json(drive.export_status, {"error": "exportFailed"})
+                                return
+                            if export_mime == "text/markdown":
+                                if drive.markdown_export_status:
+                                    self._json(drive.markdown_export_status, {"error": "exportFailed"})
+                                    return
+                                text = item.markdown if item.markdown is not None else item.content
+                                self._reply(200, text.encode("utf-8"), "text/markdown")
+                            elif export_mime == "text/plain":
+                                self._reply(200, item.content.encode("utf-8"), "text/plain")
+                            else:
+                                self._json(400, {"error": "badExportFormat"})
                         elif query.get("alt") == ["media"]:
-                            self._reply(200, item.content.encode("utf-8"), "text/markdown")
+                            if item.mime_type.startswith("application/vnd.google-apps."):
+                                self._json(403, {"error": "fileNotDownloadable"})
+                                return
+                            data = item.blob if item.blob is not None else item.content.encode("utf-8")
+                            self._reply(200, data, item.mime_type)
                         else:
                             self._json(200, self._meta(item))
                         return

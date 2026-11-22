@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from typing import Any, Protocol
 
 from agent_runtime.core.models import (
@@ -106,13 +106,15 @@ class ChannelPort(Protocol):
 
 class RunStartListener(Protocol):
     # Called once per batch after it is claimed and bound to a session, just before its executor starts.
-    # A failure is logged by the worker and never fails or delays the Run.
+    # A failure is logged by the worker and never fails or delays the Run. It may return replacement payloads by
+    # event_id (such as a task body with its fetched attachments listed): the executor sees them in this Run only,
+    # and the stored events keep their payloads.
     def on_run_started(
         self,
         inbox_id: str,
         events: Sequence[Event],
         correlation_key: str | None,
-    ) -> None: ...
+    ) -> Mapping[str, Mapping[str, Any]] | None: ...
 
 
 class RunCapabilities(Protocol):

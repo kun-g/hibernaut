@@ -12,8 +12,10 @@ from agent_runtime.adapters.channels.file_outbox import (
     render_header,
     render_summary,
 )
+from agent_runtime.adapters.channels.gdrive_attachments import DriveAttachmentStore
 from agent_runtime.adapters.channels.gdrive_tasks import (
     DriveClientProtocol,
+    DriveDownload,
     DriveFileMeta,
     DriveQueueFolders,
     DriveResultWriter,
@@ -27,7 +29,9 @@ from agent_runtime.adapters.channels.mcp_server import MCPServerAdapter
 
 __all__ = [
     "ConsoleChannelAdapter",
+    "DriveAttachmentStore",
     "DriveClientProtocol",
+    "DriveDownload",
     "DriveFileMeta",
     "DriveProxyError",
     "DriveQueueFolders",
