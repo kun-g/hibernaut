@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Installs the Hibernaut Google Drive queue credential proxy as a system service that runs under its
 # own user. Only that user can read the service account key; Hibernaut gets a local client token.
-# Usage and file layout: deploy/gdrive-proxy/README.md
+# --upgrade replaces only the code and launcher of an existing installation and leaves the key, token
+# and configuration alone. Usage and file layout: deploy/gdrive-proxy/README.md
 set -euo pipefail
 
 PREFIX=/opt/hibernaut-drive-proxy
@@ -11,7 +12,8 @@ CONFIG="$ETC/config.toml"
 MODULE=agent_runtime.adapters.credential_proxy.gdrive_queue
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/src/agent_runtime"
 
-KEY="" ROOT_FOLDER_ID="" HB_USER="" PYTHON_BIN="" PORT=9100 HTTPS_PROXY_URL="" PLATFORM="" DRY_RUN=0 RUN_CHECK=1
+KEY="" ROOT_FOLDER_ID="" HB_USER="" PYTHON_BIN="" PORT=9100 PORT_SET=0 HTTPS_PROXY_URL="" PLATFORM=""
+DRY_RUN=0 RUN_CHECK=1 UPGRADE=0
 
 usage() {
   cat <<'EOF'
@@ -26,6 +28,12 @@ sudo deploy/gdrive-proxy/install.sh --key PATH --root-folder-id ID --hb-user USE
   --no-check            skip the read-only queue check against Google Drive
   --dry-run             print the commands instead of running them
   --platform P          macos | linux (default: this machine)
+
+sudo deploy/gdrive-proxy/install.sh --upgrade [--python PATH] [--no-check] [--dry-run] [--platform P]
+
+  --upgrade             replace only the proxy code and launcher of an existing installation, check the
+                        queue with the new code, then restart the service; the key, client token,
+                        config and service unit stay as they are (--python defaults to the launcher's)
 EOF
 }
 
@@ -37,23 +45,36 @@ while [ $# -gt 0 ]; do
     --root-folder-id) ROOT_FOLDER_ID="${2:-}"; shift 2 ;;
     --hb-user) HB_USER="${2:-}"; shift 2 ;;
     --python) PYTHON_BIN="${2:-}"; shift 2 ;;
-    --port) PORT="${2:-}"; shift 2 ;;
+    --port) PORT="${2:-}"; PORT_SET=1; shift 2 ;;
     --https-proxy) HTTPS_PROXY_URL="${2:-}"; shift 2 ;;
     --platform) PLATFORM="${2:-}"; shift 2 ;;
     --no-check) RUN_CHECK=0; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --upgrade) UPGRADE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown option: $1" ;;
   esac
 done
 
-[ -n "$KEY" ] && [ -n "$ROOT_FOLDER_ID" ] && [ -n "$HB_USER" ] || { usage >&2; die "--key, --root-folder-id and --hb-user are required"; }
-[[ "$ROOT_FOLDER_ID" =~ ^[A-Za-z0-9_-]{1,200}$ ]] || die "--root-folder-id is not a Drive ID"
-[[ "$HB_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || die "--hb-user is not a user name"
-[[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port must be 1-65535"
-[ -z "$HTTPS_PROXY_URL" ] || [[ "$HTTPS_PROXY_URL" =~ ^https?://[A-Za-z0-9.:@_-]+/?$ ]] || die "--https-proxy must be http(s)://host:port"
-[ -r "$KEY" ] || die "cannot read key file $KEY"
-grep -q '"private_key"' "$KEY" || die "$KEY is not a service account JSON key (no private_key)"
+proxy_url_ok() { [[ "$1" =~ ^https?://[A-Za-z0-9.:@_-]+/?$ ]]; }
+
+if [ "$UPGRADE" = 1 ]; then
+  conflicts=()
+  [ -z "$KEY" ] || conflicts+=(--key)
+  [ -z "$ROOT_FOLDER_ID" ] || conflicts+=(--root-folder-id)
+  [ -z "$HB_USER" ] || conflicts+=(--hb-user)
+  [ "$PORT_SET" = 0 ] || conflicts+=(--port)
+  [ -z "$HTTPS_PROXY_URL" ] || conflicts+=(--https-proxy)
+  [ ${#conflicts[@]} -eq 0 ] || die "--upgrade keeps the installed key and configuration and cannot take ${conflicts[*]}; to change them run the full install without --upgrade"
+else
+  [ -n "$KEY" ] && [ -n "$ROOT_FOLDER_ID" ] && [ -n "$HB_USER" ] || { usage >&2; die "--key, --root-folder-id and --hb-user are required"; }
+  [[ "$ROOT_FOLDER_ID" =~ ^[A-Za-z0-9_-]{1,200}$ ]] || die "--root-folder-id is not a Drive ID"
+  [[ "$HB_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || die "--hb-user is not a user name"
+  [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port must be 1-65535"
+  [ -z "$HTTPS_PROXY_URL" ] || proxy_url_ok "$HTTPS_PROXY_URL" || die "--https-proxy must be http(s)://host:port"
+  [ -r "$KEY" ] || die "cannot read key file $KEY"
+  grep -q '"private_key"' "$KEY" || die "$KEY is not a service account JSON key (no private_key)"
+fi
 [ -d "$SRC_DIR" ] || die "run this script from a Hibernaut checkout ($SRC_DIR is missing)"
 
 if [ -z "$PLATFORM" ]; then
@@ -61,8 +82,10 @@ if [ -z "$PLATFORM" ]; then
 fi
 case "$PLATFORM" in
   macos) SVC_USER=_hbdriveproxy; ROOT_GROUP=wheel; LABEL=ai.hibernaut.drive-proxy
-         PLIST="/Library/LaunchDaemons/$LABEL.plist"; LOG=/var/log/hibernaut-drive-proxy.log ;;
-  linux) SVC_USER=hb-drive-proxy; ROOT_GROUP=root; UNIT=/etc/systemd/system/hibernaut-drive-proxy.service ;;
+         PLIST="/Library/LaunchDaemons/$LABEL.plist"; LOG=/var/log/hibernaut-drive-proxy.log
+         SERVICE_FILE="$PLIST"; LOGS="tail -f $LOG" ;;
+  linux) SVC_USER=hb-drive-proxy; ROOT_GROUP=root; UNIT=/etc/systemd/system/hibernaut-drive-proxy.service
+         SERVICE_FILE="$UNIT"; LOGS="journalctl -u hibernaut-drive-proxy" ;;
   *) die "--platform must be macos or linux" ;;
 esac
 
@@ -80,6 +103,43 @@ python_ok() {
   case "$1" in /Users/*|/home/*|/root/*) return 1 ;; esac
   [ -x "$1" ] && "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null
 }
+
+if [ "$UPGRADE" = 1 ]; then
+  # Test hook: with --dry-run only, look for the installation under this directory instead of /.
+  FS=""
+  [ "$DRY_RUN" = 0 ] || FS="${HB_DRIVE_PROXY_DRY_RUN_ROOT:-}"
+  missing=() unverified=0
+  id -u "$SVC_USER" >/dev/null 2>&1 || missing+=("service user $SVC_USER")
+  # Only existence is tested; the key and token are never opened.
+  for f in "$ETC/sa.json" "$ETC/client.token" "$CONFIG" "$SERVICE_FILE"; do
+    if [ -e "$FS$f" ]; then
+      :
+    elif [ "$DRY_RUN" = 1 ] && [ "${f#"$ETC"/}" != "$f" ] && [ -d "$FS$ETC" ] && [ ! -x "$FS$ETC" ]; then
+      unverified=1
+    else
+      missing+=("$f")
+    fi
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    die "no complete installation to upgrade (missing: ${missing[*]}); install it with
+  sudo deploy/gdrive-proxy/install.sh --key PATH --root-folder-id ID --hb-user USER [options]"
+  fi
+  [ "$unverified" = 0 ] || echo "note: $ETC is not readable without sudo; assuming its files are there"
+
+  if [ -z "$PYTHON_BIN" ]; then
+    shebang="$(head -n 1 "$FS$LAUNCHER" 2>/dev/null || true)"
+    case "$shebang" in '#!/'*) PYTHON_BIN="${shebang#??}"; PYTHON_BIN="${PYTHON_BIN%% *}" ;; esac
+    [ -n "$PYTHON_BIN" ] || die "cannot read the Python from $LAUNCHER; pass --python"
+  fi
+
+  # The service keeps its HTTPS_PROXY; the check must reach Google the same way.
+  if [ "$PLATFORM" = linux ]; then
+    HTTPS_PROXY_URL="$(sed -n 's/^Environment=HTTPS_PROXY=//p' "$FS$UNIT" | head -n 1)"
+  else
+    HTTPS_PROXY_URL="$(sed -n 's:.*<key>HTTPS_PROXY</key><string>\([^<]*\)</string>.*:\1:p' "$FS$PLIST" | head -n 1)"
+  fi
+  [ -z "$HTTPS_PROXY_URL" ] || proxy_url_ok "$HTTPS_PROXY_URL" || die "unexpected HTTPS_PROXY in $SERVICE_FILE"
+fi
 if [ -z "$PYTHON_BIN" ]; then
   for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 \
               /opt/homebrew/bin/python3.1{4,3,2,1} /usr/local/bin/python3.1{4,3,2,1} /usr/bin/python3.1{4,3,2,1}; do
@@ -93,6 +153,114 @@ case "$PYTHON_BIN" in
   *) die "--python must be an absolute path" ;;
 esac
 [ "$DRY_RUN" = 1 ] || python_ok "$PYTHON_BIN" || die "$PYTHON_BIN is not Python 3.11+"
+
+TMP="$(mktemp -d)"
+chmod 700 "$TMP"
+STAGED=0 SWAPPED=0 COMMITTED=0
+
+write_launcher() {
+  cat >"$1" <<EOF
+#!$PYTHON_BIN -I
+import sys
+sys.path.insert(0, "$PREFIX/src")
+from $MODULE import main
+raise SystemExit(main())
+EOF
+}
+
+# Undoes an upgrade's swap; src.old and the launcher's .old copy exist only when this run made them.
+restore_previous_code() {
+  if [ -d "$PREFIX/src.old" ]; then
+    run rm -rf "$PREFIX/src"
+    run mv "$PREFIX/src.old" "$PREFIX/src"
+  fi
+  if [ -e "$LAUNCHER.old" ]; then run mv -f "$LAUNCHER.old" "$LAUNCHER"; fi
+  run rm -f "$LAUNCHER.new"
+}
+
+cleanup() {
+  local rc=$?
+  if [ "$DRY_RUN" = 0 ] && [ "$COMMITTED" = 0 ]; then
+    set +e
+    if [ "$SWAPPED" = 1 ]; then
+      restore_previous_code
+      echo "install.sh: upgrade failed; the previous code is back in place and the service was not restarted" >&2
+    elif [ "$STAGED" = 1 ]; then
+      rm -rf "$PREFIX/src.new" "$LAUNCHER.new"
+      echo "install.sh: upgrade stopped before the swap; the installed code and the service are unchanged" >&2
+    fi
+  fi
+  rm -rf "$TMP"
+  exit "$rc"
+}
+trap cleanup EXIT
+
+PROXY_ENV=()
+[ -z "$HTTPS_PROXY_URL" ] || PROXY_ENV=("HTTPS_PROXY=$HTTPS_PROXY_URL")
+
+if [ "$UPGRADE" = 1 ]; then
+  echo "== 1/5 installation found (service user $SVC_USER, $ETC, $SERVICE_FILE); $ETC is left unchanged"
+
+  echo "== 2/5 stage the new code in $PREFIX/src.new"
+  STAGED=1
+  run rm -rf "$PREFIX/src.new" "$PREFIX/src.old" "$LAUNCHER.new" "$LAUNCHER.old"
+  run install -d -m 0755 -o root -g "$ROOT_GROUP" "$PREFIX/src.new"
+  run cp -R "$SRC_DIR" "$PREFIX/src.new/agent_runtime"
+  run find "$PREFIX/src.new" -name __pycache__ -prune -exec rm -rf {} +
+  run chown -R "root:$ROOT_GROUP" "$PREFIX/src.new"
+  run chmod -R u=rwX,go=rX "$PREFIX/src.new"
+  run sudo -u "$SVC_USER" "$PYTHON_BIN" -I -c "import sys; sys.path.insert(0, '$PREFIX/src.new'); import $MODULE"
+  write_launcher "$TMP/launcher"
+  run install -m 0755 -o root -g "$ROOT_GROUP" "$TMP/launcher" "$LAUNCHER.new"
+
+  echo "== 3/5 swap in the new code (the previous code stays in $PREFIX/src.old until the check passes)"
+  SWAPPED=1
+  if [ "$DRY_RUN" = 1 ] || [ -e "$LAUNCHER" ]; then run cp -p "$LAUNCHER" "$LAUNCHER.old"; fi
+  if [ "$DRY_RUN" = 1 ] || [ -d "$PREFIX/src" ]; then run mv "$PREFIX/src" "$PREFIX/src.old"; fi
+  run mv "$PREFIX/src.new" "$PREFIX/src"
+  run mv -f "$LAUNCHER.new" "$LAUNCHER"
+
+  echo "== 4/5 check the new code as $SVC_USER (the service still runs the previous code)"
+  if [ "$RUN_CHECK" = 1 ]; then
+    [ "$DRY_RUN" = 0 ] || echo "(if the check fails: restore $PREFIX/src.old and $LAUNCHER.old, leave the service alone, exit 1)"
+    if ! run sudo -u "$SVC_USER" env ${PROXY_ENV[@]+"${PROXY_ENV[@]}"} "$LAUNCHER" --config "$CONFIG" --check; then
+      set +e
+      restore_previous_code
+      STAGED=0 SWAPPED=0
+      cat >&2 <<EOF
+install.sh: the read-only queue check failed with the new code (its output is above).
+The previous code is back in place and the service was not restarted, so it keeps running.
+To look into it:
+  - rerun the check: sudo -u $SVC_USER ${PROXY_ENV[*]:+env ${PROXY_ENV[*]} }$LAUNCHER --config $CONFIG --check
+  - Google unreachable: the check used the service's HTTPS_PROXY (${HTTPS_PROXY_URL:-none})
+  - folder errors: is the queue folder in $CONFIG still shared with the service account?
+  - config errors: does the new code need a key that $CONFIG lacks? See deploy/gdrive-proxy/README.md
+Use --no-check only when the failure has nothing to do with the code.
+EOF
+      exit 1
+    fi
+  else
+    echo "skipped (--no-check)"
+  fi
+  COMMITTED=1
+  run rm -rf "$PREFIX/src.old"
+  run rm -f "$LAUNCHER.old"
+
+  echo "== 5/5 restart the service"
+  if [ "$PLATFORM" = linux ]; then
+    run systemctl restart hibernaut-drive-proxy || die "the new code is installed but the service did not restart; see $LOGS"
+  else
+    run launchctl kickstart -k "system/$LABEL" \
+      || die "the new code is installed but the service did not restart (load it with: launchctl bootstrap system $PLIST); see $LOGS"
+  fi
+  cat <<EOF
+
+Upgraded the proxy code in $PREFIX (logs: $LOGS).
+$ETC and $SERVICE_FILE were not changed; configuration keys that newer code adds
+take their defaults (deploy/gdrive-proxy/README.md lists them). Hibernaut needs no restart.
+EOF
+  exit 0
+fi
 
 if id -u "$HB_USER" >/dev/null 2>&1; then
   HB_GROUP="$(id -gn "$HB_USER")"
@@ -108,10 +276,6 @@ else
 fi
 HB_TOKEN_DIR="$HB_HOME/.config/hibernaut"
 HB_TOKEN="$HB_TOKEN_DIR/gdrive-proxy.token"
-
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-chmod 700 "$TMP"
 
 echo "== 1/6 service user $SVC_USER"
 if id -u "$SVC_USER" >/dev/null 2>&1; then
@@ -152,13 +316,7 @@ run chown -R "root:$ROOT_GROUP" "$PREFIX/src.new"
 run chmod -R u=rwX,go=rX "$PREFIX/src.new"
 run rm -rf "$PREFIX/src"
 run mv "$PREFIX/src.new" "$PREFIX/src"
-cat >"$TMP/launcher" <<EOF
-#!$PYTHON_BIN -I
-import sys
-sys.path.insert(0, "$PREFIX/src")
-from $MODULE import main
-raise SystemExit(main())
-EOF
+write_launcher "$TMP/launcher"
 run install -m 0755 -o root -g "$ROOT_GROUP" "$TMP/launcher" "$LAUNCHER"
 
 echo "== 3/6 key, client token and config in $ETC"
@@ -189,8 +347,6 @@ fi
 run install -m 0600 -o "$HB_USER" -g "$HB_GROUP" "$TMP/client.token" "$HB_TOKEN"
 
 echo "== 5/6 checks as $SVC_USER"
-PROXY_ENV=()
-[ -z "$HTTPS_PROXY_URL" ] || PROXY_ENV=("HTTPS_PROXY=$HTTPS_PROXY_URL")
 run sudo -u "$SVC_USER" "$PYTHON_BIN" -I -c "import sys; sys.path.insert(0, '$PREFIX/src'); import $MODULE"
 if [ "$DRY_RUN" = 1 ]; then
   run sudo -u "$HB_USER" test -r "$ETC/sa.json"
@@ -234,7 +390,6 @@ if [ "$PLATFORM" = linux ]; then
   run systemctl daemon-reload
   run systemctl enable --now hibernaut-drive-proxy
   run systemctl restart hibernaut-drive-proxy
-  LOGS="journalctl -u hibernaut-drive-proxy"
 else
   {
     echo '<?xml version="1.0" encoding="UTF-8"?>'
@@ -265,7 +420,6 @@ else
     launchctl bootout "system/$LABEL" 2>/dev/null || true
   fi
   run launchctl bootstrap system "$PLIST"
-  LOGS="tail -f $LOG"
 fi
 
 cat <<EOF

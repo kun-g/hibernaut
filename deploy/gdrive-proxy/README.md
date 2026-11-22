@@ -13,7 +13,7 @@ sudo deploy/gdrive-proxy/install.sh \
   --hb-user "$USER"
 ```
 
-Add `--https-proxy http://127.0.0.1:7890` when this machine reaches Google through a local proxy. `--dry-run` prints every command without running it. Run the same command again to upgrade the code; the client token is kept.
+Add `--https-proxy http://127.0.0.1:7890` when this machine reaches Google through a local proxy. `--dry-run` prints every command without running it. To update only the code later, see [Upgrade](#upgrade); it needs no key.
 
 The installer:
 
@@ -37,7 +37,25 @@ default_inbox_id = "proj:hibernaut"
 
 Restart Hibernaut to start polling.
 
-The proxy runs its own copy of the code. After a Hibernaut update that changes `adapters/credential_proxy/` or `adapters/channels/gdrive_tasks.py`, rerun the installer so the proxy picks it up; until then Hibernaut talks to the old proxy (for example, no attachments).
+## Upgrade
+
+The proxy runs its own copy of the code in `/opt/hibernaut-drive-proxy`, so a change to the proxy code (`src/agent_runtime/adapters/credential_proxy/` or anything it imports, such as a new operation) reaches it only after an upgrade. After pulling such a change, run from the checkout:
+
+```bash
+sudo deploy/gdrive-proxy/install.sh --upgrade
+```
+
+The upgrade:
+
+1. Checks that the proxy is installed: the service user, `sa.json`, `client.token` and `config.toml` in `/etc/hibernaut-drive-proxy/`, and the LaunchDaemon or systemd unit. Otherwise it stops and points to the full install command.
+2. Stages the checkout's `src/agent_runtime` in `/opt/hibernaut-drive-proxy/src.new` (owned by root, `go=rX`), checks that it loads as the service user, and writes the new launcher next to the old one. It reuses the launcher's Python unless `--python` is given.
+3. Swaps by renaming: the running code moves to `src.old`, the new code becomes `src`, the old launcher is kept as `hibernaut-drive-proxy.old`.
+4. Runs the read-only `--check` with the new code, as the service user and with the service's `HTTPS_PROXY`. The service still runs the previous code at this point. When the check fails, the upgrade moves `src.old` and the old launcher back, leaves the service alone and exits 1 with hints. When any earlier step fails, the installed code is not touched. `--no-check` skips the check.
+5. Deletes `src.old` and the old launcher, then restarts the service (`launchctl kickstart -k system/ai.hibernaut.drive-proxy` or `systemctl restart hibernaut-drive-proxy`).
+
+It never opens, copies or prints the key or the client token, and does not rewrite `config.toml`, the service unit, the service user or the token in the Hibernaut user's home, so the port, the queue folder ID and `HTTPS_PROXY` stay as installed. Configuration keys that new code adds have defaults (see [Configuration file](#configuration-file)); set them in `config.toml` by hand when the defaults do not fit. `--dry-run` prints the commands. Hibernaut needs no restart.
+
+`--upgrade` refuses `--key`, `--root-folder-id`, `--hb-user`, `--port` and `--https-proxy`. To change any of those, or to rotate the key, run the full install command from [Install](#install), which needs the key file again and rewrites the key, the configuration and the service unit (keeping the client token).
 
 ## Queue folder layout
 
