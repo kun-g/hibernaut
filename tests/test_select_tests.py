@@ -19,6 +19,17 @@ class TestSelectTests(unittest.TestCase):
         self.assertFalse(res.full_suite)
         self.assertEqual(res.tests, ("tests/test_ccpeer.py",))
 
+    def test_taskboard_schema_change_selects_schema_consuming_tests(self) -> None:
+        res = select_tests(["schemas/taskboard/work_ready.metadata.schema.json"])
+        self.assertFalse(res.full_suite)
+        self.assertEqual(
+            res.tests,
+            (
+                "tests/taskboard/test_m3_engine_and_switchboard.py",
+                "tests/taskboard/test_m4_architecture_and_schemas.py",
+            ),
+        )
+
     def test_switchboard_deploy_kit_change_selects_its_test(self) -> None:
         res = select_tests(["deploy/switchboard/Dockerfile"])
         self.assertFalse(res.full_suite)

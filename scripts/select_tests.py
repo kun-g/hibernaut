@@ -60,6 +60,13 @@ RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("deploy/gdrive-proxy/**", ("tests/test_gdrive_credential_proxy.py",)),
     ("deploy/switchboard/**", ("tests/test_switchboard_deploy.py",)),
     ("deploy/ccpeer/**", ("tests/test_ccpeer.py",)),
+    (
+        "schemas/taskboard/**",
+        (
+            "tests/taskboard/test_m3_engine_and_switchboard.py",
+            "tests/taskboard/test_m4_architecture_and_schemas.py",
+        ),
+    ),
     ("docs/dispatch/**", ("tests/test_sde_delivery.py",)),
     ("docs/process/versioning.md", ("tests/test_sde_delivery.py",)),
     ("guidance.toml", ("tests/test_sde_delivery.py",)),

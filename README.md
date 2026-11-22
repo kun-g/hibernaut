@@ -21,6 +21,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 安全 | agent 进程不持有真实密钥：API key 由外置代理注入，Drive 密钥由独立系统用户保管，GitHub 走宿主机凭据 |
 | 运维 | 配置热加载、跟随 `origin/main` 自动更新；Outbox 上报失败按 5/15/45/135/405 秒持久化退避，重启不丢进度 |
 | Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard |
+| Taskboard（Phase 1） | 同仓的独立包：多来源任务归集（一个任务可挂多个来源）、5 态状态机、DAG 依赖与环检测、上游完成后自动解锁下游，经 Switchboard 发 `work.ready` 或给人发待办通知；SQLite 存储；尚未接入 daemon 与 Switchboard 进程 |
 
 ## 工作方式
 
@@ -108,7 +109,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 
 | 文档 | 内容 |
 | :--- | :--- |
-| [`docs/architecture.md`](docs/architecture.md) | 完整设计：生命周期（§1）、分层（§2）、会话与路由及各入口（§3）、执行器、评审、SDE、PR 交付、worktree、多 inbox 项目、热加载（§4）、并发与新事件策略（§5）、Switchboard（§7） |
+| [`docs/architecture.md`](docs/architecture.md) | 完整设计：生命周期（§1）、分层（§2）、会话与路由及各入口（§3）、执行器、评审、SDE、PR 交付、worktree、多 inbox 项目、热加载（§4）、并发与新事件策略（§5）、Switchboard（§7）、ccpeer（§9）、Taskboard（§10） |
 | [`docs/glossary.md`](docs/glossary.md) | 术语表（术语以它为准） |
 | [`AGENTS.md`](AGENTS.md) | 开发规范与提交门禁 |
 | [`docs/dispatch/`](docs/dispatch) | 派单模板：SDE 任务（`/events`、Drive）、独立评审 |
@@ -129,6 +130,8 @@ src/agent_runtime/
 └── app/        # 配置加载与组装根（daemon、demo）
 src/switchboard/  # 独立包，不依赖 agent_runtime
 src/ccpeer/       # 独立包：与本机 Claude Code 会话收发消息（发送、会话发现、常驻接收端），只依赖标准库
+src/taskboard/    # 独立包：多源任务归集与 DAG 编排（core/ L0、ports.py L1、engine/ L2、adapters/ L3），只依赖标准库与 switchboard
+schemas/taskboard/  # Taskboard 与 Switchboard 之间事件 metadata 的 JSON Schema（Draft 2020-12）
 ```
 
 提交前三道门禁必须全绿：
@@ -137,5 +140,5 @@ src/ccpeer/       # 独立包：与本机 Claude Code 会话收发消息（发�
 pip install -e ".[dev]"
 lint-imports   # 分层与反向依赖检查
 pytest -v      # 契约、并发、端到端测试（本地快检可用 pytest -n auto $(python scripts/select_tests.py)）
-pyright        # core/、engine/、switchboard/、ccpeer/ 的 strict 类型检查
+pyright        # core/、engine/、switchboard/、ccpeer/、taskboard/ 的 strict 类型检查
 ```

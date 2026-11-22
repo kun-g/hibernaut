@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkOpenedMetadata",
+  "type": "object",
+  "required": ["work_kind", "trace_id", "hop_count"],
+  "properties": {
+    "work_kind": {
+      "type": "string",
+      "enum": ["issue", "pr", "task"]
+    },
+    "state": {
+      "type": "string"
+    },
+    "trace_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "hop_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8
+    },
+    "initial_status": {
+      "type": "string",
+      "enum": ["backlog", "ready"],
+      "default": "backlog"
+    },
+    "assignee": {
+      "type": "string",
+      "pattern": "^(agent|human):[a-z0-9.:_-]+$"
+    },
+    "task_type": {
+      "type": "string"
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3
+    },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "preferred_executor": {
+      "type": "string"
+    },
+    "reply_target": {
+      "type": "string"
+    },
+    "artifact_ref": {
+      "type": "string"
+    }
+  }
+}
