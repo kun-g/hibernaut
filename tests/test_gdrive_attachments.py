@@ -96,9 +96,10 @@ class DriveAttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.drive = _AttachmentDrive()
         self.executor = _RecordingExecutor()
 
-    def build(self, drive: _AttachmentDrive | None = None, executor: _RecordingExecutor | None = None) -> None:
+    def build(self, drive: _AttachmentDrive | None = None, executor: _RecordingExecutor | None = None,
+              db_name: str = "gd.db") -> None:
         self.daemon = build_daemon(
-            db_path=self.root / "gd.db",
+            db_path=self.root / db_name,
             memory_root=self.root / "mem",
             max_concurrency=1,
             executor_factory=lambda _iid: executor or self.executor,
@@ -224,6 +225,64 @@ class DriveAttachmentTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(f"- `{ref}`：{failure}", with_refs)
         self.assertIn(f"- 正文里的 Drive 文件 ID：{failure}，未能识别正文引用的附件", with_refs)
         self.assertEqual(self.drive.downloads, [])
+
+    async def test_real_yaml_list_reference_also_in_the_body_regression(self) -> None:
+        # The 2026-11-23 task: frontmatter wrote the ID as a YAML list and the body repeated it. The section used to
+        # list the file as downloaded and `[<ID>]` as 「不在 附件/ 目录」.
+        real_id = "1QvaVZhZkRo1f_EknUHVJtBmE7UhNyxUm03fMV2fJGXw"
+        self.drive.add_attachment(real_id, "taskboard.md", b"# Taskboard")
+        self.drive.add_file("task-1", "task.md",
+                            f"---\nscope: proj:drive\nattachments: [{real_id}]\n---\n设计方案见附件 {real_id}。")
+        self.build()
+        await self.run_once()
+        body = self.executor.bodies[0]
+        self.assertIn("`taskboard.md`：", body)
+        self.assertNotIn("没有拿到", body)
+        self.assertNotIn(f"[{real_id}", body)
+        self.assertEqual(self.drive.downloads, [real_id])
+
+    async def test_list_spellings_give_the_same_section(self) -> None:
+        spellings = {
+            "comma": "attachments: b.zip, {other}\n",
+            "inline list": 'attachments: [b.zip, "{other}"]\n',
+            "block list": "attachments:\n  - b.zip\n  - '{other}'\n",
+        }
+        sections: dict[str, str] = {}
+        for label, line in spellings.items():
+            with self.subTest(label):
+                drive = _AttachmentDrive()
+                drive.add_attachment(BUNDLE_ID, "b.zip", BUNDLE_BYTES)
+                drive.add_attachment(DESIGN_ID, "d.bin", b"design")
+                drive.add_file("task-1", "task.md", "---\n" + line.format(other=DESIGN_ID) + "---\nGo.")
+                executor = _RecordingExecutor()
+                self.attach_root = self.root / label / "attachments"
+                self.build(drive=drive, executor=executor, db_name=f"{label}.db")
+                await self.run_once()
+                body = executor.bodies[0]
+                self.assertEqual(drive.downloads, [BUNDLE_ID, DESIGN_ID])
+                self.assertNotIn("没有拿到", body)
+                sections[label] = body.replace(str(self.attach_root), "<root>")
+        self.assertEqual(len(set(sections.values())), 1, sections)
+
+    async def test_an_unrecognised_spelling_still_fails_with_its_raw_text(self) -> None:
+        self.drive.add_attachment(BUNDLE_ID, "b.zip", BUNDLE_BYTES)
+        self.drive.add_file("task-1", "task.md", "---\nattachments: [b.zip, 1NoSuchFileAbCdEfGhIjKlMnOpQrStU\n---\nGo.")
+        self.build()
+        await self.run_once()
+        body = self.executor.bodies[0]
+        # An unclosed bracket is not a list: the parts are matched as before and the bracketed one fails as written.
+        self.assertIn("- `[b.zip`：不在 附件/ 目录（引用原文 `[b.zip`", body)
+        self.assertIn("- `1NoSuchFileAbCdEfGhIjKlMnOpQrStU`：不在 附件/ 目录\n", body + "\n")
+        self.assertEqual(self.drive.downloads, [])
+
+    async def test_a_failed_spelling_of_a_chosen_file_is_not_a_failure(self) -> None:
+        self.drive.add_attachment(BUNDLE_ID, "b.zip", BUNDLE_BYTES)
+        self.drive.add_file("task-1", "task.md", f"---\nattachments: [{BUNDLE_ID}, b.zip\n---\nUse {BUNDLE_ID}.")
+        self.build()
+        await self.run_once()
+        body = self.executor.bodies[0]
+        self.assertNotIn("没有拿到", body)
+        self.assertEqual(self.drive.downloads, [BUNDLE_ID])
 
     async def test_duplicate_names_must_be_referenced_by_id(self) -> None:
         self.drive.add_attachment(BUNDLE_ID, "same.zip", b"a")

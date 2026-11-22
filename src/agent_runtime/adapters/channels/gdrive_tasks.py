@@ -76,6 +76,9 @@ _ATX_PREFIX = re.compile(r"^#{1,6}\s+")
 _MD_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
 _ANY_KEY_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:(.*)$")
 _KNOWN_KEY_AT = re.compile(r"(?:^|(?<=\s))(" + "|".join(TASK_META_KEYS) + r")\s*:")
+# `attachments:` with no value may be followed by a YAML block list, one `- item` per line (`*` in a Google export).
+_OPENS_LIST = re.compile(r"(?:^|\s)attachments\s*:\s*$")
+_LIST_ITEM = re.compile(r"^[-*+]\s+(\S.*)$")
 
 
 def _unquote(value: str) -> str:
@@ -83,6 +86,38 @@ def _unquote(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         return value[1:-1]
     return value
+
+
+def _inline_list(items: list[str]) -> str:
+    # The block list becomes `[a, "b, c"]`, the inline spelling split_attachment_refs reads.
+    quoted: list[str] = []
+    for item in items:
+        if "," in item and not (len(item) >= 2 and item[0] == item[-1] and item[0] in "'\""):
+            item = f"'{item}'" if '"' in item else f'"{item}"'
+        quoted.append(item)
+    return "[" + ", ".join(quoted) + "]"
+
+
+class _ListCollector:
+    def __init__(self, meta: dict[str, str]) -> None:
+        self._meta = meta
+        self._items: list[str] | None = None
+
+    def take(self, content: str) -> bool:
+        match = _LIST_ITEM.match(content)
+        if self._items is None or match is None:
+            return False
+        self._items.append(match.group(1))
+        return True
+
+    def after_key_line(self, content: str) -> None:
+        self.flush()
+        self._items = [] if _OPENS_LIST.search(content) else None
+
+    def flush(self) -> None:
+        if self._items:
+            self._meta["attachments"] = _inline_list(self._items)
+        self._items = None
 
 
 def _metadata_text(line: str) -> str:
@@ -126,34 +161,52 @@ def parse_task_markdown(raw_text: str) -> tuple[dict[str, str], str]:
         return {}, text.strip()
 
     close: int | None = None
+    in_list = False
     for idx in range(start + 1, len(lines)):
         line = lines[idx].strip()
         if _RULE.match(line) or _SETEXT_EQ.match(line):
             close = idx
             break
-        if line and not line.startswith("#") and not _ANY_KEY_LINE.match(_metadata_text(line)):
+        if not line:
+            continue
+        content = _metadata_text(line)
+        if in_list and _LIST_ITEM.match(content):
+            continue
+        if not line.startswith("#") and not _ANY_KEY_LINE.match(content):
             break
+        in_list = _OPENS_LIST.search(content) is not None
 
     meta: dict[str, str] = {}
+    block_list = _ListCollector(meta)
     if close is not None:
         for line in lines[start + 1 : close]:
             content = _metadata_text(line)
+            if not content or block_list.take(content):
+                continue
             known = _split_known_keys(content)
             if known is not None:
                 meta.update(known)
             elif not line.strip().startswith("#") and (match := _ANY_KEY_LINE.match(content)):
                 meta[match.group(1)] = _unquote(match.group(2))
+            block_list.after_key_line(content)
+        block_list.flush()
         return meta, "\n".join(lines[close + 1 :]).strip()
 
     body_from = start + 1
     for idx in range(start + 1, len(lines)):
         if not lines[idx].strip():
             continue
-        known = _split_known_keys(_metadata_text(lines[idx]))
+        content = _metadata_text(lines[idx])
+        if block_list.take(content):
+            body_from = idx + 1
+            continue
+        known = _split_known_keys(content)
         if known is None:
             break
         meta.update(known)
+        block_list.after_key_line(content)
         body_from = idx + 1
+    block_list.flush()
     if not meta:
         return {}, text.strip()
     return meta, "\n".join(lines[body_from:]).strip()
@@ -420,7 +473,7 @@ class DriveTaskPoller:
             if frontmatter.get("executor_id"):
                 payload["executor_id"] = frontmatter["executor_id"]
             # Guidance selection for role executors, as comma-separated lists.
-            # attachments: Drive file IDs or names in 附件/, fetched when the Run starts.
+            # attachments: Drive file IDs or names in 附件/, fetched when the Run starts; also `[a, b]`.
             for key in ("activities", "tags", "base_ref", "attachments"):
                 if frontmatter.get(key):
                     payload[key] = frontmatter[key]
