@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -27,15 +29,41 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install --disable-pip-version-check -e ".[dev]"
       - name: Run architecture, test and type gates in parallel
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          FULL_CI_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
         run: |
           set -euo pipefail
           export PATH="$PWD/.venv/bin:$PATH"
+
+          selected_tests=()
+          run_full=1
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$FULL_CI_LABEL" != "true" ]; then
+            run_full=0
+            while IFS= read -r line; do
+              [ -n "$line" ] && selected_tests+=("$line")
+            done < <(python scripts/select_tests.py --base "origin/$BASE_REF" --explain)
+          fi
+
           lint-imports > /tmp/gate-lint.log 2>&1 &
           pid_lint=$!
           pyright > /tmp/gate-pyright.log 2>&1 &
           pid_pyright=$!
-          pytest -n auto --dist worksteal -v > /tmp/gate-pytest.log 2>&1 &
-          pid_pytest=$!
+
+          if [ "$run_full" -eq 1 ]; then
+            pytest -n auto --dist worksteal -v > /tmp/gate-pytest.log 2>&1 &
+            pid_pytest=$!
+          elif [ "${#selected_tests[@]}" -eq 0 ]; then
+            echo "No tests affected by changed files; skipping pytest on PR." > /tmp/gate-pytest.log
+            pid_pytest=""
+          elif [ "${#selected_tests[@]}" -lt 4 ]; then
+            pytest -v "${selected_tests[@]}" > /tmp/gate-pytest.log 2>&1 &
+            pid_pytest=$!
+          else
+            pytest -n auto --dist worksteal -v "${selected_tests[@]}" > /tmp/gate-pytest.log 2>&1 &
+            pid_pytest=$!
+          fi
 
           rc=0
           wait "$pid_lint" || rc=$?
@@ -46,7 +74,9 @@ jobs:
           echo "=== Gate 3 - Strict static typing (pyright) ==="
           cat /tmp/gate-pyright.log
 
-          wait "$pid_pytest" || rc=$?
+          if [ -n "$pid_pytest" ]; then
+            wait "$pid_pytest" || rc=$?
+          fi
           echo "=== Gate 2 - Contract & E2E tests (pytest) ==="
           cat /tmp/gate-pytest.log
 
