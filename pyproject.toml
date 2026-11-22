@@ -17,6 +17,7 @@ Repository = "https://github.com/kun-g/hibernaut"
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-xdist>=3.6",
     "pyright>=1.1.380",
     "mypy>=1.11",
     "import-linter>=2.0",

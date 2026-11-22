@@ -446,7 +446,7 @@ class TestTwoProjectsThroughTheDaemon(unittest.TestCase):
             config = load_config(path)
             daemon = build_daemon_from_config(config)
             stop = asyncio.Event()
-            server = asyncio.create_task(serve_configured(path, config, daemon, stop))
+            server = asyncio.create_task(serve_configured(path, config, daemon, stop, reload_interval=0.02))
 
             async def wait_for(check):
                 deadline = time.monotonic() + 30
@@ -457,7 +457,7 @@ class TestTwoProjectsThroughTheDaemon(unittest.TestCase):
                             return
                     except (ConnectionRefusedError, OSError):
                         pass
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.01)
                 self.fail(f"timed out; calls={[c['role'] for c in calls()]} {stderr.getvalue()}")
 
             try:

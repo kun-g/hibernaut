@@ -35,8 +35,8 @@ def fail(state, op):
 
 
 def branch_head(bare, branch):
-    out = subprocess.run(["git", "ls-remote", bare, f"refs/heads/{branch}"], capture_output=True, text=True).stdout
-    return out.split()[0] if out.split() else ""
+    proc = subprocess.run(["git", "-C", bare, "rev-parse", "--verify", f"refs/heads/{branch}"], capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def main(argv):
@@ -102,16 +102,14 @@ def main(argv):
             print("fake gh: head commit does not match", file=sys.stderr)
             sys.exit(1)
         with tempfile.TemporaryDirectory() as tmp:
-            git("clone", "-q", bare, tmp)
-            git("config", "user.email", "gh@example.invalid", cwd=tmp)
-            git("config", "user.name", "gh", cwd=tmp)
-            git("checkout", "-q", pr["base"], cwd=tmp)
+            git("clone", "-q", "--branch", pr["base"], bare, tmp)
             squash = subprocess.run(["git", "merge", "--squash", f"origin/{pr['head']}"], cwd=tmp,
                                     capture_output=True, text=True)
             if squash.returncode != 0:
                 print(f"fake gh: Pull request is not mergeable: {squash.stdout}{squash.stderr}", file=sys.stderr)
                 sys.exit(1)
-            git("commit", "-qm", f"{pr['title']} (#{pr['number']})", cwd=tmp)
+            git("-c", "user.email=gh@example.invalid", "-c", "user.name=gh", "commit", "-qm",
+                f"{pr['title']} (#{pr['number']})", cwd=tmp)
             git("push", "-q", "origin", pr["base"], cwd=tmp)
             sha = git("rev-parse", "HEAD", cwd=tmp)
         pr.update(state="MERGED", merge_sha=sha, merged_head=head, method=[a for a in argv if a in ("--squash", "--merge", "--rebase")])

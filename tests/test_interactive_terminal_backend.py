@@ -196,7 +196,7 @@ class TestTerminalBackendThroughDaemon(unittest.TestCase):
                                                workdir=str(self.orca_wt), branch="hb/orca-1")
             daemon.workspaces.mark_ready("orca-1", workdir=str(self.orca_wt), branch="hb/orca-1")
             stop = asyncio.Event()
-            server = asyncio.create_task(serve_configured(self.path, config, daemon, stop))
+            server = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02))
 
             async def wait_for(check):
                 deadline = time.monotonic() + 30
@@ -207,7 +207,7 @@ class TestTerminalBackendThroughDaemon(unittest.TestCase):
                             return
                     except OSError:
                         pass
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.01)
                 self.fail(f"outbox={self.outbox()} orca={self.orca.verbs()} {self.stderr.getvalue()}")
 
             try:

@@ -121,7 +121,7 @@ class TestMCPServerAdapter(unittest.IsolatedAsyncioTestCase):
             mcp_adapter=disabled_daemon.mcp_server,
         )
         port_disabled = srv_disabled.server_address[1]
-        t_disabled = threading.Thread(target=srv_disabled.serve_forever, daemon=True)
+        t_disabled = threading.Thread(target=srv_disabled.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         t_disabled.start()
 
         def _post(
@@ -176,7 +176,7 @@ class TestMCPServerAdapter(unittest.IsolatedAsyncioTestCase):
             mcp_adapter=daemon.mcp_server,
         )
         port = server.server_address[1]
-        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         server_thread.start()
 
         stop = asyncio.Event()
