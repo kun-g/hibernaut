@@ -10,6 +10,7 @@ from switchboard.envelope import CanonicalEvent
 from switchboard.http_client import HttpResponse
 from switchboard.outbound.feishu_adapter import FeishuOutboundAdapter
 from switchboard.outbound.gateway import OutboundGateway
+from switchboard.addressing import GITHUB_OUTBOUND_MARKER
 from switchboard.outbound.github_adapter import GitHubOutboundAdapter
 from switchboard.ports import OutboundMessage
 from switchboard.store_sqlite import SwitchboardStore
@@ -129,7 +130,9 @@ class GatewayTests(unittest.TestCase):
             ],
         )
         self.assertEqual(self.http.calls[0]["json"], {"labels": ["review"]})
-        self.assertEqual(self.http.calls[2]["json"]["body"], "**Done**\n\nPR opened")
+        self.assertEqual(
+            self.http.calls[2]["json"]["body"], f"**Done**\n\nPR opened\n\n{GITHUB_OUTBOUND_MARKER}"
+        )
         self.assertEqual(self.http.calls[2]["headers"]["Authorization"], "Bearer ephemeral-github")
         row = self.store.list_outbound()[0]
         self.assertEqual((row.status, row.platform_msg_id), ("sent", "9001"))

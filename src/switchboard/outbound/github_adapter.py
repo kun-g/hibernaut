@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, cast
 from urllib.parse import quote
 
+from switchboard.addressing import GITHUB_OUTBOUND_MARKER
 from switchboard.http_client import HttpClient, HttpResponse
 from switchboard.ports import CredentialBrokerPort, OutboundMessage, SendResult
 
@@ -57,7 +58,8 @@ class GitHubOutboundAdapter:
             if response.status >= 300 and response.status != 404:
                 return _failure("remove_labels", response)
 
-        body = f"**{msg.title}**\n\n{msg.body_md}" if msg.title else msg.body_md
+        text = f"**{msg.title}**\n\n{msg.body_md}" if msg.title else msg.body_md
+        body = f"{text}\n\n{GITHUB_OUTBOUND_MARKER}"
         response = self._http.request(
             "POST",
             f"{issue_url}/comments",

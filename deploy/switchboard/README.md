@@ -35,7 +35,7 @@ chmod 600 .env
 ```
 
 1. `Caddyfile`：把 `sb.example.com` 换成你的域名。
-2. `switchboard.toml`：按需改 `[routing]`（仓库、飞书群到 `inbox_id` 的映射）、`[feishu]`、`[outbound]`。不要改 `[http] host/port`、`[sqlite] path` 和 `[relay] path`，它们与 Dockerfile、Compose、Caddyfile 对应；不要设置 `[relay] listen_port`，Caddy 只转发 8790。
+2. `switchboard.toml`：按需改 `[routing]`（仓库、飞书群到 `inbox_id` 的映射）、`[github]`、`[feishu]`、`[outbound]`。`[github] require_label`（默认 `hibernaut`）决定哪些 Issue/PR 及其评论会入站，公开仓库不要清空；`[routing.event_consumers]` 在没有 Taskboard 时把 Issue/PR 事件直接投给 Hibernaut，部署了 Taskboard 再删掉。不要改 `[http] host/port`、`[sqlite] path` 和 `[relay] path`，它们与 Dockerfile、Compose、Caddyfile 对应；不要设置 `[relay] listen_port`，Caddy 只转发 8790。
 3. `.env`：填六个变量，令牌可用 `openssl rand -hex 32` 生成。
 
    | 变量 | 内容 |
@@ -134,7 +134,7 @@ Hibernaut 现有的 GitHub / 飞书 / MCP 通道在 Stage B 仍然保留，可�
 
 1. 部署 VPS 并完成冒烟验收 1–5。此时还没有外部事件发到 VPS。
 2. 本机 Hibernaut 改为 `mode = "relay"`（见上文）并重启。确认启动日志无报错、没有明文告警；用冒烟第 6 步确认 `delivery_log` 中 `hibernaut` 的投递为 `acked`、没有积压的 `pending` / `retry`。
-3. 切一个入口：先在一个仓库的 GitHub Webhook 里把 Payload URL 改为 `https://sb.example.com/webhooks/github`（Content type `application/json`，Secret 用 `SWITCHBOARD_GITHUB_WEBHOOK_SECRET`），在 Recent Deliveries 确认 2xx，再发一个测试 Issue 确认 Hibernaut 收到并回写评论。
+3. 切一个入口：先在一个仓库的 GitHub Webhook 里把 Payload URL 改为 `https://sb.example.com/webhooks/github`（Content type `application/json`，Secret 用 `SWITCHBOARD_GITHUB_WEBHOOK_SECRET`），在 Recent Deliveries 确认 2xx，再发一个带 `hibernaut` 标签的测试 Issue 确认 Hibernaut 收到并回写评论（回写的评论末尾有隐藏标记 `<!-- switchboard:outbound -->`，回流时被丢弃，不会再触发 Run）。同时把该项目 `hibernaut.toml` 的 `poll_labels` 改为 `[]`：轮询和 Webhook 的 `external_id` 不同，两路都开时同一个 Issue 会跑两次。
 4. 观察一段时间（建议至少一天）没有 `dead_letter` 后，再切飞书事件订阅地址到 `https://sb.example.com/webhooks/feishu`，以及其余仓库。
 
 ## 回滚
