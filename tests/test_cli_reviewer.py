@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import shutil
 import sys
 import tempfile
 import tomllib
@@ -9,7 +11,9 @@ from unittest.mock import Mock, patch
 
 from agent_runtime.adapters.delivery import MERGE_TOOL
 from agent_runtime.adapters.executor_cli import CLIReviewer, CLITemplate, CoderReviewerExecutor, OrcaWorktreeManager
+from agent_runtime.adapters.executor_cli import orca as orca_module
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
+from agent_runtime.adapters.executor_cli.orca import OrcaCommandTerminal, TerminalUnavailable, terminal_title
 from agent_runtime.adapters.executor_cli.project_guidance import pin_head
 from agent_runtime.adapters.executor_cli.cli_reviewer import extract_verdict
 from agent_runtime.adapters.executor_cli.executor import LocalCLIExecutor, render_cli_args
@@ -26,10 +30,12 @@ from agent_runtime.core.models import Emit, Event, PermissionDecision
 from tests.fakes import InMemoryPermission
 from tests.test_coder_reviewer import CHANGES_REQUESTED, fake_command, make_repo
 from tests.test_pr_delivery import DeliveryCase
+from tests.test_visible_roles import FakeOrcaTerminals
 
 FAKE_CLI = Path(__file__).with_name("fake_cli_reviewer.py")
 PASS = {"verdict": "pass", "summary": "zero is rejected", "blocking": []}
 EVIDENCE = "red: test_zero FAILED\ngreen: 4 passed"
+REAL_ORCA = orca_module._orca
 
 
 def cli_command(root: Path) -> str:
@@ -376,3 +382,253 @@ class TestSDEWithCLIReviewer(DeliveryCase, unittest.IsolatedAsyncioTestCase):
     def git_bare(self, *args):
         import subprocess
         return subprocess.run(["git", *args], cwd=self.bare, check=True, capture_output=True, text=True).stdout.strip()
+
+
+_RUNNER = object()
+
+
+class TerminalCase(unittest.IsolatedAsyncioTestCase):
+    # The CLI reviewer with terminal = "orca": FakeOrcaTerminals runs each terminal's command in a real shell, so the
+    # wrapper script and the fake CLI really run, and their output lands in the terminal's screen file.
+    def setUp(self):
+        self.root = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
+        self.repo = make_repo(self.root)
+        self.cli = CLIPlan(self.root)
+        self.enterContext(patch.dict(os.environ, self.cli.env()))
+        self.orca = FakeOrcaTerminals(self.root)
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
+        self.runs = self.root / "cli-runs"
+        self.terminal = OrcaCommandTerminal(root=self.runs, poll_interval=0.02, liveness_interval=0.2)
+        self.caps = Mock(permissions=InMemoryPermission())
+        self.caps.is_interrupted.return_value = False
+
+    async def asyncTearDown(self):
+        await self.orca.close_all()
+
+    def reviewer(self, runner=_RUNNER, **overrides):
+        fields = {"name": "grok", "command": cli_command(self.root), "args": ("-p",), "terminal": "orca", **overrides}
+        return CLIReviewer(template=CLITemplate(**fields), terminal=self.terminal if runner is _RUNNER else runner)
+
+    def request(self, label="review of task-1 round 1"):
+        return ReviewRequest(workdir=self.repo, requirements="divide must reject a zero divisor",
+                             test_evidence=EVIDENCE, base_ref="main", pin=pin_head(self.repo, "test"), label=label)
+
+    def handles(self):
+        return list(self.orca.terminals)
+
+    def alive(self, handle):
+        return self.orca.terminals[handle]["proc"].returncode is None
+
+
+class TestCLIReviewerTerminal(TerminalCase):
+    async def test_the_cli_runs_in_a_visible_terminal_and_the_verdict_comes_from_files(self):
+        self.cli.set({"stdout": json.dumps(PASS), "stderr": "reading calc.py\n"})
+        reviewer = self.reviewer(env={"FAKE_CLI_MARK": "from-template"})
+        review = await reviewer.review(self.request(), self.caps)
+        self.assertEqual((review["verdict"], review["summary"]), ("pass", "zero is rejected"))
+        (handle,) = self.handles()
+        term = self.orca.terminals[handle]
+        self.assertEqual(term["title"], terminal_title("grok", "code-reviewer", "review of task-1 round 1"))
+        self.assertEqual(term["title"], "grok (code-reviewer) · review of task-1 round 1")
+        self.assertEqual(Path(term["worktree"]), self.repo)
+        # The prompt reaches the CLI as its {prompt} argument but never the terminal command line.
+        (call,) = self.cli.calls()
+        self.assertEqual(call["argv"][0], "-p")
+        self.assertIn("## Task requirements\ndivide must reject a zero divisor", call["argv"][1])
+        self.assertTrue(call["argv"][1].rstrip().endswith("}"))
+        self.assertEqual((Path(call["cwd"]), call["env"], call["stdin_tty"]), (self.repo, "from-template", False))
+        self.assertNotIn("divide must reject", term["command"])
+        self.assertLess(len(term["command"]), 400)
+        # A person watching the terminal sees the CLI's output as it runs.
+        screen = self.orca.screen(handle)
+        self.assertIn(json.dumps(PASS), screen)
+        self.assertIn("reading calc.py", screen)
+        # The finished terminal stays open for reading; the run's files are removed.
+        self.assertTrue(self.alive(handle))
+        self.assertNotIn("terminal close", self.orca.verbs())
+        self.assertEqual(list(self.runs.iterdir()), [])
+        self.assertEqual(review["cli_terminals"], [handle])
+        lines = reviewer.format_review(review).splitlines()
+        self.assertEqual(lines[0], f"[grok] verdict=pass (cli={cli_command(self.root)} terminal=orca)")
+        self.assertEqual(lines[1], f"Orca terminal: {handle}")
+        self.assertEqual(lines[2], "Summary: zero is rejected")
+
+    async def test_the_review_schema_placeholder_is_filled_in_the_terminal_too(self):
+        self.cli.set({"stdout": json.dumps({"text": json.dumps(PASS), "structuredOutput": PASS})})
+        reviewer = self.reviewer(args=("-p", "{prompt}", "--json-schema", "{review_schema}"))
+        review = await reviewer.review(self.request(), self.caps)
+        self.assertEqual(review["verdict"], "pass")
+        (call,) = self.cli.calls()
+        self.assertEqual(call["argv"][2], "--json-schema")
+        self.assertEqual(json.loads(call["argv"][3]), REVIEW_SCHEMA)
+
+    async def test_a_format_retry_runs_in_a_new_terminal(self):
+        self.cli.set("Looks good to me!", f"```json\n{json.dumps(CHANGES_REQUESTED)}\n```")
+        review = await self.reviewer().review(self.request(), self.caps)
+        self.assertEqual(review["verdict"], "changes_requested")
+        first, retry = self.handles()
+        self.assertEqual([self.orca.terminals[h]["title"] for h in (first, retry)],
+                         ["grok (code-reviewer) · review of task-1 round 1",
+                          "grok (code-reviewer) · review of task-1 round 1 format retry"])
+        self.assertIn("## Your previous output was rejected", self.cli.calls()[1]["argv"][1])
+        self.assertEqual(review["cli_terminals"], [first, retry])
+
+    async def test_a_nonzero_exit_fails_with_the_code_and_stderr(self):
+        self.cli.set({"stdout": json.dumps(PASS), "stderr": "auth expired: run grok login\n", "exit": 3})
+        with self.assertRaisesRegex(ReviewAborted, "grok: '.*review-cli' exited with code 3: auth expired: run grok login"):
+            await self.reviewer().review(self.request(), self.caps)
+        self.assertEqual(len(self.cli.calls()), 1)
+        with self.assertRaisesRegex(ReviewAborted, "grok: cannot start '/nonexistent/grok'"):
+            await self.reviewer(command="/nonexistent/grok").review(self.request(), self.caps)
+
+    async def test_a_timeout_closes_the_terminal(self):
+        self.cli.set({"sleep": 3, "stdout": json.dumps(PASS)})
+        with self.assertRaisesRegex(ReviewAborted, r"grok: '.*review-cli' timed out after 0.5s in Orca terminal term_"):
+            await self.reviewer(timeout_seconds=0.5).review(self.request(), self.caps)
+        (handle,) = self.handles()
+        self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
+        self.assertFalse(self.alive(handle))
+        self.assertEqual(list(self.runs.iterdir()), [])
+
+    async def test_a_terminal_closed_by_a_person_fails_the_review(self):
+        self.cli.set({"sleep": 3, "stdout": json.dumps(PASS)})
+        task = asyncio.create_task(self.reviewer().review(self.request(), self.caps))
+        while not self.handles():
+            await asyncio.sleep(0.02)
+        (handle,) = self.handles()
+        await self.orca.kill(handle)
+        with self.assertRaisesRegex(ReviewAborted, f"grok: Orca terminal {handle} was closed before "
+                                                   r"'.*review-cli' finished"):
+            await task
+
+    async def test_an_interrupt_closes_the_terminal(self):
+        self.cli.set({"sleep": 3, "stdout": json.dumps(PASS)})
+        self.caps.is_interrupted.side_effect = lambda: bool(self.handles())
+        with self.assertRaises(asyncio.CancelledError):
+            await self.reviewer().review(self.request(), self.caps)
+        (handle,) = self.handles()
+        self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
+        self.assertFalse(self.alive(handle))
+
+    async def test_an_orca_failure_falls_back_to_a_subprocess_and_says_so(self):
+        async def broken(*args, cwd):
+            raise RuntimeError("Error: no Orca worktree matches this path")
+
+        self.cli.set(json.dumps(PASS))
+        with patch("agent_runtime.adapters.executor_cli.orca._orca", new=broken):
+            reviewer = self.reviewer()
+            review = await reviewer.review(self.request(), self.caps)
+        self.assertEqual(review["verdict"], "pass")
+        self.assertEqual(len(self.cli.calls()), 1)
+        lines = reviewer.format_review(review).splitlines()
+        self.assertEqual(lines[0], f"[grok] verdict=pass (cli={cli_command(self.root)} terminal=fallback)")
+        self.assertEqual(lines[1], "Terminal fallback: Orca could not open a terminal (RuntimeError Error: no Orca "
+                                   "worktree matches this path); ran as a subprocess")
+
+    async def test_a_missing_orca_command_falls_back(self):
+        self.cli.set(json.dumps(PASS))
+        # A PATH with git but no orca.
+        empty = self.root / "no-orca-path"
+        empty.mkdir()
+        (empty / "git").symlink_to(shutil.which("git"))
+        with patch("agent_runtime.adapters.executor_cli.orca._orca", new=REAL_ORCA), \
+                patch.dict(os.environ, {"PATH": str(empty)}):
+            reviewer = self.reviewer()
+            review = await reviewer.review(self.request(), self.caps)
+        lines = reviewer.format_review(review).splitlines()
+        self.assertTrue(lines[0].endswith("terminal=fallback)"), lines[0])
+        self.assertRegex(lines[1], r"^Terminal fallback: Orca could not open a terminal \(FileNotFoundError .*orca")
+        self.assertEqual(len(self.cli.calls()), 1)
+
+    async def test_a_project_without_orca_terminals_falls_back(self):
+        self.cli.set(json.dumps(PASS))
+        reviewer = self.reviewer(runner=TerminalUnavailable("project 'x' has terminal_backend = \"none\""))
+        review = await reviewer.review(self.request(), self.caps)
+        self.assertEqual(self.orca.calls, [])
+        lines = reviewer.format_review(review).splitlines()
+        self.assertTrue(lines[0].endswith("terminal=fallback)"), lines[0])
+        self.assertEqual(lines[1], "Terminal fallback: project 'x' has terminal_backend = \"none\"; ran as a subprocess")
+
+    async def test_without_the_option_nothing_changes(self):
+        self.cli.set(json.dumps(PASS))
+        reviewer = self.reviewer(terminal="none")
+        review = await reviewer.review(self.request(), self.caps)
+        self.assertEqual(self.orca.calls, [])
+        self.assertNotIn("cli_terminals", review)
+        lines = reviewer.format_review(review).splitlines()
+        self.assertEqual(lines[:2], [f"[grok] verdict=pass (cli={cli_command(self.root)})", "Summary: zero is rejected"])
+
+
+class TestCLITerminalConfig(unittest.TestCase):
+    def test_terminal_is_off_by_default_and_checked(self):
+        cfg = parse_config({"executors": {"grok": {"command": "grok", "args": ["-p", "{prompt}"], "terminal": "orca"},
+                                          "plain": {"command": "x"}}})
+        self.assertEqual((cfg.executors["grok"].terminal, cfg.executors["plain"].terminal), ("orca", "none"))
+        with self.assertRaisesRegex(ValueError, r"executors\.grok: unsupported terminal 'tmux' \(supported: none, orca\)"):
+            parse_config({"executors": {"grok": {"command": "grok", "terminal": "tmux"}}})
+
+    def test_the_assembled_cli_reviewer_gets_terminals_only_where_the_project_has_them(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        checkout = root / "checkout"
+        checkout.mkdir()
+
+        def reviewer(project):
+            cfg = parse_config({
+                "runtime": {"db_path": str(root / f"{project}.db"), "memory_root": str(root / "mem"),
+                            "default_executor": "sde"},
+                "executors": {"grok": {"command": "grok", "terminal": "orca"},
+                              "sde": {"role": "sde", "reviewer": "grok"}},
+                "projects": {
+                    "orca": {"inbox_id": "proj:orca", "repo": "o/a", "checkout": str(checkout)},
+                    "git": {"inbox_id": "proj:git", "repo": "o/b", "checkout": str(checkout), "worktree_backend": "git"},
+                },
+            })
+            daemon = build_daemon_from_config(cfg)
+            self.addCleanup(daemon.db.close)
+            worker = daemon.pool._worker_factory(f"proj:{project}", "w")  # pyright: ignore
+            return worker._executors["sde"]._reviewer  # pyright: ignore
+
+        self.assertIsInstance(reviewer("orca")._terminal, OrcaCommandTerminal)  # pyright: ignore
+        unavailable = reviewer("git")._terminal  # pyright: ignore
+        self.assertIsInstance(unavailable, TerminalUnavailable)
+        self.assertIn("project 'git' has terminal_backend = \"none\"", unavailable.reason)
+
+
+class TestSDEClosesReviewTerminals(TestSDEWithCLIReviewer):
+    def setUp(self):
+        super().setUp()
+        self.orca = FakeOrcaTerminals(self.root)
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
+
+    async def asyncTearDown(self):
+        await self.orca.close_all()
+
+    def executor(self, delivery):
+        executor = super().executor(delivery)
+        template = CLITemplate(name="grok", command=cli_command(self.root), args=("-p",), terminal="orca")
+        executor._reviewer = CLIReviewer(  # pyright: ignore
+            template=template,
+            terminal=OrcaCommandTerminal(root=self.root / "cli-runs", poll_interval=0.02, liveness_interval=0.2))
+        return executor
+
+    async def test_review_terminals_close_with_a_verified_delivery(self):
+        self.set_dev(({"calc.py": "x = 1\n"}, "first try"), ({"calc.py": "x = 2\n"}, "zero divisor rejected"))
+        self.cli.set(f"```json\n{json.dumps(CHANGES_REQUESTED)}\n```", json.dumps(PASS))
+        self.caps.permissions = InMemoryPermission({MERGE_TOOL: PermissionDecision("block", "not in this test")})
+        outcome = await self.executor(self.delivery(close_terminal=True)).execute([self.event()], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        first, second = self.orca.terminals
+        self.assertIn(f"Review terminals: closed {first}, {second}", outcome.messages[0])
+        for handle in (first, second):
+            self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
+            self.assertIsNotNone(self.orca.terminals[handle]["proc"].returncode)
+
+    async def test_review_terminals_stay_when_closing_is_off(self):
+        self.set_dev(({"calc.py": "x = 1\n"}, "divide fixed"))
+        self.cli.set(json.dumps(PASS))
+        outcome = await self.executor(self.delivery()).execute([self.event()], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        (handle,) = self.orca.terminals
+        self.assertNotIn("terminal close", self.orca.verbs())
+        self.assertIn(f"[grok] verdict=pass (cli={cli_command(self.root)} terminal=orca)", outcome.messages[0])
+        self.assertIsNone(self.orca.terminals[handle]["proc"].returncode)

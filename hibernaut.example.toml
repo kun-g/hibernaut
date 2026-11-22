@@ -79,7 +79,7 @@ effort = "high"
 timeout_seconds = 1800.0
 review = true                   # true：送 reviewer 评审，changes_requested 时修复后复审，pass 才交付；false：测试与检查完成后直接交付
 reviewer = "code-reviewer"      # review = true 时必填有效值：role = "code-reviewer" 的执行器，或任一普通 CLI 执行器（含内置 claude / cursor-agent / grok / dsh）
-# reviewer = "grok-reviewer"    # 用 [executors.grok-reviewer] 模板非交互评审：prompt 末尾要求只输出一个 JSON 结论，格式错重试一次。
+# reviewer = "grok-reviewer"    # 用 [executors.grok-reviewer] 模板非交互评审：prompt 末尾要求只输出一个 JSON 结论，格式错重试一次；模板写 terminal = "orca" 时在 Orca 终端里可旁观。
 #                               # 只读保证较弱：CLI 的工具不受限制，只靠评审前后比对 worktree 指纹，改动了就作废结论并挂起为 review pending。
 #                               # 省略 reviewer 且没有名为 code-reviewer 的执行器时，回退用旧名 coder-reviewer 的评审角色执行器。
 max_review_rounds = 3           # 超过轮数仍未通过则保持待处理（Suspend），批准再修一轮，拒绝则标注未评审交付
@@ -96,9 +96,12 @@ timeout_seconds = 300.0
 
 [executors.grok]
 command = "grok"
-args = ["-p", "{prompt}"]
+args = ["-p", "{prompt}", "--permission-mode", "plan"]
 # resume_args = ["-p", "{prompt}", "--resume", "{executor_session_id}"]
 timeout_seconds = 300.0
+terminal = "orca"               # 仅作评审者（SDE reviewer = "grok"）时生效：在任务 worktree 的 Orca 终端里跑同一条命令，人可实时旁观；
+#                               # 结果从包装脚本写的文件读，不读屏幕。项目 terminal_backend 不是 orca 或 orca 命令失败时退回子进程，
+#                               # 评审结论首行注明 terminal=fallback。可选 none（默认，子进程）| orca。
 
 # 给 SDE 当 CLI 评审者用的 grok：{review_schema} 由评审替换为紧凑的结论 JSON Schema，grok 据此输出
 # {"structuredOutput": {...}, "text": "..."} 包装对象；只在评审时替换，作普通执行器时原样传给命令。
@@ -106,6 +109,7 @@ timeout_seconds = 300.0
 command = "grok"
 args = ["-p", "{prompt}", "--permission-mode", "plan", "--json-schema", "{review_schema}"]
 timeout_seconds = 900.0
+# terminal = "orca"             # 可选：在任务 worktree 的 Orca 终端里跑，人可旁观（见 [executors.grok]）
 
 [executors.dsh]
 command = "dsh"
@@ -146,7 +150,7 @@ require_ci = true               # 合并前要求 PR 的 CI 全部通过（gh pr
 ci_timeout_seconds = 1800.0     # 等 CI 的上限；超时则挂起，批准后再查
 ci_poll_seconds = 30.0
 merge_method = "squash"         # squash | merge | rebase
-close_terminal = true           # 交付有证据后（PR 头即已推送且检查通过的提交；授权合并时须已合并）自动关闭 SDE 终端；先记下 SHA、PR 与可恢复会话 ID，worktree 不动
+close_terminal = true           # 交付有证据后（PR 头即已推送且检查通过的提交；授权合并时须已合并）自动关闭 SDE 终端与 CLI 评审者（terminal = "orca"）留下的评审终端；先记下 SHA、PR 与可恢复会话 ID，worktree 不动
 # git / gh 由宿主机自己的凭据（gh auth login、git credential helper、SSH agent）或下面的可信包装命令认证；
 # Hibernaut 调用前剥离 GH_TOKEN / GITHUB_TOKEN 等变量，进程里不持有 token。
 git_command = "git"

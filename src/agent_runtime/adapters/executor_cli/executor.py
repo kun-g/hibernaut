@@ -7,6 +7,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout, last_text, supervise, target_events
@@ -37,7 +38,11 @@ class CLITemplate:
     env: dict[str, str] = field(default_factory=_empty_env)
     timeout_seconds: float = 300.0
     orca_agent: str | None = None
+    # Only CLIReviewer reads it: "orca" runs the review in a visible Orca terminal of the worktree.
+    terminal: Literal["none", "orca"] = "none"
 
+
+CLI_TERMINALS: tuple[Literal["none", "orca"], ...] = ("none", "orca")
 
 DEFAULT_CLI_TEMPLATES: dict[str, CLITemplate] = {
     "claude": CLITemplate(name="claude", command="claude", args=("-p",)),
