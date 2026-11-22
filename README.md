@@ -67,7 +67,7 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 | 配置段 | 管什么 |
 | :--- | :--- |
 | `[runtime]` | 数据库与记忆目录、并发数、新事件策略（`defer` / `fold` / `interrupt`）、全局默认执行器 |
-| `[channels]` | HTTP 端口、MCP 的密钥环境变量名；`outbox_dir` 设置后每条 Outbox 消息另存为该目录下一个带任务上下文的 Markdown 文件 |
+| `[channels]` | HTTP 端口、MCP 的密钥环境变量名；`outbox_dir` 设置后每条 Outbox 消息另存为该目录下一个带任务上下文的 Markdown 文件；配置了 `auto_merge` 却停在 PR 未合并时，状态为「待合并」并写明 PR 链接与未合并原因 |
 | `[executors.<id>]` | CLI 模板；写 `role = "sde"` 或 `role = "code-reviewer"` 则是角色执行器。SDE 的 `review`、`reviewer` 决定评审开关和评审者 |
 | `[launchers.<name>]`、`[credential_proxy]` | Claude Code 启动命令；`billing = "api"` 时经外置凭据代理 |
 | `[projects.<name>]` | 仓库、检出路径、服务的 `inbox_id`（字符串或正则数组）、默认 `executor`、worktree 与终端后端 |

@@ -21,7 +21,7 @@ from agent_runtime.adapters.delivery import (
     source_issue,
 )
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteDeliveryStore
-from agent_runtime.core.models import Event, PermissionDecision
+from agent_runtime.core.models import DeliveryOutcome, Event, PermissionDecision
 from tests.fakes import InMemoryPermission
 
 FAKE_GH = Path(__file__).with_name("fake_gh.py")
@@ -494,6 +494,38 @@ class TestMerge(DeliveryCase):
         self.assertEqual((rec.state, rec.problem), ("pr_open", ""))
         self.assertIn("not merged: CI failed (gates)", rec.notes)
         self.assertEqual(self.gh_calls("merge"), [])
+
+    def test_outcome_names_why_an_authorized_merge_did_not_happen(self):
+        url = "https://github.example/o/r/pull/1"
+        wt = self.task("task-r", {"calc.py": "x = 'r'\n"})
+        rec = self.merging().deliver(self.request(wt, review="pending"), permissions=InMemoryPermission())
+        self.assertEqual(self.merging().outcome(rec), DeliveryOutcome(
+            state="pr_open", pr_url=url, auto_merge=True, hold="review",
+            hold_detail="merging needs a passing independent review (review=pending)"))
+
+        wt = self.task("task-c", {"calc.py": "x = 'c'\n"})
+        self.set_gh(checks=[{"name": "gates", "state": "FAILURE", "bucket": "fail"}])
+        rec = self.merging().deliver(self.request(wt), permissions=InMemoryPermission())
+        outcome = self.merging().outcome(rec)
+        self.assertEqual((outcome.state, outcome.auto_merge, outcome.hold, outcome.hold_detail),
+                         ("pr_open", True, "ci", "CI failed (gates)"))
+        self.assertTrue(outcome.pr_url.startswith("https://github.example/o/r/pull/"))
+
+        wt = self.task("task-b", {"calc.py": "x = 'b'\n"})
+        self.set_gh(checks=[{"name": "gates", "state": "SUCCESS", "bucket": "pass"}])
+        block = InMemoryPermission({MERGE_TOOL: PermissionDecision("block", "no merges today")})
+        outcome = self.merging().outcome(self.merging().deliver(self.request(wt), permissions=block))
+        self.assertEqual((outcome.state, outcome.hold, outcome.hold_detail),
+                         ("pr_open", "other", "delivery.merge blocked: no merges today"))
+
+    def test_outcome_has_no_hold_when_merging_is_not_authorized_or_done(self):
+        wt = self.task("task-a", {"calc.py": "x = 1\n"})
+        rec = self.delivery(auto_merge=False).deliver(self.request(wt), permissions=InMemoryPermission())
+        self.assertEqual(self.delivery(auto_merge=False).outcome(rec), DeliveryOutcome(
+            state="pr_open", pr_url="https://github.example/o/r/pull/1", auto_merge=False))
+        rec = self.merging().deliver(self.request(wt), permissions=InMemoryPermission())
+        self.assertEqual(self.merging().outcome(rec), DeliveryOutcome(
+            state="merged", pr_url="https://github.example/o/r/pull/1", auto_merge=True))
 
     def test_ci_timeout_is_recoverable(self):
         wt = self.task("task-a", {"calc.py": "x = 1\n"})

@@ -15,8 +15,11 @@ NewEventPolicy: TypeAlias = Literal["defer", "fold", "interrupt"]
 # How an Emit ended, as the executor states it; channels never infer it from the message text.
 EmitStatus: TypeAlias = Literal["done", "failed", "stopped", "refused"]
 EMIT_STATUSES: tuple[EmitStatus, ...] = ("done", "failed", "stopped", "refused")
-# Outbox metadata key the worker fills with {title, source, executor_id, status}; status is an EmitStatus or
-# "awaiting_approval". Nested so channels that pass top-level keys on are unaffected.
+DeliveryState: TypeAlias = Literal["local", "pr_open", "merged"]
+MergeHold: TypeAlias = Literal["", "review", "ci", "other"]
+# Outbox metadata key the worker fills with {title, source, executor_id, status, delivery}; status is an EmitStatus
+# or "awaiting_approval", delivery the Emit's DeliveryOutcome as a dict when it has one. Nested so channels that pass
+# top-level keys on are unaffected.
 TASK_CONTEXT_KEY = "task_context"
 
 
@@ -119,6 +122,17 @@ class Silent:
 
 
 @dataclass(frozen=True, slots=True)
+class DeliveryOutcome:
+    state: DeliveryState
+    pr_url: str = ""
+    # The project authorizes merging (delivery.auto_merge), so a PR left open needs a person.
+    auto_merge: bool = False
+    # Why an authorized merge did not happen; "" when it happened or was not authorized.
+    hold: MergeHold = ""
+    hold_detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class Emit:
     messages: tuple[str, ...]
     session_id: str | None = None
@@ -126,6 +140,8 @@ class Emit:
     status: EmitStatus = "done"
     # The task is finished: once the result is written, the session closes as a close-session event closes it.
     close_session: bool = False
+    # Where the delivery step left the change; the worker passes it to channels as task_context["delivery"].
+    delivery: DeliveryOutcome | None = None
 
 
 @dataclass(frozen=True, slots=True)
