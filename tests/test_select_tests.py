@@ -28,8 +28,20 @@ class TestSelectTests(unittest.TestCase):
                 "tests/taskboard/test_m3_engine_and_switchboard.py",
                 "tests/taskboard/test_m4_architecture_and_schemas.py",
                 "tests/taskboard/test_m5_publish_replay.py",
+                "tests/taskboard/test_m6_switchboard_contract.py",
+                "tests/taskboard/test_m7_service.py",
+                "tests/test_taskboard_dual_process_e2e.py",
             ),
         )
+
+    def test_taskboard_service_entry_and_example_config_select_service_tests(self) -> None:
+        entry = select_tests(["src/taskboard/app/__main__.py"])
+        self.assertEqual(
+            entry.tests, ("tests/taskboard/test_m7_service.py", "tests/test_taskboard_dual_process_e2e.py")
+        )
+        example = select_tests(["taskboard.example.toml"])
+        self.assertFalse(example.full_suite)
+        self.assertEqual(example.tests, ("tests/taskboard/test_m7_service.py",))
 
     def test_switchboard_deploy_kit_change_selects_its_test(self) -> None:
         res = select_tests(["deploy/switchboard/Dockerfile"])

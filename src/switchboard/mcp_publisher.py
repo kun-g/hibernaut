@@ -10,6 +10,7 @@ from switchboard.ports import CredentialBrokerPort, IngestResult, IngestStatus
 
 MCP_CREDENTIAL_CHANNEL: Final = "mcp"
 REPORT_TOOL: Final = "report_execution"
+SUBMIT_TOOL: Final = "submit_work"
 _INGEST_STATUSES: Final[tuple[IngestStatus, ...]] = ("accepted", "duplicate", "invalid")
 
 
@@ -17,8 +18,9 @@ class PublishError(RuntimeError):
     pass
 
 
-# Sends execution.reported to a remote Switchboard's /mcp. Transport, auth and JSON-RPC failures raise,
-# so the caller's outbox retries; an envelope the hub rejects comes back as an "invalid" IngestResult.
+# Sends execution.reported (report_execution) and work.ready (submit_work) to a remote Switchboard's /mcp.
+# Transport, auth, JSON-RPC and tool failures raise, so the caller retries; an envelope the hub rejects
+# comes back as an "invalid" IngestResult.
 class SwitchboardMCPPublisher:
     def __init__(
         self,
@@ -35,8 +37,14 @@ class SwitchboardMCPPublisher:
         self._ids = itertools.count(1)
 
     def publish(self, event: CanonicalEvent) -> IngestResult:
-        if event.event_type != "execution.reported":
-            raise PublishError(f"only execution.reported can be published over MCP, not {event.event_type}")
+        if event.event_type == "execution.reported":
+            tool, arguments = REPORT_TOOL, report_arguments(event)
+        elif event.event_type == "work.ready":
+            tool, arguments = SUBMIT_TOOL, submit_arguments(event)
+        else:
+            raise PublishError(
+                f"only execution.reported and work.ready can be published over MCP, not {event.event_type}"
+            )
         token = self._credentials.issue_ephemeral(self._channel)
         if not token:
             raise PublishError(f"credential broker has no {self._channel!r} token")
@@ -44,7 +52,7 @@ class SwitchboardMCPPublisher:
             "jsonrpc": "2.0",
             "id": next(self._ids),
             "method": "tools/call",
-            "params": {"name": REPORT_TOOL, "arguments": report_arguments(event)},
+            "params": {"name": tool, "arguments": arguments},
         }
         try:
             response = self._http.request(
@@ -58,7 +66,7 @@ class SwitchboardMCPPublisher:
         if response.status != 200:
             # The body is not echoed: it is the hub's, and only the status matters for a retry.
             raise PublishError(f"POST {self.mcp_url} returned HTTP {response.status}")
-        return parse_tool_result(response.body)
+        return parse_tool_result(response.body, tool)
 
 
 def report_arguments(event: CanonicalEvent) -> dict[str, Any]:
@@ -72,10 +80,25 @@ def report_arguments(event: CanonicalEvent) -> dict[str, Any]:
         "actor": event.actor or "",
         "occurred_at": event.occurred_at,
         "metadata": dict(event.metadata),
+        "source": event.source,
     }
 
 
-def parse_tool_result(raw: bytes) -> IngestResult:
+def submit_arguments(event: CanonicalEvent) -> dict[str, Any]:
+    return {
+        "source": event.source,
+        "event_type": event.event_type,
+        "external_id": event.external_id,
+        "scope": event.scope,
+        **({"correlation_key": event.correlation_key} if event.correlation_key else {}),
+        **({"actor": event.actor} if event.actor else {}),
+        "subject": event.subject,
+        "body": event.body,
+        "metadata": dict(event.metadata),
+    }
+
+
+def parse_tool_result(raw: bytes, tool: str = REPORT_TOOL) -> IngestResult:
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -93,7 +116,7 @@ def parse_tool_result(raw: bytes) -> IngestResult:
     content = cast(dict[str, Any], structured)
     status = content.get("status")
     if status not in _INGEST_STATUSES:
-        raise PublishError(f"switchboard {REPORT_TOOL} failed: {content.get('error') or status!r}")
+        raise PublishError(f"switchboard {tool} failed: {content.get('error') or status!r}")
     event_id = content.get("event_id")
     return IngestResult(
         status=status,

@@ -265,8 +265,9 @@ def test_hop_count_guard_and_tb_tools(tmp_path: Path) -> None:
             external_id="gh:bad:1",
             scope="proj:hibernaut",
             correlation_key="github://org/repo/issues/8888",
-            subject="Missing trace_id",
-            metadata={"work_kind": "issue", "state": "open"},
+            subject="Empty trace_id",
+            # A missing trace_id gets a default; an explicit empty one is still a schema violation.
+            metadata={"work_kind": "issue", "state": "open", "trace_id": ""},
         )
         with pytest.raises(SchemaValidationError):
             adapter.ingest_event(ev_bad_schema)

@@ -140,8 +140,9 @@ def _row_to_source_link(row: sqlite3.Row) -> TaskSourceLink:
 
 
 class SQLiteTaskStore:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, busy_timeout_ms: int = 5000) -> None:
         self._db_path = str(db_path)
+        self._busy_timeout_ms = int(busy_timeout_ms)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(
             self._db_path,
@@ -154,7 +155,7 @@ class SQLiteTaskStore:
     def _init_db(self) -> None:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL;")
-            self._conn.execute("PRAGMA busy_timeout=5000;")
+            self._conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms};")
             self._conn.execute("PRAGMA foreign_keys=ON;")
             self._conn.executescript(_SCHEMA_SQL)
 

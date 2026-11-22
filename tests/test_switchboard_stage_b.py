@@ -95,9 +95,59 @@ class MCPPublisherTests(unittest.TestCase):
                 "actor": "hibernaut",
                 "occurred_at": event.occurred_at,
                 "metadata": {"run_id": "r-1", "session_id": "s-1", "outcome_kind": "emit"},
+                "source": "hibernaut",
             },
         )
         self.assertNotIn("event_id", params["arguments"])
+
+    def test_execution_reported_from_taskboard_keeps_its_source(self) -> None:
+        self.http.responses.append(rpc_result({"status": "accepted", "event_id": "evt_T", "consumers": []}))
+        self.publisher.publish(report(source="taskboard", actor="taskboard"))
+        self.assertEqual(self.http.calls[0]["json"]["params"]["arguments"]["source"], "taskboard")
+
+    def test_work_ready_goes_through_submit_work(self) -> None:
+        self.http.responses.append(
+            rpc_result({"status": "accepted", "event_id": "evt_R", "consumers": ["hibernaut"], "problems": []})
+        )
+        metadata = {"work_kind": "task", "state": "ready", "task_id": "tb_tsk_1", "dispatch_seq": 1}
+        event = CanonicalEvent(
+            source="taskboard",
+            event_type="work.ready",
+            external_id="tb:tb_tsk_1:d1",
+            scope=SCOPE,
+            correlation_key=KEY,
+            actor="taskboard",
+            subject="Implement",
+            body="details",
+            metadata=metadata,
+        )
+        result = self.publisher.publish(event)
+        self.assertEqual((result.status, result.event_id, result.consumers), ("accepted", "evt_R", ("hibernaut",)))
+        params = self.http.calls[0]["json"]["params"]
+        self.assertEqual(params["name"], "submit_work")
+        self.assertEqual(
+            params["arguments"],
+            {
+                "source": "taskboard",
+                "event_type": "work.ready",
+                "external_id": "tb:tb_tsk_1:d1",
+                "scope": SCOPE,
+                "correlation_key": KEY,
+                "actor": "taskboard",
+                "subject": "Implement",
+                "body": "details",
+                "metadata": metadata,
+            },
+        )
+
+        self.http.responses.append(rpc_result({"status": "invalid", "problems": ["bad"]}, is_error=True))
+        self.assertEqual(self.publisher.publish(event).status, "invalid")
+        self.http.responses.append(rpc_result({"error": "source must be one of"}, is_error=True))
+        with self.assertRaisesRegex(PublishError, "submit_work failed"):
+            self.publisher.publish(event)
+        self.http.responses.append(HttpResponse(503, b"down"))
+        with self.assertRaisesRegex(PublishError, "HTTP 503"):
+            self.publisher.publish(event)
 
     def test_invalid_report_is_a_result_and_the_channel_adapter_raises(self) -> None:
         self.http.responses.append(
@@ -143,7 +193,7 @@ class MCPPublisherTests(unittest.TestCase):
         with self.assertRaisesRegex(PublishError, "no 'mcp' token"):
             self.publisher.publish(report())
         self.credentials.tokens["mcp"] = MCP_TOKEN
-        with self.assertRaisesRegex(PublishError, "only execution.reported"):
+        with self.assertRaisesRegex(PublishError, "only execution.reported and work.ready"):
             self.publisher.publish(report(event_type="conversation.message", metadata={"channel": "github"}))
         self.assertEqual(self.http.calls, [])
 

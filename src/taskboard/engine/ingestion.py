@@ -8,6 +8,7 @@ from typing import Any, Literal
 from taskboard.core.errors import (
     IllegalTransitionError,
     OptimisticLockError,
+    SourceRefConflictError,
     TaskNotFoundError,
     UpstreamTaskNotFoundError,
 )
@@ -31,6 +32,13 @@ from taskboard.engine.flow_expander import FlowExpander
 from taskboard.ports import AuditSinkPort, EventPublisherPort, TaskStorePort
 
 _MAX_CAS_RETRIES = 3
+
+
+# A caller-held version makes the write conditional: after a CAS miss the retry rereads, sees the
+# newer version and fails here instead of overwriting what the caller has not seen.
+def _check_version(current: TaskItem, expected_version: int | None) -> None:
+    if expected_version is not None and current.version != expected_version:
+        raise OptimisticLockError(current.task_id, expected_version)
 
 
 class IngestionService:
@@ -433,6 +441,10 @@ class IngestionService:
         trace_id: str | None = None,
         hop_count: int = 0,
     ) -> TaskItem:
+        if source_ref:
+            existing = self._store.find_by_source_ref(source_ref)
+            if existing is not None:
+                raise SourceRefConflictError(source_ref, existing.task_id)
         now = utc_now_iso()
         task = TaskItem(
             task_id=new_task_id(),
@@ -469,9 +481,11 @@ class IngestionService:
         patch: Mapping[str, Any],
         *,
         unlock_fields: Collection[str] = (),
+        expected_version: int | None = None,
     ) -> TaskItem:
         for _ in range(_MAX_CAS_RETRIES):
             current = self._resolve_task(task_id=task_id)
+            _check_version(current, expected_version)
             updated = apply_manual_patch(current, patch, unlock_fields=unlock_fields)
             try:
                 return self._store.upsert_task(updated, expected_version=current.version)
@@ -488,10 +502,12 @@ class IngestionService:
         reopen: bool = False,
         trace_id: str | None = None,
         hop_count: int = 0,
+        expected_version: int | None = None,
     ) -> TaskItem:
         effective_trace = trace_id or new_trace_id()
         for _ in range(_MAX_CAS_RETRIES):
             current = self._resolve_task(task_id=task_id)
+            _check_version(current, expected_version)
             if current.status in TERMINAL_STATUSES and target_status == current.status and not reopen:
                 self._replay_terminal_fanout(current, trace_id=effective_trace, hop_count=hop_count)
                 return current
