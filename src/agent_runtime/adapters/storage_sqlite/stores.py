@@ -89,6 +89,17 @@ class SQLiteInboxAdapter:
             )
         return stored, is_duplicate
 
+    def has_open_event(self, inbox_id: str, source: str, external_id: str) -> bool:
+        row = self._db.fetchone(
+            """
+            SELECT 1 FROM event_inbox
+            WHERE inbox_id = ? AND source = ? AND external_id = ? AND status IN ('pending', 'processing')
+            LIMIT 1
+            """,
+            (inbox_id, source, external_id),
+        )
+        return row is not None
+
     def fetch_pending(self, inbox_id: str) -> list[Event]:
         rows = self._db.fetchall(
             f"""

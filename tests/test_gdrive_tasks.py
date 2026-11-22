@@ -203,7 +203,8 @@ class TestGoogleDriveTaskQueue(unittest.IsolatedAsyncioTestCase):
             daemon.run(stop_event=stop, timer_interval_seconds=0.1, outbox_interval_seconds=0.05)
         )
         try:
-            # 1. Markdown task with frontmatter -> ingested, moved to 执行中 -> Emit -> appended & moved to 已完成.
+            # 1. Markdown task with frontmatter -> ingested (stays in 待执行 until a Run starts) -> Emit ->
+            #    appended & moved to 已完成.
             drive.add_file(
                 "file-md-1",
                 "task1.md",
@@ -213,7 +214,7 @@ class TestGoogleDriveTaskQueue(unittest.IsolatedAsyncioTestCase):
             polled1 = daemon.gdrive_poller.poll_once()
             self.assertEqual(len(polled1), 1)
             self.assertFalse(polled1[0].duplicate)
-            self.assertEqual(drive.files["file-md-1"].parents, ("dir-progress",))
+            self.assertEqual(drive.files["file-md-1"].parents, ("dir-pending",))
 
             await daemon.pool.wait_until_idle(timeout_seconds=3.0)
             self.assertEqual(drive.files["file-md-1"].parents, ("dir-done",))

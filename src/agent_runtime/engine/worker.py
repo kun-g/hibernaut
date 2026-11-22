@@ -28,6 +28,7 @@ from agent_runtime.core.ports import (
     OutboxPort,
     PermissionPort,
     RunCapabilities,
+    RunStartListener,
     SessionStorePort,
     TimerPort,
 )
@@ -107,6 +108,7 @@ class AgentWorker:
         global_default_executor: str | None = None,
         on_worktree_reclaim: Callable[[str], object] | None = None,
         hold: Callable[[Event], str | None] | None = None,
+        run_start_listener: RunStartListener | None = None,
         lease_ttl_seconds: float = 60.0,
         max_retries: int = 2,
         new_event_policy: NewEventPolicy = "defer",
@@ -135,6 +137,7 @@ class AgentWorker:
         self._global_default_executor = resolved_global
         self._on_worktree_reclaim = on_worktree_reclaim
         self._hold = hold
+        self._run_start_listener = run_start_listener
         self._lock = lock
         self._sessions = sessions
         self._lease_ttl_seconds = lease_ttl_seconds
@@ -310,6 +313,7 @@ class AgentWorker:
                         )
                         try:
                             async with self._lease_heartbeat(inbox_id):
+                                await self._notify_run_started(inbox_id, batch, batch_correlation_key)
                                 outcome = await self._execute_batch(
                                     executor=selected_executor,
                                     inbox_id=inbox_id,
@@ -425,6 +429,18 @@ class AgentWorker:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+    async def _notify_run_started(self, inbox_id: str, batch: list[Event], correlation_key: str | None) -> None:
+        listener = self._run_start_listener
+        if listener is None:
+            return
+        try:
+            # In a thread: listeners such as the Drive queue make blocking network calls.
+            await asyncio.to_thread(listener.on_run_started, inbox_id, tuple(batch), correlation_key)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "Run-start listener failed for inbox %s; the Run continues", inbox_id, exc_info=True
+            )
 
     def _claim(self, inbox_id: str) -> list[Event]:
         if self._hold is None:

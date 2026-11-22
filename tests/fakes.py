@@ -42,6 +42,13 @@ class InMemoryInbox:
         self._events.append(stored)
         return stored, False
 
+    def has_open_event(self, inbox_id: str, source: str, external_id: str) -> bool:
+        return any(
+            (evt.inbox_id, evt.source, evt.external_id) == (inbox_id, source, external_id)
+            and evt.status in ("pending", "processing")
+            for evt in self._events
+        )
+
     def fetch_pending(self, inbox_id: str) -> list[Event]:
         return [
             evt

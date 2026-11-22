@@ -52,6 +52,26 @@ class InboxContractMixin:
         remaining = inbox.fetch_pending("u1")
         self.assertEqual([e.event_id for e in remaining], [stored2.event_id])
 
+    def test_has_open_event_is_true_only_while_pending_or_processing(self) -> None:
+        inbox = self.make_inbox()
+        self.assertFalse(inbox.has_open_event("u3", "drive", "f:1"))
+        stored, _ = inbox.append(Event(inbox_id="u3", source="drive", external_id="f:1", payload={}))
+        self.assertTrue(inbox.has_open_event("u3", "drive", "f:1"))
+        self.assertFalse(inbox.has_open_event("other", "drive", "f:1"))
+        self.assertFalse(inbox.has_open_event("u3", "other", "f:1"))
+        inbox.claim_pending("u3")
+        self.assertTrue(inbox.has_open_event("u3", "drive", "f:1"))
+        inbox.mark_done([stored.event_id])
+        self.assertFalse(inbox.has_open_event("u3", "drive", "f:1"))
+        # A dropped duplicate is never open, whatever its row says.
+        inbox.append(Event(inbox_id="u3", source="drive", external_id="f:1", payload={}))
+        self.assertFalse(inbox.has_open_event("u3", "drive", "f:1"))
+
+        failed, _ = inbox.append(Event(inbox_id="u3", source="drive", external_id="f:2", payload={}))
+        inbox.claim_pending("u3")
+        inbox.mark_failed([failed.event_id], "boom")
+        self.assertFalse(inbox.has_open_event("u3", "drive", "f:2"))
+
     def test_claim_bind_requeue_and_mark_failed(self) -> None:
         inbox = self.make_inbox()
         e1, _ = inbox.append(Event(inbox_id="u2", source="im", external_id="c1", payload={}))
