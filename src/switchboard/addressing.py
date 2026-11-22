@@ -3,6 +3,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
+# Appended to every comment Switchboard posts; the webhook echo of such a comment is dropped
+# because a user token's comments are not Bot-authored.
+GITHUB_OUTBOUND_MARKER = "<!-- switchboard:outbound -->"
+
 _GITHUB_KEY = re.compile(r"^github:(?P<repo>[^#\s]+/[^#\s]+)#(?P<number>\d+)$")
 
 

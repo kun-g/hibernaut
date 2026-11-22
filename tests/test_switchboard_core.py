@@ -9,6 +9,7 @@ from pathlib import Path
 
 from switchboard.config import ConfigError, load_config, parse_config
 from switchboard.envelope import CanonicalEvent, EnvelopeError, new_event_id, validate_envelope
+from switchboard.router import Router
 from switchboard.store_sqlite import SwitchboardStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -138,11 +139,34 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.delivery.retry_backoff_seconds, (5, 15, 45, 135, 405))
         self.assertEqual(config.outbound.rate_limit_per_target_rpm, 30)
         self.assertEqual(config.outbound.max_retry_attempts, 5)
+        self.assertIsNone(config.github.require_label)
+
+    def test_github_require_label(self) -> None:
+        self.assertEqual(parse_config({"github": {"require_label": " hibernaut "}}).github.require_label, "hibernaut")
+        self.assertIsNone(parse_config({"github": {"require_label": ""}}).github.require_label)
 
     def test_example_file_loads(self) -> None:
         config = load_config(REPO_ROOT / "switchboard.example.toml")
         self.assertEqual(config.routing.github_repos["kun-g/hibernaut"], "proj:hibernaut")
         self.assertEqual(config.routing.unmatched_policy, "fallback")
+
+    def test_event_consumers_override_only_the_listed_event_types(self) -> None:
+        config = parse_config(
+            {"routing": {"event_consumers": {"work.opened": ["hibernaut"], "execution.reported": ["switchboard.outbound"]}}}
+        )
+        routes = config.routing.event_consumers
+        self.assertEqual(routes, {"work.opened": ("hibernaut",), "execution.reported": ("switchboard.outbound",)})
+        router = Router.from_config(config.routing)
+        opened = _work(event_type="work.opened")
+        updated = _work(event_type="work.updated")
+        self.assertEqual(router.resolve(opened), ("hibernaut",))
+        self.assertEqual(router.resolve(updated), ("taskboard",))
+
+    def test_event_consumers_reject_unknown_types_and_non_lists(self) -> None:
+        with self.assertRaises(ConfigError):
+            parse_config({"routing": {"event_consumers": {"work.started": ["hibernaut"]}}})
+        with self.assertRaises(ConfigError):
+            parse_config({"routing": {"event_consumers": {"work.opened": "hibernaut"}}})
 
     def test_invalid_policy(self) -> None:
         with self.assertRaises(ConfigError):
