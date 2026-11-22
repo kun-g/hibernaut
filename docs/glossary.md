@@ -36,6 +36,7 @@
 - **Switchboard（事件归一化交换机）**：生态最外层的统一通信总线，负责外部平台（GitHub / 飞书 / MCP / 定时器 / 邮件）的入站验签、幂等去重、异构事件归一化为 `CanonicalEvent`、按 `event_type/scope` 路由分发以及统一出站投递。零业务依赖，不 import Taskboard 或 Hibernaut。
 - **RelayHub vs. Relay Agent（Switchboard 长连接推送）**：RelayHub 是 Switchboard 公网侧的 WebSocket 端点（`/ws/relay`），持有在线路由表并把投递推给已连接的消费方；Relay Agent 是运行在私网或本机消费方进程里的客户端，主动外连 RelayHub、收 `push` 后调用本地处理函数再回 `ack` / `nack`。节点离线时投递保持 `pending`，不计重试次数。
 - **`conn_epoch`**：RelayHub 给同一 `consumer_id` 每次握手成功分配的单调递增连接代号。新连接握手后旧连接以 Close 4009 关闭，任何携带非当前 `conn_epoch` 的 `ack` / `nack` 都被丢弃，防止两条连接同时确认（防脑裂）。
+- **ccpeer 接收端 vs. Claude Code 会话**：Claude Code 会话是 Orca 终端等处运行的交互式 `claude` 进程，在 `<配置目录>/sessions/` 登记 `messagingSocketPath`；ccpeer 接收端是以某个名字登记成 `standalone` 会话的常驻进程，只收不推理，把对方 `SendMessage(<名字>)` 的回复写进收件箱（`inbox.jsonl`，控制回执在 `control.jsonl`）。消息里的 `from-name`、`from-mode` 是发送方自称，不鉴别身份。
 - **Taskboard（多源任务与 DAG 排期）**：负责归集来自多源的任务（`TaskItem`），维护任务状态与 DAG 先后依赖关系（`TaskDependency`，含环检测）；上游结案后自动解锁下游并经 Switchboard 发送 `work.ready` 事件唤醒 Hibernaut。不直接触碰 Session、Worktree 或执行器。
 - **Runner（执行面 / 执行节点）**：独立部署在本机（如 Mac）或远端 VPS 上的执行宿主服务，负责管理所在机器的磁盘工作区（Orca / `git worktree` 与三关安全回收）、子进程生命周期、日志流落盘及 `yetone/magpie` 环境对接，并在其内部托管多个具体 Executor。与 Hibernaut 控制面通过 `ExecutorPort` / `RunnerPort` 解耦，可跨项目复用。
 - **Executor vs. Runner 区分**：Runner 是「执行机器与工位（含 worktree 与运行环境，面向分布式部署，对应未来 `runner_id`）」，Executor 是「工位上干活的具体推理引擎/CLI（如 `claude` / `grok` / `cursor-agent` / `dsh`，对应 `executor_id` 与 `executor_session_id`）」。一台 Runner 节点可同时托管多个 Executor。

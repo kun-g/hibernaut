@@ -2,7 +2,8 @@
   "include": [
     "src/agent_runtime/core",
     "src/agent_runtime/engine",
-    "src/switchboard"
+    "src/switchboard",
+    "src/ccpeer"
   ],
   "extraPaths": [
     "src"
