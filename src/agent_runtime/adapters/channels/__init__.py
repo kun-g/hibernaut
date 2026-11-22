@@ -4,11 +4,6 @@ from agent_runtime.adapters.channels.channels import (
     WebhookHTTPServer,
     create_webhook_server,
 )
-from agent_runtime.adapters.channels.feishu_channel import (
-    FeishuChannelAdapter,
-    build_feishu_or_console_channel,
-)
-from agent_runtime.adapters.channels.feishu_webhook import FeishuWebhookAdapter
 from agent_runtime.adapters.channels.file_outbox import (
     FileOutboxChannel,
     OutboxContext,
@@ -42,8 +37,6 @@ __all__ = [
     "DriveQueueFolders",
     "DriveResultWriter",
     "DriveTaskPoller",
-    "FeishuChannelAdapter",
-    "FeishuWebhookAdapter",
     "FileOutboxChannel",
     "MCPServerAdapter",
     "OutboxContext",
@@ -51,7 +44,6 @@ __all__ = [
     "WebhookChannelAdapter",
     "WebhookHTTPServer",
     "WebhookResponse",
-    "build_feishu_or_console_channel",
     "create_webhook_server",
     "local_events_url",
     "outbox_context",

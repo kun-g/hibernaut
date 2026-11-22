@@ -1,26 +1,48 @@
 #!/usr/bin/env python3
-# Runs inside a visible Orca terminal: applies the billing environment, checks the session the launcher
-# would open exactly as a headless run does, then replaces itself with the interactive Claude Code.
-# Started as `python -I <this file> <spec.json>`, so it never imports code from the worktree it runs in.
+# Runs inside a visible Orca terminal: applies the billing environment, checks the session the launcher would open
+# exactly as a headless run does, then runs the interactive Claude Code as a child in the terminal's foreground and
+# exits with it, so the terminal still ends with the agent.
+#
+# Orca can report a terminal closed without its signal ever reaching it, so the gate supervises: the probe and the
+# agent each run in a process group of their own, ended with everything in it on SIGHUP/SIGTERM/SIGINT or when
+# Hibernaut removes this terminal's lease file (it does so whenever it closes the terminal), and the probe at its
+# deadline. Started as `python -I <this file> <spec.json>`, so it never imports code from the worktree it runs in.
 from __future__ import annotations
 
-import asyncio
 import json
 import os
+import signal
+import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from agent_runtime.adapters.executor_cli.claude_code import (  # noqa: E402
+    PROBE_PROMPT,
     ClaudeCodeError,
     ClaudeCodeLauncher,
     ClaudeCodeProfile,
     check_init,
-    probe_init,
 )
+from agent_runtime.adapters.executor_cli.cli_terminal import (  # noqa: E402
+    GRACE_SECONDS,
+    Stopped,
+    end_group,
+    exited,
+    ignore_signals,
+    stop_on_signals,
+)
+
+_POLL_SECONDS = 0.1
+
+
+class _Released(Exception):
+    pass
 
 
 def _report(path: Path, body: dict[str, Any]) -> None:
@@ -30,8 +52,24 @@ def _report(path: Path, body: dict[str, Any]) -> None:
 
 
 def main(spec_path: str) -> int:
-    spec: dict[str, Any] = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    running: list[subprocess.Popen[bytes]] = []
+    stop_on_signals()
+    try:
+        return _main(json.loads(Path(spec_path).read_text(encoding="utf-8")), running)
+    except Stopped as stop:
+        return 128 + stop.signum
+    except _Released:
+        print("\n[hibernaut] Hibernaut closed this terminal; ending it.", flush=True)
+        return 1
+    finally:
+        ignore_signals()
+        for proc in running:
+            end_group(proc)
+
+
+def _main(spec: dict[str, Any], running: list[subprocess.Popen[bytes]]) -> int:
     status = Path(spec["status"])
+    lease = Path(spec["lease"])
     env = {k: v for k, v in os.environ.items() if k not in spec["unset"]}
     env.update(spec["set"])
     p = spec["profile"]
@@ -44,8 +82,7 @@ def main(spec_path: str) -> int:
         credential_proxy_url=p["credential_proxy_url"],
     )
     try:
-        init = asyncio.run(probe_init(spec["probe"], cwd=Path.cwd(), env=env, timeout_seconds=spec["probe_timeout"]))
-        check_init(profile, init)
+        check_init(profile, _probe(spec["probe"], env, spec["probe_timeout"], lease, running))
     except ClaudeCodeError as exc:
         _report(status, {"ok": False, "error": str(exc)})
         print(f"[hibernaut] {profile.name}: {exc}", file=sys.stderr, flush=True)
@@ -53,8 +90,90 @@ def main(spec_path: str) -> int:
     _report(status, {"ok": True})
     print(f"[hibernaut] {spec['title']}: starting {p['launcher']} ({p['billing']}, {p['model']}, effort {p['effort']})",
           flush=True)
-    argv: list[str] = spec["exec"]
-    os.execvpe(argv[0], argv, env)
+    return _supervise(spec["exec"], env, lease, running)
+
+
+def _probe(argv: list[str], env: dict[str, str], timeout: float, lease: Path,
+           running: list[subprocess.Popen[bytes]]) -> dict[str, Any]:
+    # Starts the harness headless and stops it at its init message, before any model request matters.
+    try:
+        proc = subprocess.Popen(argv, env=env, start_new_session=True,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        raise ClaudeCodeError(f"cannot start launcher ({argv[0]}): {exc.strerror or exc}") from exc
+    running.append(proc)
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    try:
+        proc.stdin.write(PROBE_PROMPT.encode())
+        proc.stdin.close()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    found: list[dict[str, Any]] = []
+    errors = bytearray()
+    stdout, stderr = proc.stdout, proc.stderr
+
+    def read_init() -> None:
+        for line in stdout:
+            try:
+                parsed: object = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                message = cast(dict[str, Any], parsed)
+                if message.get("type") == "system" and message.get("subtype") == "init":
+                    found.append(message)
+                    return
+
+    def read_errors() -> None:
+        while chunk := stderr.read(65536):
+            errors.extend(chunk)
+
+    reader = threading.Thread(target=read_init, daemon=True)
+    drain = threading.Thread(target=read_errors, daemon=True)
+    reader.start()
+    drain.start()
+    deadline = time.monotonic() + timeout
+    while not found:
+        if exited(proc.pid, _POLL_SECONDS):
+            reader.join(timeout=GRACE_SECONDS)
+            break
+        if not lease.exists():
+            raise _Released
+        if time.monotonic() >= deadline:
+            raise ClaudeCodeError(f"no session report within {timeout}s")
+    end_group(proc, grace=0)
+    running.remove(proc)
+    drain.join(timeout=GRACE_SECONDS)
+    if not found:
+        text = errors.decode("utf-8", errors="replace").strip()
+        raise ClaudeCodeError(f"exited ({proc.returncode}) before reporting its session: {text[-2000:]}")
+    return found[0]
+
+
+def _supervise(argv: list[str], env: dict[str, str], lease: Path, running: list[subprocess.Popen[bytes]]) -> int:
+    try:
+        proc = subprocess.Popen(argv, env=env, process_group=0)
+    except OSError as exc:
+        print(f"[hibernaut] cannot start {argv[0]}: {exc.strerror or exc}", file=sys.stderr, flush=True)
+        return 127
+    running.append(proc)
+    if sys.stdin.isatty():
+        # The agent's group takes the terminal's foreground, as a shell hands it to a job; it may already have
+        # stopped on reading the terminal before that, so it is continued.
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        try:
+            os.tcsetpgrp(sys.stdin.fileno(), proc.pid)
+            os.killpg(proc.pid, signal.SIGCONT)
+        except OSError:
+            pass
+    while not exited(proc.pid, _POLL_SECONDS):
+        if not lease.exists():
+            raise _Released
+    # Exit with the agent, after ending whatever it left in its group.
+    end_group(proc, grace=0)
+    running.remove(proc)
+    code = proc.returncode
+    return code if code >= 0 else 128 - code
 
 
 if __name__ == "__main__":

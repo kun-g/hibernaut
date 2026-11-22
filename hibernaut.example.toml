@@ -14,16 +14,12 @@ worktree_sweep_interval_seconds = 300.0
 [channels]
 host = "127.0.0.1"
 port = 8080
-feishu_app_id_env = "FEISHU_APP_ID"
-feishu_app_secret_env = "FEISHU_APP_SECRET"
-feishu_verification_token_env = "FEISHU_VERIFICATION_TOKEN"
-feishu_default_chat_id = ""
 mcp_enabled = false
 mcp_token_env = "HIBERNAUT_MCP_TOKEN"
 # 文件 Outbox：每条投递的 Outbox 消息另存为该目录下一个 Markdown 文件（文件名为本地时间到毫秒，按名排序即时间顺序），
 # 开头是任务上下文头（任务、来源、inbox_id、会话、执行器、状态、需要人做什么；审批消息附批准 / 拒绝命令）。
 # 相对路径以本文件所在目录为准，支持 ~。设置后控制台每条只打一行摘要，文件路径相对本文件所在目录显示
-# （目录外在 home 下显示为 ~/...，否则为绝对路径）；飞书 / Drive / Switchboard 照常投递。
+# （目录外在 home 下显示为 ~/...，否则为绝对路径）；Drive / Switchboard 照常投递。
 # outbox_dir = "outbox"
 
 [executors.claude]
@@ -118,7 +114,7 @@ timeout_seconds = 300.0
 
 [projects.hibernaut]
 # 字符串：一个精确 inbox_id（原有写法，不当正则）。数组：每项直接是正则，须整串匹配（fullmatch），不用加 "re:"（旧写法仍可用）；
-# 不含正则语法的项是精确 ID（字面的点写成 "\\."）。第一个精确 ID 是主 inbox，飞书按群映射到它。Switchboard 的仓库路由应指向本项目服务的 inbox。
+# 不含正则语法的项是精确 ID（字面的点写成 "\\."）。第一个精确 ID 是主 inbox，Switchboard 的群聊和仓库路由应指向本项目服务的 inbox。
 # 服务多个 inbox 的项目，每个写任务都在该 inbox 自己的 hb-* worktree 里运行。
 # inbox_id = ["proj:hibernaut", "proj:hibernaut:.+"]
 inbox_id = "proj:hibernaut"
@@ -127,7 +123,6 @@ checkout = "/absolute/path/to/your/hibernaut"
 worktree_backend = "orca"    # orca | git
 terminal_backend = "orca"    # orca | none；交互角色会话的后端，与 worktree_backend 独立。默认：orca 项目为 orca，git 项目为 none
 orca_create_terminal = false    # agent launch opens its own terminal
-feishu_chat_id = ""
 # 可选：项目级默认执行器（未设置时回退到 runtime.default_executor）
 # executor = "claude"
 

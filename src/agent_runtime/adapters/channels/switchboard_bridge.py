@@ -73,6 +73,11 @@ def canonical_to_payload(event: CanonicalEvent) -> dict[str, Any]:
         value = metadata.get(key)
         if value is not None and value != "":
             payload[key] = value
+    if event.event_type == "approval.decided":
+        decision = metadata.get("decision")
+        if decision not in ("approve", "reject"):
+            raise ValueError("approval.decided needs an approve or reject decision")
+        payload["approved"] = decision == "approve"
     if event.source == "github" and "labels" in metadata:
         payload["labels"] = metadata["labels"]
     if event.event_type == "work.closed":
@@ -143,8 +148,10 @@ class SwitchboardChannelAdapter:
             return None
         correlation_key = metadata.get("correlation_key")
         session_id = metadata.get("session_id")
-        if not (isinstance(correlation_key, str) and correlation_key):
-            raise ValueError("execution.reported needs metadata.correlation_key")
+        if not isinstance(correlation_key, str) or not correlation_key:
+            if outcome != "suspend":
+                raise ValueError("execution.reported needs metadata.correlation_key")
+            correlation_key = None
         if not (isinstance(session_id, str) and session_id):
             raise ValueError("execution.reported needs metadata.session_id")
         external_id = _external_id(inbox_id, content, metadata)
@@ -178,7 +185,9 @@ class SwitchboardChannelAdapter:
         if self._fallback is None:
             return True
         key, sid = metadata.get("correlation_key"), metadata.get("session_id")
-        return isinstance(key, str) and bool(key) and isinstance(sid, str) and bool(sid)
+        if not isinstance(sid, str) or not sid:
+            return False
+        return outcome_kind_for(metadata) == "suspend" or (isinstance(key, str) and bool(key))
 
     async def send(self, inbox_id: str, content: str, metadata: dict[str, Any]) -> None:
         if not self.routes_to_switchboard(metadata):

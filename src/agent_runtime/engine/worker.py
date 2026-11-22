@@ -186,6 +186,14 @@ class AgentWorker:
                 if not claimed:
                     break
 
+                invalid = [e.event_id for e in claimed if not self._matches_pending_approval(e)]
+                if invalid:
+                    self._inbox.mark_failed(invalid, "Approval does not match a pending request in this session")
+                    rejected = set(invalid)
+                    claimed = [e for e in claimed if e.event_id not in rejected]
+                    if not claimed:
+                        continue
+
                 restarted = False
                 snapshot_ids = {evt.event_id for evt in claimed}
                 batches = self._group_into_batches(claimed)
@@ -823,6 +831,18 @@ class AgentWorker:
     def _is_approval_decision(event: Event) -> bool:
         request_id = event.payload.get("approval_request_id")
         return isinstance(request_id, str) and bool(request_id)
+
+    def _matches_pending_approval(self, event: Event) -> bool:
+        if event.payload.get("event_type") != "approval.decided":
+            return True
+        request_id = event.payload.get("approval_request_id")
+        if not isinstance(request_id, str) or not request_id:
+            return False
+        pending = self._sessions.find_by_request_id(request_id)
+        return (
+            pending is not None and pending.status == "suspended" and pending.inbox_id == event.inbox_id
+            and (event.session_id is None or event.session_id == pending.session_id)
+        )
 
     def _resolve_session(self, event: Event) -> SessionRef | None:
         # 4-level priority: approval_request_id -> explicit session_id -> (inbox_id, correlation_key) -> new.

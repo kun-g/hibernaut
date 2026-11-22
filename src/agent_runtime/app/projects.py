@@ -100,7 +100,7 @@ def parse_inbox_rules(project: str, raw: object) -> tuple[InboxRule, ...]:
     if not any(r.literal is not None for r in rules):
         raise ValueError(
             f"{where} needs at least one exact inbox_id (an entry without regex syntax; escape a literal '.' as "
-            "'\\.'); the first one is the primary inbox that GitHub and Feishu ingress deliver to"
+            "'\\.'); the first one is the primary inbox for this project"
         )
     return tuple(rules)
 

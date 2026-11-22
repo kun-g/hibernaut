@@ -76,7 +76,7 @@ class EnvelopeTests(unittest.TestCase):
             _work(
                 source="hibernaut",
                 event_type="execution.reported",
-                metadata={"run_id": "r", "session_id": "s", "outcome_kind": "suspend"},
+                metadata={"run_id": "r", "session_id": "s", "outcome_kind": "suspend", "approval_request_id": "a"},
             )
         )
 
