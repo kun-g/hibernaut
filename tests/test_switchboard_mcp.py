@@ -19,7 +19,7 @@ class MCPToolTests(unittest.TestCase):
         self.assertEqual(init["result"]["serverInfo"]["name"], "switchboard")
         _, listed = post(f"{self.h.url}/mcp", {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, headers)
         names = [tool["name"] for tool in listed["result"]["tools"]]
-        self.assertEqual(names, ["submit_work", "post_message", "decide_approval", "replay_delivery"])
+        self.assertEqual(names, ["submit_work", "post_message", "decide_approval", "report_execution", "replay_delivery"])
 
     def test_bad_token_is_401(self) -> None:
         status, _ = mcp_call(self.h.url, "submit_work", {"external_id": "x", "subject": "s"}, token="nope")
@@ -56,6 +56,46 @@ class MCPToolTests(unittest.TestCase):
         _, missing = mcp_call(self.h.url, "submit_work", {"external_id": "r2", "subject": "go", "event_type": "work.ready"})
         self.assertTrue(missing["result"]["isError"])
         self.assertIn("work.ready requires metadata.task_id", tool_result(missing)["problems"])
+
+    def test_report_execution_fans_out_to_taskboard_and_outbound(self) -> None:
+        args = {
+            "external_id": "outbox:m-1",
+            "scope": "proj:hibernaut",
+            "correlation_key": "github:kun-g/hibernaut#42",
+            "subject": "Run finished",
+            "body": "done",
+            "occurred_at": "2026-11-22T09:00:00+08:00",
+            "metadata": {"run_id": "run-1", "session_id": "s-1", "outcome_kind": "emit"},
+        }
+        _, response = mcp_call(self.h.url, "report_execution", args)
+        self.assertFalse(response["result"]["isError"])
+        result = tool_result(response)
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["consumers"], ["taskboard", "switchboard.outbound"])
+        event = self.h.board.store.get_inbound(result["event_id"])
+        assert event is not None
+        self.assertEqual((event.source, event.event_type, event.actor), ("hibernaut", "execution.reported", "hibernaut"))
+        self.assertEqual(event.scope, "proj:hibernaut")
+        self.assertEqual(event.occurred_at, "2026-11-22T01:00:00.000000Z")
+        self.assertEqual(event.metadata["session_id"], "s-1")
+
+        _, again = mcp_call(self.h.url, "report_execution", {**args, "body": "done again"})
+        self.assertEqual(tool_result(again)["status"], "duplicate")
+        self.assertEqual(tool_result(again)["event_id"], result["event_id"])
+
+    def test_report_execution_rejects_incomplete_reports(self) -> None:
+        _, missing = mcp_call(
+            self.h.url,
+            "report_execution",
+            {"external_id": "outbox:m-2", "correlation_key": "k", "subject": "s", "metadata": {"outcome_kind": "maybe"}},
+        )
+        self.assertTrue(missing["result"]["isError"])
+        problems = tool_result(missing)["problems"]
+        self.assertIn("missing scope", problems)
+        self.assertIn("execution.reported requires metadata.run_id", problems)
+        self.assertIn("execution.reported requires metadata.session_id", problems)
+        self.assertTrue(any("outcome_kind must be one of" in p for p in problems))
+        self.assertEqual(self.h.board.store.count_inbound(), 0)
 
     def test_post_message_and_decide_approval(self) -> None:
         _, posted = mcp_call(self.h.url, "post_message", {"correlation_key": "github:kun-g/hibernaut#42", "body": "hi"})

@@ -165,3 +165,12 @@ gh_command = "gh"
 # mode = "in_process"
 # config_path = "switchboard.toml"   # relative to this file
 # consumer_id = "hibernaut"
+#
+# Stage B: connect to a remote Switchboard instead. Needs SWITCHBOARD_RELAY_TOKEN and SWITCHBOARD_MCP_TOKEN.
+# [switchboard]
+# enabled = true
+# mode = "relay"
+# relay_url = "wss://switchboard.example.com/ws/relay"
+# mcp_url = "https://switchboard.example.com/mcp"
+# consumer_id = "hibernaut"
+# ca_file = "private-ca.pem"         # optional, relative to this file

@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
+from urllib.parse import urlparse
 
 from agent_runtime.adapters.channels.github_poller import PollMode
 from agent_runtime.adapters.delivery import DeliveryConfig, parse_delivery
@@ -178,16 +179,21 @@ class GDriveConfig:
     default_inbox_id: str = "default"
 
 
-SwitchboardMode = Literal["in_process"]
+SwitchboardMode = Literal["in_process", "relay"]
+_SWITCHBOARD_MODES: tuple[SwitchboardMode, ...] = ("in_process", "relay")
 
 
 @dataclass(frozen=True, slots=True)
 class SwitchboardLinkConfig:
     enabled: bool = False
-    # "relay" (Stage B) will deliver over the network; only the same-process bridge exists today.
     mode: SwitchboardMode = "in_process"
+    # in_process: the switchboard.toml to run inside this process.
     config_path: str | None = None
     consumer_id: str = "hibernaut"
+    # relay: the remote hub's ws(s)://.../ws/relay and http(s)://.../mcp endpoints.
+    relay_url: str | None = None
+    mcp_url: str | None = None
+    ca_file: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +209,23 @@ class HibernautConfig:
     switchboard: SwitchboardLinkConfig = field(default_factory=SwitchboardLinkConfig)
 
 
+def _resolve_path(raw: str, base_dir: Path | None) -> str:
+    resolved = Path(raw).expanduser()
+    if not resolved.is_absolute() and base_dir is not None:
+        resolved = base_dir / resolved
+    return str(resolved)
+
+
+def _switchboard_url(section: dict[str, Any], key: str, schemes: tuple[str, ...]) -> str | None:
+    raw = str(section.get(key) or "").strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    if parsed.scheme not in schemes or not parsed.hostname:
+        raise ValueError(f"switchboard.{key} must be a {' or '.join(s + '://' for s in schemes)} URL")
+    return raw
+
+
 def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> SwitchboardLinkConfig:
     if raw is None:
         return SwitchboardLinkConfig()
@@ -212,22 +235,32 @@ def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> Switchb
     enabled = section.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("switchboard.enabled must be true or false")
-    mode = str(section.get("mode", "in_process")).strip()
-    if mode != "in_process":
-        raise ValueError('switchboard.mode must be "in_process"')
+    mode_raw = str(section.get("mode", "in_process")).strip()
+    mode = next((m for m in _SWITCHBOARD_MODES if m == mode_raw), None)
+    if mode is None:
+        raise ValueError('switchboard.mode must be "in_process" or "relay"')
     consumer_id = str(section.get("consumer_id", "hibernaut")).strip()
     if not consumer_id:
         raise ValueError("switchboard.consumer_id must not be empty")
     path_raw = str(section.get("config_path") or "").strip()
-    config_path: str | None = None
-    if path_raw:
-        resolved = Path(path_raw).expanduser()
-        if not resolved.is_absolute() and base_dir is not None:
-            resolved = base_dir / resolved
-        config_path = str(resolved)
-    if enabled and config_path is None:
+    config_path = _resolve_path(path_raw, base_dir) if path_raw else None
+    relay_url = _switchboard_url(section, "relay_url", ("ws", "wss"))
+    mcp_url = _switchboard_url(section, "mcp_url", ("http", "https"))
+    ca_raw = str(section.get("ca_file") or "").strip()
+    ca_file = _resolve_path(ca_raw, base_dir) if ca_raw else None
+    if enabled and mode == "in_process" and config_path is None:
         raise ValueError("switchboard.enabled needs switchboard.config_path (the switchboard.toml to run in process)")
-    return SwitchboardLinkConfig(enabled=enabled, mode="in_process", config_path=config_path, consumer_id=consumer_id)
+    if enabled and mode == "relay" and (relay_url is None or mcp_url is None):
+        raise ValueError('switchboard.mode = "relay" needs switchboard.relay_url and switchboard.mcp_url')
+    return SwitchboardLinkConfig(
+        enabled=enabled,
+        mode=mode,
+        config_path=config_path,
+        consumer_id=consumer_id,
+        relay_url=relay_url,
+        mcp_url=mcp_url,
+        ca_file=ca_file,
+    )
 
 
 def load_config(path: str | Path) -> HibernautConfig:
