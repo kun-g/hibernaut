@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+import contextlib
+import logging
+from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Never, assert_never, cast
 
@@ -139,6 +141,7 @@ class AgentWorker:
         self._interrupt_poll_interval_seconds = interrupt_poll_interval_seconds
         self._max_interrupt_restarts = max_interrupt_restarts
         self._wake_signals: dict[str, asyncio.Event] = {}
+        self._retired = False
 
     @property
     def new_event_policy(self) -> NewEventPolicy:
@@ -148,6 +151,11 @@ class AgentWorker:
         signal = self._wake_signals.get(inbox_id)
         if signal is not None:
             signal.set()
+
+    def retire(self) -> None:
+        # A config reload retires this worker: the Run in progress finishes and writes its result, but nothing
+        # more is claimed or folded in, so the next generation's workers take the inbox once the lease is released.
+        self._retired = True
 
     async def process_inbox(self, inbox_id: str) -> list[RunReport]:
         if not self._lock.acquire(inbox_id, self._worker_id, self._lease_ttl_seconds):
@@ -164,7 +172,7 @@ class AgentWorker:
             if orphans:
                 self._inbox.requeue_processing([evt.event_id for evt in orphans])
 
-            while True:
+            while not self._retired:
                 claimed = self._claim(inbox_id)
                 if not claimed:
                     break
@@ -178,6 +186,8 @@ class AgentWorker:
 
                 try:
                     for batch_idx, (session_ref, batch) in enumerate(batches):
+                        if self._retired:
+                            break
                         self._lock.renew(inbox_id, self._worker_id, self._lease_ttl_seconds)
                         wake_signal.clear()
                         batch_ids = [evt.event_id for evt in batch]
@@ -250,7 +260,12 @@ class AgentWorker:
                             _batch_target: tuple[object, ...] | None = batch_target,
                             _active_sid: str = active_session.session_id,
                         ) -> list[Event]:
-                            if self._new_event_policy != "fold" or _target_key is None or _has_decision:
+                            if (
+                                self._new_event_policy != "fold"
+                                or _target_key is None
+                                or _has_decision
+                                or self._retired
+                            ):
                                 return []
                             newly_folded: list[Event] = []
                             for candidate in self._runnable(self._inbox.fetch_pending(_inbox_id)):
@@ -288,17 +303,18 @@ class AgentWorker:
                             and not has_decision
                         )
                         try:
-                            outcome = await self._execute_batch(
-                                executor=selected_executor,
-                                inbox_id=inbox_id,
-                                batch=batch,
-                                session_ref=active_session,
-                                caps=caps,
-                                known_ids=snapshot_ids,
-                                interrupted_flag=interrupted_flag,
-                                wake_signal=wake_signal,
-                                allow_interrupt=allow_interrupt,
-                            )
+                            async with self._lease_heartbeat(inbox_id):
+                                outcome = await self._execute_batch(
+                                    executor=selected_executor,
+                                    inbox_id=inbox_id,
+                                    batch=batch,
+                                    session_ref=active_session,
+                                    caps=caps,
+                                    known_ids=snapshot_ids,
+                                    interrupted_flag=interrupted_flag,
+                                    wake_signal=wake_signal,
+                                    allow_interrupt=allow_interrupt,
+                                )
                         except _RunInterrupted:
                             # Never write Outbox on interrupt; requeue current & remaining batches.
                             requeue_ids = (
@@ -378,6 +394,26 @@ class AgentWorker:
             self._lock.release(inbox_id, self._worker_id)
 
         return reports
+
+    @contextlib.asynccontextmanager
+    async def _lease_heartbeat(self, inbox_id: str) -> AsyncGenerator[None]:
+        # A Run can outlast the lease TTL (SDE runs take hours). Without renewal another worker pool, such as the
+        # next config generation's, would take the expired lease and run the same inbox concurrently.
+        async def beat() -> None:
+            while True:
+                await asyncio.sleep(self._lease_ttl_seconds / 3)
+                if not self._lock.renew(inbox_id, self._worker_id, self._lease_ttl_seconds):
+                    logging.getLogger(__name__).warning(
+                        "Lease on inbox %s lost by %s during a run", inbox_id, self._worker_id
+                    )
+
+        task = asyncio.create_task(beat())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     def _claim(self, inbox_id: str) -> list[Event]:
         if self._hold is None:
