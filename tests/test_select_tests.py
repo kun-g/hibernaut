@@ -66,12 +66,16 @@ class TestSelectTests(unittest.TestCase):
         self.assertFalse(readme.full_suite)
         self.assertEqual(readme.tests, ("tests/test_sde_delivery.py",))
 
-        pure_doc = select_tests(["docs/architecture.md"])
+        pure_doc = select_tests(["docs/architecture.md", ".gitignore"])
         self.assertFalse(pure_doc.full_suite)
         self.assertEqual(pure_doc.tests, ())
 
     def test_global_unknown_or_deleted_code_falls_back_to_full_suite(self) -> None:
-        for path in ("pyproject.toml", ".github/workflows/ci.yml", "src/agent_runtime/deleted_mod.py"):
+        ci = select_tests([".github/workflows/ci.yml"])
+        self.assertTrue(ci.full_suite)
+        self.assertEqual(ci.reason, "global trigger: .github/workflows/ci.yml")
+
+        for path in ("pyproject.toml", ".importlinter", "src/agent_runtime/deleted_mod.py"):
             with self.subTest(path=path):
                 res = select_tests([path])
                 self.assertTrue(res.full_suite)
