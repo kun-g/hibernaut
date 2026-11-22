@@ -35,6 +35,9 @@ TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRI
 _SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 _MAX_MAIN_MOVES = 3
 _TAIL = 4000
+# No CI result for this long while the base has moved past the PR: GitHub may never run CI for it.
+_EMPTY_CHECKS_GRACE = 300.0
+CIResult = Literal["passed", "failed", "stale"]
 
 
 def bump_version(version: str, bump: Bump) -> str:
@@ -73,6 +76,8 @@ class DeliveryConfig:
     gh_command: str = "gh"
     # Close the SDE's interactive terminal once the PR is verified and recorded (never for local-only delivery).
     close_terminal: bool = False
+    # Merge conflicts with the base and failing checks go back to the developer this many times per delivery.
+    max_handbacks: int = 2
 
 
 _DELIVERY_KEYS = frozenset(f.name for f in dataclasses.fields(DeliveryConfig)) - {"repo"}
@@ -97,6 +102,13 @@ def _seconds(where: str, raw: Mapping[str, Any], key: str, default: float) -> fl
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0 or value == float("inf"):
         raise ValueError(f"{where}: {key} must be a positive number of seconds")
     return float(value)
+
+
+def _count(where: str, raw: Mapping[str, Any], key: str, default: int) -> int:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{where}: {key} must be a non-negative integer")
+    return value
 
 
 def parse_delivery(where: str, raw: object, *, repo: str) -> DeliveryConfig:
@@ -160,6 +172,7 @@ def parse_delivery(where: str, raw: object, *, repo: str) -> DeliveryConfig:
         git_command=_text(where, item, "git_command", d.git_command),
         gh_command=_text(where, item, "gh_command", d.gh_command),
         close_terminal=_flag(where, item, "close_terminal", d.close_terminal),
+        max_handbacks=_count(where, item, "max_handbacks", d.max_handbacks),
     )
 
 
@@ -183,6 +196,10 @@ def _strs() -> list[str]:
 
 def _checks() -> list[dict[str, Any]]:
     return []
+
+
+def _detail() -> dict[str, Any]:
+    return {}
 
 
 @dataclass(slots=True)
@@ -211,6 +228,8 @@ class DeliveryRecord:
     problem: str = ""
     # The permission tool that deferred to a person in this attempt.
     approval: str = ""
+    # Set with problem when the developer can fix it (a base merge conflict, failing checks): what went wrong.
+    handback: dict[str, Any] = field(default_factory=_detail)
     history: list[str] = field(default_factory=_strs)
     # Where the developer conversation can be resumed, recorded before its terminal closes.
     session_id: str = ""
@@ -270,6 +289,12 @@ class DeliveryInterrupted(Exception):
 
 class _Problem(Exception):
     pass
+
+
+class _Handback(_Problem):
+    def __init__(self, message: str, detail: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.detail = detail
 
 
 _LOCKS: dict[str, threading.Lock] = {}
@@ -369,7 +394,7 @@ class PRDelivery:
     ) -> DeliveryRecord:
         cfg = self._config
         rec = self.record(req.work_key)
-        rec.notes, rec.problem, rec.approval = [], "", ""
+        rec.notes, rec.problem, rec.approval, rec.handback = [], "", "", {}
         rec.attempts += 1
         if rec.state == "merged":
             rec.notes.append("already merged; nothing to do")
@@ -399,6 +424,8 @@ class PRDelivery:
             self._merge(req, rec, permissions, approved, is_interrupted)
         except _Problem as exc:
             rec.problem = str(exc)
+            if isinstance(exc, _Handback):
+                rec.handback = exc.detail
         finally:
             self._store.save(req.work_key, rec.to_dict())
         return rec
@@ -492,13 +519,13 @@ class PRDelivery:
             base_sha = self._fetch_base(cwd)
             merged = self._git(cwd, "merge-base", "--is-ancestor", base_sha, "HEAD", check=False).returncode == 0
             if not merged:
-                self._integrate(cwd, branch)
+                self._integrate(cwd, branch, base_sha)
             self._apply_version(req, rec, base_sha)
             rec.base_sha = base_sha
         rec.head_sha = self._git(cwd, "rev-parse", "HEAD").stdout.strip()
-        self._run_checks(rec, cwd, is_interrupted)
+        self._run_checks(rec, cwd, is_interrupted, f"{cfg.remote}/{cfg.base_branch}")
 
-    def _integrate(self, cwd: Path, branch: str) -> None:
+    def _integrate(self, cwd: Path, branch: str, base_sha: str) -> None:
         cfg = self._config
         ref = self._base_ref()
         label = f"{cfg.remote}/{cfg.base_branch}"
@@ -509,10 +536,15 @@ class PRDelivery:
         conflicted = [p for p in listed.split("\0") if p]
         if conflicted == [cfg.version_file] and self._resolve_version_conflict(cwd):
             return
+        # HEAD is still the task branch's tip while the merge is in progress.
+        commits = self._git(cwd, "log", "--oneline", "--no-merges", "-n", "20", f"HEAD..{base_sha}", "--",
+                            *conflicted, check=False).stdout.strip() if conflicted else ""
         self._git(cwd, "merge", "--abort", check=False)
-        raise _Problem(
+        raise _Handback(
             f"merging {label} into {branch} conflicts in {', '.join(conflicted) or '(unknown files)'}; "
-            "resolve it on the task branch, then approve to retry"
+            "resolve it on the task branch, then approve to retry",
+            {"kind": "conflict", "base": label, "base_sha": base_sha, "branch": branch, "files": conflicted,
+             "commits": commits},
         )
 
     def _resolve_version_conflict(self, cwd: Path) -> bool:
@@ -576,7 +608,7 @@ class PRDelivery:
                                f"{rec.version} -> {target}")
         rec.base_version, rec.version = base_version, target
 
-    def _run_checks(self, rec: DeliveryRecord, cwd: Path, is_interrupted: Callable[[], bool]) -> None:
+    def _run_checks(self, rec: DeliveryRecord, cwd: Path, is_interrupted: Callable[[], bool], label: str) -> None:
         cfg = self._config
         if rec.checked_sha == rec.head_sha and rec.checks and all(c["exit_code"] == 0 for c in rec.checks):
             return
@@ -596,7 +628,12 @@ class PRDelivery:
         failed = [r for r in results if r["exit_code"] != 0]
         if failed:
             detail = "\n".join(f"$ {r['command']} (exit {r['exit_code']})\n{_tail(r['output'], 1500)}" for r in failed)
-            raise _Problem(f"repository checks failed on {rec.head_sha[:12]}; nothing was pushed:\n{detail}")
+            message = f"repository checks failed on {rec.head_sha[:12]}; nothing was pushed:\n{detail}"
+            if all(r["exit_code"] == 127 for r in failed):
+                # A missing check command is the host's to fix, not the developer's.
+                raise _Problem(message)
+            raise _Handback(message, {"kind": "checks", "base": label, "base_sha": rec.base_sha,
+                                      "branch": rec.branch, "head": rec.head_sha, "failed": detail})
 
     # --- push and PR ---
 
@@ -726,11 +763,12 @@ class PRDelivery:
         if not self._gate(MERGE_TOOL, req, rec, permissions, approved):
             return
         for _ in range(_MAX_MAIN_MOVES):
-            if not self._wait_for_ci(rec, cwd, is_interrupted):
+            ci = self._wait_for_ci(rec, cwd, is_interrupted)
+            if ci == "failed":
                 return
             with self._repo_lock(cwd):
                 base_sha = self._fetch_base(cwd)
-                moved = (
+                moved = ci == "stale" or (
                     base_sha != rec.base_sha and bool(cfg.version_file)
                     and self._version_at(cwd, base_sha) != rec.base_version
                 )
@@ -748,7 +786,8 @@ class PRDelivery:
                     rec.verified_sha = rec.pushed_sha
                     rec.history.append(f"PR #{rec.pr_number} merged as {rec.merge_sha[:12]}")
                     return
-            # The base's version changed after this PR computed its own (a concurrent PR merged first).
+            # The base's version changed after this PR computed its own (a concurrent PR merged first), or the PR
+            # conflicts with the base and GitHub will not run CI for it.
             self._prepare(req, rec, is_interrupted)
             self._push(req, rec)
             self._open_pr(req, rec)
@@ -769,12 +808,31 @@ class PRDelivery:
             return []
         raise _Problem(f"gh pr checks failed: {_tail(proc.stderr or proc.stdout, 800)}")
 
-    def _wait_for_ci(self, rec: DeliveryRecord, cwd: Path, is_interrupted: Callable[[], bool]) -> bool:
+    def _conflicting(self, cwd: Path, number: int) -> bool:
+        view = self._gh(cwd, "pr", "view", str(number), "--json", "mergeable,mergeStateStatus", check=False)
+        try:
+            data: object = json.loads(view.stdout) if view.returncode == 0 else None
+        except json.JSONDecodeError:
+            data = None
+        if not isinstance(data, dict):
+            return False
+        info = cast(dict[str, Any], data)
+        return info.get("mergeStateStatus") == "DIRTY" or info.get("mergeable") == "CONFLICTING"
+
+    def _behind(self, cwd: Path) -> bool:
+        with self._repo_lock(cwd):
+            base_sha = self._fetch_base(cwd)
+        return self._git(cwd, "merge-base", "--is-ancestor", base_sha, "HEAD", check=False).returncode != 0
+
+    def _wait_for_ci(self, rec: DeliveryRecord, cwd: Path, is_interrupted: Callable[[], bool]) -> CIResult:
         cfg = self._config
         if not cfg.require_ci:
             rec.ci = "not required"
-            return True
-        deadline = time.monotonic() + cfg.ci_timeout_seconds
+            return "passed"
+        label = f"{cfg.remote}/{cfg.base_branch}"
+        start = time.monotonic()
+        deadline = start + cfg.ci_timeout_seconds
+        grace = min(_EMPTY_CHECKS_GRACE, cfg.ci_timeout_seconds / 2)
         while True:
             self._checkpoint(is_interrupted)
             checks = self._pr_checks(cwd, rec.pr_number)
@@ -782,11 +840,20 @@ class PRDelivery:
             if failed:
                 rec.ci = f"failed on {rec.head_sha[:12]}: {', '.join(failed)}"
                 rec.notes.append(f"not merged: CI failed ({', '.join(failed)})")
-                return False
+                return "failed"
+            # GitHub runs no pull_request CI for a PR that conflicts with its base: waiting would only time out.
+            if self._conflicting(cwd, rec.pr_number):
+                rec.history.append(f"PR #{rec.pr_number} conflicts with {label} while waiting for CI; "
+                                   f"merging {label} again")
+                return "stale"
             pending = [str(c.get("name")) for c in checks if c.get("bucket") not in ("pass", "skipping")]
             if checks and not pending:
                 rec.ci = f"passed on {rec.head_sha[:12]} ({len(checks)} check(s))"
-                return True
+                return "passed"
+            if not checks and time.monotonic() - start >= grace and self._behind(cwd):
+                rec.history.append(f"no CI reported for PR #{rec.pr_number} after {grace:g}s and {label} has moved; "
+                                   f"merging {label} again")
+                return "stale"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 waiting = f"pending: {', '.join(pending)}" if pending else "no checks reported"

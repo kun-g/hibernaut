@@ -200,6 +200,11 @@ class _State:
     inbox_id: str = ""
     # Orca terminals a CLI reviewer left open for reading; closed with the delivery when close_terminal is on.
     review_terminals: list[str] = field(default_factory=_no_history)
+    # Delivery problems sent back to the developer since a person last decided, and what each one was.
+    handbacks: int = 0
+    handback_log: list[str] = field(default_factory=_no_history)
+    # Why passed work is reviewed again (a hand-back); the next review sees only the changes since it passed.
+    recheck: str = ""
 
     def dump(self) -> str:
         return json.dumps({_CHECKPOINT_KEY: {f: getattr(self, f) for f in self.__slots__}}, ensure_ascii=False)
@@ -315,6 +320,9 @@ class SDEExecutor:
                            "incomplete": "incomplete work left in place"}.get(state.stage, "launch declined")
                     return self._stopped(session_id, native, state, why)
                 followups = self._take_followups(state)
+                if state.stage == "delivery_pending":
+                    # A person decided: the developer may be sent back again up to the limit.
+                    state.handbacks = 0
                 if state.stage == "delivery_pending" and not followups:
                     # Only the delivery step is retried; an approved permission counts for this attempt.
                     granted = frozenset({state.delivery_approval}) - {""}
@@ -587,12 +595,15 @@ class SDEExecutor:
             try:
                 snapshot = await asyncio.to_thread(worktree_fingerprint, workdir)
                 previous = ""
-                if state.blocking and state.reviewed_snapshot:
+                if (state.blocking or state.recheck) and state.reviewed_snapshot:
                     delta = await asyncio.to_thread(snapshot_diff, workdir, state.reviewed_snapshot, snapshot)
-                    previous = (
-                        f"## Previous review round\n{state.last_review}\n\n"
-                        f"## Changes since the previous review\n```diff\n{delta}\n```"
-                    )
+                    if state.blocking:
+                        previous = (
+                            f"## Previous review round\n{state.last_review}\n\n"
+                            f"## Changes since the previous review\n```diff\n{delta}\n```"
+                        )
+                    else:
+                        previous = _recheck_section(state.recheck, state.last_review, delta)
                 pin, selection = await asyncio.to_thread(self._guidance_inputs, state)
                 subject = state.work_key or workdir.name
                 review = await reviewer.review(
@@ -614,6 +625,7 @@ class SDEExecutor:
             state.last_review = reviewer.format_review(review)
             state.reviewed_snapshot = snapshot
             state.blocking = blocking
+            state.recheck = ""
             if review["verdict"] == "pass":
                 return await self._finish(session_id, native, state, caps, review="pass")
             if state.rounds >= self._options.max_review_rounds:
@@ -693,6 +705,8 @@ class SDEExecutor:
                 f"The change in {state.workdir} has not passed review. "
                 f"Approve to retry {retry}; reject to deliver it marked unreviewed."
             )
+        if state.handback_log:
+            prompt += "\n" + "\n".join(state.handback_log)
         return Suspend(
             request_id=request_id or new_id("req"),
             prompt=prompt,
@@ -749,12 +763,33 @@ class SDEExecutor:
             is_interrupted=caps.is_interrupted,
         )
         if record.problem:
+            limit = self._delivery.config.max_handbacks
+            if record.handback and state.handbacks < limit:
+                return await self._hand_back(session_id, native, state, caps, record.handback, limit)
             # Recoverable: the record keeps what already happened, so approval resumes from there.
-            state.stage, state.reason, state.delivery_approval = "delivery_pending", record.problem, record.approval
+            reason = record.problem
+            if record.handback and state.handbacks:
+                reason += (f"\nHanded back to the developer {state.handbacks} time(s) already (limit {limit}); "
+                           "a person decides now.")
+            state.stage, state.reason, state.delivery_approval = "delivery_pending", reason, record.approval
             return self._suspend(session_id, native, state)
         state.delivery_approval = ""
         exit_note = await self._exit_terminal(session_id, native, state, record)
         return self._deliver(session_id, native, state, record, exit_note=exit_note)
+
+    async def _hand_back(
+        self, session_id: str, native: str | None, state: _State, caps: RunCapabilities, handback: dict[str, Any],
+        limit: int,
+    ) -> RunOutcome:
+        # Same developer session, branch and worktree; the fix is reviewed (as a delta) and delivery runs again.
+        state.handbacks += 1
+        what = _handback_summary(handback)
+        state.handback_log.append(f"Delivery hand-back {state.handbacks} of {limit}: {what}; "
+                                  "handed back to the developer")
+        state.rounds = 0
+        if state.review_status == "pass":
+            state.recheck = what
+        return await self._run(session_id, native, state, caps, _handback_prompt(handback))
 
     async def _exit_terminal(self, session_id: str, native: str | None, state: _State, record: DeliveryRecord) -> str:
         notes = [await self._exit_dev_terminal(session_id, native, state, record),
@@ -809,6 +844,7 @@ class SDEExecutor:
             f"Summary: {state.summary or '(none)'}",
             f"Change: {state.change_kind or '(not reported)'} ({state.change_rationale or 'no rationale'})",
             *(delivery.render() if delivery is not None else []),
+            *state.handback_log,
             *([declined] if declined else []),
             *([exit_note] if exit_note else []),
             f"Test evidence:\n{state.test_evidence or '(none)'}",
@@ -828,6 +864,7 @@ class SDEExecutor:
         if state.stage == "incomplete":
             lines.append(f"Unfinished: {state.reason}")
             lines.append("Nothing was delivered; the worktree, this session and its terminal are kept.")
+        lines += state.handback_log
         if state.summary:
             lines.append(f"Summary so far: {state.summary}")
         if state.test_evidence:
@@ -908,6 +945,57 @@ def inspect_worktree(workdir: Path, base: str) -> WorktreeCheck:
         return WorktreeCheck(base=base, error=f"base {base[:12]} is unknown here: {count.stderr.strip()}")
     return WorktreeCheck(base=base, commits=int(count.stdout.strip()),
                          changes=tuple(ln for ln in status.stdout.splitlines() if ln.strip()))
+
+
+def _handback_summary(handback: Mapping[str, Any]) -> str:
+    base = str(handback.get("base", "the base branch"))
+    if handback.get("kind") == "conflict":
+        return f"merging {base} conflicts in {', '.join(_strs(handback.get('files'))) or '(unknown files)'}"
+    return f"repository checks failed on {str(handback.get('head', ''))[:12]} with {base} merged"
+
+
+def _handback_prompt(handback: Mapping[str, Any]) -> str:
+    base = str(handback.get("base", "the base branch"))
+    sha = str(handback.get("base_sha", ""))
+    branch = str(handback.get("branch", "this branch"))
+    report = (
+        "Then rerun the project's required checks, commit, and report as in your original contract: status, "
+        "summary, test_evidence with each command and its raw output, change_kind and change_rationale for the "
+        "whole branch. Do not set the version, push or open a pull request; Hibernaut continues the delivery after "
+        "the review. If resolving it needs a decision from a person, return needs_input with one question."
+    )
+    if handback.get("kind") == "conflict":
+        files = "\n".join(f"- {f}" for f in _strs(handback.get("files"))) or "- (unknown files)"
+        commits = str(handback.get("commits", "")).strip() or "(none listed)"
+        return (
+            f"## Delivery handed back: merging {base} conflicts\n"
+            f"Hibernaut's delivery step merged {base} (at {sha}) into {branch} and the merge conflicted in:\n"
+            f"{files}\n\n"
+            f"Commits on {base} that touch these files and are not on {branch} yet:\n```text\n{commits}\n```\n\n"
+            f"Hibernaut aborted its merge, so the worktree is clean. Merge {base} into {branch} yourself "
+            f"(`git merge {base}`), resolve every conflict so both sides' changes keep working (read what those "
+            "commits changed, and carry this task's change onto any code paths they added), and commit the merge. "
+            + report
+        )
+    return (
+        "## Delivery handed back: repository checks failed\n"
+        f"Hibernaut's delivery step merged {base} (at {sha}) into {branch}, set the version and ran the "
+        f"repository checks on {str(handback.get('head', ''))[:12]}; they failed and nothing was pushed:\n"
+        f"```text\n{handback.get('failed', '')}\n```\n\n"
+        "The merge is already committed on this branch. Fix the failures on this branch (often a test or file "
+        f"that the new {base} commits expect from this change). " + report
+    )
+
+
+def _recheck_section(why: str, last_review: str, delta: str) -> str:
+    return (
+        f"## Previous review round (passed)\n{last_review}\n\n"
+        f"## Why this is reviewed again\nThe delivery step handed the passed work back to the developer: {why}. "
+        "Review only the changes since the passed review below (the merge and how its conflicts were resolved, "
+        "and any fix); the rest was reviewed already. The commits merged from the base branch were reviewed "
+        "there; judge how this change was combined with them.\n\n"
+        f"## Changes since the passed review\n```diff\n{delta}\n```"
+    )
 
 
 def _unfinished_prompt(problem: str) -> str:

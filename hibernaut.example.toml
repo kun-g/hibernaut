@@ -151,6 +151,7 @@ require_ci = true               # 合并前要求 PR 的 CI 全部通过（gh pr
 ci_timeout_seconds = 1800.0     # 等 CI 的上限；超时则挂起，批准后再查
 ci_poll_seconds = 30.0
 merge_method = "squash"         # squash | merge | rebase
+max_handbacks = 2               # 合入主干出现版本号以外的冲突、或合入后检查失败时，交回同一 SDE 会话解决（再经增量评审后自动续交付）的次数；超过后挂起等人，人批准后重新计数；0 = 直接挂起
 close_terminal = true           # 交付有证据后（PR 头即已推送且检查通过的提交；授权合并时须已合并）自动关闭 SDE 终端与 CLI 评审者（terminal = "orca"）留下的评审终端；先记下 SHA、PR 与可恢复会话 ID，worktree 不动
 # git / gh 由宿主机自己的凭据（gh auth login、git credential helper、SSH agent）或下面的可信包装命令认证；
 # Hibernaut 调用前剥离 GH_TOKEN / GITHUB_TOKEN 等变量，进程里不持有 token。
