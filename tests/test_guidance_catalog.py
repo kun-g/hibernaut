@@ -94,7 +94,7 @@ def head(repo: Path) -> str:
 
 
 def dev(write=None, **extra):
-    step = {"write": write or {}, "output": {"status": "done", "summary": "done", "test_evidence": EVIDENCE}}
+    step = {"write": write or {}, "output": {"status": "done", "summary": "done", "test_evidence": EVIDENCE, "change_kind": "fix", "change_rationale": "divide handled zero wrongly"}}
     step.update(extra)
     return step
 

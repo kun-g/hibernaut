@@ -43,7 +43,7 @@ BETA_AGENTS = (
 
 
 def dev(write=None, **output):
-    out = {"status": "done", "summary": "divide implemented", "test_evidence": EVIDENCE}
+    out = {"status": "done", "summary": "divide implemented", "test_evidence": EVIDENCE, "change_kind": "fix", "change_rationale": "divide handled zero wrongly"}
     out.update(output)
     return {"write": write or {}, "output": out}
 

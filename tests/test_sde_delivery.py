@@ -1,0 +1,274 @@
+import json
+import os
+import shutil
+import tempfile
+import tomllib
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from agent_runtime.adapters.channels.gdrive_tasks import DriveTaskPoller, parse_task_markdown
+from agent_runtime.adapters.delivery import MERGE_TOOL, OPEN_PR_TOOL, PRDelivery
+from agent_runtime.adapters.executor_cli import OrcaWorktreeManager
+from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
+from agent_runtime.adapters.executor_cli.project_guidance import Selection, load_guidance, pin_head
+from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
+from agent_runtime.adapters.executor_cli.sde import SDE_SCHEMA, SDEExecutor, SDEOptions
+from agent_runtime.adapters.permissions.security import AutoModePermissionAdapter
+from agent_runtime.adapters.storage_sqlite import SQLiteSessionStoreAdapter
+from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
+from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
+from agent_runtime.app.config import parse_config
+from agent_runtime.core.models import Emit, Event, PermissionDecision, SessionRef, Suspend
+from tests.fakes import InMemoryPermission
+from tests.test_coder_reviewer import fake_command
+from tests.test_gdrive_tasks import _FakeDriveClient
+from tests.test_pr_delivery import VERSION_FILE, DeliveryCase, git
+
+REPO = Path(__file__).resolve().parents[1]
+EVIDENCE = "red: test_zero FAILED\ngreen: 4 passed"
+PASS = {"verdict": "pass", "summary": "ok", "blocking": []}
+
+
+def dev(files, kind="feature", commit="divide rejects zero", **output):
+    out = {"status": "done", "summary": "divide rejects zero", "test_evidence": EVIDENCE,
+           "change_kind": kind, "change_rationale": f"{kind}: divide now raises on zero"}
+    out.update(output)
+    return {"write": files, "commit": commit, "output": out}
+
+
+def event(payload, key="task:1"):
+    return Event(inbox_id="proj:x", source="test", external_id=f"e-{os.urandom(4).hex()}", payload=payload,
+                 correlation_key=key)
+
+
+class TestSDEDelivery(DeliveryCase, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.wt = self.clone("task-1", "hb/task-1")
+        self.log = self.root / "calls.jsonl"
+        self.plan = self.root / "plan.json"
+        self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan)}))
+        self.workspaces = SQLiteWorkspaceStore(self.db)
+        self.caps = Mock(permissions=InMemoryPermission())
+        self.caps.is_interrupted.return_value = False
+        self.caps.memory.load_baseline.return_value = {}
+
+    def set_plan(self, sde=(), reviewer=()):
+        self.plan.write_text(json.dumps({"sde": list(sde), "reviewer": list(reviewer)}))
+
+    def executor(self, review=True, delivery=None):
+        launcher = ClaudeCodeLauncher(name="fake", command=fake_command(self.root))
+        reviewer = CoderReviewerExecutor(
+            profile=ClaudeCodeProfile(name="coder-reviewer", launcher=launcher, model="claude-sonnet-5-5"),
+            workspaces=self.workspaces, tasks=SQLiteTaskMetadataStore(self.db),
+        )
+        return SDEExecutor(
+            profile=ClaudeCodeProfile(name="sde", launcher=launcher),
+            options=SDEOptions(review=review),
+            reviewer=reviewer if review else None,
+            worktree_manager=OrcaWorktreeManager(workspace_store=self.workspaces,
+                                                 session_store=SQLiteSessionStoreAdapter(self.db), backend="git"),
+            inbox_checkout_map={},
+            tasks=SQLiteTaskMetadataStore(self.db),
+            delivery=delivery,
+        )
+
+    def payload(self, **extra):
+        return {"executor_id": "sde", "text": "divide must reject a zero divisor", "title": "Reject zero divisors",
+                "explicit_workdir": str(self.wt), "base_ref": "origin/main", **extra}
+
+    def calls(self, role=None):
+        rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return [r for r in rows if role is None or r["role"] == role]
+
+    @staticmethod
+    def resume(outcome, key="task:1"):
+        return SessionRef(session_id=outcome.session_id or "s", inbox_id="proj:x", correlation_key=key,
+                          executor_id="sde", executor_session_id=outcome.executor_session_id, status="suspended",
+                          checkpoint=outcome.session_checkpoint, pending_request_id=outcome.request_id)
+
+    async def test_report_names_the_change_kind_and_the_delivery_step_opens_the_pr(self):
+        self.set_plan(sde=[dev({"calc.py": "def divide(a, b):\n    return a / b\n"})], reviewer=[PASS])
+        outcome = await self.executor(delivery=self.delivery()).execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        text = outcome.messages[0]
+        for part in ("[sde] delivered (review=pass after 1 round", "Change: feature",
+                     "feature: divide now raises on zero", "Delivery: pr_open - PR created",
+                     "PR: https://github.example/o/r/pull/1", "Version: 0.4.0 -> 0.5.0 (minor for feature)",
+                     "Checks: `", "passed", "not merged: this project does not authorize merging"):
+            self.assertIn(part, text)
+        dev_call = self.calls("sde")[0]
+        schema = json.loads(dev_call["argv"][dev_call["argv"].index("--json-schema") + 1])
+        self.assertEqual(schema["properties"]["change_kind"]["enum"], ["breaking", "feature", "fix", "test_docs"])
+        self.assertIn("## Delivery", dev_call["prompt"])
+        self.assertIn(f"sets the version in {VERSION_FILE}", dev_call["prompt"])
+        self.assertIn("do not push, open a pull request or merge", dev_call["prompt"])
+        self.assertEqual(self.gh_state()["prs"][0]["title"], "Pkg 0.5.0: Reject zero divisors")
+
+    async def test_done_without_a_change_kind_is_rejected(self):
+        step = dev({"calc.py": "x = 1\n"})
+        del step["output"]["change_kind"]
+        self.set_plan(sde=[step])
+        outcome = await self.executor(review=False).execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertIn("development failed: the developer reported done without a valid change_kind",
+                      outcome.messages[0])
+
+    async def test_without_delivery_the_receipt_still_names_the_change_kind(self):
+        self.set_plan(sde=[dev({"test_calc.py": "def test_x():\n    pass\n"}, kind="test_docs")])
+        outcome = await self.executor(review=False).execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertIn("Change: test_docs (test_docs: divide now raises on zero)", outcome.messages[0])
+        self.assertNotIn("Delivery:", outcome.messages[0])
+        self.assertNotIn("## Delivery", self.calls("sde")[0]["prompt"])
+
+    async def test_a_failed_delivery_suspends_and_approval_retries_only_the_delivery(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])
+        state = self.gh_state()
+        state["fail"] = {"create": 1}
+        self.state_file.write_text(json.dumps(state))
+        executor = self.executor(review=False, delivery=self.delivery())
+        outcome = await executor.execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Suspend), outcome
+        self.assertIn("[sde] delivery pending: gh pr create failed", outcome.prompt)
+        self.assertIn("Approve to retry the delivery step", outcome.prompt)
+        approve = event({"approval_request_id": outcome.request_id, "approved": True})
+        resumed = await executor.execute([approve], self.resume(outcome), self.caps)
+        assert isinstance(resumed, Emit), resumed
+        self.assertIn("Delivery: pr_open", resumed.messages[0])
+        self.assertEqual(len(self.calls("sde")), 1)
+        self.assertEqual(len(self.gh_state()["prs"]), 1)
+
+    async def test_a_follow_up_while_delivery_waits_is_developed_before_delivering_again(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}), dev({"calc.py": "x = 2\n"}, commit="follow-up")])
+        state = self.gh_state()
+        state["fail"] = {"create": 1}
+        self.state_file.write_text(json.dumps(state))
+        executor = self.executor(review=False, delivery=self.delivery())
+        outcome = await executor.execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Suspend), outcome
+        follow_up = event({"executor_id": "sde", "text": "also handle negative zero"})
+        approve = event({"approval_request_id": outcome.request_id, "approved": True})
+        resumed = await executor.execute([follow_up, approve], self.resume(outcome), self.caps)
+        assert isinstance(resumed, Emit), resumed
+        self.assertIn("Delivery: pr_open", resumed.messages[0])
+        self.assertIn("also handle negative zero", self.calls("sde")[1]["prompt"])
+        self.assertEqual(git(self.bare, "show", "hb/task-1:calc.py"), "x = 2")
+
+    async def test_rejecting_a_delivery_retry_delivers_the_local_state(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])
+        defer = InMemoryPermission({OPEN_PR_TOOL: PermissionDecision("defer", "a person opens PRs")})
+        self.caps.permissions = defer
+        executor = self.executor(review=False, delivery=self.delivery())
+        outcome = await executor.execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Suspend), outcome
+        self.assertIn("delivery.open_pr needs approval: a person opens PRs", outcome.prompt)
+        rejected = await executor.execute(
+            [event({"approval_request_id": outcome.request_id, "approved": False})], self.resume(outcome), self.caps)
+        assert isinstance(rejected, Emit), rejected
+        self.assertIn("[sde] delivered (review=off", rejected.messages[0])
+        self.assertIn("Delivery: local", rejected.messages[0])
+        self.assertIn("delivery declined: delivery.open_pr needs approval", rejected.messages[0])
+        self.assertEqual(self.gh_state().get("prs", []), [])
+
+    async def test_approving_a_deferred_merge_merges_with_the_recorded_sha(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
+        self.caps.permissions = InMemoryPermission({MERGE_TOOL: PermissionDecision("defer", "merge needs a person")})
+        executor = self.executor(delivery=self.delivery(auto_merge=True))
+        outcome = await executor.execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Suspend), outcome
+        self.assertIn("delivery.merge needs approval", outcome.prompt)
+        self.assertIn("PR: https://github.example/o/r/pull/1", outcome.prompt)
+        approve = event({"approval_request_id": outcome.request_id, "approved": True})
+        merged = await executor.execute([approve], self.resume(outcome), self.caps)
+        assert isinstance(merged, Emit), merged
+        main_sha = git(self.bare, "rev-parse", "main")
+        self.assertIn(f"Merge commit: {main_sha}", merged.messages[0])
+        self.assertIn("Version: 0.4.0 -> 0.4.1 (patch for fix)", merged.messages[0])
+        self.assertIn('"0.4.1"', self.main_file())
+
+    async def test_drive_task_body_and_title_reach_the_developer(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])
+        payload = {"executor_id": "sde", "title": "Reject zero", "body": "divide must raise on zero",
+                   "explicit_workdir": str(self.wt)}
+        outcome = await self.executor(review=False).execute([event(payload)], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertIn("# Reject zero\n\ndivide must raise on zero", self.calls("sde")[0]["prompt"])
+
+
+class TestProjectAdoption(unittest.TestCase):
+    def test_project_delivery_config_is_parsed_from_the_trusted_deployment_file(self):
+        cfg = parse_config({
+            "executors": {"sde": {"role": "sde", "review": False}},
+            "projects": {"hb": {"repo": "o/r", "checkout": "/tmp/x",
+                                "delivery": {"open_pr": True, "version_file": VERSION_FILE}}},
+        })
+        delivery = cfg.projects["hb"].delivery
+        assert delivery is not None
+        self.assertEqual((delivery.repo, delivery.open_pr, delivery.auto_merge), ("o/r", True, False))
+        self.assertIsNone(parse_config({"projects": {"p": {"repo": "o/r", "checkout": "/x"}}}).projects["p"].delivery)
+        with self.assertRaisesRegex(ValueError, "projects.hb.delivery: auto_merge needs open_pr = true"):
+            parse_config({"projects": {"hb": {"repo": "o/r", "checkout": "/x", "delivery": {"auto_merge": True}}}})
+
+    def test_example_config_adopts_pr_created_as_the_default_end_point_for_this_project(self):
+        raw = tomllib.loads((REPO / "hibernaut.example.toml").read_text(encoding="utf-8"))
+        cfg = parse_config(raw, base_dir=REPO)
+        delivery = cfg.projects["hibernaut"].delivery
+        assert delivery is not None
+        self.assertTrue(delivery.open_pr)
+        self.assertFalse(delivery.auto_merge)
+        self.assertEqual(delivery.version_file, "src/agent_runtime/__init__.py")
+        self.assertEqual(delivery.checks, (("lint-imports",), ("pytest", "-v"), ("pyright",)))
+        version = (REPO / delivery.version_file).read_text(encoding="utf-8")
+        PRDelivery(delivery, Mock())._read_version(version, "check")  # the pattern matches the real file
+
+    def test_delivery_tools_are_separate_permission_names_allowed_by_auto_mode(self):
+        auto = AutoModePermissionAdapter()
+        self.assertEqual(auto.check(OPEN_PR_TOOL, {}).action, "allow")
+        self.assertEqual(auto.check(MERGE_TOOL, {}).action, "allow")
+        self.assertNotEqual(OPEN_PR_TOOL, MERGE_TOOL)
+
+    def test_development_dispatch_templates_route_to_sde_and_reviews_keep_their_route(self):
+        drive_meta, body = parse_task_markdown((REPO / "docs/dispatch/sde-task.drive.md").read_text(encoding="utf-8"))
+        self.assertEqual(drive_meta["executor_id"], "sde")
+        self.assertTrue(body)
+        sde_event = json.loads((REPO / "docs/dispatch/sde-task.json").read_text(encoding="utf-8"))
+        self.assertEqual(sde_event["payload"]["executor_id"], "sde")
+        review_event = json.loads((REPO / "docs/dispatch/review-task.json").read_text(encoding="utf-8"))
+        self.assertEqual(review_event["payload"]["executor_id"], "coder-reviewer")
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        self.assertIn("executor_id: sde", readme)
+
+    def test_drive_template_routes_to_sde_with_its_activities(self):
+        drive = _FakeDriveClient()
+        drive.add_file("f1", "sde-task.md", (REPO / "docs/dispatch/sde-task.drive.md").read_text(encoding="utf-8"))
+        handler = Mock()
+        handler.ingest.return_value = Mock(duplicate=False)
+        DriveTaskPoller(handler, client=drive, default_inbox_id="proj:hibernaut", root_folder_id="root-1").poll_once()
+        payload = handler.ingest.call_args.kwargs["payload"]
+        self.assertEqual(payload["executor_id"], "sde")
+        self.assertEqual(payload["activities"], "development")
+        self.assertIn("## Acceptance", payload["body"])
+
+    def test_repository_guidance_selects_versioning_by_activity_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            for rel in ("AGENTS.md", "guidance.toml", "docs/process/versioning.md"):
+                (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(REPO / rel, repo / rel)
+            git(repo, "init", "-q", "-b", "main")
+            git(repo, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "add", "-A")
+            git(repo, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-qm", "guidance")
+            guidance = load_guidance(pin_head(repo, origin="test"))
+        versioning = "docs/process/versioning.md"
+        pick = lambda *acts: [s.doc.path for s in guidance.select(Selection(acts, ()))]  # noqa: E731
+        self.assertIn(versioning, pick("versioning"))
+        self.assertIn(versioning, pick("release"))
+        self.assertNotIn(versioning, pick("testing"))
+        self.assertNotIn(versioning, pick("development"))
+        self.assertIn("change_kind", SDE_SCHEMA["required"])
+
+
+if __name__ == "__main__":
+    unittest.main()

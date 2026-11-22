@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from agent_runtime.adapters.channels.github_poller import PollMode
+from agent_runtime.adapters.delivery import DeliveryConfig, parse_delivery
 from agent_runtime.adapters.executor_cli.claude_code import (
     ClaudeCodeLauncher,
     ClaudeCodeProfile,
@@ -66,6 +67,8 @@ class ProjectConfig:
     orca_create_terminal: bool = False
     feishu_chat_id: str = ""
     executor: str | None = None
+    # Hibernaut's PR delivery step for finished SDE tasks; None ends a task with local commits.
+    delivery: DeliveryConfig | None = None
 
 
 ROLES = (CODER_REVIEWER_ROLE, SDE_ROLE)
@@ -307,10 +310,15 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             )
         proj_exec_raw = item.get("executor")
         proj_exec = str(proj_exec_raw).strip() if proj_exec_raw is not None else None
+        repo = str(item["repo"])
+        # Authorization to publish comes only from this deployment file, never from the repository under change.
+        delivery = (
+            parse_delivery(f"projects.{name}.delivery", item["delivery"], repo=repo) if "delivery" in item else None
+        )
         projects[str(name)] = ProjectConfig(
             name=str(name),
             inbox_id=str(item.get("inbox_id", f"proj:{name}")),
-            repo=str(item["repo"]),
+            repo=repo,
             checkout=str(item["checkout"]),
             poll_labels=tuple(str(lbl) for lbl in item.get("poll_labels", ())),
             worktree_backend=cast(Literal["orca", "git"], backend),
@@ -318,6 +326,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             orca_create_terminal=bool(item.get("orca_create_terminal", False)),
             feishu_chat_id=str(item.get("feishu_chat_id", "")),
             executor=proj_exec or None,
+            delivery=delivery,
         )
 
     gd_raw = raw.get("gdrive", {})

@@ -21,6 +21,10 @@ class AutoModePermissionAdapter:
             "orca.agent.launch",
             "coder_reviewer.launch",
             "sde.launch",
+            # Each is granted per project in [projects.<name>.delivery] (open_pr, auto_merge); move one to the
+            # defer list to also ask a person every time.
+            "delivery.open_pr",
+            "delivery.merge",
         }
     )
     DEFAULT_DEFER_TOOLS: frozenset[str] = frozenset(

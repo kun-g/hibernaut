@@ -118,6 +118,18 @@ CREATE TABLE IF NOT EXISTS task_metadata (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Where a task's delivery stands (local, pr_open, merged), so a retry resumes from the last confirmed step.
+CREATE TABLE IF NOT EXISTS deliveries (
+    work_key TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    pr_url TEXT NOT NULL DEFAULT '',
+    version TEXT NOT NULL DEFAULT '',
+    merge_sha TEXT NOT NULL DEFAULT '',
+    record_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 

@@ -155,7 +155,7 @@ def run_interactive():
                 target = Path.cwd() / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
-            output = step.get("output", {"status": "done", "summary": "implemented", "test_evidence": "red: 1 failed; green: 1 passed"})
+            output = step.get("output", {"status": "done", "summary": "implemented", "test_evidence": "red: 1 failed; green: 1 passed", "change_kind": "fix", "change_rationale": "corrects the behaviour under test"})
         if HANDOFF_TOOLS[1] in permitted:
             failed, text = handoff.call("submit_result", {"turn": turn, **output})
             if failed:
@@ -198,7 +198,7 @@ else:
         subprocess.run(["git", "commit", "-qm", step["commit"]], check=True)
     for rel, content in step.get("write_uncommitted", {}).items():
         (Path.cwd() / rel).write_text(content, encoding="utf-8")
-    output = step.get("output", {"status": "done", "summary": "implemented", "test_evidence": "red: 1 failed; green: 1 passed"})
+    output = step.get("output", {"status": "done", "summary": "implemented", "test_evidence": "red: 1 failed; green: 1 passed", "change_kind": "fix", "change_rationale": "corrects the behaviour under test"})
 if isinstance(step, dict) and step.get("error"):
     emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "result": step["error"], "session_id": session_id})
     sys.exit(1)

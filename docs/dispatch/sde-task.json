@@ -1,0 +1,12 @@
+{
+  "inbox_id": "proj:hibernaut",
+  "external_id": "task-42",
+  "correlation_key": "task-42",
+  "payload": {
+    "executor_id": "sde",
+    "title": "Short title used for the pull request",
+    "text": "Task requirements and acceptance criteria",
+    "activities": ["development"],
+    "base_ref": "origin/main"
+  }
+}
