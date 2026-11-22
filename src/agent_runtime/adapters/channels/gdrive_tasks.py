@@ -3,10 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Sequence
+import re
+import urllib.parse
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from agent_runtime.adapters.channels.gdrive_attachments import (
+    ATTACHMENTS_FOLDER_NAME,
+    DriveAttachmentStore,
+    FetchedAttachment,
+    render_attachment_section,
+    split_attachment_refs,
+)
 from agent_runtime.core.models import Emit, Event, Suspend, utc_now_iso
 from agent_runtime.core.ports import ChannelPort, SessionStorePort
 from agent_runtime.engine.handler import EventHandler, IngestResult
@@ -25,6 +34,8 @@ class DriveFileMeta:
     mime_type: str
     modified_time: str
     parents: tuple[str, ...] = ()
+    # Bytes, as Drive reports them; None for Google Docs and other files Drive stores no size for.
+    size: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +44,18 @@ class DriveQueueFolders:
     in_progress_id: str
     done_id: str
     failed_id: str
+    # "" when the queue root has no 附件/ folder: attachments are then reported as unavailable.
+    attachments_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DriveDownload:
+    name: str
+    # The type of `content`: the file's own, or the export format of a Google Doc.
+    mime_type: str
+    content: bytes
+    # "" for a file downloaded as stored; text/markdown or text/plain for an exported Google Doc.
+    export_mime_type: str = ""
 
 
 class DriveClientProtocol(Protocol):
@@ -42,37 +65,98 @@ class DriveClientProtocol(Protocol):
     def read_text(self, file_meta: DriveFileMeta) -> str: ...
     def append_text(self, file_id: str, mime_type: str, addition: str) -> None: ...
     def move_file(self, file_id: str, *, add_parent: str, remove_parent: str) -> None: ...
+    def download(self, file_meta: DriveFileMeta) -> DriveDownload: ...
+
+
+TASK_META_KEYS = ("scope", "executor_id", "priority", "title", "activities", "tags", "base_ref", "attachments")
+# A thematic break: ---, ***, ___ (spaced or longer, such as the underscore rule a Google Doc exports as text).
+_RULE = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
+_SETEXT_EQ = re.compile(r"^\s{0,3}=+\s*$")
+_ATX_PREFIX = re.compile(r"^#{1,6}\s+")
+_MD_ESCAPE = re.compile(r"\\([!-/:-@\[-`{-~])")
+_ANY_KEY_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:(.*)$")
+_KNOWN_KEY_AT = re.compile(r"(?:^|(?<=\s))(" + "|".join(TASK_META_KEYS) + r")\s*:")
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _metadata_text(line: str) -> str:
+    # Google's Markdown export turns metadata lines into headings and escapes punctuation such as executor\_id.
+    return _MD_ESCAPE.sub(r"\1", _ATX_PREFIX.sub("", line.strip()).rstrip("#").strip())
+
+
+def _split_known_keys(text: str) -> dict[str, str] | None:
+    # "scope: a priority: b title: c" (lines a Google Doc joined into one) splits at each known key;
+    # a quoted value is kept whole, so `title: "Fix tags: parsing"` stays one title.
+    first = _KNOWN_KEY_AT.match(text)
+    if first is None:
+        return None
+    pairs: dict[str, str] = {}
+    key, pos = first.group(1), first.end()
+    while True:
+        rest = text[pos:].lstrip()
+        start = len(text) - len(rest)
+        search_from = start
+        if rest[:1] in ("'", '"'):
+            close = text.find(rest[0], start + 1)
+            if close != -1:
+                search_from = close + 1
+        nxt = _KNOWN_KEY_AT.search(text, search_from)
+        while nxt is not None and nxt.group(1) in pairs | {key: ""}:
+            nxt = _KNOWN_KEY_AT.search(text, nxt.end())
+        pairs[key] = _unquote(text[start : nxt.start() if nxt else len(text)])
+        if nxt is None:
+            return pairs
+        key, pos = nxt.group(1), nxt.end()
 
 
 def parse_task_markdown(raw_text: str) -> tuple[dict[str, str], str]:
-    text = raw_text.lstrip("\ufeff")
-    if not text.startswith("---"):
-        return {}, text.strip()
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return {}, text.strip()
-    end_idx: int | None = None
-    for idx in range(1, len(lines)):
-        if lines[idx].strip() == "---":
-            end_idx = idx
-            break
-    if end_idx is None:
+    # Frontmatter opens with a rule. Closed by a second rule (or a setext underline) it is read as before, any
+    # `key: value` included. Unclosed, as a Google Doc export leaves it, only lines starting with a known key count,
+    # and the block ends at the first other line. Anything not recognised stays in the body untouched.
+    text = raw_text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    start = next((i for i, ln in enumerate(lines) if ln.strip()), len(lines))
+    if start == len(lines) or not _RULE.match(lines[start]):
         return {}, text.strip()
 
+    close: int | None = None
+    for idx in range(start + 1, len(lines)):
+        line = lines[idx].strip()
+        if _RULE.match(line) or _SETEXT_EQ.match(line):
+            close = idx
+            break
+        if line and not line.startswith("#") and not _ANY_KEY_LINE.match(_metadata_text(line)):
+            break
+
     meta: dict[str, str] = {}
-    for line in lines[1:end_idx]:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or ":" not in stripped:
+    if close is not None:
+        for line in lines[start + 1 : close]:
+            content = _metadata_text(line)
+            known = _split_known_keys(content)
+            if known is not None:
+                meta.update(known)
+            elif not line.strip().startswith("#") and (match := _ANY_KEY_LINE.match(content)):
+                meta[match.group(1)] = _unquote(match.group(2))
+        return meta, "\n".join(lines[close + 1 :]).strip()
+
+    body_from = start + 1
+    for idx in range(start + 1, len(lines)):
+        if not lines[idx].strip():
             continue
-        key, val = stripped.split(":", 1)
-        clean_key = key.strip()
-        clean_val = val.strip()
-        if len(clean_val) >= 2 and clean_val[0] == clean_val[-1] and clean_val[0] in ("'", '"'):
-            clean_val = clean_val[1:-1]
-        if clean_key:
-            meta[clean_key] = clean_val
-    body = "\n".join(lines[end_idx + 1 :]).strip()
-    return meta, body
+        known = _split_known_keys(_metadata_text(lines[idx]))
+        if known is None:
+            break
+        meta.update(known)
+        body_from = idx + 1
+    if not meta:
+        return {}, text.strip()
+    return meta, "\n".join(lines[body_from:]).strip()
 
 
 def extract_gdrive_file_id(correlation_key: str | None) -> str | None:
@@ -99,12 +183,32 @@ class ServiceProxy(Protocol):
         payload: dict[str, Any] | None = None,
     ) -> ProxyResponseLike: ...
 
+    # The response body as bytes, with its headers: for the binary 'download' operation.
+    def call_service_bytes(
+        self,
+        *,
+        service_name: str,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> ProxyBytesResponseLike: ...
+
+
+class ProxyBytesResponseLike(Protocol):
+    @property
+    def status_code(self) -> int: ...
+    @property
+    def body(self) -> bytes: ...
+    @property
+    def headers(self) -> Mapping[str, str]: ...
+
 
 class DriveProxyError(RuntimeError):
     def __init__(self, op: str, status_code: int, reason: str) -> None:
         super().__init__(f"Drive queue proxy refused '{op}' (HTTP {status_code}): {reason}")
         self.op = op
         self.status_code = status_code
+        self.reason = reason
 
 
 def _meta_from_json(item: Any) -> DriveFileMeta:
@@ -114,7 +218,16 @@ def _meta_from_json(item: Any) -> DriveFileMeta:
         mime_type=str(item.get("mimeType", "text/markdown")),
         modified_time=str(item.get("modifiedTime", "")),
         parents=tuple(str(p) for p in item.get("parents", ())),
+        size=int(item["size"]) if str(item.get("size", "")).isdigit() else None,
     )
+
+
+def _error_reason(body: bytes | str) -> str:
+    try:
+        data = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    return str(data.get("error") or "no reason given") if isinstance(data, dict) else "no reason given"
 
 
 class ProxiedDriveClient:
@@ -157,6 +270,21 @@ class ProxiedDriveClient:
     def move_file(self, file_id: str, *, add_parent: str, remove_parent: str) -> None:
         self._call("move", {"file_id": file_id, "add_parent": add_parent, "remove_parent": remove_parent})
 
+    def download(self, file_meta: DriveFileMeta) -> DriveDownload:
+        # The body is the file itself; name and types come back in headers. The proxy enforces the folder and size.
+        resp = self._proxy.call_service_bytes(
+            service_name=self._service, method="POST", path="download", payload={"file_id": file_meta.file_id}
+        )
+        if resp.status_code != 200:
+            raise DriveProxyError("download", resp.status_code, _error_reason(resp.body))
+        headers = {k.lower(): v for k, v in resp.headers.items()}
+        return DriveDownload(
+            name=urllib.parse.unquote(headers.get("x-drive-file-name", "")) or file_meta.name,
+            mime_type=headers.get("x-drive-mime-type", "") or "application/octet-stream",
+            content=resp.body,
+            export_mime_type=headers.get("x-drive-export-mime-type", ""),
+        )
+
 
 def resolve_queue_folders(
     client: DriveClientProtocol,
@@ -166,6 +294,7 @@ def resolve_queue_folders(
     in_progress_folder_id: str | None = None,
     done_folder_id: str | None = None,
     failed_folder_id: str | None = None,
+    attachments_folder_id: str | None = None,
     folder_names: tuple[str, str, str, str] = _DEFAULT_FOLDER_NAMES,
 ) -> DriveQueueFolders:
     discovered: dict[str, str] = {}
@@ -174,6 +303,8 @@ def resolve_queue_folders(
             raise ValueError(
                 "Either root_folder_id or all four queue subfolder IDs must be configured"
             )
+        discovered = client.find_subfolders(root_folder_id)
+    elif root_folder_id and not attachments_folder_id:
         discovered = client.find_subfolders(root_folder_id)
 
     pending = pending_folder_id or discovered.get(folder_names[0])
@@ -196,6 +327,8 @@ def resolve_queue_folders(
         in_progress_id=in_progress,
         done_id=done,
         failed_id=failed,
+        # Optional: a queue without 附件/ still runs its text tasks.
+        attachments_id=attachments_folder_id or discovered.get(ATTACHMENTS_FOLDER_NAME, ""),
     )
 
 
@@ -287,7 +420,8 @@ class DriveTaskPoller:
             if frontmatter.get("executor_id"):
                 payload["executor_id"] = frontmatter["executor_id"]
             # Guidance selection for role executors, as comma-separated lists.
-            for key in ("activities", "tags", "base_ref"):
+            # attachments: Drive file IDs or names in 附件/, fetched when the Run starts.
+            for key in ("activities", "tags", "base_ref", "attachments"):
                 if frontmatter.get(key):
                     payload[key] = frontmatter[key]
 
@@ -341,6 +475,8 @@ class DriveResultWriter:
         in_progress_folder_id: str | None = None,
         done_folder_id: str | None = None,
         failed_folder_id: str | None = None,
+        attachments_folder_id: str | None = None,
+        attachments: DriveAttachmentStore | None = None,
     ) -> None:
         self._client = client
         self._sessions = sessions
@@ -352,6 +488,8 @@ class DriveResultWriter:
             done_folder_id,
             failed_folder_id,
         )
+        self._attachments_folder_id = attachments_folder_id
+        self._attachments = attachments
         self._folders: DriveQueueFolders | None = None
         self._reported_keys: set[str] = set()
 
@@ -364,6 +502,7 @@ class DriveResultWriter:
                 in_progress_folder_id=self._explicit_ids[1],
                 done_folder_id=self._explicit_ids[2],
                 failed_folder_id=self._explicit_ids[3],
+                attachments_folder_id=self._attachments_folder_id,
             )
         return self._folders
 
@@ -391,18 +530,83 @@ class DriveResultWriter:
         inbox_id: str,
         events: Sequence[Event],
         correlation_key: str | None,
-    ) -> None:
+    ) -> dict[str, dict[str, Any]] | None:
         # RunStartListener: a queued file moves to 执行中/ only once a Worker starts its Run. A file someone already
-        # moved elsewhere (or a resumed task already in 执行中/) is left where it is.
+        # moved elsewhere (or a resumed task already in 执行中/) is left where it is. A failed move is logged and
+        # the attachments are still fetched: neither stops the Run.
         _ = inbox_id
         file_ids = {
             fid
             for key in (correlation_key, *(evt.correlation_key for evt in events))
             if (fid := extract_gdrive_file_id(key))
         }
-        folders = self.ensure_folders()
         for file_id in sorted(file_ids):
-            self._move_out_of_pending(file_id, self._client.get_file_meta(file_id), folders.in_progress_id)
+            try:
+                folders = self.ensure_folders()
+                self._move_out_of_pending(file_id, self._client.get_file_meta(file_id), folders.in_progress_id)
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning("Drive task %s did not move to 执行中/: %s", file_id, exc)
+        return self._with_attachments(events)
+
+    def _with_attachments(self, events: Sequence[Event]) -> dict[str, dict[str, Any]] | None:
+        # The newest revision of each task file in the batch gets the 附件 section appended to its body. Only this
+        # Run's copy of the payload changes, so a restarted Run fetches the files again.
+        newest: dict[str, Event] = {}
+        for evt in events:
+            file_id = evt.payload.get("drive_file_id")
+            if isinstance(file_id, str) and extract_gdrive_file_id(evt.correlation_key) == file_id:
+                newest[file_id] = evt
+        amended: dict[str, dict[str, Any]] = {}
+        for file_id, evt in newest.items():
+            section = self._attachment_section(file_id, evt.payload)
+            if section:
+                body = str(evt.payload.get("body") or "").rstrip()
+                amended[evt.event_id] = {**evt.payload, "body": f"{body}\n\n{section}" if body else section}
+        return amended or None
+
+    def _attachment_section(self, file_id: str, payload: Mapping[str, Any]) -> str:
+        refs = split_attachment_refs(payload.get("attachments"))
+        if self._attachments is None:
+            # Unreachable from configuration, which always sets an attachments directory.
+            return render_attachment_section(
+                [FetchedAttachment(ref=r, error="Hibernaut 没有配置附件目录（gdrive.attachments_dir）") for r in refs]
+            )
+        try:
+            folder_id = self.ensure_folders().attachments_id
+        except Exception as exc:  # noqa: BLE001
+            return render_attachment_section(
+                [FetchedAttachment(ref=r, error=f"无法确定 {ATTACHMENTS_FOLDER_NAME}/ 目录：{exc}") for r in refs]
+            )
+        body = str(payload.get("body") or "")
+        return render_attachment_section(self._attachments.fetch(file_id, folder_id=folder_id, refs=refs, body=body))
+
+    def sweep_attachments(self) -> list[str]:
+        # Drops the attachment directories of tasks with no active or suspended session. Directories are listed
+        # before sessions: a Run saves its active session before it downloads, so a directory seen here whose session
+        # is open is never mistaken for an orphan.
+        if self._attachments is None:
+            return []
+        try:
+            held = self._attachments.task_ids()
+            if not held:
+                return []
+            open_ids = {
+                fid
+                for status in ("active", "suspended")
+                for session in self._sessions.list_sessions(status=status)
+                if (fid := extract_gdrive_file_id(session.correlation_key))
+            }
+            removed = [fid for fid in held if fid not in open_ids and self._attachments.remove(fid)]
+        except OSError:
+            logging.getLogger(__name__).warning("Sweeping Drive task attachments failed", exc_info=True)
+            return []
+        if removed:
+            logging.getLogger(__name__).info("Removed attachments of closed Drive tasks: %s", ", ".join(removed))
+        return removed
+
+    def _drop_attachments(self, file_id: str) -> None:
+        if self._attachments is not None:
+            self._attachments.remove(file_id)
 
     def write_emit(
         self,
@@ -489,9 +693,18 @@ class DriveResultWriter:
         self._move_if_in_progress(file_id, meta, folders.failed_id)
         if dedup_key:
             self._reported_keys.add(dedup_key)
+        # 失败/ ends the task in the queue; a rerun moved back to 待执行/ fetches its attachments again.
+        self._drop_attachments(file_id)
         return True
 
     def handle_run_report(self, report: RunReport) -> bool:
+        try:
+            return self._write_report(report)
+        finally:
+            # After every Run: a session that closed (this one, or one closed through MCP) no longer needs its files.
+            self.sweep_attachments()
+
+    def _write_report(self, report: RunReport) -> bool:
         if not report.session_id:
             return False
         session = self._sessions.get(report.session_id)

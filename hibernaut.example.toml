@@ -165,11 +165,16 @@ gh_command = "gh"
 # root_folder_id = "your_task_queue_root_folder_id"
 # poll_interval_seconds = 30.0
 # default_inbox_id = "proj:hibernaut"
-# 可选显式覆盖四个子目录 ID（不填则自动按名称发现：待执行 / 执行中 / 已完成 / 失败）
+# 可选显式覆盖子目录 ID（不填则自动按名称发现：待执行 / 执行中 / 已完成 / 失败，以及可选的 附件）
 # pending_folder_id = ""
 # in_progress_folder_id = ""
 # done_folder_id = ""
 # failed_folder_id = ""
+# attachments_folder_id = ""
+# 任务附件（frontmatter attachments 或正文里 附件/ 内文件的 Drive ID）在 Run 开始时下载到这里：
+# <目录>/<任务文件 ID>/<附件文件 ID>/<文件名>，目录 0700、文件 0600，任务会话结案或失败后删除。
+# 须在所有 worktree 之外；不填 = runtime.db_path 所在目录下的 attachments/。相对路径以本文件目录为准
+# attachments_dir = "~/.local/share/hibernaut/attachments"
 
 # GitHub webhooks go to Switchboard. Configure repository routes and [github] require_label in switchboard.toml.
 # Stage A: run Switchboard in this process (off by default). Tokens come only from SWITCHBOARD_* env vars,

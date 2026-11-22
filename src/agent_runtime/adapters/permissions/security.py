@@ -118,6 +118,13 @@ class ProxyResponse:
     body: str
 
 
+@dataclass(frozen=True, slots=True)
+class ProxyBytesResponse:
+    status_code: int
+    body: bytes
+    headers: dict[str, str]
+
+
 class CredentialProxyClient:
     # Agent runtime holds zero real secrets; external proxy injects credentials per service_name.
     # `token` only authenticates this process to the local proxy; it grants nothing upstream by itself.
@@ -134,6 +141,17 @@ class CredentialProxyClient:
         path: str,
         payload: dict[str, Any] | None = None,
     ) -> ProxyResponse:
+        resp = self.call_service_bytes(service_name=service_name, method=method, path=path, payload=payload)
+        return ProxyResponse(status_code=resp.status_code, body=resp.body.decode("utf-8", "replace"))
+
+    def call_service_bytes(
+        self,
+        *,
+        service_name: str,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> ProxyBytesResponse:
         url = f"{proxy_service_url(self._proxy_base_url, service_name)}/{path.lstrip('/')}"
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         headers = {"Content-Type": "application/json"}
@@ -142,8 +160,8 @@ class CredentialProxyClient:
         req = urllib.request.Request(url=url, data=data, method=method.upper(), headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=self._timeout_seconds) as resp:  # noqa: S310
-                return ProxyResponse(status_code=int(resp.status), body=resp.read().decode("utf-8"))
+                return ProxyBytesResponse(int(resp.status), resp.read(), dict(resp.headers.items()))
         except urllib.error.HTTPError as exc:
             # A refusal from the proxy is a business result for the caller, not a transport failure.
             with exc:
-                return ProxyResponse(status_code=int(exc.code), body=exc.read().decode("utf-8", "replace"))
+                return ProxyBytesResponse(int(exc.code), exc.read(), dict(exc.headers.items()))
