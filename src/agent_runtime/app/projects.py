@@ -12,46 +12,74 @@ from agent_runtime.engine.worker import ExecutorFailed
 
 _log = logging.getLogger(__name__)
 
-INBOX_PATTERN_PREFIX = "re:"
+# Accepted for configs written before array entries became plain regexes; such entries never act as an address.
+LEGACY_PATTERN_PREFIX = "re:"
+_REGEX_SYNTAX = frozenset(".^$*+?{}[]|()")
+
+
+def _fixed_inbox_id(pattern: str) -> str | None:
+    # The one inbox_id a pattern can fullmatch when it uses no regex syntax beyond escaped punctuation
+    # ("proj:a\.b" -> "proj:a.b"); None when it can match more than one string.
+    out: list[str] = []
+    chars = iter(pattern)
+    for c in chars:
+        if c == "\\":
+            nxt = next(chars, "")
+            if not nxt or (nxt.isascii() and nxt.isalnum()):
+                return None
+            out.append(nxt)
+        elif c in _REGEX_SYNTAX:
+            return None
+        else:
+            out.append(c)
+    return "".join(out)
 
 
 @dataclass(frozen=True, slots=True)
 class InboxRule:
-    # Exactly one of literal / pattern; patterns match the whole inbox_id (fullmatch).
-    literal: str | None = None
-    pattern: str | None = None
-    _compiled: re.Pattern[str] | None = field(default=None, compare=False, repr=False)
+    # Every rule fullmatches the whole inbox_id. `literal` is the single inbox_id the rule can match, the only
+    # form that may serve as a delivery address; patterns route but never receive deliveries.
+    text: str
+    pattern: str
+    literal: str | None
+    _compiled: re.Pattern[str] = field(compare=False, repr=False)
 
     @staticmethod
     def exact(inbox_id: str) -> InboxRule:
-        return InboxRule(literal=inbox_id)
+        escaped = re.escape(inbox_id)
+        return InboxRule(text=inbox_id, pattern=escaped, literal=inbox_id, _compiled=re.compile(escaped))
 
     @staticmethod
-    def regex(pattern: str) -> InboxRule:
-        return InboxRule(pattern=pattern, _compiled=re.compile(pattern))
+    def parse(entry: str) -> InboxRule:
+        # Raises re.error for an invalid pattern.
+        legacy = entry.startswith(LEGACY_PATTERN_PREFIX)
+        pattern = entry[len(LEGACY_PATTERN_PREFIX):] if legacy else entry
+        compiled = re.compile(pattern)
+        literal = None if legacy else _fixed_inbox_id(pattern)
+        if literal is not None and compiled.fullmatch(literal) is None:
+            literal = None
+        return InboxRule(text=entry, pattern=pattern, literal=literal, _compiled=compiled)
 
     def matches(self, inbox_id: str) -> bool:
-        if self.literal is not None:
-            return self.literal == inbox_id
-        assert self._compiled is not None
         return self._compiled.fullmatch(inbox_id) is not None
 
     def __str__(self) -> str:
-        return self.literal if self.literal is not None else f"{INBOX_PATTERN_PREFIX}{self.pattern}"
+        return self.text
 
 
 def parse_inbox_rules(project: str, raw: object) -> tuple[InboxRule, ...]:
-    # A string is one exact inbox_id (the pre-array form); an array mixes exact IDs and "re:" patterns.
+    # A string is one exact inbox_id (the pre-array form, kept verbatim). In an array every entry is a regex that
+    # must fullmatch the inbox_id; an entry without regex syntax names exactly one inbox.
     where = f"projects.{project}.inbox_id"
     if raw is None:
         return (InboxRule.exact(f"proj:{project}"),)
     if isinstance(raw, str):
         if not raw.strip():
             raise ValueError(f"{where} must not be empty")
-        if raw.startswith(INBOX_PATTERN_PREFIX):
+        if raw.startswith(LEGACY_PATTERN_PREFIX):
             raise ValueError(
                 f"{where} = {raw!r} is a pattern; list it in an array after a literal inbox_id, "
-                f'e.g. inbox_id = ["proj:{project}", {raw!r}]'
+                f'e.g. inbox_id = ["proj:{project}", {raw[len(LEGACY_PATTERN_PREFIX):]!r}]'
             )
         return (InboxRule.exact(raw),)
     if not isinstance(raw, list) or not raw:
@@ -60,23 +88,19 @@ def parse_inbox_rules(project: str, raw: object) -> tuple[InboxRule, ...]:
     for item in raw:  # pyright: ignore[reportUnknownVariableType]
         if not isinstance(item, str) or not item.strip():
             raise ValueError(f"{where} entries must be non-empty strings, got {item!r}")
-        if item.startswith(INBOX_PATTERN_PREFIX):
-            pattern = item[len(INBOX_PATTERN_PREFIX):]
-            if not pattern:
-                raise ValueError(f"{where}: {item!r} has an empty pattern")
-            try:
-                rule = InboxRule.regex(pattern)
-            except re.error as exc:
-                raise ValueError(f"{where}: invalid pattern {item!r}: {exc}") from exc
-        else:
-            rule = InboxRule.exact(item)
-        if rule in rules:
+        if item == LEGACY_PATTERN_PREFIX:
+            raise ValueError(f"{where}: {item!r} has an empty pattern")
+        try:
+            rule = InboxRule.parse(item)
+        except re.error as exc:
+            raise ValueError(f"{where}: invalid pattern {item!r}: {exc}") from exc
+        if any(r.pattern == rule.pattern for r in rules):
             raise ValueError(f"{where} lists {item!r} twice")
         rules.append(rule)
     if not any(r.literal is not None for r in rules):
         raise ValueError(
-            f"{where} needs at least one literal inbox_id; the first one is the primary inbox that "
-            "GitHub and Feishu ingress deliver to"
+            f"{where} needs at least one exact inbox_id (an entry without regex syntax; escape a literal '.' as "
+            "'\\.'); the first one is the primary inbox that GitHub and Feishu ingress deliver to"
         )
     return tuple(rules)
 
@@ -118,7 +142,7 @@ def validate_project_rules(projects: Iterable[_Routable]) -> None:
     # A literal one project claims and another project's pattern also matches would be ambiguous at every dispatch.
     for literal, owner in owners.items():
         for proj in listed:
-            if proj.name != owner and any(r.pattern is not None and r.matches(literal) for r in proj.inbox_rules):
+            if proj.name != owner and any(r.literal is None and r.matches(literal) for r in proj.inbox_rules):
                 raise ValueError(
                     f"inbox_id {literal!r} of projects.{owner} also matches a pattern of projects.{proj.name}"
                 )
