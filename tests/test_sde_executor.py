@@ -15,11 +15,19 @@ from agent_runtime.adapters.executor_cli import OrcaWorktreeManager
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions
-from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteSessionStoreAdapter
+from agent_runtime.adapters.storage_sqlite import (
+    SQLiteDatabase,
+    SQLiteInboxAdapter,
+    SQLiteLeaseLockAdapter,
+    SQLiteOutboxAdapter,
+    SQLiteSessionStoreAdapter,
+    SQLiteTimerAdapter,
+)
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.app.config import load_config, parse_config
 from agent_runtime.app.main import build_daemon_from_config, serve_configured
 from agent_runtime.core.models import Emit, Event, PermissionDecision, SessionRef, Suspend
+from agent_runtime.engine import AgentWorker, EventHandler
 from tests.fakes import InMemoryPermission
 from tests.test_coder_reviewer import (
     CHANGES_REQUESTED,
@@ -316,6 +324,158 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
         call = self.calls("sde")[0]
         self.assertEqual(call["base_url"], PROXY)
         self.assertNotEqual(call["api_key"], "sk-real-secret")
+
+
+class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
+    # Suspend/Resume through the real AgentWorker, SQLite sessions, inbox and outbox.
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.repo = make_base_repo(self.root)
+        git(self.repo, "checkout", "-qb", "hb/task-1")
+        self.log = self.root / "calls.jsonl"
+        self.plan = self.root / "plan.json"
+        self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan)}))
+        self.db = SQLiteDatabase(":memory:")
+        self.addCleanup(self.db.close)
+        self.inbox = SQLiteInboxAdapter(self.db)
+        self.outbox = SQLiteOutboxAdapter(self.db)
+        self.sessions = SQLiteSessionStoreAdapter(self.db)
+        self.workspaces = SQLiteWorkspaceStore(self.db)
+        self.handler = EventHandler(inbox=self.inbox)
+        self.permissions = InMemoryPermission()
+        self.n = 0
+
+    def set_plan(self, sde=(), reviewer=()):
+        self.plan.write_text(json.dumps({"sde": list(sde), "reviewer": list(reviewer)}))
+
+    def worker(self):
+        launcher = ClaudeCodeLauncher(name="fake", command=fake_command(self.root))
+        reviewer = CoderReviewerExecutor(profile=ClaudeCodeProfile(name="coder-reviewer", launcher=launcher),
+                                         workspaces=self.workspaces)
+        sde = SDEExecutor(
+            profile=ClaudeCodeProfile(name="sde", launcher=launcher),
+            options=SDEOptions(),
+            reviewer=reviewer,
+            worktree_manager=OrcaWorktreeManager(workspace_store=self.workspaces, session_store=self.sessions,
+                                                 backend="git"),
+            inbox_checkout_map={},
+        )
+        memory = Mock()
+        memory.load_baseline.return_value = {}
+        return AgentWorker(worker_id="w", inbox=self.inbox, timers=SQLiteTimerAdapter(self.db), memory=memory,
+                           permissions=self.permissions, outbox=self.outbox, lock=SQLiteLeaseLockAdapter(self.db),
+                           sessions=self.sessions, executors={"sde": sde}, global_default_executor="sde")
+
+    async def send(self, payload):
+        self.n += 1
+        self.handler.ingest(inbox_id="proj:x", source="test", external_id=f"w{self.n}",
+                            payload=payload, correlation_key="task:1")
+        await self.worker().process_inbox("proj:x")
+
+    async def task(self):
+        await self.send({"executor_id": "sde", "text": "divide must reject a zero divisor",
+                         "explicit_workdir": str(self.repo), "base_ref": "main"})
+
+    async def decide(self, approved, **extra):
+        (pending,) = [m for m in self.outbox.fetch_pending(100) if m.metadata.get("kind") == "approval_request"][-1:]
+        await self.send({"approval_request_id": pending.metadata["request_id"], "approved": approved, **extra})
+
+    def cards(self):
+        return [m for m in self.outbox.fetch_pending(100) if m.metadata.get("kind") == "approval_request"]
+
+    def emits(self):
+        return [m.content for m in self.outbox.fetch_pending(100) if m.metadata.get("kind") == "emit"]
+
+    def calls(self, role=None):
+        rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return [r for r in rows if role is None or r["role"] == role]
+
+    async def test_follow_up_while_suspended_reaches_developer_and_reviewer_without_a_new_card(self):
+        self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?"), dev(FIXED)], reviewer=[PASS])
+        await self.task()
+        self.assertEqual(len(self.cards()), 1)
+        await self.send({"text": "Raise ValueError and mention b in the message"})
+        # The follow-up is recorded; the same request stays open and no duplicate card is posted.
+        self.assertEqual(len(self.cards()), 1)
+        self.assertEqual(len(self.calls("sde")), 1)
+        session = self.sessions.find_by_correlation_key("proj:x", "task:1")
+        assert session is not None
+        self.assertEqual((session.status, session.pending_request_id), ("suspended", self.cards()[0].metadata["request_id"]))
+        self.assertIn("mention b in the message", session.checkpoint or "")
+        await self.decide(True)
+        resumed = self.calls("sde")[1]
+        self.assertIn("mention b in the message", resumed["prompt"])
+        review = self.calls("reviewer")[0]
+        self.assertIn("divide must reject a zero divisor", review["prompt"])
+        self.assertIn("mention b in the message", review["prompt"])
+        self.assertIn("review=pass", self.emits()[-1])
+
+    async def test_follow_up_while_review_pending_is_developed_before_the_retry_review(self):
+        self.set_plan(sde=[dev(FIXED), dev(FIXED, summary="also logs")], reviewer=[{"error": "reviewer crashed"}, PASS])
+        await self.task()
+        self.assertIn("review pending", self.cards()[0].content)
+        await self.send({"text": "also log rejected divisions"})
+        self.assertEqual(len(self.cards()), 1)
+        await self.decide(True)
+        self.assertEqual([c["role"] for c in self.calls()], ["sde", "reviewer", "sde", "reviewer"])
+        self.assertIn("also log rejected divisions", self.calls("sde")[1]["prompt"])
+        self.assertIn("also log rejected divisions", self.calls("reviewer")[1]["prompt"])
+        self.assertIn("review=pass", self.emits()[-1])
+
+    async def test_deferred_launch_resumes_on_approval(self):
+        self.permissions = InMemoryPermission({"sde.launch": PermissionDecision(action="defer", reason="approve sde")})
+        self.set_plan(sde=[dev(BUGGY), dev(FIXED)], reviewer=[CHANGES_REQUESTED, PASS])
+        await self.task()
+        self.assertEqual(self.calls(), [])
+        self.assertIn("approve sde", self.cards()[0].content)
+        await self.decide(True)
+        # Approval runs the deferred launch; the fix round asks the gate again and is deferred again.
+        self.assertEqual([c["role"] for c in self.calls()], ["sde", "reviewer"])
+        self.assertEqual(len(self.cards()), 2)
+        self.assertIn("approve sde", self.cards()[1].content)
+        await self.decide(True)
+        self.assertEqual([c["role"] for c in self.calls()], ["sde", "reviewer", "sde", "reviewer"])
+        self.assertIn("calc.py:2", self.calls("sde")[1]["prompt"])
+        self.assertIn("review=pass after 2 round", self.emits()[-1])
+
+    async def test_deferred_launch_rejected_stops_without_running(self):
+        self.permissions = InMemoryPermission({"sde.launch": PermissionDecision(action="defer", reason="approve sde")})
+        self.set_plan(sde=[dev(FIXED)])
+        await self.task()
+        await self.decide(False)
+        self.assertEqual(self.calls(), [])
+        self.assertIn("[sde] stopped: launch declined", self.emits()[-1])
+        self.assertNotIn("delivered", self.emits()[-1])
+
+    async def test_fix_round_blocked_by_the_gate_stops(self):
+        class FixRoundBlocked:
+            def __init__(self):
+                self.seen = 0
+
+            def check(self, tool_name, args):
+                if tool_name == "sde.launch":
+                    self.seen += 1
+                    if self.seen > 1:
+                        return PermissionDecision(action="block", reason="no more launches")
+                return PermissionDecision(action="allow", reason="ok")
+
+        self.permissions = FixRoundBlocked()
+        self.set_plan(sde=[dev(BUGGY), dev(FIXED)], reviewer=[CHANGES_REQUESTED])
+        await self.task()
+        self.assertEqual([c["role"] for c in self.calls()], ["sde", "reviewer"])
+        self.assertIn("no more launches", self.emits()[-1])
+        self.assertNotIn("delivered", self.emits()[-1])
+
+    async def test_declined_question_reports_stopped_not_delivered(self):
+        self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?")])
+        await self.task()
+        await self.decide(False)
+        text = self.emits()[-1]
+        self.assertIn("[sde] stopped: question declined", text)
+        self.assertIn("Raise or return None?", text)
+        self.assertIn(str(self.repo), text)
+        self.assertNotIn("delivered", text)
+        self.assertNotIn("review=", text)
 
 
 class TestSDEDispatchAndHotReload(unittest.TestCase):

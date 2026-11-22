@@ -83,7 +83,7 @@ def _no_history() -> list[str]:
 
 @dataclass(slots=True)
 class _State:
-    stage: Literal["develop", "needs_input", "review_pending"]
+    stage: Literal["develop", "launch_pending", "needs_input", "review_pending"]
     workdir: str
     base_ref: str
     requirements: str
@@ -95,6 +95,9 @@ class _State:
     last_review: str = ""
     reviewed_snapshot: str = ""
     reason: str = ""
+    # Messages that arrived while suspended; folded into the requirements when the run resumes.
+    followups: list[str] = field(default_factory=_no_history)
+    pending_prompt: str = ""
 
     def dump(self) -> str:
         return json.dumps({_CHECKPOINT_KEY: {f: getattr(self, f) for f in self.__slots__}}, ensure_ascii=False)
@@ -165,35 +168,50 @@ class SDEExecutor:
         try:
             resumed = _State.load(session.checkpoint) if session is not None and pending_id else None
             prompt: str | None
+            approved_launch = False
             if resumed is not None:
                 state = resumed
                 answer = _approval(events, pending_id)
                 if answer is None:
-                    # Not the awaited decision: the change stays pending under the same request.
+                    # Not the awaited decision: record it and keep the same request open.
+                    text = join_text(targets, ("requirements", "text"))
+                    if text:
+                        state.followups.append(text)
                     return self._suspend(session_id, native, state, request_id=pending_id)
                 approved, comment = answer
                 if not approved:
-                    note = f"retry declined; {state.reason}" if state.stage == "review_pending" else "question declined"
-                    return self._deliver(session_id, native, state, review="pending", note=note)
+                    if state.stage == "review_pending":
+                        return self._deliver(session_id, native, state, review="pending",
+                                             note=f"retry declined; {state.reason}")
+                    why = "question declined" if state.stage == "needs_input" else "launch declined"
+                    return self._stopped(session_id, native, state, why)
+                followups = self._take_followups(state)
                 if state.stage == "needs_input":
-                    reply = "\n\n".join(p for p in (comment, join_text(targets, ("text",))) if p)
+                    reply = "\n\n".join(p for p in (comment, followups) if p)
                     prompt = f"## Answer from a person\n{reply or '(approved without comment)'}"
+                elif state.stage == "launch_pending":
+                    prompt = state.pending_prompt + (f"\n\n## Follow-up from a person\n{followups}" if followups else "")
+                    approved_launch = True
                 else:
                     state.rounds = 0
                     prompt = self._fix_prompt(state) if state.blocking else None
+                    if followups:
+                        # New requirements must be developed before the retried review sees them.
+                        prompt = (prompt + "\n\n" if prompt else "") + f"## Follow-up from a person\n{followups}"
             else:
                 state = await self._new_state(events, targets, session)
                 prompt = self._first_prompt(state, caps)
-            if prompt is not None:
-                decision = caps.permissions.check("sde.launch", {**self._launch_args(), "workdir": state.workdir})
-                if decision.action == "block":
-                    return self._fail(session_id, native, decision.reason)
-                if decision.action == "defer":
-                    return Suspend(request_id=new_id("req"), prompt=decision.reason, session_checkpoint="{}",
-                                   session_id=session_id, executor_session_id=native)
-            return await self._run(session_id, native, state, caps, prompt)
+            return await self._run(session_id, native, state, caps, prompt, approved_launch=approved_launch)
         except (ClaudeCodeError, ReviewAborted, RuntimeError, OSError) as exc:
             return self._fail(session_id, native, str(exc))
+
+    @staticmethod
+    def _take_followups(state: _State) -> str:
+        text = "\n\n".join(state.followups)
+        if text:
+            state.requirements = f"{state.requirements}\n\n## Follow-up from a person\n{text}"
+        state.followups = []
+        return text
 
     def _launch_args(self) -> dict[str, Any]:
         p = self._profile
@@ -261,11 +279,28 @@ class SDEExecutor:
         return _validate_report(result.get("structured_output")), sid
 
     async def _run(
-        self, session_id: str, native: str | None, state: _State, caps: RunCapabilities, prompt: str | None
+        self,
+        session_id: str,
+        native: str | None,
+        state: _State,
+        caps: RunCapabilities,
+        prompt: str | None,
+        *,
+        approved_launch: bool = False,
     ) -> RunOutcome:
         # prompt=None goes straight to review (retrying one that could not complete).
         while True:
             if prompt is not None:
+                # Every developer launch passes the gate, fix rounds included; an approved deferral runs once.
+                if not approved_launch:
+                    decision = caps.permissions.check("sde.launch", {**self._launch_args(), "workdir": state.workdir})
+                    if decision.action == "block":
+                        return self._stopped(session_id, native, state, f"launch blocked: {decision.reason}")
+                    if decision.action == "defer":
+                        state.stage, state.reason, state.pending_prompt = "launch_pending", decision.reason, prompt
+                        return self._suspend(session_id, native, state)
+                approved_launch = False
+                state.pending_prompt = ""
                 report, native = await self._develop(native, state, prompt, caps)
                 if report["status"] == "needs_input":
                     state.stage, state.reason = "needs_input", report["question"]
@@ -320,7 +355,15 @@ class SDEExecutor:
     def _suspend(self, session_id: str, native: str | None, state: _State, request_id: str | None = None) -> Suspend:
         name = self._profile.name
         if state.stage == "needs_input":
-            prompt = f"[{name}] needs input: {state.reason}\nApprove with a comment to answer; reject to stop the task."
+            prompt = (
+                f"[{name}] needs input: {state.reason}\n"
+                "Answer by replying on this task or approving with a comment, then approve; reject to stop the task."
+            )
+        elif state.stage == "launch_pending":
+            prompt = (
+                f"[{name}] launch needs approval: {state.reason}\n"
+                f"Approve to start this development run in {state.workdir}; reject to stop the task."
+            )
         else:
             retry = "with another fix round" if state.blocking else "the review"
             prompt = (
@@ -358,6 +401,20 @@ class SDEExecutor:
             lines.append(f"Review history: {'; '.join(state.history)}")
         if state.last_review:
             lines.append(f"Last review:\n{state.last_review}")
+        return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native)
+
+    def _stopped(self, session_id: str, native: str | None, state: _State, why: str) -> Emit:
+        lines = [f"[{self._profile.name}] stopped: {why} ({self._settings()})", f"Workdir: {state.workdir}"]
+        if state.stage == "needs_input":
+            lines.append(f"Question: {state.reason}")
+        if state.summary:
+            lines.append(f"Summary so far: {state.summary}")
+        if state.test_evidence:
+            lines.append(f"Test evidence so far:\n{state.test_evidence}")
+        if state.history:
+            lines.append(f"Review history: {'; '.join(state.history)}")
+        if state.followups:
+            lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
         return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native)
 
     def _fail(self, session_id: str, native: str | None, detail: str) -> Emit:
