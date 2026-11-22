@@ -99,9 +99,8 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual((row.status, row.attempts), ("failed", 1))
         self.assertIn("230001", row.last_error or "")
 
-    def test_emit_report_becomes_github_comment_with_labels(self) -> None:
-        gateway = self.gateway()
-        report = CanonicalEvent(
+    def _github_report(self, **metadata: object) -> CanonicalEvent:
+        return CanonicalEvent(
             source="hibernaut",
             event_type="execution.reported",
             external_id="run:r2:emit",
@@ -109,13 +108,23 @@ class GatewayTests(unittest.TestCase):
             correlation_key="github:kun-g/hibernaut#42",
             subject="Done",
             body="PR opened",
-            metadata={
-                "run_id": "r2",
-                "session_id": "s2",
-                "outcome_kind": "emit",
-                "add_labels": ["review"],
-                "remove_labels": ["in progress"],
-            },
+            metadata={"run_id": "r2", "session_id": "s2", "outcome_kind": "emit", **metadata},
+        )
+
+    def test_reports_do_not_go_back_to_their_github_issue_unless_targeted(self) -> None:
+        for outcome in ("emit", "error", "suspend"):
+            self.assertIsNone(self.gateway().message_for_report(self._github_report(outcome_kind=outcome)))
+        opted_in = self.gateway(reply_to_origin=("github", "feishu")).message_for_report(self._github_report())
+        assert opted_in is not None
+        self.assertEqual((opted_in.channel, dict(opted_in.target)), ("github", {"repo": "kun-g/hibernaut", "number": 42}))
+
+    def test_emit_report_becomes_github_comment_with_labels(self) -> None:
+        gateway = self.gateway()
+        report = self._github_report(
+            reply_channel="github",
+            reply_target="kun-g/hibernaut#42",
+            add_labels=["review"],
+            remove_labels=["in progress"],
         )
         self.assertIsNone(gateway.consume_event(report))
         gateway.consume_event(report)

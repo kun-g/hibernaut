@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 from urllib.parse import quote
 
+from switchboard.feishu_auth import TOKEN_REJECTED_CODES, FeishuAuthError, FeishuTokenSource
 from switchboard.http_client import HttpClient, HttpResponse
 from switchboard.ports import CredentialBrokerPort, OutboundMessage, SendResult
 
@@ -16,9 +17,11 @@ class FeishuOutboundAdapter:
         credentials: CredentialBrokerPort,
         *,
         api_base: str = "https://open.feishu.cn",
+        tokens: FeishuTokenSource | None = None,
     ) -> None:
         self._http = http
         self._credentials = credentials
+        self._tokens = tokens
         self._api_base = api_base.rstrip("/")
 
     def render(self, msg: OutboundMessage) -> tuple[str, str]:
@@ -30,7 +33,10 @@ class FeishuOutboundAdapter:
         return "text", json.dumps({"text": text}, ensure_ascii=False)
 
     def send(self, msg: OutboundMessage) -> SendResult:
-        token = self._credentials.issue_ephemeral("feishu")
+        try:
+            token = self._tokens.token() if self._tokens is not None else self._credentials.issue_ephemeral("feishu")
+        except FeishuAuthError as exc:
+            return SendResult(ok=False, error=str(exc), retryable=exc.retryable)
         if not token:
             return SendResult(ok=False, error="feishu credential unavailable", retryable=True)
         msg_type, content = self.render(msg)
@@ -58,10 +64,14 @@ class FeishuOutboundAdapter:
             },
             body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
-        return _feishu_result(response)
+        result, code = _feishu_result(response)
+        if code in TOKEN_REJECTED_CODES and self._tokens is not None:
+            self._tokens.invalidate()
+            return SendResult(ok=False, error=result.error, retryable=True)
+        return result
 
 
-def _feishu_result(response: HttpResponse) -> SendResult:
+def _feishu_result(response: HttpResponse) -> tuple[SendResult, object]:
     data: Mapping[str, Any]
     try:
         data = cast(Mapping[str, Any], json.loads(response.body.decode("utf-8") or "{}"))
@@ -70,10 +80,9 @@ def _feishu_result(response: HttpResponse) -> SendResult:
     if response.status == 200 and data.get("code") == 0:
         inner: Any = data.get("data")
         message_id: Any = cast(Mapping[str, Any], inner).get("message_id") if isinstance(inner, Mapping) else None
-        return SendResult(ok=True, platform_msg_id=None if message_id is None else str(message_id))
+        return SendResult(ok=True, platform_msg_id=None if message_id is None else str(message_id)), 0
     retryable = response.status == 429 or response.status >= 500
+    code = data.get("code")
     return SendResult(
-        ok=False,
-        error=f"feishu HTTP {response.status} code={data.get('code')} msg={data.get('msg')}",
-        retryable=retryable,
-    )
+        ok=False, error=f"feishu HTTP {response.status} code={code} msg={data.get('msg')}", retryable=retryable
+    ), code

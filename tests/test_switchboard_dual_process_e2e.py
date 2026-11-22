@@ -142,6 +142,7 @@ retry_backoff_seconds = [0.2, 0.2, 0.2, 0.2, 0.2]
 [outbound]
 # A closed loopback port: replies are recorded in outbound_messages but never reach GitHub.
 github_api_base = "http://127.0.0.1:9"
+reply_to_origin = ["github"]
 
 [relay]
 enabled = true
