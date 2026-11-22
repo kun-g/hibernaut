@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ccpeer receiver as a per-user LaunchAgent. Replace /Users/YOU and the repository path, then see README.md.
+  The receiver runs in the foreground; launchd starts it at login and restarts it whenever it exits.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hibernaut.ccpeer</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>-m</string>
+    <string>ccpeer</string>
+    <string>serve</string>
+    <string>--as</string>
+    <string>hibernaut</string>
+    <!-- launchd does not pass CLAUDE_CONFIG_DIR: list every config dir whose sessions must reach you. -->
+    <string>--config-dir</string>
+    <string>/Users/YOU/.claude</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>/Users/YOU/workspace/runtime/repos/hibernaut/src</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/Users/YOU</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/ccpeer.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/ccpeer.log</string>
+</dict>
+</plist>

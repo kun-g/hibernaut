@@ -59,6 +59,7 @@ RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("switchboard.example.toml", ("tests/test_switchboard_core.py",)),
     ("deploy/gdrive-proxy/**", ("tests/test_gdrive_credential_proxy.py",)),
     ("deploy/switchboard/**", ("tests/test_switchboard_deploy.py",)),
+    ("deploy/ccpeer/**", ("tests/test_ccpeer.py",)),
     ("docs/dispatch/**", ("tests/test_sde_delivery.py",)),
     ("docs/process/versioning.md", ("tests/test_sde_delivery.py",)),
     ("guidance.toml", ("tests/test_sde_delivery.py",)),

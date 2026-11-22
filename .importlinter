@@ -2,6 +2,7 @@
 root_packages =
     agent_runtime
     switchboard
+    ccpeer
 include_external_packages = True
 
 [importlinter:contract:clean-layers]
@@ -38,5 +39,17 @@ source_modules =
 forbidden_modules =
     taskboard
     agent_runtime
+    runner
+    memory_hub
+
+[importlinter:contract:ccpeer-zero-business-deps]
+name = ccpeer must not depend on business packages
+type = forbidden
+source_modules =
+    ccpeer
+forbidden_modules =
+    taskboard
+    agent_runtime
+    switchboard
     runner
     memory_hub

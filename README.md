@@ -114,6 +114,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 | [`docs/dispatch/`](docs/dispatch) | 派单模板：SDE 任务（`/events`、Drive）、独立评审 |
 | [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md) | Drive 队列凭据代理的安装与维护 |
 | [`deploy/switchboard/`](deploy/switchboard/README.md) | Switchboard 公网 VPS 容器部署（Docker Compose + Caddy 自动 TLS，或接入 Dokploy / Traefik 等已有反向代理）、GitHub App 收事件与回写评论、`scripts/onboard_project.py` 一键接入新仓库、Hibernaut 配对、冒烟验收、灰度切流与回滚 |
+| [`deploy/ccpeer/`](deploy/ccpeer/README.md) | `ccpeer` 接收端的 launchd 常驻部署（登录自启、崩溃拉起）、运行时文件、同名接收端规则与手工排查命令 |
 | [`docs/adr/`](docs/adr) | 架构决策记录 |
 
 ## 开发
@@ -127,6 +128,7 @@ src/agent_runtime/
 ├── adapters/   # L3 实现：SQLite、记忆、权限、执行器、交付、各通道
 └── app/        # 配置加载与组装根（daemon、demo）
 src/switchboard/  # 独立包，不依赖 agent_runtime
+src/ccpeer/       # 独立包：与本机 Claude Code 会话收发消息（发送、会话发现、常驻接收端），只依赖标准库
 ```
 
 提交前三道门禁必须全绿：
@@ -135,5 +137,5 @@ src/switchboard/  # 独立包，不依赖 agent_runtime
 pip install -e ".[dev]"
 lint-imports   # 分层与反向依赖检查
 pytest -v      # 契约、并发、端到端测试（本地快检可用 pytest -n auto $(python scripts/select_tests.py)）
-pyright        # core/、engine/、switchboard/ 的 strict 类型检查
+pyright        # core/、engine/、switchboard/、ccpeer/ 的 strict 类型检查
 ```
