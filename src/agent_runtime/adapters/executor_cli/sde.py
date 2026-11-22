@@ -798,18 +798,15 @@ class SDEExecutor:
 
     async def _exit_terminal(self, session_id: str, native: str | None, state: _State, record: DeliveryRecord) -> str:
         notes = [await self._exit_dev_terminal(session_id, native, state, record),
-                 await self._close_review_terminals(state, record)]
+                 await self._close_review_terminals(state)]
         return "\n".join(n for n in notes if n)
 
-    async def _close_review_terminals(self, state: _State, record: DeliveryRecord) -> str:
-        # A CLI reviewer's finished terminals only hold output to read; they close on the same delivery evidence as
-        # the developer's terminal, but a question or a live peer of the developer session does not keep them.
+    async def _close_review_terminals(self, state: _State) -> str:
+        # A CLI reviewer's terminal ends with its CLI and holds nothing to read, so no delivery evidence keeps it;
+        # closing only makes sure nothing of it is left (Orca can lose a close, and an ended one counts as closed).
         delivery = self._delivery
         if delivery is None or not state.review_terminals or not delivery.config.close_terminal:
             return ""
-        holds = delivery.unverified(record)
-        if holds:
-            return f"Review terminals: kept {', '.join(state.review_terminals)} ({'; '.join(holds)})"
         result = await close_terminals(state.review_terminals, Path(state.workdir))
         state.review_terminals = []
         return f"Review terminals: {result}"

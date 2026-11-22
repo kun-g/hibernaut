@@ -625,6 +625,19 @@ class TestSDEClosesReviewTerminals(TestSDEWithCLIReviewer):
             self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
             self.assertIsNotNone(self.orca.terminals[handle]["proc"].returncode)
 
+    async def test_review_terminals_close_even_when_the_delivery_evidence_is_incomplete(self):
+        # A review terminal ends with its CLI and holds nothing to read, so missing delivery evidence does not keep
+        # it; the close only confirms that nothing of it is left.
+        self.set_dev(({"calc.py": "x = 1\n"}, "divide fixed"))
+        self.cli.set(json.dumps(PASS))
+        outcome = await self.executor(self.delivery(close_terminal=True, open_pr=False)).execute(
+            [self.event()], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        (handle,) = self.orca.terminals
+        self.assertIn(f"Review terminals: closed {handle}", outcome.messages[0])
+        self.assertNotIn("Review terminals: kept", outcome.messages[0])
+        self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
+
     async def test_review_terminals_are_not_closed_when_closing_is_off(self):
         self.set_dev(({"calc.py": "x = 1\n"}, "divide fixed"))
         self.cli.set(json.dumps(PASS))
