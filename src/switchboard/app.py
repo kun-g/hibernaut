@@ -8,8 +8,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from switchboard.config import ConfigError, SwitchboardConfig, load_config
-from switchboard.credentials import EnvCredentialBroker, github_app_credentials
+from switchboard.credentials import EnvCredentialBroker, feishu_app_credentials, github_app_credentials
 from switchboard.envelope import utc_now
+from switchboard.feishu_auth import FeishuTenantTokenSource, FeishuTokenSource
 from switchboard.github_app import GitHubAppTokenSource, GitHubTokenSource
 from switchboard.http_client import HttpClient, UrllibHttpClient
 from switchboard.http_server import SwitchboardHTTPServer, UpgradeHandler
@@ -102,12 +103,15 @@ def build_switchboard(
     router: Router | None = None,
     port: int | None = None,
     github_tokens: GitHubTokenSource | None = None,
+    feishu_tokens: FeishuTokenSource | None = None,
 ) -> Switchboard:
     sink: AuditSinkPort = audit or NoopAuditSink()
     store = SwitchboardStore(config.sqlite.path, busy_timeout_ms=config.sqlite.busy_timeout_ms)
     client: HttpClient = http_client or UrllibHttpClient()
     adapters: Mapping[str, OutboundChannelAdapter] = outbound_adapters or {
-        "feishu": FeishuOutboundAdapter(client, credentials, api_base=config.feishu.api_base),
+        "feishu": FeishuOutboundAdapter(
+            client, credentials, api_base=config.feishu.api_base, tokens=feishu_tokens
+        ),
         "github": GitHubOutboundAdapter(
             client, credentials, api_base=config.outbound.github_api_base, tokens=github_tokens
         ),
@@ -207,12 +211,28 @@ def _github_app_tokens(config: SwitchboardConfig) -> GitHubTokenSource | None:
     )
 
 
+def _feishu_tokens(config: SwitchboardConfig) -> FeishuTokenSource | None:
+    app = feishu_app_credentials()
+    if app is None:
+        return None
+    app_id, app_secret = app
+    print(f"[switchboard] Feishu messages as app {app_id}", file=sys.stderr)
+    return FeishuTenantTokenSource(
+        UrllibHttpClient(), app_id=app_id, app_secret=app_secret, api_base=config.feishu.api_base
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="switchboard")
     parser.add_argument("--config", required=True)
     args = parser.parse_args(argv)
     config = load_config(args.config)
-    board = build_switchboard(config, credentials=EnvCredentialBroker(), github_tokens=_github_app_tokens(config))
+    board = build_switchboard(
+        config,
+        credentials=EnvCredentialBroker(),
+        github_tokens=_github_app_tokens(config),
+        feishu_tokens=_feishu_tokens(config),
+    )
     stopped = threading.Event()
 
     def _stop(signum: int, frame: object) -> None:

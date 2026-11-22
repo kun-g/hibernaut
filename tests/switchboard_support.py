@@ -96,7 +96,8 @@ def make_config(tmp: str, **sections: Mapping[str, Any]) -> SwitchboardConfig:
             "dead_letter_alert_channel": "feishu",
             "dead_letter_alert_target": "oc_alerts",
         },
-        "outbound": {"approval_channel": "feishu", "approval_target": "oc_approvals"},
+        # These harnesses exercise the reply loop; the default origin policy has its own tests.
+        "outbound": {"approval_channel": "feishu", "approval_target": "oc_approvals", "reply_to_origin": ["github", "feishu"]},
     }
     for name, values in sections.items():
         raw[name] = {**raw.get(name, {}), **values}
