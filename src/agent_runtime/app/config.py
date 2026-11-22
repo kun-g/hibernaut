@@ -83,7 +83,7 @@ class ProjectConfig:
         # Such a project shares one checkout between concurrent inboxes, so every writable task needs its own
         # managed worktree.
         rules = self.inbox_rules
-        return len(rules) > 1 or any(r.pattern is not None for r in rules)
+        return len(rules) > 1 or any(r.literal is None for r in rules)
 
 
 ROLES = (CODER_REVIEWER_ROLE, SDE_ROLE)
