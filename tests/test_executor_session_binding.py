@@ -145,7 +145,6 @@ class TestExecutorSessionBindingAndIngestOnly(unittest.IsolatedAsyncioTestCase):
 
         channel = RecordingChannel()
         daemon = build_daemon_from_config(cfg, channel=channel)
-        daemon.github_poller = None
         self.assertFalse(daemon.ingest_only)
         # Pre-register ready worktree so git worktree creation is skipped.
         daemon.workspaces.reserve_creating(

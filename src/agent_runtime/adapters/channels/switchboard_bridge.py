@@ -73,6 +73,8 @@ def canonical_to_payload(event: CanonicalEvent) -> dict[str, Any]:
         value = metadata.get(key)
         if value is not None and value != "":
             payload[key] = value
+    if event.source == "github" and "labels" in metadata:
+        payload["labels"] = metadata["labels"]
     if event.event_type == "work.closed":
         # The worker closes the session under the inbox lease, so the close cannot race a running Run,
         # and its existing work_key reference count decides whether the worktree is reclaimed.

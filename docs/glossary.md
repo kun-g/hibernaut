@@ -9,7 +9,7 @@
 | **Event Inbox** | 全局共享的事件缓冲存储（SQLite `event_inbox` 表），所有外部触发源与定时器的唯一事实源 | 全局 1 套 | 物理容器，存放所有 `inbox_id` 的事件 |
 | **Inbox** | Event Inbox 内的一个逻辑队列与并发隔离域（Actor Mailbox） | 按需划分（1 至 N 个） | 同一个 Inbox 内串行消费，不同 Inbox 之间并发 |
 | **inbox_id** | 唯一标识单个逻辑 Inbox 的路由键（如 `user:main`、`proj:hibernaut`、`hibernaut:issue-42`） | 全链路一等字段 | `worker_leases` 租约锁主键；L3 据此路由项目 Memory 与仓库；与 Project 严格保持 **1 个 Project → 多个 inbox_id（1:N）** |
-| **Event** | 进入 Event Inbox 的单条不可变输入信封（Webhook、Poller、用户消息、定时触发、审批回复） | 单次触发 | 必属某个 `inbox_id`，确定会话后即时回填 `session_id`；状态为 `pending / processing / done / failed`（去重记 `dropped`） |
+| **Event** | 进入 Event Inbox 的单条不可变输入信封（经 Switchboard 转入的 GitHub 事件、Drive 轮询任务、用户消息、定时触发、审批回复） | 单次触发 | 必属某个 `inbox_id`，确定会话后即时回填 `session_id`；状态为 `pending / processing / done / failed`（去重记 `dropped`） |
 | **correlation_key** | 外部业务实体的确定性关联键（如 `github:kun-g/hibernaut#42`、`gdrive:<file_id>`、`feishu:<chat>:<thread>`），由 L3 入站适配器提取 | 隶属于某个 `inbox_id` | 通过 `SessionStorePort.find_by_correlation_key()` 映射到当前活跃/挂起 `session_id`，跨外部源自动续接并支持会话轮换 |
 | **Session / session_id** | 跨多次 Run 的逻辑会话与挂起断点上下文单元 | 隶属于某个 `inbox_id` | 显式 4 态（`active / suspended / archived / closed`）；绑定 `executor_id`、`executor_session_id`、`work_key` 与可选 `parent_session_id` |
 | **work_key** | 托管动态 `hb-*` worktree 的复用与引用计数键（默认沿用 `correlation_key`） | 单件活（Task / Issue） | 仅当某 `work_key` 下 `active / suspended` 会话引用数归零（`ref=0`）且过三关检查才允许安全回收目录 |

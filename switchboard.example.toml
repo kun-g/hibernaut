@@ -27,6 +27,9 @@ unmatched_policy = "fallback"  # or "reject"
 # Override the consumers of individual event types (defaults: src/switchboard/router.py), e.g. without a Taskboard:
 # [routing.event_consumers]
 # "work.opened" = ["hibernaut"]
+# "work.updated" = ["hibernaut"]  # includes adding the trigger label to an existing issue
+# "work.closed" = ["hibernaut"]
+# "execution.reported" = ["switchboard.outbound"]
 
 [github]
 # Only issues/PRs carrying this label (and comments on them) become events; empty accepts all.
