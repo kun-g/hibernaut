@@ -709,10 +709,11 @@ def build_daemon_from_config(
     peer_projects = [p.name for p in config.projects.values() if p.handoff == "peer" and p.terminal_backend == "orca"]
     if has_configured_executor and not demo and peer_projects:
         # Fails before anything runs: a peer-handoff task sent with no receiver would have nowhere to answer.
+        # ValueError, like any unusable setting: a cold start exits, a hot reload keeps the running generation.
         try:
             require_receiver(config.peer)
         except ClaudeCodeError as exc:
-            raise RuntimeError(
+            raise ValueError(
                 f"handoff = \"peer\" for {', '.join(peer_projects)}, but {exc}"
             ) from exc
 

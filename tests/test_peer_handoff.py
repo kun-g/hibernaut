@@ -535,7 +535,7 @@ class TestPeerConfig(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.config({"handoff": "peer"}, {"state_dir": tmp}, db_path=f"{tmp}/hb.db",
                               memory_root=f"{tmp}/mem")
-            with self.assertRaisesRegex(RuntimeError, r'handoff = "peer" for demo, but the ccpeer receiver '
+            with self.assertRaisesRegex(ValueError, r'handoff = "peer" for demo, but the ccpeer receiver '
                                                       r"'hibernaut' is not running"):
                 build_daemon_from_config(cfg)
 
