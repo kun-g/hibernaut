@@ -142,6 +142,7 @@ class AgentWorker:
         self._max_interrupt_restarts = max_interrupt_restarts
         self._wake_signals: dict[str, asyncio.Event] = {}
         self._retired = False
+        self._interruptible = True
 
     @property
     def new_event_policy(self) -> NewEventPolicy:
@@ -152,10 +153,13 @@ class AgentWorker:
         if signal is not None:
             signal.set()
 
-    def retire(self) -> None:
+    def retire(self, *, interruptible: bool = True) -> None:
         # A config reload retires this worker: the Run in progress finishes and writes its result, but nothing
         # more is claimed or folded in, so the next generation's workers take the inbox once the lease is released.
+        # A stop also makes the Run uninterruptible: nothing in this process would restart an interrupted batch.
         self._retired = True
+        if not interruptible:
+            self._interruptible = False
 
     async def process_inbox(self, inbox_id: str) -> list[RunReport]:
         if not self._lock.acquire(inbox_id, self._worker_id, self._lease_ttl_seconds):
@@ -581,7 +585,7 @@ class AgentWorker:
         exec_task: asyncio.Task[RunOutcome],
     ) -> None:
         while not exec_task.done():
-            has_new = any(
+            has_new = self._interruptible and any(
                 evt.event_id not in known_ids
                 for evt in self._runnable(self._inbox.fetch_pending(inbox_id))
             )

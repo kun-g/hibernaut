@@ -57,7 +57,10 @@ class TestSelectTests(unittest.TestCase):
     def test_run_updating_and_resource_rules_select_targeted_tests(self) -> None:
         updater = select_tests(["scripts/run_updating.py"])
         self.assertFalse(updater.full_suite)
-        self.assertEqual(updater.tests, ("tests/test_auto_update.py", "tests/test_config_reload.py"))
+        self.assertEqual(
+            updater.tests,
+            ("tests/test_auto_update.py", "tests/test_config_reload.py", "tests/test_graceful_stop.py"),
+        )
 
         readme = select_tests(["README.md"])
         self.assertFalse(readme.full_suite)
