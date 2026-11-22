@@ -3,7 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -23,12 +23,14 @@ class FeishuInboundAdapter:
         credentials: CredentialBrokerPort,
         scopes: ScopeResolver,
         *,
+        card_report: Callable[[str, str], CanonicalEvent | None],
         group_require_mention: bool = True,
         bot_open_id: str | None = None,
         clock: Clock = utc_now,
     ) -> None:
         self._credentials = credentials
         self._scopes = scopes
+        self._card_report = card_report
         self._group_require_mention = group_require_mention
         self._bot_open_id = bot_open_id
         self._clock = clock
@@ -153,16 +155,25 @@ class FeishuInboundAdapter:
 
     def _card_action(self, event: dict[str, Any]) -> AdapterParseResult:
         value = obj(obj(event.get("action")).get("value"))
-        approval_request_id = text(value.get("approval_request_id"))
-        decision = text(value.get("decision"))
-        if not approval_request_id or not decision:
-            return reject(400, "card value missing approval_request_id or decision")
+        decision = value.get("decision")
+        actor = obj(event.get("operator")).get("open_id")
+        if decision not in ("approve", "reject") or not isinstance(actor, str) or not actor.strip():
+            return reject(400, "card action requires a decision and an operator")
         context = obj(event.get("context"))
-        actor = text(obj(event.get("operator")).get("open_id")) or None
-        scope = text(value.get("scope")) or self._scopes.fallback(
-            self._scopes.feishu(text(context.get("open_chat_id")))
-        )
-        correlation_key = text(value.get("correlation_key")) or None
+        message_id = text(context.get("open_message_id"))
+        chat_id = text(context.get("open_chat_id"))
+        report = self._card_report(message_id, chat_id) if message_id and chat_id else None
+        if report is None:
+            return reject(400, "no matching sent approval card")
+        approval_request_id = report.metadata.get("approval_request_id")
+        session_id = report.metadata.get("session_id")
+        if (not isinstance(approval_request_id, str) or not approval_request_id.strip()
+                or not isinstance(session_id, str) or not session_id.strip()
+                or value.get("approval_request_id") != approval_request_id
+                or value.get("session_id") != session_id):
+            return reject(400, "approval card does not match the suspended request and session")
+        scope = report.scope
+        correlation_key = report.correlation_key
         card = render_resolved_card(
             approval_request_id=approval_request_id,
             decision=decision,
@@ -183,9 +194,9 @@ class FeishuInboundAdapter:
                 metadata={
                     "approval_request_id": approval_request_id,
                     "decision": decision,
-                    "session_id": text(value.get("session_id")),
+                    "session_id": session_id,
                     "channel": "feishu",
-                    "message_id": text(context.get("open_message_id")),
+                    "message_id": message_id,
                 },
             ),
             http_status=200,

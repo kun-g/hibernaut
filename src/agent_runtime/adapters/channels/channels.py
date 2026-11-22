@@ -8,7 +8,6 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from agent_runtime.adapters.channels.feishu_webhook import FeishuWebhookAdapter
 from agent_runtime.adapters.channels.mcp_server import MCPServerAdapter
 from agent_runtime.engine.handler import EventHandler
 
@@ -113,7 +112,6 @@ class WebhookChannelAdapter:
 def webhook_request_handler(
     handler: EventHandler,
     *,
-    feishu_adapter: FeishuWebhookAdapter | None = None,
     mcp_adapter: MCPServerAdapter | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     class _IngestRequestHandler(BaseHTTPRequestHandler):
@@ -128,7 +126,6 @@ def webhook_request_handler(
         def do_POST(self) -> None:  # noqa: N802
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
-            header_map = {k: v for k, v in self.headers.items()}
 
             if self.path == "/events":
                 body = json.loads(raw.decode("utf-8"))
@@ -150,13 +147,8 @@ def webhook_request_handler(
                 )
                 return
 
-            if self.path == "/webhooks/feishu" and feishu_adapter is not None:
-                resp = feishu_adapter.handle(raw, header_map)
-                self._write_json(resp.status_code, resp.body)
-                return
-
             if self.path == "/mcp" and mcp_adapter is not None and mcp_adapter.http_enabled:
-                resp = mcp_adapter.handle_http(raw, header_map)
+                resp = mcp_adapter.handle_http(raw, dict(self.headers.items()))
                 self._write_json(resp.status_code, resp.body)
                 return
 
@@ -173,10 +165,6 @@ def create_webhook_server(
     port: int,
     handler: EventHandler,
     *,
-    feishu_adapter: FeishuWebhookAdapter | None = None,
     mcp_adapter: MCPServerAdapter | None = None,
 ) -> WebhookHTTPServer:
-    return WebhookHTTPServer((host, port), webhook_request_handler(
-        handler, feishu_adapter=feishu_adapter,
-        mcp_adapter=mcp_adapter,
-    ))
+    return WebhookHTTPServer((host, port), webhook_request_handler(handler, mcp_adapter=mcp_adapter))

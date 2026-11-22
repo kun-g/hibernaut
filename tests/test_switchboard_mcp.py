@@ -97,6 +97,16 @@ class MCPToolTests(unittest.TestCase):
         self.assertTrue(any("outcome_kind must be one of" in p for p in problems))
         self.assertEqual(self.h.board.store.count_inbound(), 0)
 
+    def test_originless_report_requires_a_bound_suspend(self) -> None:
+        args = {"external_id": "outbox:local", "scope": "proj:local", "subject": "Run"}
+        meta = {"run_id": "run", "outcome_kind": "suspend", "session_id": "s", "approval_request_id": "a"}
+        for override in ({"outcome_kind": "emit"}, {"approval_request_id": ""}, {"session_id": " "},
+                         {"approval_request_id": 12}, {"session_id": True}):
+            with self.subTest(override=override):
+                _, result = mcp_call(self.h.url, "report_execution", {**args, "metadata": {**meta, **override}})
+                self.assertEqual(tool_result(result)["status"], "invalid")
+        self.assertEqual(self.h.board.store.count_inbound(), 0)
+
     def test_post_message_and_decide_approval(self) -> None:
         _, posted = mcp_call(self.h.url, "post_message", {"correlation_key": "github:kun-g/hibernaut#42", "body": "hi"})
         self.assertEqual(tool_result(posted)["consumers"], ["hibernaut"])

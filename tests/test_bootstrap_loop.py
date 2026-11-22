@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 import tempfile
 import unittest
@@ -10,11 +9,7 @@ import warnings
 from pathlib import Path
 from typing import Any
 
-from agent_runtime.adapters.channels import (
-    ConsoleChannelAdapter,
-    FeishuChannelAdapter,
-    build_feishu_or_console_channel,
-)
+from agent_runtime.adapters.channels import ConsoleChannelAdapter
 from agent_runtime.adapters.executor_cli import (
     CLITemplate,
     CommandResult,
@@ -395,52 +390,7 @@ class TestLocalCLIExecutor(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task, timeout=2.0)
 
 
-class TestFeishuChannelAndConfig(unittest.IsolatedAsyncioTestCase):
-    async def test_feishu_token_cache_approval_card_and_console_fallback(self) -> None:
-        calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
-        now_box = [100.0]
-
-        def fake_post(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
-            calls.append((url, headers, payload))
-            if "tenant_access_token" in url:
-                return {"tenant_access_token": "tok_abc", "expire": 7200}
-            return {"code": 0, "msg": "ok"}
-
-        ch = FeishuChannelAdapter(
-            app_id="cli_a",
-            app_secret="sec_b",
-            default_chat_id="oc_default",
-            inbox_chat_map={"proj:hibernaut": "oc_proj"},
-            http_post=fake_post,
-            clock=lambda: now_box[0],
-        )
-
-        await ch.send("proj:hibernaut", "Build passed", {"kind": "emit"})
-        await ch.send(
-            "proj:hibernaut",
-            "Approve deploy?",
-            {"kind": "approval_request", "request_id": "req_77"},
-        )
-
-        # Token fetched once and cached for second message (3 total HTTP calls).
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(calls[1][2]["msg_type"], "text")
-        self.assertEqual(calls[2][2]["msg_type"], "interactive")
-        card = json.loads(calls[2][2]["content"])
-        buttons = card["elements"][1]["actions"]
-        self.assertEqual(buttons[0]["value"]["approval_request_id"], "req_77")
-        self.assertTrue(buttons[0]["value"]["approved"])
-        self.assertFalse(buttons[1]["value"]["approved"])
-
-        # Missing env credentials fall back safely to ConsoleChannelAdapter.
-        os.environ.pop("FEISHU_TEST_MISSING_ID", None)
-        os.environ.pop("FEISHU_TEST_MISSING_SECRET", None)
-        fallback = build_feishu_or_console_channel(
-            app_id_env="FEISHU_TEST_MISSING_ID",
-            app_secret_env="FEISHU_TEST_MISSING_SECRET",
-        )
-        self.assertIsInstance(fallback, ConsoleChannelAdapter)
-
+class TestConfig(unittest.TestCase):
     def test_legacy_github_ingress_settings_warn_and_are_ignored(self) -> None:
         project = {"repo": "o/r", "checkout": "/tmp/repo"}
         baseline = parse_config({"projects": {"demo": project}})
@@ -458,6 +408,21 @@ class TestFeishuChannelAndConfig(unittest.IsolatedAsyncioTestCase):
                               ("projects.demo", ("github_poll", "poll_labels"))):
             for key in keys:
                 self.assertIn(f"{section}.{key}", messages)
+
+    def test_legacy_feishu_settings_warn_per_field_and_are_ignored(self) -> None:
+        project = {"repo": "o/r", "checkout": "/tmp/repo"}
+        channels = {"feishu_app_id_env": "OLD_ID", "feishu_app_secret_env": "OLD_SECRET",
+                    "feishu_default_chat_id": "", "feishu_verification_token_env": False}
+        raw = {"channels": channels, "projects": {"demo": {**project, "feishu_chat_id": "oc_old"}}}
+        baseline = parse_config({"projects": {"demo": project}})
+        with warnings.catch_warnings(record=True) as notices:
+            warnings.simplefilter("always")
+            self.assertEqual(parse_config(raw), baseline)
+        fields = [*(f"channels.{key}" for key in channels), "projects.demo.feishu_chat_id"]
+        self.assertCountEqual(
+            [(w.category, str(w.message)) for w in notices],
+            [(UserWarning, f"{field} is obsolete and ignored. Configure Feishu in Switchboard.") for field in fields],
+        )
 
     def test_load_example_toml_and_build_daemon_from_config(self) -> None:
         example_path = Path(__file__).resolve().parents[1] / "hibernaut.example.toml"
@@ -483,7 +448,7 @@ class TestFeishuChannelAndConfig(unittest.IsolatedAsyncioTestCase):
             )
             daemon = build_daemon_from_config(local_cfg)
             try:
-                self.assertIsNotNone(daemon.feishu_webhook)
+                self.assertIsInstance(daemon.channel, ConsoleChannelAdapter)
             finally:
                 daemon.close()
 

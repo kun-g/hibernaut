@@ -111,10 +111,12 @@ class OutboundGateway:
                     target = origin[1]
             if target is None:
                 return None
-            approval_request_id = str(meta.get("approval_request_id") or f"apr_{meta['run_id']}")
             card: dict[str, Any] | None = None
             kind: Any = "comment" if channel == "github" else "text"
             if channel == "feishu":
+                approval_request_id = meta.get("approval_request_id")
+                if not isinstance(approval_request_id, str) or not approval_request_id.strip():
+                    return None
                 kind = "approval_card"
                 card = render_approval_card(
                     title=event.subject,

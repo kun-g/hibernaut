@@ -201,13 +201,13 @@ class TestWiring(unittest.IsolatedAsyncioTestCase):
              "channels": channels},
             base_dir=self.root,
         )
-        with patch.dict(os.environ, {"FEISHU_APP_ID": "", "FEISHU_APP_SECRET": ""}):
-            daemon = build_daemon_from_config(cfg, demo=True)
+        daemon = build_daemon_from_config(cfg, demo=True)
         self.addCleanup(daemon.close)
         return daemon
 
     async def test_unconfigured_prints_full_text_and_writes_no_file(self) -> None:
-        daemon = self._from_config({})
+        with patch.dict(os.environ, {"FEISHU_APP_ID": "legacy-id", "FEISHU_APP_SECRET": "legacy-secret"}):
+            daemon = self._from_config({})
         self.assertIsInstance(daemon.channel, ConsoleChannelAdapter)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -236,8 +236,7 @@ class TestWiring(unittest.IsolatedAsyncioTestCase):
             f'[runtime]\ndb_path = "{self.root / "hb.db"}"\nmemory_root = "{self.root / "mem"}"\n'
             '[channels]\noutbox_dir = "outbox"\n'
         )
-        with patch.dict(os.environ, {"FEISHU_APP_ID": "", "FEISHU_APP_SECRET": ""}):
-            daemon = build_daemon_from_config(load_config(cfg_path), demo=True)
+        daemon = build_daemon_from_config(load_config(cfg_path), demo=True)
         self.addCleanup(daemon.close)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

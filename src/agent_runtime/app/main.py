@@ -22,12 +22,10 @@ from agent_runtime.adapters.channels import (
     DriveClientProtocol,
     DriveResultWriter,
     DriveTaskPoller,
-    FeishuWebhookAdapter,
     FileOutboxChannel,
     MCPServerAdapter,
     ProxiedDriveClient,
     WebhookHTTPServer,
-    build_feishu_or_console_channel,
     local_events_url,
 )
 from agent_runtime.adapters.channels.channels import webhook_request_handler
@@ -281,7 +279,6 @@ class AlwaysOnDaemon:
     sessions: SQLiteSessionStoreAdapter
     workspaces: SQLiteWorkspaceStore
     channel: ChannelPort
-    feishu_webhook: FeishuWebhookAdapter | None = None
     gdrive_poller: DriveTaskPoller | None = None
     gdrive_result_writer: DriveResultWriter | None = None
     mcp_server: MCPServerAdapter | None = None
@@ -302,7 +299,6 @@ class AlwaysOnDaemon:
     def http_handler(self) -> type[BaseHTTPRequestHandler]:
         return webhook_request_handler(
             self.handler,
-            feishu_adapter=self.feishu_webhook,
             mcp_adapter=self.mcp_server,
         )
 
@@ -477,8 +473,6 @@ def build_daemon(
     min_outbox_interval_seconds: float = 0.0,
     lease_ttl_seconds: float = 60.0,
     new_event_policy: NewEventPolicy = "defer",
-    feishu_verification_token: str | None = None,
-    feishu_chat_inbox_map: Mapping[str, str] | None = None,
     mcp_bearer_token: str | None = None,
     worktree_manager: OrcaWorktreeManager | None = None,
     ingest_only: bool = False,
@@ -614,11 +608,6 @@ def build_daemon(
         channel=resolved_channel,
         min_interval_seconds=min_outbox_interval_seconds,
     )
-    feishu_webhook = FeishuWebhookAdapter(
-        handler,
-        verification_token=feishu_verification_token,
-        chat_inbox_map=feishu_chat_inbox_map,
-    )
     mcp_server = MCPServerAdapter(
         handler=handler,
         sessions=sessions,
@@ -643,7 +632,6 @@ def build_daemon(
         sessions=sessions,
         workspaces=workspaces,
         channel=resolved_channel,
-        feishu_webhook=feishu_webhook,
         gdrive_poller=(
             DriveTaskPoller(
                 handler,
@@ -677,26 +665,12 @@ def build_daemon_from_config(
     # Every inbox -> project lookup goes through the router, so pattern-matched inboxes get their project's settings
     # and an inbox matching two projects raises AmbiguousProjectMatch instead of picking one.
     router = ProjectRouter(config.projects.values())
-    chat_inbox_map: dict[str, str] = {}
     inbox_checkout_map = router.inbox_map(lambda p: p.checkout)
-    inbox_chat_map = router.inbox_map(lambda p: p.feishu_chat_id or None)
 
-    for proj in config.projects.values():
-        if proj.feishu_chat_id:
-            chat_inbox_map[proj.feishu_chat_id] = proj.inbox_id
-
-    resolved_channel = channel or build_feishu_or_console_channel(
-        app_id_env=config.channels.feishu_app_id_env,
-        app_secret_env=config.channels.feishu_app_secret_env,
-        default_chat_id=config.channels.feishu_default_chat_id or None,
-        inbox_chat_map=inbox_chat_map,
-        console_echo=not config.channels.outbox_dir,
-    )
+    resolved_channel = channel if channel is not None else ConsoleChannelAdapter(echo=not config.channels.outbox_dir)
     if switchboard is not None:
-        # Replies with an origin go out through the Switchboard gateway; session-less notices keep the old channel.
         resolved_channel = SwitchboardChannelAdapter(switchboard_bus(switchboard).publish, fallback=resolved_channel)
 
-    feishu_token = os.environ.get(config.channels.feishu_verification_token_env) or None
     mcp_token = (
         (os.environ.get(config.channels.mcp_token_env) or None)
         if config.channels.mcp_enabled
@@ -736,8 +710,6 @@ def build_daemon_from_config(
         max_concurrency=config.runtime.max_concurrency,
         channel=resolved_channel,
         new_event_policy=config.runtime.new_event_policy,
-        feishu_verification_token=feishu_token,
-        feishu_chat_inbox_map=chat_inbox_map,
         mcp_bearer_token=mcp_token,
         ingest_only=ingest_only,
         gdrive_client=resolved_gdrive_client,
@@ -942,11 +914,6 @@ def build_daemon_from_config(
             timers=daemon.timers,
             inbox=daemon.inbox,
             on_wake=daemon.pool.wake,
-        )
-        daemon.feishu_webhook = FeishuWebhookAdapter(
-            daemon.handler,
-            verification_token=feishu_token,
-            chat_inbox_map=chat_inbox_map,
         )
         daemon.mcp_server = MCPServerAdapter(
             handler=daemon.handler,
@@ -1215,7 +1182,6 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--policy", choices=("defer", "fold", "interrupt"), default="defer")
-    parser.add_argument("--feishu-token", default=None)
     parser.add_argument("--mcp-token", default=None)
     parser.add_argument("--config-poll-interval", type=float, default=1.0)
     parser.add_argument("--outbox-interval", type=float, default=1.0)
@@ -1238,7 +1204,6 @@ def main() -> None:
             memory_root=args.memory_root,
             max_concurrency=args.workers,
             new_event_policy=args.policy,
-            feishu_verification_token=args.feishu_token,
             mcp_bearer_token=args.mcp_token,
         )
         host = args.host
