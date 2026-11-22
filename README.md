@@ -61,7 +61,7 @@ curl -s localhost:8080/events -H 'Content-Type: application/json' -d @docs/dispa
 
 ## 配置
 
-所有配置都在 `hibernaut.toml`，带注释的模板是 [`hibernaut.example.toml`](hibernaut.example.toml)。保存后自动热加载，非法配置保留当前设置；改存储路径或 `[switchboard]` 需要重启。
+所有配置都在 `hibernaut.toml`，带注释的模板是 [`hibernaut.example.toml`](hibernaut.example.toml)。保存后自动热加载：入口、消息发送和轮询不停，进行中的任务用旧配置跑完，新事件用新配置；非法配置保留当前设置；改存储路径或 `[switchboard]` 需要重启。
 
 | 配置段 | 管什么 |
 | :--- | :--- |
