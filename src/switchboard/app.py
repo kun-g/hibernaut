@@ -165,6 +165,7 @@ def build_switchboard(
         "/webhooks/feishu": FeishuInboundAdapter(
             credentials,
             scopes,
+            card_report=store.feishu_card_report,
             group_require_mention=config.feishu.group_require_mention,
             bot_open_id=config.feishu.bot_open_id,
             clock=clock,

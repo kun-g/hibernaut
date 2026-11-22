@@ -5,7 +5,10 @@ import unittest
 from typing import Any
 
 from switchboard.envelope import CanonicalEvent
-from tests.switchboard_support import FEISHU_TOKEN, Harness, issue_payload, make_harness, post, send_github
+from tests.switchboard_support import (
+    FEISHU_TOKEN, Harness, issue_payload, make_harness, mcp_call, post, send_github, tool_result,
+)
+from tests.test_switchboard_inbound import feishu_message
 
 
 def card_click(value: dict[str, Any], operator: str = "ou_kun") -> dict[str, Any]:
@@ -15,20 +18,62 @@ def card_click(value: dict[str, Any], operator: str = "ou_kun") -> dict[str, Any
         "event": {
             "operator": {"open_id": operator},
             "action": {"tag": "button", "value": value},
-            "context": {"open_message_id": "om_card", "open_chat_id": "oc_approvals"},
+            "context": {"open_message_id": "om_out", "open_chat_id": "oc_approvals"},
         },
     }
 
 
 class CrossSourceApprovalTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.h: Harness = make_harness()
+        self.h: Harness = make_harness(routing={"feishu_chats": {"oc_approvals": "proj:chat"}})
         self.hibernaut: list[CanonicalEvent] = []
         self.h.board.bus.subscribe("hibernaut", lambda e: self.hibernaut.append(e) or None)
         self.h.board.bus.subscribe("taskboard", lambda e: None)
 
     def tearDown(self) -> None:
         self.h.close()
+
+    def test_originless_mcp_suspend_uses_the_sent_card_as_its_return_route(self) -> None:
+        board = self.h.board
+        scope = "proj:local"
+        _, rpc = mcp_call(self.h.url, "report_execution", {
+            "external_id": "outbox:local", "scope": scope, "subject": "Continue?",
+            "metadata": {"run_id": "run", "outcome_kind": "suspend",
+                         "session_id": "session-local", "approval_request_id": "req-local"},
+        })
+        self.assertEqual(tool_result(rpc)["status"], "accepted")
+        board.worker.run_once()
+        board.gateway.run_once()
+        (send,) = self.h.http.calls
+        self.assertEqual(send["json"]["receive_id"], "oc_approvals")
+        card = json.loads(send["json"]["content"])
+        value = next(el for el in card["elements"] if el["tag"] == "action")["actions"][1]["value"]
+        url = f"{self.h.url}/webhooks/feishu"
+        for field, wrong in (("session_id", "other"), ("approval_request_id", "other"), ("decision", "unknown")):
+            with self.subTest(field=field):
+                self.assertEqual(post(url, card_click({**value, field: wrong}))[0], 400)
+        for field in ("open_chat_id", "open_message_id"):
+            with self.subTest(field=field):
+                click = card_click(value)
+                click["event"]["context"][field] = "other"
+                self.assertEqual(post(url, click)[0], 400)
+        self.assertEqual(post(url, card_click(value, operator=""))[0], 400)
+        click = card_click(value)
+        click["header"]["token"] = "invalid"
+        self.assertEqual(post(url, click)[0], 401)
+        self.assertEqual(board.store.count_inbound(), 1)
+
+        status, result = post(url, card_click({**value, "scope": "other", "correlation_key": "other"}))
+        self.assertEqual((status, result["toast"]["type"]), (200, "success"))
+        board.worker.run_once()
+        (decision,) = self.hibernaut
+        self.assertEqual((decision.scope, decision.correlation_key, decision.actor), (scope, None, "ou_kun"))
+        self.assertEqual((decision.metadata["session_id"], decision.metadata["approval_request_id"],
+                          decision.metadata["decision"]), ("session-local", "req-local", "reject"))
+        _, posted = post(url, feishu_message(chat_id="oc_approvals"))
+        message = board.store.get_inbound(posted["event_id"])
+        assert message is not None
+        self.assertEqual((message.scope, message.correlation_key), ("proj:chat", "feishu:p2p:oc_approvals"))
 
     def test_github_suspend_to_feishu_card_and_single_decision(self) -> None:
         board = self.h.board

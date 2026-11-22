@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbound_sched ON outbound_messages (status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_feishu_card ON outbound_messages (platform_msg_id)
+    WHERE channel = 'feishu' AND kind = 'approval_card' AND status = 'sent';
 """
 
 # Head of each (consumer_id, scope) queue: the oldest row not yet acked. A head in
@@ -202,6 +204,26 @@ class SwitchboardStore:
                 "SELECT payload_json FROM inbound_events WHERE event_id = ?", (event_id,)
             ).fetchone()
         return None if row is None else CanonicalEvent.from_json(str(row["payload_json"]))
+
+    def feishu_card_report(self, message_id: str, chat_id: str) -> CanonicalEvent | None:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT idempotency_key, target_json FROM outbound_messages
+                   WHERE platform_msg_id = ? AND channel = 'feishu'
+                     AND kind = 'approval_card' AND status = 'sent' LIMIT 2""",
+                (message_id,),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        target = cast(dict[str, Any], json.loads(row["target_json"]))
+        if "chat_id" in target and target["chat_id"] != chat_id:
+            return None
+        prefix, _, event_id = str(row["idempotency_key"]).partition(":")
+        report = self.get_inbound(event_id) if prefix == "report" else None
+        if report is None or report.source != "hibernaut" or report.event_type != "execution.reported":
+            return None
+        return report if report.metadata.get("outcome_kind") == "suspend" else None
 
     def count_inbound(self) -> int:
         with self._lock:
