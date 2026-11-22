@@ -66,7 +66,9 @@ def main() -> int:
             except OSError:
                 pass
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    # The daemon runs in its own session (so a terminal's Ctrl-C is not delivered twice): a closed terminal's SIGHUP
+    # reaches only this process, which must stop the daemon too. SIGKILL cannot be handled and leaves the daemon running.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, on_signal)
 
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")}
