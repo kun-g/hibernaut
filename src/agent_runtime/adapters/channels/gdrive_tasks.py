@@ -1,18 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
-import os
-import subprocess
-import tempfile
-import time
-import urllib.parse
-import urllib.request
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Protocol
 
 from agent_runtime.core.models import Emit, Event, Suspend, utc_now_iso
@@ -20,9 +12,7 @@ from agent_runtime.core.ports import ChannelPort, SessionStorePort
 from agent_runtime.engine.handler import EventHandler, IngestResult
 from agent_runtime.engine.worker import RunReport
 
-_GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 _GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
-_GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
 _DEFAULT_FOLDER_NAMES = ("待执行", "执行中", "已完成", "失败")
 _GDRIVE_KEY_PREFIX = "gdrive:"
 
@@ -51,42 +41,6 @@ class DriveClientProtocol(Protocol):
     def read_text(self, file_meta: DriveFileMeta) -> str: ...
     def append_text(self, file_id: str, mime_type: str, addition: str) -> None: ...
     def move_file(self, file_id: str, *, add_parent: str, remove_parent: str) -> None: ...
-
-
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-def sign_rs256(signing_input: bytes, private_key_pem: str) -> bytes:
-    try:
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding, rsa
-
-        key = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
-        if not isinstance(key, rsa.RSAPrivateKey):
-            raise TypeError("Service Account private key must be an RSA key")
-        return key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
-    except ImportError:
-        pass
-
-    # Fallback to system openssl (present on macOS/Linux) to keep zero mandatory third-party deps.
-    fd, tmp_path = tempfile.mkstemp(prefix="hb_sa_", suffix=".pem")
-    try:
-        os.chmod(tmp_path, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(private_key_pem)
-        proc = subprocess.run(
-            ["openssl", "dgst", "-sha256", "-sign", tmp_path],
-            input=signing_input,
-            capture_output=True,
-            check=True,
-        )
-        return proc.stdout
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
 
 
 def parse_task_markdown(raw_text: str) -> tuple[dict[str, str], str]:
@@ -127,177 +81,80 @@ def extract_gdrive_file_id(correlation_key: str | None) -> str | None:
     return None
 
 
-HttpRequestFn = Callable[[str, str, Mapping[str, str], bytes | None], bytes]
+class ProxyResponseLike(Protocol):
+    @property
+    def status_code(self) -> int: ...
+    @property
+    def body(self) -> str: ...
 
 
-def _default_http_request(
-    method: str,
-    url: str,
-    headers: Mapping[str, str],
-    body: bytes | None,
-) -> bytes:
-    req = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
-    with urllib.request.urlopen(req, timeout=30.0) as resp:
-        return bytes(resp.read())
-
-
-class ServiceAccountTokenProvider:
-    def __init__(
+class ServiceProxy(Protocol):
+    def call_service(
         self,
         *,
-        key_path: str | Path,
-        scope: str = _GDRIVE_SCOPE,
-        http_request: HttpRequestFn | None = None,
-        jwt_signer: Callable[[bytes, str], bytes] | None = None,
-        clock: Callable[[], float] = time.time,
-    ) -> None:
-        raw = json.loads(Path(key_path).read_text(encoding="utf-8"))
-        self._client_email = str(raw["client_email"])
-        self._private_key = str(raw["private_key"])
-        self._token_uri = str(raw.get("token_uri") or "https://oauth2.googleapis.com/token")
-        self._scope = scope
-        self._http = http_request or _default_http_request
-        self._signer = jwt_signer or sign_rs256
-        self._clock = clock
-        self._cached_token: str | None = None
-        self._expires_at: float = 0.0
-
-    def get_token(self) -> str:
-        now = float(self._clock())
-        if self._cached_token is not None and now < self._expires_at - 60.0:
-            return self._cached_token
-
-        header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode("utf-8"))
-        claims = _b64url(
-            json.dumps(
-                {
-                    "iss": self._client_email,
-                    "scope": self._scope,
-                    "aud": self._token_uri,
-                    "iat": int(now),
-                    "exp": int(now) + 3600,
-                }
-            ).encode("utf-8")
-        )
-        signing_input = f"{header}.{claims}".encode("ascii")
-        signature = _b64url(self._signer(signing_input, self._private_key))
-        assertion = f"{header}.{claims}.{signature}"
-
-        form = urllib.parse.urlencode(
-            {
-                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                "assertion": assertion,
-            }
-        ).encode("utf-8")
-        raw_resp = self._http(
-            "POST",
-            self._token_uri,
-            {"Content-Type": "application/x-www-form-urlencoded"},
-            form,
-        )
-        payload = json.loads(raw_resp.decode("utf-8"))
-        token = str(payload["access_token"])
-        expires_in = float(payload.get("expires_in", 3600))
-        self._cached_token = token
-        self._expires_at = now + expires_in
-        return token
+        service_name: str,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> ProxyResponseLike: ...
 
 
-class GoogleDriveHTTPClient:
-    def __init__(
-        self,
-        *,
-        token_provider: ServiceAccountTokenProvider,
-        http_request: HttpRequestFn | None = None,
-    ) -> None:
-        self._tokens = token_provider
-        self._http = http_request or _default_http_request
+class DriveProxyError(RuntimeError):
+    def __init__(self, op: str, status_code: int, reason: str) -> None:
+        super().__init__(f"Drive queue proxy refused '{op}' (HTTP {status_code}): {reason}")
+        self.op = op
+        self.status_code = status_code
 
-    def _auth_headers(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
-        headers = {"Authorization": f"Bearer {self._tokens.get_token()}"}
-        if extra:
-            headers.update(extra)
-        return headers
+
+def _meta_from_json(item: Any) -> DriveFileMeta:
+    return DriveFileMeta(
+        file_id=str(item["id"]),
+        name=str(item.get("name", "")),
+        mime_type=str(item.get("mimeType", "text/markdown")),
+        modified_time=str(item.get("modifiedTime", "")),
+        parents=tuple(str(p) for p in item.get("parents", ())),
+    )
+
+
+class ProxiedDriveClient:
+    # Holds no Google credential: the external proxy owns the service account key, talks to Drive
+    # and returns only queue business results (file metadata, text, ok).
+    def __init__(self, proxy: ServiceProxy, *, service_name: str = "gdrive-queue") -> None:
+        self._proxy = proxy
+        self._service = service_name
+
+    def _call(self, op: str, payload: dict[str, Any]) -> dict[str, Any]:
+        resp = self._proxy.call_service(service_name=self._service, method="POST", path=op, payload=payload)
+        try:
+            data = json.loads(resp.body) if resp.body else {}
+        except json.JSONDecodeError:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if resp.status_code != 200:
+            raise DriveProxyError(op, resp.status_code, str(data.get("error") or "no reason given"))
+        return data
 
     def find_subfolders(self, parent_id: str) -> dict[str, str]:
-        query = (
-            f"'{parent_id}' in parents and mimeType = '{_GOOGLE_FOLDER_MIME}' and trashed = false"
-        )
-        params = urllib.parse.urlencode(
-            {"q": query, "fields": "files(id,name)", "pageSize": "100"}
-        )
-        url = f"https://www.googleapis.com/drive/v3/files?{params}"
-        data = json.loads(self._http("GET", url, self._auth_headers(), None).decode("utf-8"))
-        return {str(item["name"]): str(item["id"]) for item in data.get("files", [])}
+        folders = self._call("subfolders", {"parent_id": parent_id}).get("folders", {})
+        return {str(k): str(v) for k, v in folders.items()}
 
     def list_files(self, folder_id: str) -> list[DriveFileMeta]:
-        query = f"'{folder_id}' in parents and mimeType != '{_GOOGLE_FOLDER_MIME}' and trashed = false"
-        params = urllib.parse.urlencode(
-            {
-                "q": query,
-                "fields": "files(id,name,mimeType,modifiedTime,parents)",
-                "orderBy": "modifiedTime asc",
-                "pageSize": "100",
-            }
-        )
-        url = f"https://www.googleapis.com/drive/v3/files?{params}"
-        data = json.loads(self._http("GET", url, self._auth_headers(), None).decode("utf-8"))
-        return [
-            DriveFileMeta(
-                file_id=str(item["id"]),
-                name=str(item.get("name", "")),
-                mime_type=str(item.get("mimeType", "text/markdown")),
-                modified_time=str(item.get("modifiedTime", "")),
-                parents=tuple(str(p) for p in item.get("parents", ())),
-            )
-            for item in data.get("files", [])
-        ]
+        return [_meta_from_json(item) for item in self._call("list", {"folder_id": folder_id}).get("files", [])]
 
     def get_file_meta(self, file_id: str) -> DriveFileMeta:
-        params = urllib.parse.urlencode({"fields": "id,name,mimeType,modifiedTime,parents"})
-        url = f"https://www.googleapis.com/drive/v3/files/{urllib.parse.quote(file_id)}?{params}"
-        item = json.loads(self._http("GET", url, self._auth_headers(), None).decode("utf-8"))
-        return DriveFileMeta(
-            file_id=str(item["id"]),
-            name=str(item.get("name", "")),
-            mime_type=str(item.get("mimeType", "text/markdown")),
-            modified_time=str(item.get("modifiedTime", "")),
-            parents=tuple(str(p) for p in item.get("parents", ())),
-        )
+        return _meta_from_json(self._call("meta", {"file_id": file_id})["file"])
 
     def read_text(self, file_meta: DriveFileMeta) -> str:
-        quoted = urllib.parse.quote(file_meta.file_id)
-        if file_meta.mime_type == _GOOGLE_DOC_MIME:
-            url = f"https://www.googleapis.com/drive/v3/files/{quoted}/export?mimeType=text%2Fplain"
-        else:
-            url = f"https://www.googleapis.com/drive/v3/files/{quoted}?alt=media"
-        return self._http("GET", url, self._auth_headers(), None).decode("utf-8")
+        # The proxy decides export vs. download from Drive's own metadata, not from the caller.
+        return str(self._call("read", {"file_id": file_meta.file_id})["text"])
 
     def append_text(self, file_id: str, mime_type: str, addition: str) -> None:
-        meta = DriveFileMeta(file_id=file_id, name="", mime_type=mime_type, modified_time="")
-        existing = self.read_text(meta)
-        combined = existing.rstrip() + "\n\n" + addition.strip() + "\n"
-        upload_mime = "text/plain; charset=utf-8" if mime_type == _GOOGLE_DOC_MIME else "text/markdown; charset=utf-8"
-        quoted = urllib.parse.quote(file_id)
-        url = f"https://www.googleapis.com/upload/drive/v3/files/{quoted}?uploadType=media"
-        self._http(
-            "PATCH",
-            url,
-            self._auth_headers({"Content-Type": upload_mime}),
-            combined.encode("utf-8"),
-        )
+        _ = mime_type
+        self._call("append", {"file_id": file_id, "text": addition})
 
     def move_file(self, file_id: str, *, add_parent: str, remove_parent: str) -> None:
-        params = urllib.parse.urlencode(
-            {
-                "addParents": add_parent,
-                "removeParents": remove_parent,
-                "fields": "id,parents",
-            }
-        )
-        quoted = urllib.parse.quote(file_id)
-        url = f"https://www.googleapis.com/drive/v3/files/{quoted}?{params}"
-        self._http("PATCH", url, self._auth_headers({"Content-Type": "application/json"}), b"{}")
+        self._call("move", {"file_id": file_id, "add_parent": add_parent, "remove_parent": remove_parent})
 
 
 def resolve_queue_folders(

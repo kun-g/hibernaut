@@ -11,9 +11,9 @@ from agent_runtime.adapters.channels import (
     DriveFileMeta,
     DriveResultWriter,
     DriveTaskPoller,
-    ServiceAccountTokenProvider,
     parse_task_markdown,
 )
+from agent_runtime.adapters.credential_proxy.gdrive_queue import ServiceAccountTokenProvider
 from agent_runtime.app.config import parse_config
 from agent_runtime.app.main import build_daemon, build_daemon_from_config
 from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Suspend
@@ -295,7 +295,8 @@ class TestGoogleDriveTaskQueue(unittest.IsolatedAsyncioTestCase):
                 },
                 "gdrive": {
                     "enabled": True,
-                    "service_account_key_env": "HIBERNAUT_GDRIVE_SA_KEY",
+                    "proxy_url": "http://127.0.0.1:9100",
+                    "proxy_token_file": str(self.root / "gdrive-proxy.token"),
                     "root_folder_id": "root-1",
                     "poll_interval_seconds": 15.0,
                     "default_inbox_id": "proj:hibernaut",

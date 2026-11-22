@@ -24,9 +24,10 @@ src/agent_runtime/
 │   ├── storage_sqlite/    # SQLite WAL, one lock-guarded connection + BEGIN IMMEDIATE writes (Inbox, Timers, Outbox, Leases, Sessions + correlation_key/executor binding, Workspaces, task metadata)
 │   ├── memory_fs/         # FileSystemMemoryAdapter + PartitionedMemoryAdapter & WorkspacePartitionRegistry
 │   ├── permissions/       # Auto Mode classifier (allow / block / defer) + external CredentialProxyClient
+│   ├── credential_proxy/  # External Drive queue proxy (own OS user holds the service account key; fixed queue operations on loopback)
 │   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
 │   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + resume_args + magpie env), shared Claude Code launch adapter (claude_code.py), CoderReviewerExecutor (read-only review) & OrcaWorktreeManager (3 safety gates)
-│   └── channels/          # Multi-route HTTP (/events, /webhooks/github, /webhooks/feishu, /mcp), MCPServerAdapter, GitHubIssuePoller, FeishuChannelAdapter, Console
+│   └── channels/          # Multi-route HTTP (/events, /webhooks/github, /webhooks/feishu, /mcp), MCPServerAdapter, GitHubIssuePoller, FeishuChannelAdapter, Console, Drive queue poller/writer (via ProxiedDriveClient)
 └── app/
     ├── config.py          # Stdlib tomllib loader for hibernaut.toml
     ├── bootstrap.py       # Single-inbox Composition Root
@@ -278,15 +279,31 @@ Remote clients call `POST https://<your-tunnel-host>/mcp` with header `Authoriza
 
 Run a tunnel-free cloud-to-local task loop via Google Drive (`待执行/` → `执行中/` → `已完成/` / `失败/`), supporting `.md` files with optional YAML frontmatter (`scope`, `executor_id`, `priority`, `title`) and Google Docs (auto-exported as `text/plain`). Re-editing a file and moving it back to `待执行/` automatically continues the same `Session` and `hb-*` worktree via `correlation_key = "gdrive:<file_id>"`.
 
-### 3-Step GCP Service Account Single-Folder Setup
+### Setup: service account behind the external credential proxy
 
-1. **Create a GCP Service Account & JSON key**: In Google Cloud Console, enable the **Google Drive API**, create a Service Account (no broad IAM roles needed), generate a JSON key, and save it locally (e.g., `~/.config/hibernaut/gdrive-sa.json`, `chmod 600`).
-2. **Share only the Task Queue root folder**: In Google Drive, create `任务队列/{待执行, 执行中, 已完成, 失败}`, right-click the `任务队列` root folder → **Share**, and grant **Editor** access solely to the Service Account email (`<name>@<project>.iam.gserviceaccount.com`) so it cannot see anything outside that folder.
-3. **Enable `[gdrive]` in `hibernaut.toml` and export the key path**:
+Hibernaut never holds the service account key. An external credential proxy, running as its own system user, keeps the key, calls Google Drive, and answers only the queue's operations (list a queue folder, read a task file, move it between the four queue folders, append the result) on `127.0.0.1`. Hibernaut reaches it through `CredentialProxyClient` with a local client token and receives file metadata, task text and `ok`, never a Google token.
+
+1. **Service account**: In Google Cloud Console, enable the **Google Drive API**, create a Service Account (no IAM roles needed) and a JSON key.
+2. **Share only the queue folder**: Create `任务队列/{待执行, 执行中, 已完成, 失败}` in Drive and share the `任务队列` folder as **Editor** with the Service Account email only.
+3. **Install the proxy** (macOS LaunchDaemon or Linux systemd unit; details, allowed operations and maintenance in [`deploy/gdrive-proxy/README.md`](deploy/gdrive-proxy/README.md)):
    ```bash
-   export HIBERNAUT_GDRIVE_SA_KEY="$HOME/.config/hibernaut/gdrive-sa.json"
+   sudo deploy/gdrive-proxy/install.sh --key ~/.config/hibernaut/gdrive-sa.json \
+     --root-folder-id <queue folder ID from its Drive URL> --hb-user "$USER"
    ```
-   Uncomment `[gdrive]` in `hibernaut.toml`, set `enabled = true`, `root_folder_id = "<folder_id_from_url>"`, and `default_inbox_id = "proj:hibernaut"`, then start Hibernaut.
+   It copies the key to `/etc/hibernaut-drive-proxy/sa.json` (readable only by the proxy user), writes the client token to `~/.config/hibernaut/gdrive-proxy.token`, checks the queue read-only and starts the service. Delete the original key file afterwards.
+4. **Enable `[gdrive]` in `hibernaut.toml`** and restart Hibernaut:
+   ```toml
+   [gdrive]
+   enabled = true
+   proxy_url = "http://127.0.0.1:9100"      # default: [credential_proxy] url
+   proxy_token_file = "~/.config/hibernaut/gdrive-proxy.token"
+   root_folder_id = "<queue folder ID>"
+   default_inbox_id = "proj:hibernaut"
+   ```
+
+- `proxy_token_file` (relative paths resolve against the directory of `hibernaut.toml`) must be mode 0600; if it is missing, empty or readable by others, Hibernaut prints the reason and starts without the Drive poller.
+- `service_account_key_env` is no longer accepted: the config fails with a message pointing to the proxy. `HIBERNAUT_GDRIVE_SA_KEY` is ignored.
+- A proxy refusal or Drive error reaches the poller as `DriveProxyError` with the HTTP status and reason; the poll logs it and retries on the next interval.
 
 ## Anti-Corruption Gates (CI)
 
