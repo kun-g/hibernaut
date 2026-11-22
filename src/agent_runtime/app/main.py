@@ -32,6 +32,7 @@ from agent_runtime.adapters.executor_cli import (
     OrcaWorktreeManager,
     SDEExecutor,
 )
+from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
     RuleBasedDemoLLM,
@@ -474,28 +475,32 @@ def build_daemon_from_config(
     if has_configured_executor and not demo:
         # Instantiate all configured [executors.<id>] per project so AgentWorker can sticky-route.
         # Role executors are rebuilt with each config reload, so the next run uses the new profile and launcher.
-        reviewers: dict[str, CoderReviewerExecutor] = {
-            name: CoderReviewerExecutor(profile=role.profile, workspaces=daemon.workspaces)
-            for name, role in config.roles.items()
-            if role.role == CODER_REVIEWER_ROLE
-        }
-        reviewer_executors: dict[str, ExecutorPort] = dict(reviewers)
+        terminal_bindings = SQLiteTerminalBindingStore(daemon.db)
+        visible_runner = OrcaVisibleRunner(bindings=terminal_bindings)
 
-        def _sde_executors(wt_mgr: OrcaWorktreeManager) -> dict[str, ExecutorPort]:
-            # Each SDE run reviews through the reviewer built from the same config generation.
-            return {
-                name: SDEExecutor(
+        def _role_executors(wt_mgr: OrcaWorktreeManager, orca: bool) -> dict[str, ExecutorPort]:
+            # Orca worktree projects run roles in visible terminals unless the role sets visible = false.
+            # Each SDE run reviews through the reviewer built for the same project and config generation.
+            reviewers: dict[str, CoderReviewerExecutor] = {
+                name: CoderReviewerExecutor(profile=role.profile, workspaces=daemon.workspaces,
+                                            visible=visible_runner if orca and role.visible else None)
+                for name, role in config.roles.items()
+                if role.role == CODER_REVIEWER_ROLE
+            }
+            built: dict[str, ExecutorPort] = dict(reviewers)
+            for name, role in config.roles.items():
+                if role.sde is None:
+                    continue
+                built[name] = SDEExecutor(
                     profile=role.profile,
                     options=role.sde,
                     reviewer=reviewers.get(role.sde.reviewer) if role.sde.review else None,
                     worktree_manager=wt_mgr,
                     inbox_checkout_map=inbox_checkout_map,
+                    visible=visible_runner if orca and role.visible else None,
                 )
-                for name, role in config.roles.items()
-                if role.sde is not None
-            }
+            return built
 
-        terminal_bindings = SQLiteTerminalBindingStore(daemon.db)
         executors_by_inbox: dict[str, dict[str, ExecutorPort]] = {}
         wt_mgr_by_inbox: dict[str, OrcaWorktreeManager] = {}
         for proj in config.projects.values():
@@ -514,11 +519,11 @@ def build_daemon_from_config(
                     default_executor=exec_name,
                     orca_workspace=proj.worktree_backend == "orca",
                     terminal_bindings=terminal_bindings,
+                    visible_runner=visible_runner,
                 )
                 for exec_name in config.executors
             }
-            executors_by_inbox[proj.inbox_id].update(reviewer_executors)
-            executors_by_inbox[proj.inbox_id].update(_sde_executors(wt_mgr))
+            executors_by_inbox[proj.inbox_id].update(_role_executors(wt_mgr, proj.worktree_backend == "orca"))
 
         default_mgr = OrcaWorktreeManager(
             workspace_store=daemon.workspaces,
@@ -533,8 +538,7 @@ def build_daemon_from_config(
             )
             for exec_name in config.executors
         }
-        fallback_executors.update(reviewer_executors)
-        fallback_executors.update(_sde_executors(default_mgr))
+        fallback_executors.update(_role_executors(default_mgr, False))
 
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
             return AgentWorker(

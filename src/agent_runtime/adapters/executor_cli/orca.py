@@ -1,20 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
 import os
 import re
 import shlex
+import shutil
 import stat
+import sys
 import tempfile
 import time
-from collections.abc import Sequence
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from agent_runtime.adapters.executor_cli.claude_code import (
+    PROBE_ROLE_ARGS,
+    ClaudeCodeError,
+    ClaudeCodeProfile,
+    env_overrides,
+    harness_args,
+    interactive_args,
+)
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore, TerminalBinding
 from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Silent, Suspend, new_id
 from agent_runtime.core.ports import RunCapabilities
@@ -24,6 +36,14 @@ _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 UNCONFIRMED_CHECKPOINT = json.dumps({"orca_continuation": "unconfirmed"})
 _SUBMIT_WAIT_SECONDS = "10"
 _RESUME_READY_MS = "60000"
+ROLE_AGENT = "claude"
+GATE_SCRIPT = Path(__file__).with_name("claude_gate.py")
+HANDOFF_SCRIPT = Path(__file__).with_name("handoff_mcp.py")
+HANDOFF_SERVER = "hibernaut_handoff"
+HANDOFF_TOOLS = (f"mcp__{HANDOFF_SERVER}__get_task", f"mcp__{HANDOFF_SERVER}__submit_result")
+_PROBE_TIMEOUT_SECONDS = 120
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
+_ORCA_ERRORS = (OSError, TimeoutError, ValueError, RuntimeError, KeyError)
 
 
 async def _orca(*args: str, cwd: Path) -> dict[str, Any]:
@@ -123,6 +143,61 @@ def _with_native(outcome: RunOutcome, native: str | None) -> RunOutcome:
     return dataclasses.replace(outcome, executor_session_id=native)
 
 
+@dataclass(frozen=True, slots=True)
+class RoleReply:
+    data: dict[str, Any]
+    native_session_id: str
+    handle: str
+
+
+def _read_json(path: Path) -> bytes | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        data = stream.read(1024 * 1024 + 1)
+    if len(data) > 1024 * 1024:
+        raise ValueError(f"{path} exceeds 1 MiB")
+    return data
+
+
+def _handoff(prompt: str, turn: str) -> str:
+    return (
+        f"{prompt}\n\n## Result handoff\n"
+        "A person may watch this terminal and answer questions here; keep progress visible. As the final action, "
+        f"call the {HANDOFF_TOOLS[1]} tool with turn \"{turn}\" and your result; that call is the only way the "
+        "result is read, and its input schema is the result format. If it rejects the result, fix it and call again."
+    )
+
+
+def _instruction(turn: str) -> str:
+    return (
+        f"Call the {HANDOFF_TOOLS[0]} tool with turn \"{turn}\" and carry out the task it returns. "
+        f"Finish by calling {HANDOFF_TOOLS[1]} with turn \"{turn}\" and your result."
+    )
+
+
+def with_handoff(role_args: Sequence[str], root: Path) -> list[str]:
+    # The launcher's handoff server is the agent's only channel for the task and the result, so no directory
+    # outside the worktree is added (that opens a trust dialog) and no file-writing permission is needed.
+    args = list(role_args)
+    if "--allowedTools" in args:
+        i = args.index("--allowedTools") + 1
+        args[i] = ",".join((args[i], *HANDOFF_TOOLS))
+    else:
+        args += ["--allowedTools", ",".join(HANDOFF_TOOLS)]
+    server = {"type": "stdio", "command": sys.executable, "args": ["-I", str(HANDOFF_SCRIPT), str(root)]}
+    return [*args, "--mcp-config", json.dumps({"mcpServers": {HANDOFF_SERVER: server}})]
+
+
+def terminal_title(executor_id: str, role: str, subject: str) -> str:
+    who = executor_id if executor_id == role else f"{executor_id} ({role})"
+    return f"{who} · {subject}"
+
+
 class OrcaVisibleRunner:
     def __init__(
         self,
@@ -130,10 +205,192 @@ class OrcaVisibleRunner:
         bindings: SQLiteTerminalBindingStore | None = None,
         transcript_roots: Sequence[Path] | None = None,
         poll_interval: float = 0.25,
+        handoff_root: Path | None = None,
+        liveness_interval: float = 5.0,
     ) -> None:
         self._bindings = bindings
         self._roots = list(transcript_roots) if transcript_roots is not None else None
         self._poll_interval = poll_interval
+        self._handoff_root = handoff_root or Path(tempfile.gettempdir()) / "hibernaut-handoff"
+        self._liveness_interval = liveness_interval
+
+    async def converse(
+        self,
+        profile: ClaudeCodeProfile,
+        *,
+        title: str,
+        workdir: Path,
+        prompt: str,
+        schema: Mapping[str, Any],
+        role_args: Sequence[str],
+        is_interrupted: Callable[[], bool],
+        session_id: str | None = None,
+        native: str | None = None,
+    ) -> RoleReply:
+        # One turn of a role conversation in a visible Orca terminal. With session_id the conversation bound to
+        # that session continues (live terminal, else --resume); without it every call starts a fresh one.
+        workdir = Path(os.path.realpath(workdir))
+        binding: TerminalBinding | None = None
+        if session_id is not None and self._bindings is not None:
+            binding = self._bindings.get(session_id)
+            if binding is not None and (binding.executor_id != profile.name or binding.workdir != str(workdir)):
+                binding = None
+        if session_id is not None:
+            native = native or (binding.native_session_id if binding is not None else None)
+        else:
+            native = None
+        root = self._handoff_root / (_SAFE_NAME_RE.sub("_", session_id) if session_id else uuid.uuid4().hex)
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root = Path(os.path.realpath(root))
+        (root / "schema.json").write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+        turn = Path(tempfile.mkdtemp(prefix="turn-", dir=root))
+        result_path = turn / "result.json"
+        (turn / "prompt.md").write_text(_handoff(prompt, turn.name), encoding="utf-8")
+        instruction = _instruction(turn.name)
+        handle: str | None = None
+        completed = False
+        deadline = asyncio.timeout(profile.timeout_seconds)
+        try:
+            async with deadline:
+                if binding is not None and binding.handle and await self._live(binding, ROLE_AGENT, workdir):
+                    handle = binding.handle
+                    await self._send(binding, instruction, workdir)
+                    native = binding.native_session_id or native
+                else:
+                    fresh = native is None
+                    native = native or str(uuid.uuid4())
+                    continuation = ("--session-id", native) if fresh else ("--resume", native)
+                    args = [*with_handoff(role_args, root), *continuation, "--name", title]
+                    handle, incarnation = await self._start(profile, title, workdir, turn, args, instruction)
+                    if session_id is not None:
+                        binding = TerminalBinding(session_id=session_id, executor_id=profile.name, agent=ROLE_AGENT,
+                                                  workdir=str(workdir), handle=handle, incarnation_id=incarnation,
+                                                  native_session_id=native)
+                        self._save(binding)
+                    await self._await_gate(turn / "gate-status.json", handle, workdir, is_interrupted)
+                data = await self._await_result(result_path, handle, workdir, is_interrupted)
+                completed = True
+                return RoleReply(data=data, native_session_id=native, handle=handle)
+        except TimeoutError as exc:
+            if not deadline.expired():
+                raise ClaudeCodeError(f"Orca did not answer in {workdir}: {exc}") from exc
+            raise ClaudeCodeError(
+                f"timed out after {profile.timeout_seconds}s in Orca terminal {handle or '(not started)'}"
+            ) from exc
+        except ContinuationUnconfirmed as exc:
+            raise ClaudeCodeError(str(exc)) from exc
+        except _ORCA_ERRORS as exc:
+            raise ClaudeCodeError(f"Orca terminal {handle or '(not started)'} in {workdir}: {type(exc).__name__} {exc}") from exc
+        finally:
+            shutil.rmtree(turn, ignore_errors=True)
+            if session_id is None:
+                shutil.rmtree(root, ignore_errors=True)
+            if handle and not completed:
+                # Close the run's terminal; the native ID stays bound so the next Run resumes this conversation.
+                if session_id is not None and binding is not None:
+                    self._save(dataclasses.replace(binding, handle=None, incarnation_id=None, native_session_id=native))
+                await _close_quietly(handle, workdir)
+
+    async def _start(
+        self, profile: ClaudeCodeProfile, title: str, workdir: Path, turn: Path, args: Sequence[str], instruction: str
+    ) -> tuple[str, str | None]:
+        launcher = profile.launcher
+        unset, values = env_overrides(profile)
+        spec = {
+            "title": title,
+            "profile": {"name": profile.name, "launcher": launcher.name, "launcher_command": launcher.command,
+                        "billing": profile.billing, "model": profile.model, "effort": profile.effort,
+                        "credential_proxy_url": profile.credential_proxy_url},
+            "unset": list(unset),
+            "set": values,
+            "probe": [launcher.command, *harness_args(profile, permission_mode="dontAsk", role_args=PROBE_ROLE_ARGS)],
+            "probe_timeout": _PROBE_TIMEOUT_SECONDS,
+            # `--` ends the options: --allowedTools and --mcp-config take several values and would swallow it.
+            "exec": [launcher.command, *interactive_args(profile, permission_mode="dontAsk", role_args=args), "--",
+                     instruction],
+            "status": str(turn / "gate-status.json"),
+        }
+        spec_path = turn / "gate.json"
+        fd = os.open(spec_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(spec, stream)
+        # `exec` lets the terminal end with the agent, so a crashed or exited agent is seen as a closed terminal.
+        command = shlex.join(["exec", sys.executable, "-I", str(GATE_SCRIPT), str(spec_path)])
+        create = asyncio.create_task(_orca("terminal", "create", "--worktree", f"path:{workdir}", "--title", title,
+                                           "--command", command, cwd=workdir))
+        try:
+            created = (await asyncio.shield(create)).get("terminal", {})
+        except asyncio.CancelledError:
+            # Cancellation may race the create receipt. Recover its handle so the terminal is closed, not leaked.
+            with contextlib.suppress(*_ORCA_ERRORS):
+                late = (await create).get("terminal", {}).get("handle")
+                if isinstance(late, str):
+                    await _close_quietly(late, workdir)
+            raise
+        handle = created.get("handle")
+        if not isinstance(handle, str):
+            raise ValueError("Orca returned no terminal handle")
+        incarnation = created.get("incarnationId")
+        return handle, incarnation if isinstance(incarnation, str) else None
+
+    async def _alive(self, handle: str, workdir: Path) -> bool:
+        listed = (await _orca("terminal", "list", "--worktree", f"path:{workdir}", "--limit", "500",
+                              cwd=workdir)).get("terminals", [])
+        return any(isinstance(t, dict) and cast(dict[str, Any], t).get("handle") == handle
+                   for t in cast(list[object], listed))
+
+    async def _poll(
+        self, read: Callable[[], Any], handle: str, workdir: Path, is_interrupted: Callable[[], bool], waiting_for: str
+    ) -> Any:
+        loop = asyncio.get_running_loop()
+        next_check = loop.time() + self._liveness_interval
+        while True:
+            if is_interrupted():
+                raise asyncio.CancelledError("visible run interrupted by a new event")
+            value = read()
+            if value is not None:
+                return value
+            if loop.time() >= next_check:
+                if not await self._alive(handle, workdir):
+                    # The file may have landed just before the agent exited.
+                    value = read()
+                    if value is not None:
+                        return value
+                    raise ClaudeCodeError(f"Orca terminal {handle} exited before {waiting_for}")
+                next_check = loop.time() + self._liveness_interval
+            await asyncio.sleep(self._poll_interval)
+
+    async def _await_gate(self, path: Path, handle: str, workdir: Path, is_interrupted: Callable[[], bool]) -> None:
+        def read() -> dict[str, Any] | None:
+            raw = _read_json(path)
+            return cast(dict[str, Any], json.loads(raw)) if raw is not None else None
+
+        status = await self._poll(read, handle, workdir, is_interrupted, "its session check finished")
+        if status.get("ok") is not True:
+            raise ClaudeCodeError(str(status.get("error") or "the session check failed"))
+
+    async def _await_result(
+        self, path: Path, handle: str, workdir: Path, is_interrupted: Callable[[], bool]
+    ) -> dict[str, Any]:
+        invalid: list[bytes] = []
+
+        def read() -> dict[str, Any] | None:
+            raw = _read_json(path)
+            if raw is None:
+                return None
+            try:
+                body: object = json.loads(raw)
+            except json.JSONDecodeError:
+                # A write may still be in progress; the same bytes twice are a final, invalid result.
+                if invalid and invalid[-1] == raw:
+                    raise ClaudeCodeError(f"the agent wrote invalid JSON to {path}") from None
+                invalid.append(raw)
+                return None
+            if not isinstance(body, dict):
+                raise ClaudeCodeError(f"the agent's result in {path} is not a JSON object")
+            return cast(dict[str, Any], body)
+
+        return await self._poll(read, handle, workdir, is_interrupted, "it returned its result")
 
     async def run(
         self,

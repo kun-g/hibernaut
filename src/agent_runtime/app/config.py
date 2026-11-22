@@ -63,6 +63,8 @@ class ProjectConfig:
 
 
 ROLES = (CODER_REVIEWER_ROLE, SDE_ROLE)
+# Deployment mode shared by every role executor.
+ROLE_DEPLOYMENT_KEYS = frozenset({"visible"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +72,8 @@ class RoleConfig:
     role: str
     profile: ClaudeCodeProfile
     sde: SDEOptions | None = None
+    # In projects with worktree_backend = "orca", runs open a visible, interactive Orca terminal; false keeps them headless.
+    visible: bool = True
 
 
 def _sde_options(name: str, item: dict[str, Any]) -> SDEOptions:
@@ -215,13 +219,16 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
         if role is not None:
             if role not in ROLES:
                 raise ValueError(f"executors.{name}: unsupported role '{role}' (supported: {', '.join(ROLES)})")
-            extra = SDE_OPTION_KEYS if role == SDE_ROLE else frozenset[str]()
+            extra = (SDE_OPTION_KEYS if role == SDE_ROLE else frozenset[str]()) | ROLE_DEPLOYMENT_KEYS
             profile = parse_profile(
                 str(name), item, role=str(role), launchers=launchers, credential_proxy_url=anthropic_url,
                 extra_keys=extra,
             )
             options = _sde_options(str(name), item) if role == SDE_ROLE else None
-            roles[str(name)] = RoleConfig(role=str(role), profile=profile, sde=options)
+            visible = item.get("visible", True)
+            if not isinstance(visible, bool):
+                raise ValueError(f"executors.{name}: visible must be true or false")
+            roles[str(name)] = RoleConfig(role=str(role), profile=profile, sde=options, visible=visible)
             continue
         env_raw = item.get("env", {})
         resume_raw = item.get("resume_args")
