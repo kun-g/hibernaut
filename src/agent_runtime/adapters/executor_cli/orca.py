@@ -34,6 +34,7 @@ from agent_runtime.adapters.executor_cli.peer_handoff import (
     task_message,
 )
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout
+from agent_runtime.adapters.executor_cli.run_state import TurnSlot, detached, parked
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore, TerminalBinding
 from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Silent, Suspend, new_id
 from agent_runtime.core.ports import RunCapabilities
@@ -288,9 +289,14 @@ class OrcaVisibleRunner:
         native: str | None = None,
         schema_name: str = "result",
         inbox_id: str | None = None,
+        slot: TurnSlot | None = None,
+        slot_label: str = "turn",
+        slot_extra: Mapping[str, Any] | None = None,
     ) -> RoleReply:
         # One turn of a role conversation in a visible Orca terminal. With session_id the conversation bound to
         # that session continues (live terminal, else --resume); without it every call starts a fresh one.
+        # With a slot (peer handoff only) the turn is recorded in the Run's directory and its wait can be detached;
+        # a turn the slot recorded before a restart is waited on again, never sent twice.
         workdir = Path(os.path.realpath(workdir))
         binding: TerminalBinding | None = None
         if session_id is not None and self._bindings is not None:
@@ -305,7 +311,8 @@ class OrcaVisibleRunner:
             return await self._converse_peer(
                 self._peer, profile, title=title, workdir=workdir, prompt=prompt, schema=schema,
                 schema_name=schema_name, role_args=role_args, is_interrupted=is_interrupted, session_id=session_id,
-                native=native, binding=binding, inbox_id=inbox_id,
+                native=native, binding=binding, inbox_id=inbox_id, slot=slot, slot_label=slot_label,
+                slot_extra=slot_extra or {},
             )
         if binding is not None and binding.handle and binding.peer_socket:
             # A peer-handoff session has no handoff MCP server to fetch a turn from; it is ended and resumed with one.
@@ -381,15 +388,26 @@ class OrcaVisibleRunner:
         native: str | None,
         binding: TerminalBinding | None,
         inbox_id: str | None,
+        slot: TurnSlot | None = None,
+        slot_label: str = "turn",
+        slot_extra: Mapping[str, Any] | None = None,
     ) -> RoleReply:
         # The task goes to the session as a peer message and the result comes back through the receiver's inbox, so
         # nothing the session needs lives in a directory this process owns.
         await asyncio.to_thread(peer.receiver)
+        saved = slot.take(slot_label) if slot is not None else None
+        if saved is not None and slot is not None:
+            picked = await self._pick_up(peer, profile, saved, slot, workdir=workdir, schema=schema,
+                                         is_interrupted=is_interrupted, binding=binding, inbox_id=inbox_id)
+            if picked is not None:
+                return picked
         task_id = session_id or new_id("task")
         attempt = new_id("att")
-        self._handoff_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        turn = Path(tempfile.mkdtemp(prefix="turn-", dir=self._handoff_root))
+        turns_root = slot.turns_dir if slot is not None else self._handoff_root
+        turns_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        turn = Path(tempfile.mkdtemp(prefix="turn-", dir=turns_root))
         handle: str | None = None
+        incarnation: str | None = None
         completed = False
         deadline = asyncio.timeout(profile.timeout_seconds)
         try:
@@ -405,7 +423,7 @@ class OrcaVisibleRunner:
                         binding = dataclasses.replace(binding, handle=None, incarnation_id=None)
                         self._save(binding)
                     else:
-                        handle = binding.handle
+                        handle, incarnation = binding.handle, binding.incarnation_id
                 if target is None:
                     fresh = native is None
                     native = native or str(uuid.uuid4())
@@ -433,10 +451,26 @@ class OrcaVisibleRunner:
                 since = time.time() - 1
                 body = task_message(prompt, task_id=task_id, attempt_id=attempt, reply_to=peer.name,
                                     schema_name=schema_name, schema=schema)
+                loop = asyncio.get_running_loop()
+                when = deadline.when()
+                record: dict[str, Any] = {
+                    **(slot_extra or {}), "kind": "peer", "task_id": task_id, "attempt_id": attempt,
+                    "native": native, "handle": handle, "incarnation": incarnation, "workdir": str(workdir),
+                    "since": since, "addresses": peer.addresses(target), "sent": [],
+                    "deadline_at": time.time() + (when - loop.time() if when is not None else profile.timeout_seconds),
+                }
+                if slot is not None:
+                    # Recorded before the task goes out: a resumed Run waits for this attempt instead of sending it.
+                    slot.record(slot_label, record)
                 sent = [await asyncio.to_thread(peer.send, target, body)]
-                data = await self._await_peer_result(peer, target, sent, since, schema, task_id, attempt, handle,
-                                                     workdir, is_interrupted, inbox_id)
+                if slot is not None:
+                    slot.record(slot_label, {**record, "sent": sent})
+                with parked(slot):
+                    data = await self._await_peer_result(peer, target, sent, since, schema, task_id, attempt, handle,
+                                                         workdir, is_interrupted, inbox_id)
                 completed = True
+                if slot is not None:
+                    slot.record(slot_label, {**record, "sent": sent, "result": data})
                 return RoleReply(data=data, native_session_id=native, handle=handle)
         except TimeoutError as exc:
             if not deadline.expired():
@@ -448,8 +482,77 @@ class OrcaVisibleRunner:
             raise ClaudeCodeError(f"Orca terminal {handle or '(not started)'} in {workdir}: {type(exc).__name__} {exc}") from exc
         finally:
             shutil.rmtree(turn, ignore_errors=True)
-            if handle and not completed:
+            # A detached turn keeps its terminal and binding: the agent goes on and the next process waits for it.
+            if handle and not completed and not detached(slot):
                 if binding is not None:
+                    self._save(dataclasses.replace(binding, handle=None, incarnation_id=None, native_session_id=native,
+                                                   peer_pid=None, peer_socket=None))
+                await _close_quietly(handle, workdir)
+
+    async def _pick_up(
+        self,
+        peer: PeerHandoff,
+        profile: ClaudeCodeProfile,
+        saved: Mapping[str, Any],
+        slot: TurnSlot,
+        *,
+        workdir: Path,
+        schema: Mapping[str, Any],
+        is_interrupted: Callable[[], bool],
+        binding: TerminalBinding | None,
+        inbox_id: str | None,
+    ) -> RoleReply | None:
+        # Continues a turn recorded before a restart. Returns None when it has to run again: its terminal and
+        # session are gone and no result of it arrived.
+        try:
+            task_id, attempt = str(saved["task_id"]), str(saved["attempt_id"])
+            native, handle = str(saved["native"]), str(saved["handle"])
+            since, deadline_at = float(saved["since"]), float(saved["deadline_at"])
+            addresses = [str(a) for a in cast(list[object], saved["addresses"])]
+            sent = [str(m) for m in cast(list[object], saved.get("sent") or [])]
+            recorded_dir = str(saved["workdir"])
+        except (KeyError, TypeError, ValueError):
+            slot.note("the recorded turn could not be read, so it was sent again")
+            return None
+        if os.path.realpath(recorded_dir) != str(workdir):
+            slot.note(f"the recorded turn ran in {recorded_dir}, not {workdir}, so it was sent again")
+            return None
+        result = saved.get("result")
+        if isinstance(result, dict):
+            return RoleReply(data=cast(dict[str, Any], result), native_session_id=native, handle=handle)
+        incarnation = saved.get("incarnation")
+        probe = TerminalBinding(session_id="", executor_id=profile.name, agent=ROLE_AGENT, workdir=str(workdir),
+                                handle=handle, incarnation_id=incarnation if isinstance(incarnation, str) else None)
+        target: Session | None = None
+        if await self._live(probe, ROLE_AGENT, workdir):
+            target = await asyncio.to_thread(peer.find, native, workdir)
+        if target is None:
+            # The session is gone; a result it sent before ending is still in the receiver's inbox.
+            await asyncio.to_thread(peer.ingest)
+            for reply in await asyncio.to_thread(peer.replies_at, addresses, since):
+                data, _ = parse_result(reply.body, schema, task_id=task_id, attempt_id=attempt)
+                if data is not None:
+                    slot.record(str(saved.get("label")), {**saved, "result": data})
+                    return RoleReply(data=data, native_session_id=native, handle=handle)
+            slot.note(f"Orca terminal {handle} ended without a result for attempt {attempt}, so the turn ran again")
+            return None
+        remaining = deadline_at - time.time()
+        completed = False
+        try:
+            async with asyncio.timeout(max(remaining, 0.0)):
+                with parked(slot):
+                    data = await self._await_peer_result(peer, target, sent, since, schema, task_id, attempt, handle,
+                                                         workdir, is_interrupted, inbox_id)
+            completed = True
+            slot.record(str(saved.get("label")), {**saved, "result": data})
+            return RoleReply(data=data, native_session_id=native, handle=handle)
+        except TimeoutError as exc:
+            raise ClaudeCodeError(f"timed out after {profile.timeout_seconds}s in Orca terminal {handle}") from exc
+        except _ORCA_ERRORS as exc:
+            raise ClaudeCodeError(f"Orca terminal {handle} in {workdir}: {type(exc).__name__} {exc}") from exc
+        finally:
+            if not completed and not slot.run.detached():
+                if binding is not None and binding.handle == handle:
                     self._save(dataclasses.replace(binding, handle=None, incarnation_id=None, native_session_id=native,
                                                    peer_pid=None, peer_socket=None))
                 await _close_quietly(handle, workdir)
@@ -1047,12 +1150,17 @@ class OrcaCommandTerminal:
         env: Mapping[str, str],
         timeout_seconds: float,
         is_interrupted: Callable[[], bool],
+        slot: TurnSlot | None = None,
+        slot_label: str = "cli",
+        slot_extra: Mapping[str, Any] | None = None,
     ) -> TerminalRun:
         # Raises TerminalStartFailed when no terminal opened (nothing ran), ProcessTimeout on the deadline,
         # TerminalRunFailed when the terminal ended early or Orca failed, CancelledError on interrupt.
+        # With a slot the run directory lives in the Run's directory and survives a detach with its terminal.
         workdir = Path(os.path.realpath(workdir))
-        self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=self._root))
+        root = slot.turns_dir if slot is not None else self._root
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=root))
         files = {name: str(run_dir / name) for name in ("stdout", "stderr", "exit.json")}
         # The argv holds the prompt; it reaches the wrapper through this private file, not the command line.
         # The wrapper's own deadline outlasts this one, so it only fires when Hibernaut is no longer waiting.
@@ -1065,40 +1173,90 @@ class OrcaCommandTerminal:
         command = shlex.join(["exec", sys.executable, "-I", str(CLI_TERMINAL_SCRIPT), str(spec_path)])
         handle: str | None = None
         finished = False
-        deadline = asyncio.timeout(timeout_seconds)
         try:
             try:
                 handle, _ = await _create_terminal(workdir, title, command)
             except _ORCA_ERRORS as exc:
                 raise TerminalStartFailed(f"{type(exc).__name__} {exc}".strip()) from exc
-            exit_path = Path(files["exit.json"])
+            if slot is not None:
+                slot.record(slot_label, {**(slot_extra or {}), "kind": "cli", "handle": handle, "dir": str(run_dir),
+                                         "workdir": str(workdir), "deadline_at": time.time() + timeout_seconds,
+                                         "timeout_seconds": timeout_seconds})
+            run = await self._wait(handle, run_dir, workdir, argv[0], timeout_seconds, is_interrupted, slot)
+            finished = True
+            return run
+        finally:
+            if not detached(slot):
+                if handle and not finished:
+                    await _close_quietly(handle, workdir)
+                shutil.rmtree(run_dir, ignore_errors=True)
 
-            def read() -> dict[str, Any] | None:
-                raw = _read_json(exit_path)
-                return cast(dict[str, Any], json.loads(raw)) if raw is not None else None
+    async def pick_up(
+        self, slot: TurnSlot, label: str, workdir: Path, is_interrupted: Callable[[], bool]
+    ) -> TerminalRun | None:
+        # The command a stopped process left running for this label: its result if it already ended, else waits
+        # for it. None when nothing usable is recorded, or the terminal ended without a result: run it again.
+        saved = slot.take(label)
+        if saved is None:
+            return None
+        workdir = Path(os.path.realpath(workdir))
+        try:
+            handle, run_dir = str(saved["handle"]), Path(os.path.realpath(str(saved["dir"])))
+            deadline_at, timeout_seconds = float(saved["deadline_at"]), float(saved["timeout_seconds"])
+        except (KeyError, TypeError, ValueError):
+            slot.note("the recorded review command could not be read, so it ran again")
+            return None
+        if Path(os.path.realpath(slot.run.run_dir)) not in run_dir.parents:
+            slot.note(f"the recorded review command's directory {run_dir} is outside this Run, so it ran again")
+            return None
+        if not (run_dir / "exit.json").exists() and not await _still_listed(handle, workdir):
+            slot.note(f"Orca terminal {handle} ended without a result, so the review command ran again")
+            await _close_quietly(handle, workdir)
+            shutil.rmtree(run_dir, ignore_errors=True)
+            return None
+        finished = False
+        try:
+            run = await self._wait(handle, run_dir, workdir, "the review command", max(deadline_at - time.time(), 0.0),
+                                   is_interrupted, slot, timeout_label=timeout_seconds)
+            finished = True
+            return run
+        finally:
+            if not slot.run.detached():
+                if not finished:
+                    await _close_quietly(handle, workdir)
+                shutil.rmtree(run_dir, ignore_errors=True)
 
-            try:
-                async with deadline:
+    async def _wait(
+        self, handle: str, run_dir: Path, workdir: Path, what: str, timeout_seconds: float,
+        is_interrupted: Callable[[], bool], slot: TurnSlot | None, *, timeout_label: float | None = None,
+    ) -> TerminalRun:
+        exit_path = run_dir / "exit.json"
+
+        def read() -> dict[str, Any] | None:
+            raw = _read_json(exit_path)
+            return cast(dict[str, Any], json.loads(raw)) if raw is not None else None
+
+        deadline = asyncio.timeout(timeout_seconds)
+        try:
+            async with deadline:
+                with parked(slot):
                     status = await _await_file(read, handle, workdir, is_interrupted, poll_interval=self._poll_interval,
                                                liveness_interval=self._liveness_interval)
-            except _TerminalGone:
-                raise TerminalRunFailed(f"Orca terminal {handle} was closed before '{argv[0]}' finished") from None
-            except TimeoutError as exc:
-                if deadline.expired():
-                    raise ProcessTimeout(f"timed out after {timeout_seconds:g}s in Orca terminal {handle}") from exc
-                raise TerminalRunFailed(f"Orca terminal {handle}: TimeoutError {exc}") from exc
-            except _ORCA_ERRORS as exc:
-                raise TerminalRunFailed(f"Orca terminal {handle}: {type(exc).__name__} {exc}") from exc
-            finished = True
-            code = status.get("exit")
-            return TerminalRun(
-                handle=handle,
-                stdout=Path(files["stdout"]).read_bytes() if os.path.exists(files["stdout"]) else b"",
-                stderr=Path(files["stderr"]).read_bytes() if os.path.exists(files["stderr"]) else b"",
-                exit_code=code if isinstance(code, int) else None,
-                error=str(status.get("error") or ""),
-            )
-        finally:
-            if handle and not finished:
-                await _close_quietly(handle, workdir)
-            shutil.rmtree(run_dir, ignore_errors=True)
+        except _TerminalGone:
+            raise TerminalRunFailed(f"Orca terminal {handle} was closed before '{what}' finished") from None
+        except TimeoutError as exc:
+            if deadline.expired():
+                shown = timeout_label if timeout_label is not None else timeout_seconds
+                raise ProcessTimeout(f"timed out after {shown:g}s in Orca terminal {handle}") from exc
+            raise TerminalRunFailed(f"Orca terminal {handle}: TimeoutError {exc}") from exc
+        except _ORCA_ERRORS as exc:
+            raise TerminalRunFailed(f"Orca terminal {handle}: {type(exc).__name__} {exc}") from exc
+        code = status.get("exit")
+        stdout, stderr = run_dir / "stdout", run_dir / "stderr"
+        return TerminalRun(
+            handle=handle,
+            stdout=stdout.read_bytes() if stdout.exists() else b"",
+            stderr=stderr.read_bytes() if stderr.exists() else b"",
+            exit_code=code if isinstance(code, int) else None,
+            error=str(status.get("error") or ""),
+        )

@@ -141,6 +141,14 @@ class PeerHandoff:
     def replies(self, session: Session, since: float) -> list[PeerRecord]:
         return self.mailbox.take("user", _addresses(session), since)
 
+    def replies_at(self, addresses: Sequence[str], since: float) -> list[PeerRecord]:
+        # Replies from a session that may no longer be running, by the addresses it had.
+        return self.mailbox.take("user", list(addresses), since)
+
+    @staticmethod
+    def addresses(session: Session) -> list[str]:
+        return _addresses(session)
+
     def receipts(self, sent: Sequence[str], session: Session, since: float) -> list[PeerRecord]:
         return self.mailbox.take_controls(sent, _addresses(session), since)
 

@@ -299,6 +299,9 @@ class DeliveryRecord:
     pr_number: int = 0
     pr_url: str = ""
     ci: str = ""
+    # When the wait for CI on ci_head began (epoch seconds), so a wait resumed after a restart keeps its deadline.
+    ci_head: str = ""
+    ci_since: float = 0.0
     merge_sha: str = ""
     attempts: int = 0
     # Per attempt: final outcomes that a retry cannot change (not authorized, review not passed, CI failed).
@@ -366,6 +369,12 @@ class DeliveryInterrupted(Exception):
     pass
 
 
+class DeliveryDetached(Exception):
+    # The process is stopping and the delivery stopped at a checkpoint; the record holds everything a later
+    # delivery of the same task needs to continue from there.
+    pass
+
+
 class _Problem(Exception):
     pass
 
@@ -416,11 +425,14 @@ class PRDelivery:
         *,
         env: Mapping[str, str] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._config = config
         self._store = store
         self._env = remote_env(os.environ if env is None else env)
         self._sleep = sleep
+        # Wall clock: a CI deadline outlives the process that started the wait.
+        self._clock = clock
         self._pattern = re.compile(config.version_pattern)
 
     @property
@@ -479,9 +491,17 @@ class PRDelivery:
         permissions: PermissionPort,
         approved: frozenset[str] = frozenset(),
         is_interrupted: Callable[[], bool] = _never,
+        should_detach: Callable[[], bool] = _never,
     ) -> DeliveryRecord:
+        # Raises DeliveryDetached at a checkpoint once should_detach() is true; every step before it is recorded.
         cfg = self._config
         rec = self.record(req.work_key)
+
+        def stop() -> bool:
+            if should_detach():
+                raise DeliveryDetached("delivery stopped at a checkpoint: the process is stopping")
+            return is_interrupted()
+
         rec.notes, rec.problem, rec.approval, rec.handback = [], "", "", {}
         rec.attempts += 1
         if rec.state == "merged":
@@ -489,7 +509,7 @@ class PRDelivery:
             self._store.save(req.work_key, rec.to_dict())
             return rec
         try:
-            self._publish(req, rec, permissions, approved, is_interrupted)
+            self._publish(req, rec, permissions, approved, stop)
             if rec.state == "merged":
                 self._delete_remote_branch(req, rec)
         except _Problem as exc:
@@ -872,7 +892,7 @@ class PRDelivery:
         if not self._gate(MERGE_TOOL, req, rec, permissions, approved):
             return
         for _ in range(_MAX_MAIN_MOVES):
-            ci = self._wait_for_ci(rec, cwd, is_interrupted)
+            ci = self._wait_for_ci(req, rec, cwd, is_interrupted)
             if ci == "failed":
                 return
             with self._repo_lock(cwd):
@@ -964,13 +984,19 @@ class PRDelivery:
             base_sha = self._fetch_base(cwd)
         return self._git(cwd, "merge-base", "--is-ancestor", base_sha, "HEAD", check=False).returncode != 0
 
-    def _wait_for_ci(self, rec: DeliveryRecord, cwd: Path, is_interrupted: Callable[[], bool]) -> CIResult:
+    def _wait_for_ci(
+        self, req: DeliveryRequest, rec: DeliveryRecord, cwd: Path, is_interrupted: Callable[[], bool]
+    ) -> CIResult:
         cfg = self._config
         if not cfg.require_ci:
             rec.ci = "not required"
             return "passed"
         label = f"{cfg.remote}/{cfg.base_branch}"
-        start = time.monotonic()
+        if rec.ci_head != rec.head_sha or not rec.ci_since:
+            # A new head starts a new wait; the same head keeps the wait (and deadline) it began before a restart.
+            rec.ci_head, rec.ci_since = rec.head_sha, self._clock()
+            self._store.save(req.work_key, rec.to_dict())
+        start = rec.ci_since
         deadline = start + cfg.ci_timeout_seconds
         grace = min(_EMPTY_CHECKS_GRACE, cfg.ci_timeout_seconds / 2)
         while True:
@@ -990,14 +1016,22 @@ class PRDelivery:
             if checks and not pending:
                 rec.ci = f"passed on {rec.head_sha[:12]} ({len(checks)} check(s))"
                 return "passed"
-            if not checks and time.monotonic() - start >= grace and self._behind(cwd):
+            if not checks and self._clock() - start >= grace and self._behind(cwd):
                 rec.history.append(f"no CI reported for PR #{rec.pr_number} after {grace:g}s and {label} has moved; "
                                    f"merging {label} again")
                 return "stale"
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._clock()
             if remaining <= 0:
                 waiting = f"pending: {', '.join(pending)}" if pending else "no checks reported"
                 rec.ci = f"not finished on {rec.head_sha[:12]} ({waiting})"
+                # An approved retry waits a full period again.
+                rec.ci_since = 0.0
                 raise _Problem(f"CI has not finished for PR #{rec.pr_number} after {cfg.ci_timeout_seconds:g}s "
                                f"({waiting}); approve to check again")
-            self._sleep(min(cfg.ci_poll_seconds, remaining))
+            # In slices of at most a second, each a checkpoint, so a stop does not wait out a whole poll interval.
+            left = min(cfg.ci_poll_seconds, remaining)
+            while left > 0:
+                self._sleep(min(1.0, left))
+                left -= 1.0
+                if left > 0:
+                    self._checkpoint(is_interrupted)
