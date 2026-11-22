@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
@@ -15,12 +17,42 @@ from agent_runtime.engine.handler import EventHandler
 PollMode = Literal["gh", "api"]
 IssueFetcher = Callable[["PollTarget"], list[dict[str, Any]]]
 
+_log = logging.getLogger(__name__)
+_GH_TIMEOUT_SECONDS = 60.0
+_DETAIL_LIMIT = 500
+
 
 @dataclass(frozen=True, slots=True)
 class PollTarget:
     repo: str
     inbox_id: str | None = None
     labels: tuple[str, ...] = ()
+
+
+class GitHubPollError(Exception):
+    def __init__(self, failed_repos: Sequence[str], ingested: int) -> None:
+        super().__init__(f"poll failed for {', '.join(failed_repos)}")
+        self.failed_repos = tuple(failed_repos)
+        self.ingested = ingested
+
+
+def describe_poll_error(exc: BaseException) -> str:
+    if isinstance(exc, subprocess.CalledProcessError):
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        detail = " ".join(stderr.split())[:_DETAIL_LIMIT] or "no stderr"
+        return f"gh exit {exc.returncode}: {detail}"
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return f"gh timed out after {exc.timeout:g}s"
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            body = ""
+        detail = " ".join(body.split())[:_DETAIL_LIMIT]
+        return f"HTTP {exc.code} {exc.reason}: {detail}".rstrip(": ")
+    if isinstance(exc, urllib.error.URLError):
+        return f"network error: {exc.reason}"
+    return f"{type(exc).__name__}: {exc}"
 
 
 class GitHubIssuePoller:
@@ -33,6 +65,8 @@ class GitHubIssuePoller:
         github_token_env: str = "GITHUB_TOKEN",
         repo_inbox_map: Mapping[str, str] | None = None,
         fetcher: IssueFetcher | None = None,
+        retry_initial_seconds: float = 5.0,
+        retry_max_seconds: float = 300.0,
     ) -> None:
         self._handler = handler
         self._targets = tuple(targets)
@@ -40,11 +74,29 @@ class GitHubIssuePoller:
         self._github_token_env = github_token_env
         self._repo_inbox_map: dict[str, str] = dict(repo_inbox_map or {})
         self._fetcher = fetcher
+        self._retry_initial_seconds = retry_initial_seconds
+        self._retry_max_seconds = retry_max_seconds
+
+    def retry_delay(self, consecutive_failures: int) -> float:
+        exponent = min(max(consecutive_failures - 1, 0), 32)
+        return min(self._retry_initial_seconds * (2**exponent), self._retry_max_seconds)
 
     def poll_once(self) -> int:
         ingested = 0
+        failed: list[str] = []
         for target in self._targets:
-            issues = self._fetch_issues(target)
+            # One unreachable repo must not starve the other targets of polling.
+            try:
+                issues = self._fetch_issues(target)
+            except Exception as exc:  # noqa: BLE001
+                _log.warning(
+                    "GitHub poll fetch failed for %s (mode=%s): %s",
+                    target.repo,
+                    self._mode,
+                    describe_poll_error(exc),
+                )
+                failed.append(target.repo)
+                continue
             inbox_id = (
                 target.inbox_id
                 or self._repo_inbox_map.get(target.repo)
@@ -80,6 +132,8 @@ class GitHubIssuePoller:
                 )
                 if not result.duplicate:
                     ingested += 1
+        if failed:
+            raise GitHubPollError(failed, ingested)
         return ingested
 
     async def run_forever(
@@ -88,10 +142,30 @@ class GitHubIssuePoller:
         stop_event: asyncio.Event | None = None,
     ) -> None:
         stopper = stop_event or asyncio.Event()
+        failures = 0
         while not stopper.is_set():
-            await asyncio.to_thread(self.poll_once)
+            delay = interval_seconds
             try:
-                await asyncio.wait_for(stopper.wait(), timeout=interval_seconds)
+                await asyncio.to_thread(self.poll_once)
+            except Exception as exc:  # noqa: BLE001
+                # Transient gh/network/API failures must never escape: the daemon's TaskGroup would cancel /events.
+                failures += 1
+                delay = self.retry_delay(failures)
+                if isinstance(exc, GitHubPollError):
+                    _log.warning(
+                        "GitHub poll failed for %s (failure #%d); retry in %.1fs",
+                        ", ".join(exc.failed_repos),
+                        failures,
+                        delay,
+                    )
+                else:
+                    _log.exception("GitHub poll failed (failure #%d); retry in %.1fs", failures, delay)
+            else:
+                if failures:
+                    _log.warning("GitHub poll recovered after %d consecutive failure(s)", failures)
+                failures = 0
+            try:
+                await asyncio.wait_for(stopper.wait(), timeout=delay)
             except asyncio.TimeoutError:
                 continue
 
@@ -116,7 +190,7 @@ class GitHubIssuePoller:
         ]
         for label in target.labels:
             cmd.extend(["--label", label])
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=_GH_TIMEOUT_SECONDS)
         raw = proc.stdout.strip()
         if not raw:
             return []

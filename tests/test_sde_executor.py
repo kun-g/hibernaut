@@ -23,6 +23,7 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteSessionStoreAdapter,
     SQLiteTimerAdapter,
 )
+from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.app.config import load_config, parse_config
 from agent_runtime.app.main import build_daemon_from_config, serve_configured
@@ -164,7 +165,7 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
         overrides.setdefault("launcher", self.launcher())
         reviewer = CoderReviewerExecutor(
             profile=ClaudeCodeProfile(name="coder-reviewer", launcher=self.launcher(), model="claude-sonnet-5-5"),
-            workspaces=self.workspaces,
+            workspaces=self.workspaces, tasks=SQLiteTaskMetadataStore(self.db),
         )
         return SDEExecutor(
             profile=ClaudeCodeProfile(name="sde", **overrides),
@@ -172,6 +173,7 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
             reviewer=reviewer if review else None,
             worktree_manager=self.wt,
             inbox_checkout_map={},
+            tasks=SQLiteTaskMetadataStore(self.db),
         )
 
     def calls(self, role=None):
@@ -201,7 +203,7 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Edit", self.arg(dev_call, "--allowedTools"))
         self.assertIn("Bash(git push:*)", self.arg(dev_call, "--disallowedTools"))
         self.assertEqual((self.arg(dev_call, "--model"), self.arg(dev_call, "--effort")), ("claude-opus-5-5", "high"))
-        self.assertIn("failing test", dev_call["prompt"])
+        self.assertIn("failing test", self.arg(dev_call, "--append-system-prompt"))
         self.assertIn("divide must reject a zero divisor", dev_call["prompt"])
         self.assertIn("Edit", self.arg(review_call, "--disallowedTools"))
         self.assertEqual(self.arg(review_call, "--model"), "claude-sonnet-5-5")
@@ -351,7 +353,7 @@ class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
     def worker(self):
         launcher = ClaudeCodeLauncher(name="fake", command=fake_command(self.root))
         reviewer = CoderReviewerExecutor(profile=ClaudeCodeProfile(name="coder-reviewer", launcher=launcher),
-                                         workspaces=self.workspaces)
+                                         workspaces=self.workspaces, tasks=SQLiteTaskMetadataStore(self.db))
         sde = SDEExecutor(
             profile=ClaudeCodeProfile(name="sde", launcher=launcher),
             options=SDEOptions(),
@@ -359,6 +361,7 @@ class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
             worktree_manager=OrcaWorktreeManager(workspace_store=self.workspaces, session_store=self.sessions,
                                                  backend="git"),
             inbox_checkout_map={},
+            tasks=SQLiteTaskMetadataStore(self.db),
         )
         memory = Mock()
         memory.load_baseline.return_value = {}

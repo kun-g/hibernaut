@@ -114,6 +114,16 @@ def run_interactive():
         print(f"No conversation found with session ID: {sid}", file=sys.stderr, flush=True)
         sys.exit(1)
     assert argv[-2] == "--", "the instruction must follow `--` so no variadic option swallows it"
+    registry = os.environ.get("FAKE_PEER_REGISTRY")
+    if registry:
+        # Like Claude Code: a live interactive session registers its name, native ID and cwd for SendMessage.
+        Path(registry).mkdir(parents=True, exist_ok=True)
+        entry = Path(registry) / f"{os.getpid()}.json"
+        entry.write_text(json.dumps({
+            "pid": os.getpid(), "sessionId": sid, "cwd": os.getcwd(), "kind": "interactive",
+            "name": argv[argv.index("--name") + 1] if "--name" in argv else "",
+            "messagingSocketPath": f"/tmp/fake-socks/{os.getpid()}.sock",
+        }))
     handoff = Handoff()
     permitted = [t for t in HANDOFF_TOOLS if t in allowed.split(",")]
     instruction = argv[-1]
@@ -181,6 +191,13 @@ else:
         target = Path.cwd() / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+    if step.get("commit"):
+        # Commit everything written so far; later "write" steps stay uncommitted unless they commit too.
+        import subprocess
+        subprocess.run(["git", "add", "-A"], check=True)
+        subprocess.run(["git", "commit", "-qm", step["commit"]], check=True)
+    for rel, content in step.get("write_uncommitted", {}).items():
+        (Path.cwd() / rel).write_text(content, encoding="utf-8")
     output = step.get("output", {"status": "done", "summary": "implemented", "test_evidence": "red: 1 failed; green: 1 passed"})
 if isinstance(step, dict) and step.get("error"):
     emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "result": step["error"], "session_id": session_id})

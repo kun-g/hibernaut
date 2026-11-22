@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout, supervise
+from agent_runtime.adapters.executor_cli.role_skills import builtin_skill, parse_skills, render_skills
 
 CLAUDE_CODE = "claude-code"
 HARNESSES = (CLAUDE_CODE,)
@@ -32,11 +33,15 @@ _PAID_ENV_KEYS = (
 _ROUTING_ENV_KEYS = (*_PAID_ENV_KEYS, "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN")
 _CREDENTIAL_ENV_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD)", re.IGNORECASE)
 _STREAM_LIMIT = 16 * 1024 * 1024
-PROFILE_KEYS = frozenset({"harness", "launcher", "billing", "model", "effort", "timeout_seconds", "env"})
+PROFILE_KEYS = frozenset({"harness", "launcher", "billing", "model", "effort", "timeout_seconds", "env", "skills"})
 
 
 def _empty_env() -> dict[str, str]:
     return {}
+
+
+def _no_skills() -> tuple[Path, ...]:
+    return ()
 
 
 def _check_env(where: str, env: Mapping[str, str]) -> None:
@@ -93,6 +98,8 @@ class ClaudeCodeProfile:
     env: dict[str, str] = field(default_factory=_empty_env)
     # Anthropic base URL on the external credential proxy; billing "api" sends every request there.
     credential_proxy_url: str = ""
+    # Ordered SKILL.md files from the deployment file; empty means the role's built-in skill.
+    skills: tuple[Path, ...] = field(default_factory=_no_skills)
 
     def __post_init__(self) -> None:
         where = f"executors.{self.name}"
@@ -144,6 +151,7 @@ def parse_profile(
     launchers: Mapping[str, ClaudeCodeLauncher],
     credential_proxy_url: str,
     extra_keys: frozenset[str] = frozenset(),
+    base_dir: Path | None = None,
 ) -> ClaudeCodeProfile:
     where = f"executors.{name}"
     unknown = sorted(set(item) - PROFILE_KEYS - extra_keys - {"role"})
@@ -164,7 +172,18 @@ def parse_profile(
         timeout_seconds=float(item.get("timeout_seconds", defaults.timeout_seconds)),
         env=_str_env(where, item.get("env", {})),
         credential_proxy_url=credential_proxy_url,
+        skills=parse_skills(where, role, item.get("skills"), base_dir or Path.cwd()),
     )
+
+
+def role_system_prompt(profile: ClaudeCodeProfile, *, role: str, contract: str) -> str:
+    # The contract is program-owned and comes first; skills only shape how the role works inside it.
+    skills = profile.skills or (builtin_skill(role),)
+    try:
+        body = render_skills(skills)
+    except ValueError as exc:
+        raise ClaudeCodeError(f"executors.{profile.name}: {exc}") from exc
+    return f"{contract}\n\n{body}"
 
 
 def env_overrides(profile: ClaudeCodeProfile) -> tuple[tuple[str, ...], dict[str, str]]:

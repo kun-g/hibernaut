@@ -24,6 +24,7 @@ from agent_runtime.adapters.executor_cli.reviewer import (
     worktree_fingerprint,
 )
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase
+from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.app.config import parse_config
 from agent_runtime.app.main import build_daemon_from_config, serve_configured
@@ -181,7 +182,8 @@ class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
     def executor(self, **overrides):
         overrides.setdefault("launcher", ClaudeCodeLauncher(name="fake", command=fake_command(self.root)))
         profile = ClaudeCodeProfile(name="coder-reviewer", **overrides)
-        return CoderReviewerExecutor(profile=profile, workspaces=self.workspaces)
+        return CoderReviewerExecutor(profile=profile, workspaces=self.workspaces,
+                                     tasks=SQLiteTaskMetadataStore(self.db))
 
     def calls(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
@@ -309,6 +311,19 @@ class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
         (self.repo / "notes.txt").write_text("changed\n")
         self.assertNotEqual(worktree_fingerprint(self.repo), before)
         self.assertEqual(staged(), "")
+
+    async def test_fingerprint_sees_a_same_size_edit_whose_stat_still_matches_the_index(self):
+        # Regression: the scratch index got a fresh timestamp, so git trusted a stale stat entry for a
+        # same-size edit with the same mtime and two fingerprints of one working tree could disagree.
+        git(self.repo, "config", "core.trustctime", "false")
+        calc = self.repo / "calc.py"
+        old = time.time_ns() - 60_000_000_000
+        os.utime(calc, ns=(old, old))
+        git(self.repo, "add", "calc.py")
+        before = worktree_fingerprint(self.repo)
+        calc.write_text(calc.read_text().replace("return a / b", "return b / a"))
+        os.utime(calc, ns=(old, old))
+        self.assertNotEqual(worktree_fingerprint(self.repo), before)
 
     async def test_review_of_finds_the_developer_workspace_and_never_creates_one(self):
         outcome = await self.executor().execute(

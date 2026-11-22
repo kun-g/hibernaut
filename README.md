@@ -21,7 +21,7 @@ src/agent_runtime/
 │   ├── scheduler.py       # TimerScheduler: scans due Follow-up & Schedule timers -> appends Inbox events
 │   └── dispatcher.py      # OutboxDispatcher: paced Outbox delivery with anti-spam throttling and retries
 ├── adapters/              # L3: Volatile infrastructure implementations
-│   ├── storage_sqlite/    # SQLite WAL, one lock-guarded connection + BEGIN IMMEDIATE writes (Inbox, Timers, Outbox, Leases, Sessions + correlation_key/executor binding, Workspaces)
+│   ├── storage_sqlite/    # SQLite WAL, one lock-guarded connection + BEGIN IMMEDIATE writes (Inbox, Timers, Outbox, Leases, Sessions + correlation_key/executor binding, Workspaces, task metadata)
 │   ├── memory_fs/         # FileSystemMemoryAdapter + PartitionedMemoryAdapter & WorkspacePartitionRegistry
 │   ├── permissions/       # Auto Mode classifier (allow / block / defer) + external CredentialProxyClient
 │   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
@@ -50,6 +50,8 @@ PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
 ```
 
 When started with `--config`, Hibernaut registers all `[executors.<id>]` templates into `AgentWorker` for 4-level sticky executor routing (`event.payload["executor_id"]` → `session.executor_id` → `projects.<name>.executor` → `runtime.default_executor`) and never silently falls back to `RuleBasedDemoLLM`. If `[executors]` or `runtime.default_executor` is not configured, it prints a warning to `stderr` and starts in **`ingest-only`** mode (keeping inbound webhooks, polling, and MCP active while events remain safely `pending` in SQLite). Pass `--demo` explicitly if you want `RuleBasedDemoLLM` with `--config`.
+
+The GitHub Issue poller tolerates transient failures (`gh` errors or timeouts, network errors, GitHub API 4xx/5xx): each failing repo logs one WARNING with the repo, poll mode and the `gh` stderr or HTTP status and body excerpt, other repos keep polling, and the poller retries with exponential backoff (5s doubling, capped at 300s) before returning to `runtime.poll_interval_seconds`. `/events`, webhooks and MCP keep accepting events during an outage, and shutdown is not delayed by the backoff.
 
 The HTTP daemon watches the file passed to `--config` once per second, including under `scripts/run_updating.py`. Save project mappings, CLI templates, worker limits or channel settings and look for `[config] Reloaded` in the console. The daemon finishes accepted work before activating the new settings, so incoming requests may briefly wait. Invalid TOML or a busy replacement port leaves the current configuration active. Changing `db_path` or `memory_root`, updating the process environment, or reconfiguring a stdio MCP session requires a restart.
 
@@ -111,13 +113,78 @@ curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
   }}'
 ```
 
-- Workspace: `explicit_workdir`, or the ready workspace of `review_of` (the developer task's `correlation_key`). The reviewer never creates a worktree. Use its own `correlation_key` so the developer session stays bound to its executor.
+- Workspace: `explicit_workdir`, or the ready workspace of `review_of` (the developer task's `correlation_key`), or the workdir recorded for that task. The reviewer never creates a worktree.
+- Project guidance: read from the commit recorded for the `review_of` task, otherwise from the merge base of `base_ref` and `HEAD`; selected by the task's `activities`, `tags`/`labels` and the diff's paths (see Project Guidance). Use its own `correlation_key` so the developer session stays bound to its executor.
 - Diff: computed by the executor from the merge base with `base_ref` (default `origin/HEAD`, then `main`), including uncommitted and untracked files.
 - Result: one Outbox message with `verdict=pass` or `verdict=changes_requested`. Each blocking item lists location, trigger, impact and an optional fix. After a fix, send a new event (new `external_id`) for a fresh, independent review.
 - Read-only: edit tools are denied and the working tree is fingerprinted before and after; any change discards the review.
 - Launcher: chosen only in `hibernaut.toml`; event payloads cannot name a launcher or command. The launcher may set its own config dir, account, gateway or proxy (like `claude-sg`) and receives `-p --output-format stream-json --verbose --model --effort --permission-mode dontAsk` plus the reviewer's tool and schema arguments unchanged. The permission mode is always explicit, so a launcher's own default (such as `bypassPermissions`) never applies.
 - Billing: both modes remove `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL` and the Bedrock/Vertex/Foundry switches from the daemon environment before starting the launcher. `subscription` uses the launcher's own login and stops at session start if Claude Code reports any paid credential source. `api` points Claude Code at `<credential_proxy.url>/proxy/anthropic` with a placeholder key; the external proxy injects the real key, and the run stops if Claude Code authenticates any other way. Credentials never go in `hibernaut.toml` (the parser rejects them).
 - Hot reload: save the settings (including launcher) and the next review uses them. Invalid values or combinations print `[config] Invalid ... (ValueError: <reason>)` and keep the running settings.
+
+## Role Skills
+
+How each role works comes from a skill; what it may do and what it must return stays in code. Each role-based executor takes an ordered `skills` list in its own `[executors.<id>]` table:
+
+```toml
+[executors.sde]
+role = "sde"
+skills = ["builtin:sde", "./skills/team-tdd", "~/skills/security/SKILL.md"]
+
+[executors.coder-reviewer]
+role = "coder-reviewer"
+skills = ["./skills/team-review"]   # replaces the built-in review method
+```
+
+- Entries: a local `SKILL.md`, a directory containing one, or `builtin:<role>` (the skill shipped in the package under `agent_runtime/adapters/executor_cli/skills/<role>/`). Relative paths resolve against the directory of `hibernaut.toml`; `~` expands.
+- Default: without `skills`, the role uses its built-in skill (`sde`: test-first development; `coder-reviewer`: the review method). A listed `skills` replaces the default; list `builtin:<role>` to keep it and add your own. A role can name only its own built-in skill.
+- Delivery: every launch reads the files again and passes them, in order, with `--append-system-prompt`, each headed by its absolute path and resource directory (`Relative resources are relative to <dir>`). Editing a `SKILL.md` affects the next run without a reload.
+- Fixed by code: the system prompt starts with the role's contract (what to return, no push for `sde`, read-only for the reviewer). Tools, permission mode, JSON schema and launcher come from the executor and `hibernaut.toml`. A skill, an event payload or a project document cannot change them or choose a skill.
+- Errors: a missing file, an empty list or another role's `builtin:` entry fails config parsing with the executor name and path (`executors.sde: skill './skills/team-tdd' not found (no file at ...)`); hot reload keeps the running settings. A skill deleted after loading fails that run before launch.
+- Separate roles: the SDE's built-in review uses the reviewer executor's own `skills`, never the SDE's.
+
+## Project Guidance (`AGENTS.md` + `guidance.toml`)
+
+A project keeps its own process in its repository, versioned with its code. Two files at the repository root:
+
+- `AGENTS.md`: short general rules for every task and a pointer to the catalog. Always included.
+- `guidance.toml`: the catalog of detailed documents. Each entry names the document, a one-line summary, the activities and tags it applies to, and the file paths it governs.
+
+```markdown
+# AGENTS.md
+- Run `make check` before every commit; all of it must pass.
+- Detailed rules for specific work are listed in guidance.toml.
+```
+
+```toml
+# guidance.toml
+[[docs]]
+path = "docs/process/versioning.md"   # repository-relative, must exist in the same commit
+summary = "Changing the version"
+activities = ["versioning", "release"]  # matched against the task's explicit activities
+tags = ["version"]                      # matched against the task's tags or issue labels
+paths = ["VERSION", "src/*/__init__.py"] # a review also selects it when the diff touches these
+
+[[docs]]
+path = "docs/process/testing.md"
+summary = "Writing tests"
+activities = ["testing"]
+tags = ["tests"]
+paths = ["tests/**"]                    # "*" stays in one directory, "**" spans directories
+```
+
+- Selection for development: explicit `activities` in the task payload (list or comma-separated string) win; without them the task's `tags` and `labels` (GitHub label objects included) pick documents by `tags`. Matching ignores case.
+- Selection for review: the same, plus every document whose `paths` match a file the actual diff changes (committed, uncommitted or untracked). Paths are read unquoted (`git -z`), so non-ASCII names such as `docs/规范/版本.md` match as written. A version bump inside a test-only task therefore brings the versioning document into the review.
+- Nothing selected: the task message carries `AGENTS.md` and the catalog (path, summary, activities, tags, paths) and says that no document matched. Bodies of unselected documents are never included; the agent can read one with `git show <commit>:<path>` if it turns out to need it.
+- Pinned commit: every guidance file is read from a commit with `git show <commit>:<path>`, never from the working tree. Each quoted body is headed `Source: <commit>:<path>`, so `git show` reproduces exactly what the agent received. Uncommitted edits to guidance files are never used.
+  - SDE task: the worktree's `HEAD` when the task starts. It is stored with the task's activities and tags in the `task_metadata` table under the task's `correlation_key`, and in the session checkpoint. Development, review rounds, fix rounds, resumed runs and later tasks on the same `correlation_key` and worktree all read that commit, even after the change commits edits to the guidance.
+  - Independent review with `review_of`: the commit recorded for that developer task, plus its activities and tags merged with the review event's own. The workdir falls back to the task's recorded workdir when there is no ready workspace.
+  - Independent review without a recorded task (only `explicit_workdir`): the merge base of `base_ref` and `HEAD`, the same base the diff is computed from. The change under review starts after it and cannot rewrite its own review rules. The message says `Pinned to commit <sha> (merge base of <ref> and HEAD; ...)`; `git merge-base <ref> HEAD` verifies it.
+- Review citations: a blocking item that rests on project guidance carries `guidance_path` and `guidance_clause` (both or neither). The review shows them as `Guidance:` and `Clause:` lines. In the SDE's fix round, cited documents the developer session has not received are sent with the fix request, read from the same pinned commit; each is sent once.
+- Errors: an invalid `guidance.toml` (bad TOML, unknown key, duplicate or missing document, a path outside the repository) or a guidance file that is a symlink resolving outside the repository fails the run before launch with the file and commit. A failing built-in review suspends as `review pending`.
+- Limits: the text is project requirements. It cannot grant tools, change the permission mode, pick a launcher or a role skill, or change the report format.
+- Neither file: the task message is the same as before, with no project section. `AGENTS.md` alone: it is included without a catalog.
+- Keep project-specific rules such as versioning and release steps in the project's documents, not in role skills.
 
 ## SDE Executor (`sde`)
 
@@ -145,7 +212,8 @@ curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
 ```
 
 - Workspace: `explicit_workdir`, else the task worktree for `correlation_key` (created on first use, reused afterwards), like other executors.
-- Development: the launcher starts Claude Code with `--permission-mode dontAsk`, read/edit/write tools and Bash allowed, `git push` and `gh pr create/merge` denied. The prompt requires a failing test first, the smallest fix, the repository's full checks and a commit on the task branch. The run returns a structured report (`summary`, `test_evidence`); a question for a person becomes a `Suspend`: answer by replying on the task (same `correlation_key`) or with an approval `comment`, then approve. Rejecting stops the task with `[sde] stopped: question declined`.
+- Guidance selection: optional `activities` (for example `["versioning"]`) and `tags` or `labels` in the payload pick the project documents the developer receives; the commit and selection are recorded for the task when it starts.
+- Development: the launcher starts Claude Code with `--permission-mode dontAsk`, read/edit/write tools and Bash allowed, `git push` and `gh pr create/merge` denied. The system prompt carries the role contract and the role skills (by default: a failing test first, the smallest fix, the repository's full checks); the task message carries the requirements and the project guidance selected for the task from its pinned commit (see Project Guidance). The developer commits on the task branch. The run returns a structured report (`summary`, `test_evidence`); a question for a person becomes a `Suspend`: answer by replying on the task (same `correlation_key`) or with an approval `comment`, then approve. Rejecting stops the task with `[sde] stopped: question declined`.
 - Review on: the SDE sends the requirements, the diff it computes from the worktree (not the developer's own description) and the test evidence to the configured `coder-reviewer`, which runs as its own read-only session with its own launcher, billing and model. `changes_requested` sends every blocking item back to the same developer session for a fix; the re-review also gets the previous findings and the diff since that review. `pass` delivers. If the review cannot finish (reviewer error, malformed verdict, model or billing mismatch) or rounds run out, the run suspends as `review pending`: approve to retry (another fix round when changes were requested), reject to deliver marked `review=pending`.
 - Review off: the SDE delivers after its own tests and checks (`review=off`).
 - While suspended: messages on the same task are kept with the suspended state (the open approval card is not posted again). Messages that arrive in the same batch as the decision count too. On approval they are added to the requirements, developed first, and shown to the reviewer; a rejected review retry lists them as unprocessed in the delivery.
@@ -162,6 +230,7 @@ In projects with `worktree_backend = "orca"`, `sde` and `coder-reviewer` runs op
 - Result: the launcher gives Claude Code a `hibernaut_handoff` MCP server. The agent calls `get_task` to read its task and `submit_result` to return the structured result. The server checks the result against the role schema and rejects a malformed one so the agent can fix it. The agent never reads or writes the handoff directory, so no `--add-dir` trust dialog appears. Claude Code still asks once if the worktree itself is not yet trusted.
 - Continuation: SDE follow-up events, answers after `needs_input` and review fix rounds go back to the task's live terminal, or `--resume` its conversation in a new terminal once the tab is closed. Every review is a new conversation; a re-review receives the previous findings in its prompt.
 - Read-only review: the visible reviewer has no file-writing tool; Edit, Write, MultiEdit and NotebookEdit are denied. The worktree fingerprint check still discards a review if anything changed.
+- Developer channel: an independent `review_of` review and its developer talk through Claude Code's native `SendMessage`; each keeps its own `/events` task, native session and result. Hibernaut names the developer only after verifying the binding: an open session for the `review_of` key in the same inbox, run by an `sde` executor, with a terminal binding in the reviewed worktree, whose native session is live under exactly one name in the Claude Code session registry (`<config dir>/sessions`) with that worktree as its cwd. Only then does the reviewer get the developer's exact session name and messaging socket (Claude Code sends it as the `from` of every reply, with the name in `from-name`) and `SendMessage`/`ListAgents` (still no file-writing tool); otherwise its prompt says why there is no channel and it messages no one. The reviewer tags messages `[review of <task>]`, sends questions and its conclusion, and records the exchange in `developer_messages`; the review message shows `Developer channel:` and the exchange. The SDE is told its reviewer's address (`<reviewer> · review of <task>`, or `<name>-<words>` when Claude Code de-duplicates the name for a second review), answers only such a sender whose message starts with the exact `[review of <task>]` tag, with evidence, and does not change the worktree while a review is open. The SDE cannot start a reviewer as its own subagent: `Agent` and `Task` are denied.
 - Timeout and cancel: `timeout_seconds` includes time spent waiting for a person. A timeout or interrupt closes the terminal and writes nothing to the Outbox. The SDE conversation stays bound and resumes on the next event.
 
 ## MCP Server Integration (`stdio` & Remote `/mcp`)
