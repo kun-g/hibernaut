@@ -261,7 +261,11 @@ class AlwaysOnDaemon:
         if server is None and webhook_host is not None and webhook_port is not None:
             server = WebhookHTTPServer((webhook_host, webhook_port), self.http_handler())
         if server is not None:
-            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread = threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": 0.02},
+                daemon=True,
+            )
             server_thread.start()
 
         workers_stop = asyncio.Event()
@@ -869,15 +873,23 @@ async def serve_configured(
     *,
     demo: bool = False,
     switchboard: Switchboard | None = None,
+    reload_interval: float = 1.0,
+    outbox_interval_seconds: float = 1.0,
 ) -> None:
     server = WebhookHTTPServer((config.channels.host, config.channels.port), daemon.http_handler())
-    changes = config_changes(path, stop)
+    changes = config_changes(path, stop, interval=reload_interval)
     next_server = server
     try:
         while not stop.is_set():
             drain = asyncio.Event()
             async with asyncio.TaskGroup() as tasks:
-                tasks.create_task(daemon.run(server=server, stop_event=drain))
+                tasks.create_task(
+                    daemon.run(
+                        server=server,
+                        stop_event=drain,
+                        outbox_interval_seconds=outbox_interval_seconds,
+                    )
+                )
                 try:
                     async for candidate in changes:
                         if candidate == config:
@@ -959,6 +971,8 @@ def main() -> None:
     parser.add_argument("--github-secret", default=None)
     parser.add_argument("--feishu-token", default=None)
     parser.add_argument("--mcp-token", default=None)
+    parser.add_argument("--config-poll-interval", type=float, default=1.0)
+    parser.add_argument("--outbox-interval", type=float, default=1.0)
     banner = f"Hibernaut {__version__}"
     parser.add_argument("--version", action="version", version=banner)
     args = parser.parse_args()
@@ -1014,9 +1028,16 @@ def main() -> None:
                     stop_event,
                     demo=args.demo,
                     switchboard=board,
+                    reload_interval=args.config_poll_interval,
+                    outbox_interval_seconds=args.outbox_interval,
                 )
             else:
-                await daemon.run(stop_event=stop_event, webhook_host=host, webhook_port=port)
+                await daemon.run(
+                    stop_event=stop_event,
+                    webhook_host=host,
+                    webhook_port=port,
+                    outbox_interval_seconds=args.outbox_interval,
+                )
         finally:
             daemon.close()
             if board is not None:

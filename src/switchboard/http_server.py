@@ -172,12 +172,15 @@ class SwitchboardHTTPServer:
         if self._thread is not None:
             return
         self._thread = threading.Thread(
-            target=self._server.serve_forever, name="switchboard-http", daemon=True
+            target=self._server.serve_forever,
+            kwargs={"poll_interval": 0.02},
+            name="switchboard-http",
+            daemon=True,
         )
         self._thread.start()
 
     def serve_forever(self) -> None:
-        self._server.serve_forever()
+        self._server.serve_forever(poll_interval=0.02)
 
     # shutdown() blocks until serve_forever exits, so it is only called on a started server.
     def stop(self) -> None:

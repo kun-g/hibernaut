@@ -310,9 +310,9 @@ class TestVisibleSDE(VisibleCase):
 
     async def test_timeout_closes_the_terminal_and_keeps_the_conversation_resumable(self):
         self.set_plan(sde=[{"hang": True}])
-        outcome = await self.sde(review=False, timeout=3).execute([event(self.payload())], None, self.caps)
+        outcome = await self.sde(review=False, timeout=0.8).execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Emit), outcome
-        self.assertIn("development failed: timed out after 3", outcome.messages[0])
+        self.assertIn("development failed: timed out after 0.8", outcome.messages[0])
         (handle,) = self.orca.terminals
         self.assertIsNotNone(self.orca.terminals[handle]["proc"].returncode)
         binding = self.bindings.get(outcome.session_id)
@@ -522,7 +522,7 @@ class TestVisibleRolesThroughEvents(unittest.TestCase):
                                                branch="hb/task-42")
             daemon.workspaces.mark_ready("task-42", workdir=str(workdir), branch="hb/task-42")
             stop = asyncio.Event()
-            server = asyncio.create_task(serve_configured(path, config, daemon, stop))
+            server = asyncio.create_task(serve_configured(path, config, daemon, stop, reload_interval=0.02))
 
             async def wait_for(check):
                 deadline = time.monotonic() + 30
@@ -533,7 +533,7 @@ class TestVisibleRolesThroughEvents(unittest.TestCase):
                             return
                     except OSError:
                         pass
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.01)
                 self.fail(f"outbox={outbox()} calls={orca.verbs()} {stderr.getvalue()}")
 
             try:

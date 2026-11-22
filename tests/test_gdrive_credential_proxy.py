@@ -70,7 +70,7 @@ class DriveCredentialProxyTests(unittest.IsolatedAsyncioTestCase):
         self.proxy_server = build_proxy_server(
             guard, host="127.0.0.1", port=0, service_name="gdrive-queue", client_token=CLIENT_TOKEN
         )
-        threading.Thread(target=self.proxy_server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.proxy_server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         self.proxy_url = f"http://127.0.0.1:{self.proxy_server.server_address[1]}"
         self.proxy_client = _RecordingProxyClient(self.proxy_url, token=CLIENT_TOKEN)
         self.client = ProxiedDriveClient(self.proxy_client, service_name="gdrive-queue")

@@ -255,7 +255,7 @@ class TestIndependentEventsTalk(unittest.TestCase):
                                                    workdir=str(workdir), branch=f"hb/task-{n}")
                 daemon.workspaces.mark_ready(f"task-{n}", workdir=str(workdir), branch=f"hb/task-{n}")
             stop = asyncio.Event()
-            server = asyncio.create_task(serve_configured(path, config, daemon, stop))
+            server = asyncio.create_task(serve_configured(path, config, daemon, stop, reload_interval=0.02))
 
             async def wait_for(check):
                 deadline = time.monotonic() + 30
@@ -266,7 +266,7 @@ class TestIndependentEventsTalk(unittest.TestCase):
                             return
                     except OSError:
                         pass
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.01)
                 self.fail(f"outbox={outbox()} calls={orca.verbs()} {stderr.getvalue()}")
 
             try:

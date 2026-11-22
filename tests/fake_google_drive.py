@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import os
 import subprocess
@@ -21,30 +22,39 @@ def _b64url_decode(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
 
 
+@functools.lru_cache(maxsize=1)
+def _cached_test_keypair() -> tuple[str, bytes]:
+    with tempfile.TemporaryDirectory(prefix="gdrive_test_key_") as tmp:
+        root = Path(tmp)
+        private_pem = root / "private.pem"
+        public_pem = root / "public.pem"
+        subprocess.run(["openssl", "genrsa", "-out", str(private_pem), "2048"], check=True, capture_output=True)
+        subprocess.run(
+            ["openssl", "rsa", "-in", str(private_pem), "-pubout", "-out", str(public_pem)],
+            check=True,
+            capture_output=True,
+        )
+        return private_pem.read_text(encoding="utf-8"), public_pem.read_bytes()
+
+
 # A throwaway RSA key made with openssl; the fake token endpoint verifies JWTs against its public half.
 def make_test_service_account(directory: Path, token_uri: str) -> tuple[Path, Path]:
-    private_pem = directory / "test-sa-private.pem"
+    private_text, public_bytes = _cached_test_keypair()
     public_pem = directory / "test-sa-public.pem"
-    subprocess.run(["openssl", "genrsa", "-out", str(private_pem), "2048"], check=True, capture_output=True)
-    subprocess.run(
-        ["openssl", "rsa", "-in", str(private_pem), "-pubout", "-out", str(public_pem)],
-        check=True,
-        capture_output=True,
-    )
+    public_pem.write_bytes(public_bytes)
     key_json = directory / "test-sa.json"
     key_json.write_text(
         json.dumps(
             {
                 "type": "service_account",
                 "client_email": "queue-test@hibernaut-test.iam.gserviceaccount.com",
-                "private_key": private_pem.read_text(encoding="utf-8"),
+                "private_key": private_text,
                 "token_uri": token_uri,
             }
         ),
         encoding="utf-8",
     )
     os.chmod(key_json, 0o600)
-    private_pem.unlink()
     return key_json, public_pem
 
 
@@ -203,5 +213,5 @@ class FakeGoogleDrive:
                     self._json(200, {"id": item.file_id, "parents": item.parents})
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
         return server

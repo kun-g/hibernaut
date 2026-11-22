@@ -1,7 +1,10 @@
 import asyncio
+import atexit
+import functools
 import http.client
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -53,8 +56,11 @@ def git(cwd, *args):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
-def make_repo(root: Path) -> Path:
-    repo = root / "repo"
+@functools.lru_cache(maxsize=1)
+def _template_repo() -> Path:
+    tmp = tempfile.TemporaryDirectory(prefix="coder_reviewer_tmpl_")
+    atexit.register(tmp.cleanup)
+    repo = Path(tmp.name) / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
     git(repo, "config", "user.email", "t@example.invalid")
@@ -66,6 +72,12 @@ def make_repo(root: Path) -> Path:
     (repo / "calc.py").write_text("def divide(a, b):\n    return a / b\n")
     git(repo, "commit", "-qam", "divide")
     (repo / "notes.txt").write_text("untracked evidence\n")
+    return repo
+
+
+def make_repo(root: Path) -> Path:
+    repo = root / "repo"
+    shutil.copytree(_template_repo(), repo)
     return repo
 
 
@@ -436,7 +448,7 @@ class TestDispatchAndHotReload(unittest.TestCase):
             config = load_config(path)
             daemon = build_daemon_from_config(config)
             stop = asyncio.Event()
-            server = asyncio.create_task(serve_configured(path, config, daemon, stop))
+            server = asyncio.create_task(serve_configured(path, config, daemon, stop, reload_interval=0.02))
 
             async def wait_for(check):
                 deadline = time.monotonic() + 15
@@ -447,7 +459,7 @@ class TestDispatchAndHotReload(unittest.TestCase):
                             return
                     except (ConnectionRefusedError, OSError):
                         pass
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.01)
                 self.fail(stderr.getvalue())
 
             async def post_async(n, **extra):
