@@ -14,7 +14,7 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Callable, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -48,6 +48,18 @@ class _Clock:
 
     def __call__(self) -> datetime:
         return self._stamps.pop(0) if len(self._stamps) > 1 else self._stamps[0]
+
+
+class _UtcNow:
+    # Wall clock for OutboxDispatcher retries, moved past the backoff instead of sleeping.
+    def __init__(self) -> None:
+        self.now = datetime(2026, 11, 22, 8, 0, 0, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def past_first_backoff(self) -> None:
+        self.now += timedelta(seconds=5)
 
 
 def _channel(directory: Path, inner: Any = None, **kwargs: Any) -> tuple[FileOutboxChannel, list[str]]:
@@ -122,14 +134,16 @@ class TestFileNames(unittest.IsolatedAsyncioTestCase):
         channel, _ = _channel(blocker, inner)
         outbox = InMemoryOutbox()
         outbox.enqueue(INBOX, "keep me", {"kind": "emit"})
-        dispatcher = OutboxDispatcher(outbox=outbox, channel=channel)
+        utc_now = _UtcNow()
+        dispatcher = OutboxDispatcher(outbox=outbox, channel=channel, utc_clock=utc_now)
         with self.assertLogs("agent_runtime.adapters.channels.file_outbox", level="ERROR"):
             self.assertEqual(await dispatcher.dispatch_once(), 0)
-        (pending,) = outbox.fetch_pending()
+        (pending,) = outbox.fetch_pending(now_iso="2999-01-01T00:00:00.000000+00:00")
         self.assertEqual((pending.status, pending.attempts), ("pending", 1))
         self.assertEqual(inner.sent, [])
 
         blocker.unlink()
+        utc_now.past_first_backoff()
         self.assertEqual(await dispatcher.dispatch_once(), 1)
         self.assertEqual(inner.sent, [(INBOX, "keep me", {"kind": "emit"})])
         self.assertTrue(_md(blocker)[0].read_text().endswith("keep me\n"))
@@ -139,8 +153,10 @@ class TestFileNames(unittest.IsolatedAsyncioTestCase):
         channel, lines = _channel(self.root, inner)
         outbox = InMemoryOutbox()
         outbox.enqueue(INBOX, "once", {"kind": "emit"})
-        dispatcher = OutboxDispatcher(outbox=outbox, channel=channel)
+        utc_now = _UtcNow()
+        dispatcher = OutboxDispatcher(outbox=outbox, channel=channel, utc_clock=utc_now)
         self.assertEqual(await dispatcher.dispatch_once(), 0)
+        utc_now.past_first_backoff()
         self.assertEqual(await dispatcher.dispatch_once(), 1)
         self.assertEqual(len(_md(self.root)), 1)
         self.assertEqual(len(lines), 1)
