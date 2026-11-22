@@ -32,7 +32,7 @@ from agent_runtime.adapters.executor_cli.worktree import CommandResult, OrcaWork
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteWorkspaceStore
 from agent_runtime.app.config import load_config, parse_config
 from agent_runtime.app.main import build_daemon, build_daemon_from_config
-from agent_runtime.core.models import TASK_CONTEXT_KEY, Emit, Event, RunOutcome, SessionRef, Suspend
+from agent_runtime.core.models import TASK_CONTEXT_KEY, DeliveryOutcome, Emit, Event, RunOutcome, SessionRef, Suspend
 from agent_runtime.core.ports import RunCapabilities
 from agent_runtime.engine.dispatcher import OutboxDispatcher
 from tests.fakes import InMemoryOutbox, RecordingChannel
@@ -40,6 +40,7 @@ from tests.test_gdrive_tasks import _DriveTestExecutor, _FakeDriveClient  # pyri
 
 NAME = re.compile(r"^\d{8}-\d{6}\.\d{3}(-\d+)?\.md$")
 INBOX = "proj:hibernaut"
+PR_URL = "https://github.com/kun-g/hibernaut/pull/53"
 
 
 class _Clock:
@@ -307,6 +308,10 @@ class _ScriptedExecutor:
             return Suspend(request_id="req_file_1", prompt="Deploy to prod?", session_checkpoint="{}")
         if mode == "failed":
             return Emit(messages=("[sde] development failed: payload needs the task requirements",), status="failed")
+        if mode == "pr_open":
+            return Emit(messages=("[sde] delivered",), delivery=DeliveryOutcome(
+                state="pr_open", pr_url=PR_URL, auto_merge=True, hold="review",
+                hold_detail="merging needs a passing independent review (review=pending)"))
         return Emit(messages=("all good",))
 
 
@@ -393,6 +398,15 @@ class TestHeadersEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[sde] development failed: payload needs the task requirements", failed.read_text())
         self.assertNotIn("## 审批", failed.read_text())
 
+    async def test_an_authorized_merge_that_did_not_happen_is_awaiting_merge(self) -> None:
+        self.ingest("e1", {"title": "Fix outbox status", "mode": "pr_open"}, correlation_key="gdrive:pr")
+        (path,) = await self.files(1)
+        h = _header(path)
+        self.assertEqual(h["状态"], "待合并")
+        self.assertEqual(h["需要人做什么"], f"查看 PR {PR_URL}，未合并原因：评审不通过（merging needs a passing "
+                                       "independent review (review=pending)）；处理后手动合并或重新提交任务")
+        self.assertTrue(path.read_text().endswith("## 正文\n\n[sde] delivered\n"))
+
     async def test_title_falls_back_to_drive_file_name_then_correlation_key(self) -> None:
         self.ingest("e1", {"drive_file_name": "task1.md"}, correlation_key="gdrive:a")
         self.ingest("e2", {"text": "no title here"}, source="webhook", correlation_key="corr:b")
@@ -429,6 +443,61 @@ class TestHeadersEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertIn("resumed approved=True", resumed.read_text())
         self.assertEqual((_header(resumed)["状态"], _header(resumed)["会话 ID"]), ("完成", session.session_id))
         self.assertEqual(_header(resumed)["correlation_key"], "gdrive:dep")
+
+
+def _delivered(state: str, *, auto_merge: bool, hold: str = "", detail: str = "") -> dict[str, Any]:
+    delivery = {"state": state, "pr_url": PR_URL, "auto_merge": auto_merge, "hold": hold, "hold_detail": detail}
+    return {"kind": "emit", TASK_CONTEXT_KEY: {"title": "Fix outbox", "status": "done", "delivery": delivery}}
+
+
+class TestDeliveryStatus(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    async def write(self, metadata: dict[str, Any]) -> tuple[dict[str, str], str]:
+        channel, lines = _channel(self.root / str(len(list(self.root.iterdir()))))
+        await channel.send(INBOX, "body", metadata)
+        (path,) = _md(channel.directory)
+        return _header(path), lines[0]
+
+    async def test_pr_open_with_auto_merge_is_awaiting_merge_with_link_and_reason(self) -> None:
+        cases = {
+            "review": ("merging needs a passing independent review (review=pending)",
+                       "评审不通过（merging needs a passing independent review (review=pending)）"),
+            "ci": ("CI failed (gates)", "CI 失败（CI failed (gates)）"),
+            "other": ("delivery.merge blocked: no merges today", "其他（delivery.merge blocked: no merges today）"),
+        }
+        for hold, (detail, reason) in cases.items():
+            with self.subTest(hold):
+                h, line = await self.write(_delivered("pr_open", auto_merge=True, hold=hold, detail=detail))
+                self.assertEqual(h["状态"], "待合并")
+                self.assertEqual(h["需要人做什么"],
+                                 f"查看 PR {PR_URL}，未合并原因：{reason}；处理后手动合并或重新提交任务")
+                self.assertIn(" 待合并 | Fix outbox | ", line)
+
+    async def test_unknown_reason_still_awaits_merge(self) -> None:
+        h, _ = await self.write(_delivered("pr_open", auto_merge=True))
+        self.assertEqual((h["状态"], h["需要人做什么"]),
+                         ("待合并", f"查看 PR {PR_URL}，未合并原因：未记录；处理后手动合并或重新提交任务"))
+
+    async def test_pr_open_without_auto_merge_is_done_and_asks_to_review_the_pr(self) -> None:
+        h, line = await self.write(_delivered("pr_open", auto_merge=False))
+        self.assertEqual((h["状态"], h["需要人做什么"]), ("完成", f"审阅并合并 PR {PR_URL}"))
+        self.assertIn(" 完成 | Fix outbox | ", line)
+
+    async def test_merged_local_and_plain_results_are_unchanged(self) -> None:
+        plain = {"kind": "emit", TASK_CONTEXT_KEY: {"title": "Fix outbox", "status": "done"}}
+        for meta in (_delivered("merged", auto_merge=True), _delivered("local", auto_merge=False), plain):
+            with self.subTest(meta):
+                h, line = await self.write(meta)
+                self.assertEqual((h["状态"], h["需要人做什么"]), ("完成", "无需操作，查看结果即可"))
+                self.assertIn(" 完成 | Fix outbox | ", line)
+
+    async def test_a_failed_or_stopped_run_keeps_its_status(self) -> None:
+        meta = _delivered("pr_open", auto_merge=True, hold="ci", detail="CI failed (gates)")
+        meta[TASK_CONTEXT_KEY]["status"] = "stopped"
+        h, _ = await self.write(meta)
+        self.assertEqual(h["状态"], "已停止")
 
 
 class TestNonWorkerAndOtherChannels(unittest.IsolatedAsyncioTestCase):

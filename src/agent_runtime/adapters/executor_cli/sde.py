@@ -1035,8 +1035,9 @@ class SDEExecutor:
             lines.append(f"Last review:\n{state.last_review}")
         if state.followups:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
+        outcome = self._delivery.outcome(delivery) if self._delivery is not None and delivery is not None else None
         return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native,
-                    close_session=finished)
+                    close_session=finished, delivery=outcome)
 
     def _stopped(self, session_id: str, native: str | None, state: _State, why: str) -> Emit:
         lines = [f"[{self._profile.name}] stopped: {why} ({self._settings()})", f"Workdir: {state.workdir}"]

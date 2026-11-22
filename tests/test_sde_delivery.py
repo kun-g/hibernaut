@@ -19,7 +19,7 @@ from agent_runtime.adapters.storage_sqlite import SQLiteSessionStoreAdapter
 from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.app.config import parse_config
-from agent_runtime.core.models import Emit, Event, PermissionDecision, SessionRef, Suspend
+from agent_runtime.core.models import DeliveryOutcome, Emit, Event, PermissionDecision, SessionRef, Suspend
 from tests.fakes import InMemoryPermission
 from tests.test_coder_reviewer import fake_command
 from tests.test_gdrive_tasks import _FakeDriveClient
@@ -232,6 +232,33 @@ class TestSDEDelivery(SDEDeliveryCase):
         assert isinstance(outcome, Emit), outcome
         self.assertFalse(outcome.close_session)
         self.assertNotIn("Worktree: the PR is merged", outcome.messages[0])
+
+    async def test_the_result_carries_the_delivery_outcome_for_the_outbox(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
+        state = self.gh_state()
+        state["checks"] = [{"name": "gates", "state": "FAILURE", "bucket": "fail"}]
+        self.state_file.write_text(json.dumps(state))
+        outcome = await self.executor(delivery=self.delivery(auto_merge=True)).execute(
+            [event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertEqual((outcome.status, outcome.close_session), ("done", False))
+        self.assertEqual(outcome.delivery, DeliveryOutcome(
+            state="pr_open", pr_url="https://github.example/o/r/pull/1", auto_merge=True, hold="ci",
+            hold_detail="CI failed (gates)"))
+
+    async def test_a_merged_result_carries_a_merged_outcome(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
+        outcome = await self.executor(delivery=self.delivery(auto_merge=True)).execute(
+            [event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertEqual(outcome.delivery, DeliveryOutcome(
+            state="merged", pr_url="https://github.example/o/r/pull/1", auto_merge=True))
+
+    async def test_without_delivery_the_result_carries_no_outcome(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])
+        outcome = await self.executor(review=False).execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertIsNone(outcome.delivery)
 
     async def test_local_delivery_keeps_the_session(self):
         self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])

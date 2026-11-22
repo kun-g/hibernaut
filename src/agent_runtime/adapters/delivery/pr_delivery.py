@@ -16,14 +16,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
 from agent_runtime.adapters.storage_sqlite.deliveries import SQLiteDeliveryStore
-from agent_runtime.core.models import Event
+from agent_runtime.core.models import DeliveryOutcome, DeliveryState, Event, MergeHold
 from agent_runtime.core.ports import PermissionPort
 
 ChangeKind = Literal["breaking", "feature", "fix", "test_docs"]
 CHANGE_KINDS: tuple[ChangeKind, ...] = ("breaking", "feature", "fix", "test_docs")
 Bump = Literal["major", "minor", "patch", "skip"]
 BUMP_FOR_KIND: dict[str, Bump] = {"breaking": "major", "feature": "minor", "fix": "patch", "test_docs": "skip"}
-DeliveryState = Literal["local", "pr_open", "merged"]
 MergeMethod = Literal["squash", "merge", "rebase"]
 MERGE_METHODS: tuple[MergeMethod, ...] = ("squash", "merge", "rebase")
 IssueLink = Literal["closes", "refs", "none"]
@@ -306,6 +305,9 @@ class DeliveryRecord:
     attempts: int = 0
     # Per attempt: final outcomes that a retry cannot change (not authorized, review not passed, CI failed).
     notes: list[str] = field(default_factory=_strs)
+    # Per attempt: why an authorized merge stopped at the review or CI gate, as said in notes.
+    merge_hold: MergeHold = ""
+    merge_hold_detail: str = ""
     # Recoverable: approving a retry runs the step again from the recorded state.
     problem: str = ""
     # The permission tool that deferred to a person in this attempt.
@@ -503,6 +505,7 @@ class PRDelivery:
             return is_interrupted()
 
         rec.notes, rec.problem, rec.approval, rec.handback = [], "", "", {}
+        rec.merge_hold, rec.merge_hold_detail = "", ""
         rec.attempts += 1
         if rec.state == "merged":
             rec.notes.append("already merged; nothing to do")
@@ -546,6 +549,23 @@ class PRDelivery:
             rec.notes.append("not merged: this project does not authorize merging (delivery.auto_merge = false)")
             return
         self._merge(req, rec, permissions, approved, is_interrupted)
+
+    def outcome(self, rec: DeliveryRecord) -> DeliveryOutcome:
+        # What the Outbox shows a person: an authorized merge that did not happen always names a reason.
+        auto_merge = self._config.auto_merge
+        pr_url = rec.pr_url if rec.state != "local" else ""
+        if not (auto_merge and rec.state == "pr_open"):
+            return DeliveryOutcome(state=rec.state, pr_url=pr_url, auto_merge=auto_merge)
+        if rec.merge_hold:
+            hold, detail = rec.merge_hold, rec.merge_hold_detail
+        else:
+            hold, detail = "other", rec.problem or "; ".join(rec.notes)
+        return DeliveryOutcome(state=rec.state, pr_url=pr_url, auto_merge=True, hold=hold, hold_detail=detail)
+
+    @staticmethod
+    def _hold(rec: DeliveryRecord, hold: MergeHold, detail: str) -> None:
+        rec.merge_hold, rec.merge_hold_detail = hold, detail
+        rec.notes.append(f"not merged: {detail}")
 
     # --- permission ---
 
@@ -887,7 +907,7 @@ class PRDelivery:
     ) -> None:
         cfg, cwd = self._config, req.workdir
         if cfg.require_review and req.review != "pass":
-            rec.notes.append(f"not merged: merging needs a passing independent review (review={req.review})")
+            self._hold(rec, "review", f"merging needs a passing independent review (review={req.review})")
             return
         if not self._gate(MERGE_TOOL, req, rec, permissions, approved):
             return
@@ -1005,7 +1025,7 @@ class PRDelivery:
             failed = [str(c.get("name")) for c in checks if c.get("bucket") in ("fail", "cancel")]
             if failed:
                 rec.ci = f"failed on {rec.head_sha[:12]}: {', '.join(failed)}"
-                rec.notes.append(f"not merged: CI failed ({', '.join(failed)})")
+                self._hold(rec, "ci", f"CI failed ({', '.join(failed)})")
                 return "failed"
             # GitHub runs no pull_request CI for a PR that conflicts with its base: waiting would only time out.
             if self._conflicting(cwd, rec.pr_number):

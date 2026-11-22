@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Never, assert_never, cast
 
 from agent_runtime.core.models import (
+    DeliveryOutcome,
     Emit,
     Event,
     NewEventPolicy,
@@ -1130,11 +1131,17 @@ class AgentWorker:
         return exec_id, None
 
     @staticmethod
-    def _with_status(extra: dict[str, Any], status: str) -> dict[str, Any]:
+    def _with_status(extra: dict[str, Any], status: str, delivery: DeliveryOutcome | None = None) -> dict[str, Any]:
         context = extra.get(TASK_CONTEXT_KEY)
         if not isinstance(context, dict):
             return extra
-        return {**extra, TASK_CONTEXT_KEY: {**cast(dict[str, Any], context), "status": status}}
+        updated: dict[str, Any] = {**cast(dict[str, Any], context), "status": status}
+        if delivery is not None:
+            updated["delivery"] = {
+                "state": delivery.state, "pr_url": delivery.pr_url, "auto_merge": delivery.auto_merge,
+                "hold": delivery.hold, "hold_detail": delivery.hold_detail,
+            }
+        return {**extra, TASK_CONTEXT_KEY: updated}
 
     def _apply_outcome(
         self,
@@ -1176,6 +1183,7 @@ class AgentWorker:
                 session_id=emit_session_id,
                 executor_session_id=exec_sid,
                 status=emit_status,
+                delivery=delivery,
             ):
                 exec_id, bound_exec_sid = self._resolve_executor_binding(
                     selected_executor,
@@ -1188,7 +1196,7 @@ class AgentWorker:
                         inbox_id=inbox_id,
                         content=text,
                         metadata={
-                            **self._with_status(extra, emit_status),
+                            **self._with_status(extra, emit_status, delivery),
                             "kind": "emit",
                             "outcome_kind": "emit",
                             "session_id": target_sid,
