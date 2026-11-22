@@ -255,10 +255,17 @@ def build_reverse_graph(root: Path = ROOT) -> tuple[dict[str, set[str]], list[st
     return reverse, all_tests
 
 
+def _normalize_rel(path: str) -> str:
+    rel = Path(path).as_posix()
+    while rel.startswith("./"):
+        rel = rel[2:]
+    return rel.lstrip("/")
+
+
 def select_tests(changed_files: list[str], *, root: Path = ROOT) -> SelectionResult:
     reverse, all_tests = build_reverse_graph(root)
     all_test_set = set(all_tests)
-    normalized = sorted({Path(f).as_posix().lstrip("./") for f in changed_files if f.strip()})
+    normalized = sorted({_normalize_rel(f) for f in changed_files if f.strip()})
     if not normalized:
         return SelectionResult(tests=(), full_suite=False, reason="no changed files")
 
