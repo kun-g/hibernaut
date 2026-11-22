@@ -115,7 +115,11 @@ class CredentialProxyConfig:
 @dataclass(frozen=True, slots=True)
 class GDriveConfig:
     enabled: bool = False
-    service_account_key_env: str = "HIBERNAUT_GDRIVE_SA_KEY"
+    # The service account key lives only in the external Drive queue proxy; Hibernaut holds a
+    # local client token for that proxy and receives queue results, never a Google credential.
+    proxy_url: str = ""
+    proxy_service: str = "gdrive-queue"
+    proxy_token_file: str = ""
     root_folder_id: str = ""
     pending_folder_id: str = ""
     in_progress_folder_id: str = ""
@@ -320,9 +324,37 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
     gd_interval = float(gd_raw.get("poll_interval_seconds", 30.0))
     if not math.isfinite(gd_interval) or gd_interval <= 0:
         raise ValueError("gdrive.poll_interval_seconds must be finite and positive")
+    if "service_account_key_env" in gd_raw:
+        raise ValueError(
+            "gdrive.service_account_key_env is no longer supported: the service account key belongs to the "
+            "external Drive queue proxy (deploy/gdrive-proxy); set gdrive.proxy_url and gdrive.proxy_token_file"
+        )
+    gd_enabled = gd_raw.get("enabled", False)
+    if not isinstance(gd_enabled, bool):
+        raise ValueError("gdrive.enabled must be true or false")
+    gd_proxy_url = str(gd_raw.get("proxy_url", "")).strip() or credential_proxy.url
+    gd_service = str(gd_raw.get("proxy_service", "gdrive-queue")).strip()
+    gd_token_raw = str(gd_raw.get("proxy_token_file", "")).strip()
+    gd_token_file = ""
+    if gd_token_raw:
+        token_path = Path(gd_token_raw).expanduser()
+        if not token_path.is_absolute() and base_dir is not None:
+            token_path = base_dir / token_path
+        gd_token_file = str(token_path)
+    if gd_proxy_url and not gd_proxy_url.startswith(("http://", "https://")):
+        raise ValueError("gdrive.proxy_url must be an http(s) URL")
+    if gd_enabled:
+        if not gd_proxy_url:
+            raise ValueError("gdrive.enabled needs gdrive.proxy_url (or [credential_proxy] url) for the Drive queue proxy")
+        if not gd_token_file:
+            raise ValueError("gdrive.enabled needs gdrive.proxy_token_file (the local client token for the Drive queue proxy)")
+        if not gd_service:
+            raise ValueError("gdrive.proxy_service must not be empty")
     gdrive = GDriveConfig(
-        enabled=bool(gd_raw.get("enabled", False)),
-        service_account_key_env=str(gd_raw.get("service_account_key_env", "HIBERNAUT_GDRIVE_SA_KEY")),
+        enabled=gd_enabled,
+        proxy_url=gd_proxy_url,
+        proxy_service=gd_service,
+        proxy_token_file=gd_token_file,
         root_folder_id=str(gd_raw.get("root_folder_id", "")).strip(),
         pending_folder_id=str(gd_raw.get("pending_folder_id", "")).strip(),
         in_progress_folder_id=str(gd_raw.get("in_progress_folder_id", "")).strip(),

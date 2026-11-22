@@ -110,9 +110,13 @@ feishu_chat_id = ""
 # executor = "claude"
 
 # 可选：Google Drive 任务队列入站与回写闭环（将「任务队列」根目录单独共享给 GCP Service Account 邮箱）
+# Service Account 密钥只放在外置凭据代理里（sudo deploy/gdrive-proxy/install.sh，见 deploy/gdrive-proxy/README.md），
+# Hibernaut 只持有本机 client token，经 CredentialProxyClient 收发队列业务结果。
 # [gdrive]
 # enabled = true
-# service_account_key_env = "HIBERNAUT_GDRIVE_SA_KEY"
+# proxy_url = "http://127.0.0.1:9100"            # 不填则用 [credential_proxy] url
+# proxy_service = "gdrive-queue"
+# proxy_token_file = "~/.config/hibernaut/gdrive-proxy.token"   # 须 chmod 600；相对路径以本文件目录为准
 # root_folder_id = "your_task_queue_root_folder_id"
 # poll_interval_seconds = 30.0
 # default_inbox_id = "proj:hibernaut"

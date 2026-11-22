@@ -21,11 +21,10 @@ from agent_runtime.adapters.channels import (
     DriveTaskPoller,
     FeishuWebhookAdapter,
     GitHubIssuePoller,
-    GoogleDriveHTTPClient,
-    ServiceAccountTokenProvider,
     GitHubWebhookAdapter,
     MCPServerAdapter,
     PollTarget,
+    ProxiedDriveClient,
     WebhookHTTPServer,
     build_feishu_or_console_channel,
 )
@@ -45,7 +44,7 @@ from agent_runtime.adapters.executor_whitebox import (
     WhiteboxExecutor,
 )
 from agent_runtime.adapters.memory_fs import WorkspacePartitionRegistry
-from agent_runtime.adapters.permissions import AutoModePermissionAdapter
+from agent_runtime.adapters.permissions import AutoModePermissionAdapter, CredentialProxyClient, read_private_token
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
@@ -550,17 +549,14 @@ def build_daemon_from_config(
 
     resolved_gdrive_client: DriveClientProtocol | None = gdrive_client
     if resolved_gdrive_client is None and config.gdrive.enabled:
-        sa_key_path = os.environ.get(config.gdrive.service_account_key_env, "").strip()
-        if not sa_key_path:
-            print(
-                f"[hibernaut] [gdrive] enabled=true but env '{config.gdrive.service_account_key_env}' "
-                "is unset; skipping Google Drive task poller.",
-                file=sys.stderr,
-                flush=True,
-            )
+        try:
+            proxy_token = read_private_token(Path(config.gdrive.proxy_token_file))
+        except ValueError as exc:
+            print(f"[hibernaut] [gdrive] {exc}; skipping Google Drive task poller.", file=sys.stderr, flush=True)
         else:
-            resolved_gdrive_client = GoogleDriveHTTPClient(
-                token_provider=ServiceAccountTokenProvider(key_path=sa_key_path)
+            resolved_gdrive_client = ProxiedDriveClient(
+                CredentialProxyClient(config.gdrive.proxy_url, timeout_seconds=60.0, token=proxy_token),
+                service_name=config.gdrive.proxy_service,
             )
 
     daemon = build_daemon(
