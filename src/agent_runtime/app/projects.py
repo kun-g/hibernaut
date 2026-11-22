@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Generic, Protocol, TypeVar
 
+from agent_runtime.core.models import Event
+from agent_runtime.core.ports import SessionStorePort
 from agent_runtime.engine.worker import ExecutorFailed
+
+_log = logging.getLogger(__name__)
 
 INBOX_PATTERN_PREFIX = "re:"
 
@@ -165,3 +170,45 @@ class ProjectInboxMap(Mapping[str, V], Generic[P, V]):
 
     def __len__(self) -> int:
         return sum(1 for _ in self)
+
+
+class UnmatchedProjectHold:
+    # Hold policy for an inbox that matches no [projects] entry. An event that would need the project's checkout
+    # stays pending and unclaimed until a restart or config reload brings a rule that matches; events that name
+    # their own workdir, review target, approval or close request run as before. One WARNING per held event and
+    # hold instance (each worker pool generation builds its own).
+    def __init__(self, sessions: SessionStorePort) -> None:
+        self._sessions = sessions
+        self._warned: set[str] = set()
+
+    def __call__(self, event: Event) -> str | None:
+        if self._runs_without_project(event):
+            return None
+        reason = (
+            f"inbox_id {event.inbox_id!r} matches no [projects] entry and the event names no explicit_workdir; "
+            "it stays pending until a project's inbox_id rule matches (restart or config reload)"
+        )
+        if event.event_id not in self._warned:
+            self._warned.add(event.event_id)
+            _log.warning(
+                "Event %s (source=%s, external_id=%s) in inbox %s is waiting for a project: %s",
+                event.event_id, event.source, event.external_id, event.inbox_id, reason,
+            )
+        return reason
+
+    def _runs_without_project(self, event: Event) -> bool:
+        payload = event.payload
+        if any(isinstance(payload.get(key), str) and payload[key].strip()
+               for key in ("explicit_workdir", "review_of", "approval_request_id")):
+            return True
+        if (payload.get("action") == "close_session" or payload.get("close_session") is True
+                or event.source == "session:close"):
+            return True
+        # A follow-up to a suspended session goes to the executor holding its checkpoint, which names the workdir.
+        if event.session_id:
+            session = self._sessions.get(event.session_id)
+        elif event.correlation_key:
+            session = self._sessions.find_by_correlation_key(event.inbox_id, event.correlation_key)
+        else:
+            session = None
+        return session is not None and session.status == "suspended"
