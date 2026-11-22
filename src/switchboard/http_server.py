@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import json
+import threading
+from collections.abc import Mapping
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, cast
+
+from switchboard.pipeline import InboundPipeline, describe_ingest
+from switchboard.ports import InboundAdapter, IngestAwareAdapter
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128
+
+    def __init__(
+        self,
+        address: tuple[str, int],
+        pipeline: InboundPipeline,
+        routes: Mapping[str, InboundAdapter],
+        max_body_bytes: int,
+    ) -> None:
+        self.pipeline = pipeline
+        self.routes = dict(routes)
+        self.max_body_bytes = max_body_bytes
+        super().__init__(address, _Handler)
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "Switchboard"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return None
+
+    def do_GET(self) -> None:
+        if self._path() == "/healthz":
+            self._reply(200, {"status": "ok"})
+            return
+        self._reply(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        path = self._path()
+        adapter = self._srv().routes.get(path)
+        if adapter is None:
+            self._reply(404, {"error": "not found"})
+            return
+        source = path.rstrip("/").rsplit("/", 1)[-1]
+        pipeline = self._srv().pipeline
+
+        length_header = self.headers.get("Content-Length")
+        if length_header is None:
+            self._reply(411, {"error": "Content-Length required"})
+            return
+        try:
+            length = int(length_header)
+        except ValueError:
+            self._reply(400, {"error": "invalid Content-Length"})
+            return
+        # Reject oversized bodies before reading them.
+        if length < 0 or length > self._srv().max_body_bytes:
+            pipeline.record_rejection(
+                stage="http", http_status=413, source=source, reason=f"body of {length} bytes"
+            )
+            self.close_connection = True
+            self._reply(413, {"error": "payload too large"})
+            return
+        raw_body = self.rfile.read(length)
+        headers = {key: value for key, value in self.headers.items()}
+
+        try:
+            parsed = adapter.handle(headers, raw_body)
+        except Exception as exc:  # noqa: BLE001
+            pipeline.record_rejection(stage="inbound", http_status=500, source=source, reason=repr(exc))
+            self._reply(500, {"error": "internal error"})
+            return
+
+        if parsed.event is None:
+            if parsed.http_status in (400, 401):
+                reason = str((parsed.response_body or {}).get("error", "rejected"))
+                pipeline.record_rejection(
+                    stage="inbound", http_status=parsed.http_status, source=source, reason=reason
+                )
+            self._reply(parsed.http_status, parsed.response_body or {})
+            return
+
+        ingest = pipeline.ingest(parsed.event)
+        if isinstance(adapter, IngestAwareAdapter):
+            final = adapter.finalize(parsed, ingest)
+            status = final.http_status
+            body: dict[str, Any] = final.response_body or dict(describe_ingest(ingest))
+        else:
+            status = 400 if ingest.status == "invalid" else parsed.http_status
+            body = {**(parsed.response_body or {}), **describe_ingest(ingest)}
+        self._reply(status, body)
+
+    def _srv(self) -> _Server:
+        return cast(_Server, self.server)
+
+    def _path(self) -> str:
+        return self.path.split("?", 1)[0]
+
+    def _reply(self, status: int, body: Mapping[str, Any]) -> None:
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class SwitchboardHTTPServer:
+    def __init__(
+        self,
+        pipeline: InboundPipeline,
+        routes: Mapping[str, InboundAdapter],
+        *,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        max_body_bytes: int = 1_048_576,
+    ) -> None:
+        self._server = _Server((host, port), pipeline, routes, max_body_bytes)
+        self._thread: threading.Thread | None = None
+
+    @property
+    def port(self) -> int:
+        return int(self._server.server_address[1])
+
+    @property
+    def base_url(self) -> str:
+        host = str(self._server.server_address[0])
+        return f"http://{host}:{self.port}"
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, name="switchboard-http", daemon=True
+        )
+        self._thread.start()
+
+    def serve_forever(self) -> None:
+        self._server.serve_forever()
+
+    # shutdown() blocks until serve_forever exits, so it is only called on a started server.
+    def stop(self) -> None:
+        if self._thread is not None:
+            self._server.shutdown()
+            self._thread.join(5)
+            self._thread = None
+        self._server.server_close()
