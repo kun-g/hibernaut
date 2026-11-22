@@ -12,6 +12,7 @@ from agent_runtime.adapters.channels.switchboard_bridge import (
     SwitchboardChannelAdapter,
     SwitchboardInboundBridge,
 )
+from agent_runtime.adapters.delivery import source_issue
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
@@ -306,6 +307,22 @@ class ClosedLoopTests(_Stack):
         (call,) = self.http_calls()
         self.assertTrue(call["url"].endswith("/repos/kun-g/hibernaut/issues/42/comments"))
         self.assertIn("Fixed in #43", call["json"]["body"])
+
+    async def test_the_bridged_comment_tells_source_issue_whether_it_is_on_a_pull_request(self) -> None:
+        # The events the SDE's _new_state receives, built by the live webhook -> Switchboard -> bridge path.
+        on_pr = comment_payload("please fix", comment_id=8)
+        on_pr["issue"] = {**on_pr["issue"], "pull_request": {"url": "https://api.github.com/repos/x/pulls/42"}}
+        cases = [(on_pr, "d-pr", ""), (comment_payload("please fix", comment_id=9), "d-issue", "kun-g/hibernaut#42")]
+        for payload, delivery, expected in cases:
+            with self.subTest(delivery):
+                status, _ = send_github(self.h.url, payload, event="issue_comment", delivery=delivery)
+                self.assertEqual(status, 202)
+                self.h.board.worker.run_once()
+                await self.worker.process_inbox(SCOPE)
+                batch = self.executor.batches[-1]
+                self.assertEqual(batch[0].source, "sb:github")
+                self.assertEqual(batch[0].correlation_key, KEY)
+                self.assertEqual(source_issue(batch, batch[0].correlation_key), expected)
 
     async def test_github_suspend_feishu_approval_resumes_session(self) -> None:
         send_github(self.h.url, comment_payload("deploy it"), event="issue_comment", delivery="d-c2")
