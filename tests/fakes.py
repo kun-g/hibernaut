@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -55,11 +55,15 @@ class InMemoryInbox:
             if evt.inbox_id == inbox_id and evt.status == "processing"
         ]
 
-    def claim_pending(self, inbox_id: str) -> list[Event]:
+    def claim_pending(self, inbox_id: str, event_ids: Collection[str] | None = None) -> list[Event]:
         claimed: list[Event] = []
         updated: list[Event] = []
         for evt in self._events:
-            if evt.inbox_id == inbox_id and evt.status == "pending":
+            if (
+                evt.inbox_id == inbox_id
+                and evt.status == "pending"
+                and (event_ids is None or evt.event_id in event_ids)
+            ):
                 nxt = replace(evt, status="processing")
                 self._attempts[evt.event_id] = self._attempts.get(evt.event_id, 0) + 1
                 claimed.append(nxt)
