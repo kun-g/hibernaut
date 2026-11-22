@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
+from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore, WorkspaceRecord
 from agent_runtime.core.ports import OutboxPort, SessionStorePort
 
 WorktreeBackend = Literal["orca", "git"]
@@ -19,6 +19,7 @@ WorktreeBackend = Literal["orca", "git"]
 _GITHUB_ISSUE_RE = re.compile(r"^github:[^#]+#(\d+)$")
 _ISSUE_RE = re.compile(r"^issue:(\d+)$")
 _PR_RE = re.compile(r"^(?:github-pr:[^#]+#|pr:)(\d+)$")
+_NAMING_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,10 @@ class CommandResult:
 
 
 CommandRunner = Callable[[Sequence[str], Path | None], CommandResult]
+
+
+class WorkspaceIsolationError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +92,15 @@ class OrcaWorktreeManager:
         runner: CommandRunner | None = None,
         worktree_base_dir: str | Path | None = None,
         reclaim_stale_after_seconds: float = 600.0,
+        primary_inbox_id: str | None = None,
+        isolate_inboxes: bool = False,
     ) -> None:
+        # isolate_inboxes: the project serves several inboxes from one checkout, so each (inbox, work_key) writes
+        # only in its own managed hb-* worktree. The primary inbox keeps the bare work_key, as before isolation.
+        if isolate_inboxes and not primary_inbox_id:
+            raise ValueError("isolate_inboxes needs the project's primary_inbox_id")
+        self._primary_inbox_id = primary_inbox_id
+        self._isolate = isolate_inboxes
         self._store = workspace_store
         self._session_store = session_store
         self._reclaim_stale_after_seconds = reclaim_stale_after_seconds
@@ -98,28 +111,97 @@ class OrcaWorktreeManager:
             Path(worktree_base_dir).resolve() if worktree_base_dir is not None else None
         )
 
+    @property
+    def isolates_inboxes(self) -> bool:
+        return self._isolate
+
+    def workspace_key(self, inbox_id: str | None, work_key: str) -> str:
+        # The workspaces-table key for a task; equal to work_key unless another inbox of an isolated project asks.
+        if not self._isolate or inbox_id is None or inbox_id == self._primary_inbox_id:
+            return work_key
+        return f"{inbox_id}/{work_key}"
+
     def resolve_workdir(
         self,
         *,
         work_key: str,
         primary_checkout: str | Path,
         explicit_workdir: str | Path | None = None,
+        inbox_id: str | None = None,
     ) -> Path:
-        # Priority 1: explicit read-only / review override skips worktree creation entirely.
-        if explicit_workdir is not None:
-            return Path(explicit_workdir).resolve()
-
+        if not self._isolate:
+            # Priority 1: explicit read-only / review override skips worktree creation entirely.
+            if explicit_workdir is not None:
+                return Path(explicit_workdir).resolve()
+            return self._resolve_managed(work_key, work_key, Path(primary_checkout).resolve(), inbox_id)
+        if inbox_id is None:
+            raise WorkspaceIsolationError(f"workspace for {work_key!r} requested without its inbox_id")
+        key = self.workspace_key(inbox_id, work_key)
         primary = Path(primary_checkout).resolve()
-        existing = self._store.get(work_key)
+        if explicit_workdir is not None:
+            # Only the task's own managed worktree may be named explicitly; anything else could be shared.
+            record = self._owned_record(key, inbox_id)
+            requested = Path(explicit_workdir).resolve()
+            if record is None or record.status != "ready" or Path(record.workdir).resolve() != requested:
+                raise WorkspaceIsolationError(
+                    f"explicit_workdir {requested} refused for {inbox_id!r}: a project serving several inboxes "
+                    f"writes only in the managed hb-* worktree of {work_key!r} owned by that inbox"
+                )
+        workdir = self._resolve_managed(key, work_key, primary, inbox_id)
+        self._check_isolated(workdir, primary, inbox_id)
+        return workdir
+
+    def assert_writable(self, *, inbox_id: str, work_key: str, workdir: str | Path) -> None:
+        # Re-checked before a resumed or retried launch, whose workdir comes from a checkpoint.
+        if not self._isolate:
+            return
+        key = self.workspace_key(inbox_id, work_key)
+        record = self._owned_record(key, inbox_id)
+        path = Path(workdir).resolve()
+        if record is None or record.status != "ready" or Path(record.workdir).resolve() != path:
+            raise WorkspaceIsolationError(
+                f"{path} is not the managed worktree of {work_key!r} owned by {inbox_id!r}; refusing to write there"
+            )
+        self._check_isolated(path, Path(record.repo_checkout).resolve(), inbox_id)
+
+    def _owned_record(self, key: str, inbox_id: str) -> WorkspaceRecord | None:
+        record = self._store.get(key)
+        if record is None:
+            return None
+        if record.inbox_id is None:
+            # A row from before ownership was recorded: only the inbox whose sessions alone used it adopts it.
+            others = self._store.session_inboxes(key) - {inbox_id}
+            if others or not self._store.claim_owner(key, inbox_id):
+                raise WorkspaceIsolationError(
+                    f"workspace {key!r} at {record.workdir} was used by {', '.join(sorted(others)) or 'another inbox'}; "
+                    f"{inbox_id!r} cannot write there"
+                )
+            return self._store.get(key)
+        if record.inbox_id != inbox_id:
+            raise WorkspaceIsolationError(
+                f"workspace {key!r} at {record.workdir} belongs to {record.inbox_id!r}, not {inbox_id!r}"
+            )
+        return record
+
+    @staticmethod
+    def _check_isolated(workdir: Path, primary: Path, inbox_id: str) -> None:
+        if workdir == primary or not workdir.name.startswith("hb-"):
+            raise WorkspaceIsolationError(
+                f"{workdir} is not a managed hb-* worktree of {primary}; {inbox_id!r} cannot write there"
+            )
+
+    def _resolve_managed(self, key: str, work_key: str, primary: Path, inbox_id: str | None) -> Path:
+        # inbox_id is recorded as the owner of a new row; only isolation enforces it on existing rows.
+        existing = self._owned_record(key, inbox_id) if self._isolate and inbox_id is not None else self._store.get(key)
 
         branches = self._registered_worktrees(primary)
         if existing is not None:
             if Path(existing.repo_checkout).resolve() != primary or existing.status == "reclaiming":
-                raise RuntimeError(f"Cannot reuse workspace {work_key!r} in {primary}: {existing}")
+                raise RuntimeError(f"Cannot reuse workspace {key!r} in {primary}: {existing}")
             if existing.branch in branches:
                 actual = self._worktree_path(branches, primary, existing.branch)
                 if existing.status != "ready" or str(actual) != existing.workdir:
-                    self._store.mark_ready(work_key, workdir=str(actual), branch=existing.branch)
+                    self._store.mark_ready(key, workdir=str(actual), branch=existing.branch)
                 return actual
             if existing.status == "ready":
                 raise RuntimeError(f"No registered worktree for {existing.branch!r} in {primary}")
@@ -130,18 +212,21 @@ class OrcaWorktreeManager:
 
         base_dir = self._worktree_base_dir if self._worktree_base_dir is not None else primary.parent
         if existing is None:
-            existing_names = {Path(r.workdir).name for r in self._store.list_by_repo(str(primary))}
-            refs = self._runner(["git", "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/hb/"], primary)
-            if refs.returncode != 0:
-                raise RuntimeError(f"Cannot list local branches in {primary}: {refs.stderr.strip()}")
-            existing_names.update(name.replace("hb/", "hb-", 1) for name in refs.stdout.splitlines())
-            if base_dir.is_dir():
-                existing_names.update(p.name for p in base_dir.iterdir() if p.is_dir())
-            dir_name, branch_name = derive_worktree_names(work_key, self._store.next_task_seq(), existing_names)
-            expected_workdir = (base_dir / dir_name).resolve()
-            self._store.reserve_creating(
-                work_key=work_key, repo_checkout=str(primary), workdir=str(expected_workdir), branch=branch_name,
-            )
+            # Naming and reservation are one step: concurrent inboxes with the same work_key get distinct names.
+            with _NAMING_LOCK:
+                existing_names = {Path(r.workdir).name for r in self._store.list_by_repo(str(primary))}
+                refs = self._runner(["git", "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/hb/"], primary)
+                if refs.returncode != 0:
+                    raise RuntimeError(f"Cannot list local branches in {primary}: {refs.stderr.strip()}")
+                existing_names.update(name.replace("hb/", "hb-", 1) for name in refs.stdout.splitlines())
+                if base_dir.is_dir():
+                    existing_names.update(p.name for p in base_dir.iterdir() if p.is_dir())
+                dir_name, branch_name = derive_worktree_names(work_key, self._store.next_task_seq(), existing_names)
+                expected_workdir = (base_dir / dir_name).resolve()
+                self._store.reserve_creating(
+                    work_key=key, repo_checkout=str(primary), workdir=str(expected_workdir), branch=branch_name,
+                    inbox_id=inbox_id,
+                )
         else:
             expected_workdir = Path(existing.workdir)
             dir_name, branch_name = expected_workdir.name, existing.branch
@@ -167,7 +252,7 @@ class OrcaWorktreeManager:
         actual_workdir = self._worktree_path(self._registered_worktrees(primary), primary, branch_name)
         if reported_path is not None and reported_path != actual_workdir:
             raise RuntimeError(f"Orca returned {reported_path} for {branch_name!r}, Git registered {actual_workdir}")
-        self._store.mark_ready(work_key, workdir=str(actual_workdir), branch=branch_name)
+        self._store.mark_ready(key, workdir=str(actual_workdir), branch=branch_name)
         if self._backend == "orca" and self._create_terminal:
             self._runner(["orca", "terminal", "create", "--workdir", str(actual_workdir)], primary)
         return actual_workdir
@@ -180,16 +265,28 @@ class OrcaWorktreeManager:
         inbox_id: str | None = None,
     ) -> ReclaimResult:
         # Safety 3: dual ownership check (DB record + 'hb-' basename prefix) + 3 safety gates.
-        record = self._store.get(work_key)
+        # work_key is the sessions' key; with inbox_id it maps to the inbox's workspace, without it it is the
+        # workspaces-table key itself (as hibernaut_list_workspaces shows it).
+        key = self.workspace_key(inbox_id, work_key)
+        record = self._store.get(key)
         if record is None:
             return ReclaimResult(reclaimed=False, reason="workspace not managed in workspaces table")
+        if self._isolate and inbox_id is not None and record.inbox_id not in (None, inbox_id):
+            msg = f"Refused reclaim for '{record.workdir}': owned by {record.inbox_id!r}, not {inbox_id!r}"
+            self._alert(notify_outbox, inbox_id, msg)
+            return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
+        sessions_key = work_key
+        if inbox_id is None and record.inbox_id and key.startswith(f"{record.inbox_id}/"):
+            sessions_key = key.removeprefix(f"{record.inbox_id}/")
 
-        # Gate 0: refuse reclaim while any active or suspended session still references work_key.
+        # Gate 0: refuse reclaim while any active or suspended session still references work_key. An isolated
+        # worktree belongs to one inbox, so only that inbox's sessions hold it; otherwise every inbox's do.
+        owner = (record.inbox_id or inbox_id or self._primary_inbox_id) if self._isolate else None
         if self._session_store is not None:
-            active_refs = self._session_store.count_active_by_work_key(work_key)
+            active_refs = self._session_store.count_active_by_work_key(sessions_key, owner)
             if active_refs > 0:
                 list_fn = getattr(self._session_store, "list_active_by_work_key", None)
-                occupying = list_fn(work_key) if callable(list_fn) else []
+                occupying = list_fn(sessions_key, owner) if callable(list_fn) else []
                 suffix = f" ({', '.join(occupying)})" if occupying else f" ({active_refs} active)"
                 msg = f"Skipped reclaim for '{work_key}': active/suspended session(s) still referencing worktree{suffix}"
                 self._alert(notify_outbox, inbox_id, msg)
@@ -238,7 +335,7 @@ class OrcaWorktreeManager:
             datetime.now(timezone.utc) - timedelta(seconds=self._reclaim_stale_after_seconds)
         ).isoformat()
         claim = self._store.claim_for_reclaim(
-            work_key,
+            key,
             seen_updated_at=record.updated_at,
             stale_before=stale_before,
         )
@@ -251,7 +348,7 @@ class OrcaWorktreeManager:
         primary = Path(record.repo_checkout)
         heartbeat = _ClaimHeartbeat(
             self._store,
-            work_key,
+            key,
             claim,
             interval_seconds=self._reclaim_stale_after_seconds / 3,
         )
@@ -261,17 +358,17 @@ class OrcaWorktreeManager:
             else:
                 rm_res = self._runner(["git", "worktree", "remove", str(workdir)], primary)
         except BaseException:
-            self._store.release_reclaim(work_key, claim=heartbeat.stop(), status=record.status)
+            self._store.release_reclaim(key, claim=heartbeat.stop(), status=record.status)
             raise
         claim = heartbeat.stop()
         if rm_res.returncode != 0:
-            self._store.release_reclaim(work_key, claim=claim, status=record.status)
+            self._store.release_reclaim(key, claim=claim, status=record.status)
             msg = f"Failed to remove worktree '{workdir}': {rm_res.stderr.strip()}"
             self._alert(notify_outbox, inbox_id, msg)
             return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
 
         # Only the claim holder may drop the record; a takeover may have re-registered the key.
-        if not self._store.finish_reclaim(work_key, claim=claim):
+        if not self._store.finish_reclaim(key, claim=claim):
             msg = f"Reclaim of '{workdir}' lost its claim; record left to its new owner"
             self._alert(notify_outbox, inbox_id, msg)
             return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)

@@ -57,6 +57,7 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteWorkspaceStore,
 )
 from agent_runtime.app.config import HibernautConfig, RoleConfig, config_changes, load_config
+from agent_runtime.app.projects import ProjectRouter
 from agent_runtime.core.models import NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, RunCapabilities
 from agent_runtime.engine import (
@@ -125,9 +126,10 @@ class AsyncWorkerPool:
                 continue
 
             self._queued.discard(inbox_id)
-            worker = self._worker_factory(inbox_id, worker_id)
-            self._active[inbox_id] = worker
             try:
+                # Inside the try: a factory that refuses the inbox (AmbiguousProjectMatch) leaves its events pending.
+                worker = self._worker_factory(inbox_id, worker_id)
+                self._active[inbox_id] = worker
                 batch_reports = await worker.process_inbox(inbox_id)
                 self.reports.extend(batch_reports)
                 if batch_reports and self._on_run_reports is not None:
@@ -507,27 +509,23 @@ def build_daemon_from_config(
     demo: bool = False,
     gdrive_client: DriveClientProtocol | None = None,
 ) -> AlwaysOnDaemon:
+    # Every inbox -> project lookup goes through the router, so pattern-matched inboxes get their project's settings
+    # and an inbox matching two projects raises AmbiguousProjectMatch instead of picking one.
+    router = ProjectRouter(config.projects.values())
     repo_inbox_map: dict[str, str] = {}
-    inbox_checkout_map: dict[str, str] = {}
-    inbox_chat_map: dict[str, str] = {}
     chat_inbox_map: dict[str, str] = {}
-    inbox_project_executor: dict[str, str | None] = {}
     poll_targets: list[PollTarget] = []
+    inbox_checkout_map = router.inbox_map(lambda p: p.checkout)
+    inbox_chat_map = router.inbox_map(lambda p: p.feishu_chat_id or None)
 
     for proj in config.projects.values():
+        # Ingress that names no inbox (GitHub repo, Feishu chat) delivers to the primary inbox; one poll per project.
         repo_inbox_map[proj.repo] = proj.inbox_id
-        inbox_checkout_map[proj.inbox_id] = proj.checkout
-        inbox_project_executor[proj.inbox_id] = proj.executor
         if proj.feishu_chat_id:
-            inbox_chat_map[proj.inbox_id] = proj.feishu_chat_id
             chat_inbox_map[proj.feishu_chat_id] = proj.inbox_id
-        poll_targets.append(
-            PollTarget(
-                repo=proj.repo,
-                inbox_id=proj.inbox_id,
-                labels=proj.poll_labels,
-            )
-        )
+        target = PollTarget(repo=proj.repo, inbox_id=proj.inbox_id, labels=proj.poll_labels)
+        if target not in poll_targets:
+            poll_targets.append(target)
 
     resolved_channel = channel or build_feishu_or_console_channel(
         app_id_env=config.channels.feishu_app_id_env,
@@ -619,7 +617,8 @@ def build_daemon_from_config(
 
             reviewers: dict[str, CoderReviewerExecutor] = {
                 name: CoderReviewerExecutor(profile=role.profile, workspaces=daemon.workspaces,
-                                            terminal=terminal(role), peers=developer_peers, tasks=tasks)
+                                            terminal=terminal(role), peers=developer_peers, tasks=tasks,
+                                            workspace_key=wt_mgr.workspace_key)
                 for name, role in config.roles.items()
                 if role.role == CODER_REVIEWER_ROLE
             }
@@ -638,17 +637,19 @@ def build_daemon_from_config(
                 )
             return built
 
-        executors_by_inbox: dict[str, dict[str, ExecutorPort]] = {}
-        wt_mgr_by_inbox: dict[str, OrcaWorktreeManager] = {}
+        executors_by_project: dict[str, dict[str, ExecutorPort]] = {}
+        wt_mgr_by_project: dict[str, OrcaWorktreeManager] = {}
         for proj in config.projects.values():
             wt_mgr = OrcaWorktreeManager(
                 workspace_store=daemon.workspaces,
                 session_store=daemon.sessions,
                 backend=proj.worktree_backend,
                 create_terminal=proj.orca_create_terminal,
+                primary_inbox_id=proj.inbox_id,
+                isolate_inboxes=proj.serves_multiple_inboxes,
             )
-            wt_mgr_by_inbox[proj.inbox_id] = wt_mgr
-            executors_by_inbox[proj.inbox_id] = {
+            wt_mgr_by_project[proj.name] = wt_mgr
+            executors_by_project[proj.name] = {
                 exec_name: LocalCLIExecutor(
                     worktree_manager=wt_mgr,
                     inbox_checkout_map=inbox_checkout_map,
@@ -660,7 +661,7 @@ def build_daemon_from_config(
                 )
                 for exec_name in config.executors
             }
-            executors_by_inbox[proj.inbox_id].update(_role_executors(
+            executors_by_project[proj.name].update(_role_executors(
                 wt_mgr,
                 None if proj.terminal_backend == "orca" else f"project '{proj.name}' has terminal_backend = \"none\"",
             ))
@@ -680,7 +681,19 @@ def build_daemon_from_config(
         }
         fallback_executors.update(_role_executors(default_mgr, "the inbox matches no [projects] entry"))
 
+        def _manager_for(inbox_id: str | None, work_key: str) -> OrcaWorktreeManager:
+            if inbox_id is not None:
+                project = router.resolve(inbox_id)
+            else:
+                record = daemon.workspaces.get(work_key)
+                checkout = Path(record.repo_checkout).resolve() if record is not None else None
+                project = next((p for p in config.projects.values() if Path(p.checkout).resolve() == checkout), None)
+            return wt_mgr_by_project[project.name] if project is not None else default_mgr
+
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
+            # Raises AmbiguousProjectMatch before any lease, executor or workspace exists for the inbox.
+            project = router.resolve(inbox_id)
+            wt_mgr = wt_mgr_by_project[project.name] if project is not None else default_mgr
             return AgentWorker(
                 worker_id=worker_id,
                 inbox=daemon.inbox,
@@ -688,12 +701,10 @@ def build_daemon_from_config(
                 memory=daemon.partitions.memory_for(inbox_id),
                 permissions=AutoModePermissionAdapter(),
                 outbox=daemon.outbox,
-                executors=executors_by_inbox.get(inbox_id, fallback_executors),
-                project_default_executor=inbox_project_executor.get(inbox_id),
+                executors=executors_by_project[project.name] if project is not None else fallback_executors,
+                project_default_executor=project.executor if project is not None else None,
                 global_default_executor=config.runtime.default_executor,
-                on_worktree_reclaim=lambda wk, _iid=inbox_id: wt_mgr_by_inbox.get(
-                    _iid, default_mgr
-                ).reclaim(wk, notify_outbox=daemon.outbox, inbox_id=_iid),
+                on_worktree_reclaim=lambda wk: wt_mgr.reclaim(wk, notify_outbox=daemon.outbox, inbox_id=inbox_id),
                 lock=daemon.lock,
                 sessions=daemon.sessions,
                 new_event_policy=config.runtime.new_event_policy,
@@ -740,6 +751,7 @@ def build_daemon_from_config(
             worktree_manager=default_mgr,
             outbox=daemon.outbox,
             bearer_token=mcp_token,
+            worktree_manager_for=_manager_for,
         )
 
     if poll_targets:

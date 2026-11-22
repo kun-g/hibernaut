@@ -98,6 +98,9 @@ args = ["-c"]
 timeout_seconds = 300.0
 
 [projects.hibernaut]
+# 字符串：一个精确 inbox_id（原有写法）。数组：精确 ID 与 "re:" 正则混排，正则须整串匹配（fullmatch）；
+# 第一个精确 ID 是主 inbox，GitHub 与飞书入站投递到它。服务多个 inbox 的项目，每个写任务都在该 inbox 自己的 hb-* worktree 里运行。
+# inbox_id = ["proj:hibernaut", "proj:hibernaut:drive", "re:proj:hibernaut:task-\\d+"]
 inbox_id = "proj:hibernaut"
 repo = "kun-g/hibernaut"
 checkout = "/absolute/path/to/your/hibernaut"
