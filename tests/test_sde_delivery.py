@@ -107,6 +107,24 @@ class TestSDEDelivery(SDEDeliveryCase):
         self.assertIn("do not push, open a pull request or merge", dev_call["prompt"])
         self.assertEqual(self.gh_state()["prs"][0]["title"], "Pkg 0.5.0: Reject zero divisors")
 
+    async def test_a_task_from_a_github_issue_links_its_pr_to_the_issue(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])
+        issue = Event(inbox_id="proj:x", source="github:issue_poll", external_id="github-poll:o/r#7:t",
+                      correlation_key="github:o/r#7",
+                      payload={**self.payload(), "repository": {"full_name": "o/r"},
+                               "issue": {"number": 7, "url": "https://github.example/o/r/issues/7"}})
+        outcome = await self.executor(review=False, delivery=self.delivery(issue_link="closes")).execute(
+            [issue], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertTrue(self.gh_state()["prs"][0]["body"].startswith("Closes #7\n\n## Summary"))
+
+    async def test_a_task_from_another_source_opens_a_pr_without_an_issue_line(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])
+        outcome = await self.executor(review=False, delivery=self.delivery(issue_link="closes")).execute(
+            [event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertTrue(self.gh_state()["prs"][0]["body"].startswith("## Summary"))
+
     async def test_done_without_a_change_kind_is_rejected(self):
         step = dev({"calc.py": "x = 1\n"})
         del step["output"]["change_kind"]
@@ -332,6 +350,13 @@ class TestProjectAdoption(unittest.TestCase):
         self.assertIsNone(parse_config({"projects": {"p": {"repo": "o/r", "checkout": "/x"}}}).projects["p"].delivery)
         with self.assertRaisesRegex(ValueError, "projects.hb.delivery: auto_merge needs open_pr = true"):
             parse_config({"projects": {"hb": {"repo": "o/r", "checkout": "/x", "delivery": {"auto_merge": True}}}})
+        self.assertEqual(delivery.issue_link, "refs")
+        closes = parse_config({"projects": {"hb": {"repo": "o/r", "checkout": "/x",
+                                                   "delivery": {"issue_link": "closes"}}}}).projects["hb"].delivery
+        assert closes is not None
+        self.assertEqual(closes.issue_link, "closes")
+        with self.assertRaisesRegex(ValueError, "projects.hb.delivery: issue_link must be one of closes, refs, none"):
+            parse_config({"projects": {"hb": {"repo": "o/r", "checkout": "/x", "delivery": {"issue_link": "fix"}}}})
 
     def test_example_config_adopts_pr_created_as_the_default_end_point_for_this_project(self):
         raw = tomllib.loads((REPO / "hibernaut.example.toml").read_text(encoding="utf-8"))

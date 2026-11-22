@@ -11,6 +11,7 @@ from agent_runtime.adapters.delivery.pr_delivery import (
     bump_version,
     merged_head,
     parse_delivery,
+    source_issue,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "bump_version",
     "merged_head",
     "parse_delivery",
+    "source_issue",
 ]

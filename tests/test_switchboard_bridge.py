@@ -12,6 +12,7 @@ from agent_runtime.adapters.channels.switchboard_bridge import (
     SwitchboardChannelAdapter,
     SwitchboardInboundBridge,
 )
+from agent_runtime.adapters.delivery import source_issue
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
@@ -168,6 +169,45 @@ class InboundBridgeTests(_Stack):
         self.assertEqual(stored.payload["work_key"], "wk-42")
         self.assertEqual(pending[ready.event_id].payload["metadata"]["preferred_executor"], "claude")
 
+    def test_pull_request_markers_reach_the_stored_event_payload(self) -> None:
+        cases = {
+            "comment:pr": {"channel": "github", "work_kind": "pull_request", "github_event": "issue_comment"},
+            "review:1": {"channel": "github", "work_kind": "pull_request", "github_event": "pull_request_review"},
+        }
+        for external_id, metadata in cases.items():
+            self.h.board.bus.publish(CanonicalEvent(
+                source="github", event_type="conversation.message", external_id=external_id, scope=SCOPE,
+                correlation_key=KEY, actor="kun", subject="t", body="[review approved]",
+                metadata={**metadata, "repo": "kun-g/hibernaut", "number": 42},
+            ))
+        self.h.board.worker.run_once()
+        stored = {evt.payload["external_id"]: evt for evt in self.inbox.fetch_pending(SCOPE)}
+        self.assertEqual(set(stored), set(cases))
+        for external_id, metadata in cases.items():
+            with self.subTest(external_id):
+                evt = stored[external_id]
+                self.assertEqual(evt.payload["metadata"]["work_kind"], metadata["work_kind"])
+                self.assertEqual(evt.payload["metadata"]["github_event"], metadata["github_event"])
+                self.assertEqual(source_issue([evt], evt.correlation_key), "")
+
+    def test_work_events_routed_to_hibernaut_name_an_issue_but_never_a_pull_request(self) -> None:
+        # [routing.event_consumers] can send work.* straight to Hibernaut (no Taskboard): an issue's work.opened
+        # names the issue, a pull request's never does.
+        cases = {"issue": "kun-g/hibernaut#42", "pull_request": ""}
+        for kind, expected in cases.items():
+            work = CanonicalEvent(
+                source="github", event_type="work.opened", external_id=f"{kind}:kun-g/hibernaut#42:opened:t",
+                scope=SCOPE, correlation_key=KEY, subject="t", body="b",
+                metadata={"work_kind": kind, "state": "open", "repo": "kun-g/hibernaut", "number": 42,
+                          "github_event": "pull_request" if kind == "pull_request" else "issues"},
+            )
+            self.assertEqual(self.bridge.handle_canonical_event(work), "acked")
+        stored = {evt.payload["metadata"]["work_kind"]: evt for evt in self.inbox.fetch_pending(SCOPE)}
+        for kind, expected in cases.items():
+            with self.subTest(kind):
+                evt = stored[kind]
+                self.assertEqual(source_issue([evt], evt.correlation_key), expected)
+
     def test_redelivery_is_deduplicated_and_still_acked(self) -> None:
         msg = message_event()
         self.assertEqual(self.bridge.handle_canonical_event(msg), "acked")
@@ -306,6 +346,26 @@ class ClosedLoopTests(_Stack):
         (call,) = self.http_calls()
         self.assertTrue(call["url"].endswith("/repos/kun-g/hibernaut/issues/42/comments"))
         self.assertIn("Fixed in #43", call["json"]["body"])
+
+    async def test_the_bridged_comment_tells_source_issue_whether_it_is_on_a_pull_request(self) -> None:
+        # The events the SDE's _new_state receives, built by the live webhook -> Switchboard -> bridge path.
+        on_pr = comment_payload("please fix", comment_id=8)
+        on_pr["issue"] = {**on_pr["issue"], "pull_request": {"url": "https://api.github.com/repos/x/pulls/42"}}
+        cases = [(on_pr, "d-pr", "pull_request", ""),
+                 (comment_payload("please fix", comment_id=9), "d-issue", "issue", "kun-g/hibernaut#42")]
+        for payload, delivery, kind, expected in cases:
+            with self.subTest(delivery):
+                status, _ = send_github(self.h.url, payload, event="issue_comment", delivery=delivery)
+                self.assertEqual(status, 202)
+                self.h.board.worker.run_once()
+                await self.worker.process_inbox(SCOPE)
+                batch = self.executor.batches[-1]
+                self.assertEqual(batch[0].source, "sb:github")
+                self.assertEqual(batch[0].correlation_key, KEY)
+                # The marker source_issue reads is on the runtime Event the SDE receives, not on a side channel.
+                self.assertEqual(batch[0].payload["metadata"]["work_kind"], kind)
+                self.assertEqual(batch[0].payload["metadata"]["github_event"], "issue_comment")
+                self.assertEqual(source_issue(batch, batch[0].correlation_key), expected)
 
     async def test_github_suspend_feishu_approval_resumes_session(self) -> None:
         send_github(self.h.url, comment_payload("deploy it"), event="issue_comment", delivery="d-c2")
