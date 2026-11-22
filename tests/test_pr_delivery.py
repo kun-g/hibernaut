@@ -18,9 +18,10 @@ from agent_runtime.adapters.delivery import (
     PRDelivery,
     bump_version,
     parse_delivery,
+    source_issue,
 )
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteDeliveryStore
-from agent_runtime.core.models import PermissionDecision
+from agent_runtime.core.models import Event, PermissionDecision
 from tests.fakes import InMemoryPermission
 
 FAKE_GH = Path(__file__).with_name("fake_gh.py")
@@ -59,12 +60,91 @@ class TestVersionRules(unittest.TestCase):
             with self.subTest(message), self.assertRaisesRegex(ValueError, message):
                 parse_delivery("d", raw, repo="o/r")
 
+    def test_issue_link_defaults_to_refs_and_rejects_other_values(self):
+        self.assertEqual(parse_delivery("d", {}, repo="o/r").issue_link, "refs")
+        for value in ("closes", "refs", "none"):
+            self.assertEqual(parse_delivery("d", {"issue_link": value}, repo="o/r").issue_link, value)
+        for bad in ("close", "fixes", "", True):
+            with self.subTest(bad), self.assertRaisesRegex(
+                ValueError, r"d: issue_link must be one of closes, refs, none"
+            ):
+                parse_delivery("d", {"issue_link": bad}, repo="o/r")
+
     def test_hand_backs_to_the_developer_default_to_two_and_can_be_turned_off(self):
         self.assertEqual(parse_delivery("d", {}, repo="o/r").max_handbacks, 2)
         self.assertEqual(parse_delivery("d", {"max_handbacks": 0}, repo="o/r").max_handbacks, 0)
         for bad in (True, 1.5, "2"):
             with self.subTest(bad), self.assertRaisesRegex(ValueError, "max_handbacks must be a non-negative integer"):
                 parse_delivery("d", {"max_handbacks": bad}, repo="o/r")
+
+
+def _evt(source, payload=None, key=None):
+    return Event(inbox_id="proj:x", source=source, external_id=source, payload=payload or {}, correlation_key=key)
+
+
+class TestSourceIssue(unittest.TestCase):
+    def test_issue_events_and_issue_correlation_keys_name_the_issue(self):
+        issue = {"repository": {"full_name": "o/r"}, "issue": {"number": 7, "url": "https://x/o/r/issues/7"}}
+        cases = {
+            "poller": ([_evt("github:issue_poll", issue, "github:o/r#7")], None),
+            "webhook issues": ([_evt("github:issues", issue)], None),
+            "webhook issue_comment": ([_evt("github:issue_comment", issue)], None),
+            "string number": ([_evt("github:issue_poll", {**issue, "issue": {"number": "7"}})], None),
+            "issue repo from the key": ([_evt("github:issue_poll", {"issue": {"number": 7}}, "github:o/r#7")], None),
+            "relayed key": ([_evt("switchboard:task", {"text": "x"}, "github:o/r#7")], None),
+            "session key": ([_evt("switchboard:task", {"text": "x"})], "github:o/r#7"),
+        }
+        for name, (events, key) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(source_issue(events, key), "o/r#7")
+
+    def test_other_sources_and_missing_numbers_name_no_issue(self):
+        cases = {
+            "/events": ([_evt("http", {"text": "x"}, "task:1")], None),
+            "drive": ([_evt("gdrive:task", {"text": "x"}, "gdrive:abc")], "gdrive:abc"),
+            "feishu": ([_evt("feishu:message", {"text": "x"}, "feishu:c:t")], None),
+            "mcp": ([_evt("mcp", {"text": "x"})], None),
+            "pull request": ([_evt("github:pull_request", {"pull_request": {"number": 5}}, "github:o/r#5")], None),
+            "no number": ([_evt("github:issue_poll", {"repository": {"full_name": "o/r"}, "issue": {}})], None),
+            "bad number": ([_evt("github:issues", {"repository": {"full_name": "o/r"}, "issue": {"number": "x"}})],
+                           None),
+            "bool number": ([_evt("github:issues", {"repository": {"full_name": "o/r"}, "issue": {"number": True}})],
+                            None),
+            "no repo": ([_evt("github:issues", {"issue": {"number": 7}})], None),
+            "bad key": ([_evt("http", {"text": "x"}, "github:o/r#x")], None),
+        }
+        for name, (events, key) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(source_issue(events, key), "")
+
+    def test_events_about_a_pull_request_name_no_issue_even_with_the_task_key(self):
+        # Called the way SDEExecutor._new_state calls it: the batch's github key as the second argument.
+        key = "github:o/r#5"
+        repo = {"full_name": "o/r"}
+        pr_issue = {"number": 5, "pull_request": {"url": "https://api.github.example/repos/o/r/pulls/5"}}
+        cases = {
+            "webhook issues on a PR": _evt("github:issues", {"repository": repo, "issue": pr_issue}, key),
+            "webhook issue_comment on a PR": _evt("github:issue_comment", {"repository": repo, "issue": pr_issue}, key),
+            "switchboard review": _evt("sb:github", {"event_type": "conversation.message", "body": "[review approved]",
+                                                     "metadata": {"github_event": "pull_request_review",
+                                                                  "number": 5}}, key),
+            "switchboard review comment": _evt("sb:github", {"metadata": {
+                "github_event": "pull_request_review_comment", "number": 5}}, key),
+            "switchboard PR closed": _evt("sb:github", {"event_type": "work.closed", "metadata": {
+                "work_kind": "pull_request", "github_event": "pull_request", "number": 5}}, key),
+            "switchboard comment on a PR": _evt("sb:github", {"metadata": {
+                "github_event": "issue_comment", "work_kind": "pull_request", "number": 5}}, key),
+        }
+        for name, evt in cases.items():
+            with self.subTest(name):
+                self.assertEqual(source_issue([evt], key), "")
+
+    def test_switchboard_issue_events_still_name_the_issue(self):
+        key = "github:o/r#7"
+        for metadata in ({"work_kind": "issue", "github_event": "issues"},
+                         {"work_kind": "issue", "github_event": "issue_comment"}):
+            with self.subTest(**metadata):
+                self.assertEqual(source_issue([_evt("sb:github", {"metadata": metadata}, key)], key), "o/r#7")
 
 
 @functools.lru_cache(maxsize=1)
@@ -164,10 +244,10 @@ class DeliveryCase(unittest.TestCase):
         return PRDelivery(dataclasses.replace(self.config, **overrides), self.store, env=self.env,
                           sleep=sleep or self.sleeps.append)
 
-    def request(self, workdir, kind="feature", review="pass", work_key=None, title="divide rejects zero"):
+    def request(self, workdir, kind="feature", review="pass", work_key=None, title="divide rejects zero", issue=""):
         return DeliveryRequest(work_key=work_key or f"task:{workdir.name}", workdir=workdir, title=title,
                                summary="divide raises on zero", test_evidence="red: 1 failed\ngreen: 3 passed",
-                               change_kind=kind, rationale="adds a new rejection path", review=review)
+                               change_kind=kind, rationale="adds a new rejection path", review=review, issue=issue)
 
     def gh_state(self):
         return json.loads(self.state_file.read_text())
@@ -222,6 +302,40 @@ class TestOpenPullRequest(DeliveryCase):
         self.assertEqual(self.gh_state()["prs"][0]["edits"], 1)
         self.assertEqual(self.check_log.read_text(), "ran\n")
         self.assertEqual(second.attempts, 2)
+
+    def test_pr_body_opens_with_the_source_issue_line_for_each_issue_link(self):
+        cases = {
+            ("closes", "o/r#7"): "Closes #7\n\n## Summary",
+            ("refs", "o/r#7"): "Refs #7\n\n## Summary",
+            ("closes", "other/lib#12"): "Closes other/lib#12\n\n## Summary",
+            ("refs", "Other/Lib#12"): "Refs Other/Lib#12\n\n## Summary",
+            ("closes", "O/R#3"): "Closes #3\n\n## Summary",
+            ("none", "o/r#7"): "## Summary",
+            ("closes", ""): "## Summary",
+        }
+        for (link, issue), start in cases.items():
+            with self.subTest(link=link, issue=issue):
+                name = f"task-{link}-{issue.replace('/', '-').replace('#', '-') or 'plain'}".lower()
+                wt = self.task(name, {"calc.py": "x = 1\n"})
+                rec = self.delivery(issue_link=link).deliver(self.request(wt, issue=issue),
+                                                             permissions=InMemoryPermission())
+                self.assertEqual(rec.problem, "")
+                pr = next(p for p in self.gh_state()["prs"] if p["head"] == f"hb/{name}")
+                self.assertTrue(pr["body"].startswith(start), pr["body"][:80])
+
+    def test_without_a_configured_repo_the_issue_is_written_in_full(self):
+        wt = self.task("task-a", {"calc.py": "x = 1\n"})
+        self.delivery(repo="", issue_link="closes").deliver(self.request(wt, issue="o/r#7"),
+                                                            permissions=InMemoryPermission())
+        self.assertTrue(self.gh_state()["prs"][0]["body"].startswith("Closes o/r#7\n\n## Summary"))
+
+    def test_a_reused_pr_keeps_the_issue_line_when_its_body_is_updated(self):
+        wt = self.task("task-a", {"calc.py": "x = 1\n"})
+        self.delivery().deliver(self.request(wt, issue="o/r#7"), permissions=InMemoryPermission())
+        self.delivery(issue_link="closes").deliver(self.request(wt, issue="o/r#7"), permissions=InMemoryPermission())
+        pr = self.gh_state()["prs"][0]
+        self.assertEqual(pr["edits"], 1)
+        self.assertTrue(pr["body"].startswith("Closes #7\n\n## Summary"), pr["body"][:80])
 
     def test_partial_success_push_done_pr_failed_is_resumed(self):
         wt = self.task("task-a", {"calc.py": "x = 1\n"})

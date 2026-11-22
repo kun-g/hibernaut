@@ -29,14 +29,6 @@ class TestSelectTests(unittest.TestCase):
         self.assertNotIn("tests/test_switchboard_inbound.py", delivery.tests)
         self.assertNotIn("tests/test_gdrive_credential_proxy.py", delivery.tests)
 
-        poller = select_tests(["src/agent_runtime/adapters/channels/github_poller.py"])
-        self.assertFalse(poller.full_suite)
-        self.assertIn("tests/test_github_poller_resilience.py", poller.tests)
-        self.assertIn("tests/test_architecture_boundaries.py", poller.tests)
-        self.assertNotIn("tests/test_guidance_catalog.py", poller.tests)
-        self.assertNotIn("tests/test_pr_delivery.py", poller.tests)
-        self.assertNotIn("tests/test_switchboard_relay.py", poller.tests)
-
         mcp = select_tests(["src/agent_runtime/adapters/channels/mcp_server.py"])
         self.assertFalse(mcp.full_suite)
         self.assertIn("tests/test_mcp_server.py", mcp.tests)

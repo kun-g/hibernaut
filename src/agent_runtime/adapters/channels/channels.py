@@ -9,7 +9,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from agent_runtime.adapters.channels.feishu_webhook import FeishuWebhookAdapter
-from agent_runtime.adapters.channels.github_webhook import GitHubWebhookAdapter
 from agent_runtime.adapters.channels.mcp_server import MCPServerAdapter
 from agent_runtime.engine.handler import EventHandler
 
@@ -114,7 +113,6 @@ class WebhookChannelAdapter:
 def webhook_request_handler(
     handler: EventHandler,
     *,
-    github_adapter: GitHubWebhookAdapter | None = None,
     feishu_adapter: FeishuWebhookAdapter | None = None,
     mcp_adapter: MCPServerAdapter | None = None,
 ) -> type[BaseHTTPRequestHandler]:
@@ -152,11 +150,6 @@ def webhook_request_handler(
                 )
                 return
 
-            if self.path == "/webhooks/github" and github_adapter is not None:
-                resp = github_adapter.handle(raw, header_map)
-                self._write_json(resp.status_code, resp.body)
-                return
-
             if self.path == "/webhooks/feishu" and feishu_adapter is not None:
                 resp = feishu_adapter.handle(raw, header_map)
                 self._write_json(resp.status_code, resp.body)
@@ -180,11 +173,10 @@ def create_webhook_server(
     port: int,
     handler: EventHandler,
     *,
-    github_adapter: GitHubWebhookAdapter | None = None,
     feishu_adapter: FeishuWebhookAdapter | None = None,
     mcp_adapter: MCPServerAdapter | None = None,
 ) -> WebhookHTTPServer:
     return WebhookHTTPServer((host, port), webhook_request_handler(
-        handler, github_adapter=github_adapter, feishu_adapter=feishu_adapter,
+        handler, feishu_adapter=feishu_adapter,
         mcp_adapter=mcp_adapter,
     ))

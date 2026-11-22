@@ -6,14 +6,13 @@ import os
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from typing import Any
 
 from agent_runtime.adapters.channels import (
     ConsoleChannelAdapter,
     FeishuChannelAdapter,
-    GitHubIssuePoller,
-    PollTarget,
     build_feishu_or_console_channel,
 )
 from agent_runtime.adapters.executor_cli import (
@@ -24,11 +23,10 @@ from agent_runtime.adapters.executor_cli import (
     derive_worktree_names,
 )
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteWorkspaceStore
-from agent_runtime.app.config import load_config
+from agent_runtime.app.config import load_config, parse_config
 from agent_runtime.app.main import build_daemon_from_config
 from agent_runtime.core.models import Emit, Event, Silent, Suspend
-from agent_runtime.engine.handler import EventHandler
-from tests.fakes import InMemoryInbox, InMemoryMemoryStore, InMemoryOutbox, InMemoryPermission, InMemoryTimerStore
+from tests.fakes import InMemoryMemoryStore, InMemoryOutbox, InMemoryPermission, InMemoryTimerStore
 
 
 class _FakeCaps:
@@ -43,41 +41,6 @@ class _FakeCaps:
 
     def is_interrupted(self) -> bool:
         return self._interrupted
-
-
-class TestGitHubIssuePoller(unittest.TestCase):
-    def test_poll_once_idempotency_and_correlation_key(self) -> None:
-        inbox = InMemoryInbox()
-        handler = EventHandler(inbox=inbox)
-        sample_issues = [
-            {
-                "number": 42,
-                "title": "Fix bug",
-                "body": "details",
-                "labels": [{"name": "hibernaut"}],
-                "updatedAt": "2026-11-21T10:00:00Z",
-                "url": "https://github.com/kun-g/hibernaut/issues/42",
-            }
-        ]
-        poller = GitHubIssuePoller(
-            handler,
-            targets=[PollTarget(repo="kun-g/hibernaut", inbox_id="proj:hibernaut", labels=("hibernaut",))],
-            fetcher=lambda _target: sample_issues,
-        )
-
-        self.assertEqual(poller.poll_once(), 1)
-        # Polling same unchanged updatedAt must be deduplicated (0 new events).
-        self.assertEqual(poller.poll_once(), 0)
-
-        pending = inbox.fetch_pending("proj:hibernaut")
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0].external_id, "github-poll:kun-g/hibernaut#42:2026-11-21T10:00:00Z")
-        self.assertEqual(pending[0].correlation_key, "github:kun-g/hibernaut#42")
-
-        # Updated timestamp triggers a fresh event with the same correlation_key.
-        sample_issues[0]["updatedAt"] = "2026-11-21T10:05:00Z"
-        self.assertEqual(poller.poll_once(), 1)
-        self.assertEqual(len(inbox.fetch_pending("proj:hibernaut")), 2)
 
 
 class TestOrcaWorktreeManager(unittest.TestCase):
@@ -478,6 +441,24 @@ class TestFeishuChannelAndConfig(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsInstance(fallback, ConsoleChannelAdapter)
 
+    def test_legacy_github_ingress_settings_warn_and_are_ignored(self) -> None:
+        project = {"repo": "o/r", "checkout": "/tmp/repo"}
+        baseline = parse_config({"projects": {"demo": project}})
+        # Invalid legacy values must not prevent an installed daemon from starting after upgrade.
+        raw = {
+            "runtime": {"poll_interval_seconds": -1, "poll_mode": "obsolete"},
+            "channels": {"github_webhook_secret_env": "OLD_SECRET", "github_token_env": "OLD_TOKEN"},
+            "projects": {"demo": {**project, "github_poll": "obsolete", "poll_labels": 42}},
+        }
+        with warnings.catch_warnings(record=True) as notices:
+            warnings.simplefilter("always", UserWarning)
+            self.assertEqual(parse_config(raw), baseline)
+        messages = "\n".join(str(notice.message) for notice in notices if notice.category is UserWarning)
+        for section, keys in (("runtime", raw["runtime"]), ("channels", raw["channels"]),
+                              ("projects.demo", ("github_poll", "poll_labels"))):
+            for key in keys:
+                self.assertIn(f"{section}.{key}", messages)
+
     def test_load_example_toml_and_build_daemon_from_config(self) -> None:
         example_path = Path(__file__).resolve().parents[1] / "hibernaut.example.toml"
         cfg = load_config(example_path)
@@ -502,8 +483,6 @@ class TestFeishuChannelAndConfig(unittest.IsolatedAsyncioTestCase):
             )
             daemon = build_daemon_from_config(local_cfg)
             try:
-                self.assertIsNotNone(daemon.github_poller)
-                self.assertIsNotNone(daemon.github_webhook)
                 self.assertIsNotNone(daemon.feishu_webhook)
             finally:
                 daemon.close()

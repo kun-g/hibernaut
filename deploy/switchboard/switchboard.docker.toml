@@ -18,6 +18,10 @@ unmatched_policy = "fallback"  # or "reject"
 [routing.github_repos]
 "kun-g/hibernaut" = "proj:hibernaut"
 
+[routing.github_owners]
+# Every repo of these owners routes to proj:<lower-cased repo name> unless github_repos lists it.
+# "kun-g" = "proj:{repo}"
+
 [routing.feishu_chats]
 # "oc_xxx" = "proj:hibernaut"
 
@@ -42,11 +46,16 @@ retry_backoff_seconds = [5, 15, 45, 135, 405]
 # dead_letter_alert_target = "oc_xxx"
 
 [outbound]
+# Results go back to the issue/chat that started a task only for these channels; GitHub replies need an
+# explicit reply_channel/reply_target on the task.
+reply_to_origin = ["feishu"]
 rate_limit_per_target_rpm = 30
 max_retry_attempts = 5
 approval_channel = "feishu"
 # approval_target = "oc_xxx"
 
+# With SWITCHBOARD_GITHUB_APP_ID/_PRIVATE_KEY set, comments are posted as the App, only for these owners.
+# github_app_owners = ["kun-g"]
 [relay]
 enabled = true
 path = "/ws/relay"

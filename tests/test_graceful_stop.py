@@ -20,6 +20,7 @@ from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteOutboxAd
 from agent_runtime.app.main import build_daemon
 from agent_runtime.core.models import Emit
 from scripts import run_updating
+from tests.process_cleanup import kill_processes_under, processes_under
 from tests.test_reload_handover import GATED_CLI
 
 BLOCKED = "proj:blocked"
@@ -45,30 +46,6 @@ def post(port: int, inbox_id: str, text: str, workdir: Path, external_id: str | 
         return None, None
     finally:
         conn.close()
-
-
-def processes_under(root: Path) -> list[tuple[int, str]]:
-    listing = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "command="], stdout=subprocess.PIPE, text=True,
-                             check=True).stdout
-    found = []
-    for line in listing.splitlines():
-        pid, _, command = line.strip().partition(" ")
-        if str(root) in command and int(pid) != os.getpid():
-            found.append((int(pid), command))
-    return found
-
-
-def kill_processes_under(root: Path, timeout: float = 10.0) -> None:
-    # run_updating.py starts the daemon in its own session, so neither killing the supervisor nor its process group
-    # reaches it; every process this case started (supervisor, daemon, gated CLI) names the case's temp root instead.
-    deadline = time.monotonic() + timeout
-    while found := processes_under(root):
-        for pid, _ in found:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
-        if time.monotonic() > deadline:
-            raise AssertionError(f"processes still running under {root}: {found}")
-        time.sleep(0.05)
 
 
 class GatedDaemonCase(unittest.TestCase):
@@ -256,10 +233,14 @@ class TestUpdateWaitsForDrain(GatedDaemonCase):
 
     def test_a_second_signal_to_the_supervisor_reaches_the_draining_daemon(self):
         proc = self.spawn([sys.executable, str(run_updating.ROOT / "scripts/run_updating.py"), "--interval", "300",
-                           "--config", str(self.config), "--outbox-interval", "0.02"], cwd=self.root)
+                           "--wait-log-interval", "0.2", "--config", str(self.config), "--outbox-interval", "0.02"],
+                          cwd=self.root)
         blocked_id = self.start_blocked_run(proc)
+        [daemon_pid] = [pid for pid, command in processes_under(self.root) if "agent_runtime.app.main" in command]
         proc.send_signal(signal.SIGTERM)
-        time.sleep(0.5)
+        # The daemon stalls on the blocked Run; the supervisor keeps reporting who waits on whom, and for how long.
+        waiting = f"Supervisor {proc.pid} still waiting for daemon {daemon_pid} to exit ("
+        self.wait_for(lambda: self.log_path.read_text().count(waiting) >= 2, proc)
         self.assertIsNone(proc.poll())
         self.assertEqual(self.post(OTHER, "other-1")[0], 202)
 

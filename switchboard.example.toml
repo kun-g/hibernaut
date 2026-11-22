@@ -1,7 +1,8 @@
 # Switchboard config. Secrets never go here: the default EnvCredentialBroker reads
 # SWITCHBOARD_GITHUB_WEBHOOK_SECRET, SWITCHBOARD_FEISHU_WEBHOOK_SECRET (verification token),
 # SWITCHBOARD_MCP_WEBHOOK_SECRET (bearer token), SWITCHBOARD_GITHUB_TOKEN and
-# SWITCHBOARD_FEISHU_TOKEN (tenant access token) from the environment, plus
+# SWITCHBOARD_FEISHU_TOKEN (a fixed tenant access token; prefer SWITCHBOARD_FEISHU_APP_ID and
+# SWITCHBOARD_FEISHU_APP_SECRET, which Switchboard exchanges and refreshes itself) from the environment, plus
 # SWITCHBOARD_RELAY_WEBHOOK_SECRET (the token relay agents must present) when [relay] is enabled.
 
 [http]
@@ -26,6 +27,9 @@ unmatched_policy = "fallback"  # or "reject"
 # Override the consumers of individual event types (defaults: src/switchboard/router.py), e.g. without a Taskboard:
 # [routing.event_consumers]
 # "work.opened" = ["hibernaut"]
+# "work.updated" = ["hibernaut"]  # includes adding the trigger label to an existing issue
+# "work.closed" = ["hibernaut"]
+# "execution.reported" = ["switchboard.outbound"]
 
 [github]
 # Only issues/PRs carrying this label (and comments on them) become events; empty accepts all.

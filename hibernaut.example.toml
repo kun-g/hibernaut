@@ -7,14 +7,13 @@ memory_root = "./agent_memory"
 max_concurrency = 4
 new_event_policy = "defer"   # defer | fold | interrupt
 default_executor = "claude"
-poll_mode = "gh"             # gh | api
-poll_interval_seconds = 60.0
+# 后台回收清扫：启动时一轮，之后每隔这么多秒一轮，回收交付时因排队事件、在线会话等被跳过、PR 已合并且已无人使用的 hb-* worktree；
+# 门禁与回收方式同交付时的回收，跳过只记日志，回收成功才发一条通知；0 = 关闭
+worktree_sweep_interval_seconds = 300.0
 
 [channels]
 host = "127.0.0.1"
 port = 8080
-github_webhook_secret_env = "GITHUB_WEBHOOK_SECRET"
-github_token_env = "GITHUB_TOKEN"
 feishu_app_id_env = "FEISHU_APP_ID"
 feishu_app_secret_env = "FEISHU_APP_SECRET"
 feishu_verification_token_env = "FEISHU_VERIFICATION_TOKEN"
@@ -119,13 +118,12 @@ timeout_seconds = 300.0
 
 [projects.hibernaut]
 # 字符串：一个精确 inbox_id（原有写法，不当正则）。数组：每项直接是正则，须整串匹配（fullmatch），不用加 "re:"（旧写法仍可用）；
-# 不含正则语法的项是精确 ID（字面的点写成 "\\."）。第一个精确 ID 是主 inbox，GitHub 与飞书入站投递到它，表达式不作投递地址。
+# 不含正则语法的项是精确 ID（字面的点写成 "\\."）。第一个精确 ID 是主 inbox，飞书按群映射到它。Switchboard 的仓库路由应指向本项目服务的 inbox。
 # 服务多个 inbox 的项目，每个写任务都在该 inbox 自己的 hb-* worktree 里运行。
 # inbox_id = ["proj:hibernaut", "proj:hibernaut:.+"]
 inbox_id = "proj:hibernaut"
 repo = "kun-g/hibernaut"
 checkout = "/absolute/path/to/your/hibernaut"
-poll_labels = ["hibernaut"]
 worktree_backend = "orca"    # orca | git
 terminal_backend = "orca"    # orca | none；交互角色会话的后端，与 worktree_backend 独立。默认：orca 项目为 orca，git 项目为 none
 orca_create_terminal = false    # agent launch opens its own terminal
@@ -154,6 +152,7 @@ merge_method = "squash"         # squash | merge | rebase
 max_handbacks = 2               # 合入主干出现版本号以外的冲突、或合入后检查失败时，交回同一 SDE 会话解决（再经增量评审后自动续交付）的次数；超过后挂起等人，人批准后重新计数；0 = 直接挂起
 close_terminal = true           # 交付有证据后（PR 头即已推送且检查通过的提交；授权合并时须已合并）自动关闭 SDE 终端与 CLI 评审者（terminal = "orca"）留下的评审终端；先记下 SHA、PR 与可恢复会话 ID，worktree 不动
 delete_branch = true            # PR 合并后删除远端源分支（不强推；已不存在算成功），worktree 回收时一并删除本地分支；false 则都保留
+issue_link = "refs"             # 任务来自 GitHub Issue 时 PR 正文开头的一行：closes = `Closes #<n>`（合并进默认分支后关闭 Issue）；refs = `Refs #<n>`（只关联，Issue 保持打开）；none = 不写。跨仓库写 <owner>/<repo>#<n>
 # PR 合并后任务自动结案：会话关闭并按回收门禁回收 worktree，被门禁拒绝时只发一条说明原因的通知
 # git / gh 由宿主机自己的凭据（gh auth login、git credential helper、SSH agent）或下面的可信包装命令认证；
 # Hibernaut 调用前剥离 GH_TOKEN / GITHUB_TOKEN 等变量，进程里不持有 token。
@@ -177,6 +176,7 @@ gh_command = "gh"
 # done_folder_id = ""
 # failed_folder_id = ""
 
+# GitHub webhooks go to Switchboard. Configure repository routes and [github] require_label in switchboard.toml.
 # Stage A: run Switchboard in this process (off by default). Tokens come only from SWITCHBOARD_* env vars,
 # which are moved out of the process environment at startup so executor subprocesses do not inherit them.
 # [switchboard]

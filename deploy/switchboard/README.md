@@ -36,7 +36,7 @@ chmod 600 .env
 
 1. `Caddyfile`：把 `sb.example.com` 换成你的域名。
 2. `switchboard.toml`：按需改 `[routing]`（仓库、飞书群到 `inbox_id` 的映射）、`[github]`、`[feishu]`、`[outbound]`。`[github] require_label`（默认 `hibernaut`）决定哪些 Issue/PR 及其评论会入站，公开仓库不要清空；`[routing.event_consumers]` 在没有 Taskboard 时把 Issue/PR 事件直接投给 Hibernaut，部署了 Taskboard 再删掉。不要改 `[http] host/port`、`[sqlite] path` 和 `[relay] path`，它们与 Dockerfile、Compose、Caddyfile 对应；不要设置 `[relay] listen_port`，Caddy 只转发 8790。
-3. `.env`：填六个变量，令牌可用 `openssl rand -hex 32` 生成。
+3. `.env`：填下表中的变量，令牌可用 `openssl rand -hex 32` 生成。
 
    | 变量 | 内容 |
    | :--- | :--- |
@@ -45,7 +45,7 @@ chmod 600 .env
    | `SWITCHBOARD_GITHUB_WEBHOOK_SECRET` | GitHub Webhook 的 Secret |
    | `SWITCHBOARD_GITHUB_TOKEN` | 发 GitHub 评论用的 Token |
    | `SWITCHBOARD_FEISHU_WEBHOOK_SECRET` | 飞书事件订阅的 Verification Token |
-   | `SWITCHBOARD_FEISHU_TOKEN` | 飞书 tenant access token |
+   | `SWITCHBOARD_FEISHU_APP_ID`、`SWITCHBOARD_FEISHU_APP_SECRET` | 飞书应用凭证，Switchboard 自己换取并刷新 tenant access token；不接飞书可留空 |
 
 4. 构建并启动：
 
@@ -56,6 +56,71 @@ chmod 600 .env
    ```
 
 改 `switchboard.toml` 或 `.env` 后执行 `docker compose up -d --force-recreate switchboard`（Switchboard 不热加载）。改 `Caddyfile` 后执行 `docker compose restart caddy`。
+
+## 已有反向代理（如 Dokploy / Traefik）
+
+主机的 80/443 已被现有反向代理占用（如 Dokploy 的 Traefik）时，Caddy 起不来，改为：
+
+- 只部署 `switchboard` 服务，不要 `caddy` 服务，也不映射宿主机端口。
+- 由反向代理把域名转发到容器的 8790，并负责 TLS。Traefik 能直接透传 WebSocket，`/ws/relay` 不需要额外规则。
+
+`switchboard.toml` 的内容和约束与上文「部署」第 2 步相同，变量与第 3 步相同。
+
+### Dokploy
+
+1. 新建 Compose 服务，类型选 raw compose，填入下面的模板：
+
+   ```yaml
+   services:
+     switchboard:
+       build:
+         # 固定到一个 commit，升级时只改这里
+         context: https://github.com/kun-g/hibernaut.git#<commit>
+         dockerfile: deploy/switchboard/Dockerfile
+       restart: unless-stopped
+       environment:
+         SWITCHBOARD_RELAY_WEBHOOK_SECRET: ${SWITCHBOARD_RELAY_WEBHOOK_SECRET}
+         SWITCHBOARD_MCP_WEBHOOK_SECRET: ${SWITCHBOARD_MCP_WEBHOOK_SECRET}
+         SWITCHBOARD_GITHUB_WEBHOOK_SECRET: ${SWITCHBOARD_GITHUB_WEBHOOK_SECRET}
+         SWITCHBOARD_GITHUB_TOKEN: ${SWITCHBOARD_GITHUB_TOKEN}
+         SWITCHBOARD_FEISHU_WEBHOOK_SECRET: ${SWITCHBOARD_FEISHU_WEBHOOK_SECRET}
+         SWITCHBOARD_FEISHU_APP_ID: ${SWITCHBOARD_FEISHU_APP_ID:-}
+         SWITCHBOARD_FEISHU_APP_SECRET: ${SWITCHBOARD_FEISHU_APP_SECRET:-}
+       configs:
+         - source: switchboard_toml
+           target: /etc/switchboard/switchboard.toml
+       volumes:
+         - switchboard_data:/data
+
+   configs:
+     switchboard_toml:
+       content: |
+         # 粘贴 switchboard.docker.toml 改好后的全文，整体缩进到这一层
+
+   volumes:
+     switchboard_data:
+   ```
+
+   - `build.context` 是本仓库带固定 commit 的 git URL，`<commit>` 换成要部署的 commit；`dockerfile` 是相对仓库根的路径。
+   - `switchboard.toml` 用 `configs.<name>.content` 内联，挂到 `/etc/switchboard/switchboard.toml`，不需要在主机上放文件。内容里的 `$` 会被 compose 当作变量插值，要写成 `$$`。
+   - 不写 `ports:`。
+
+2. 在 Dokploy 该服务的 Environment 里填下表中的变量（`NAME=value` 每行一个），compose 里的 `${...}` 从这里取值。
+3. 在 Domains 里给 compose 的 `switchboard` 服务绑域名：Service Name 选 `switchboard`，Container Port 填 `8790`，打开 HTTPS，证书选 Let's Encrypt。
+4. Deploy。服务日志出现 `[switchboard] relay endpoint ... (transport=hybrid)` 后，按下文「冒烟验收」检查；其中第 5 步的端口检查同样适用，第 6 步的 `docker compose exec` 改在 Dokploy 的容器终端里执行。
+
+**改配置不重建的坑**：compose 察觉不到 `configs.content` 的变化，只改 `switchboard.toml` 再部署时容器不会重建，新配置不生效。给服务加一个随配置变化的 label，例如 `labels: ["switchboard.config-sha=<toml 的哈希>"]`，每次改 toml 同步改它。`labels` 必须写成列表：写成映射时 Dokploy 不再注入它的 Traefik label，域名会返回 404。
+
+**证书坑**：Traefik 只在路由首次加载时申请证书。DNS 记录如果晚于部署才建好，证书申请会失败并一直用默认自签证书；DNS 生效后要改一下域名配置（比如把 HTTPS 关掉再打开）并重新部署，才会重新申请。
+
+**升级**：改 `build.context` 里的 commit 后重新部署。回滚同理，改回上一个可用的 commit；新版本改过表结构时，要连同数据卷一起恢复到升级前的备份（见下文「回滚」）。
+
+## 用 GitHub App 收事件和回写评论
+
+- **收事件**：在 GitHub App 的设置里打开 Webhook，URL 填 `https://<域名>/webhooks/github`，Secret 用 `SWITCHBOARD_GITHUB_WEBHOOK_SECRET`，订阅 Issues、Issue comment、Pull request、Pull request review、Pull request review comment。App 装到哪些账号，哪些仓库的事件就会发来，所以 `[routing] unmatched_policy` 要设为 `"reject"`；`[routing.github_owners]` 让某个账号下的新仓库自动路由到 `proj:<仓库名>`，不用再逐个改 `github_repos`。
+- **回写哪里**：运行结果默认不回帖到发起任务的 GitHub Issue，只留在 Hibernaut 本机 Outbox；任务显式带 `reply_channel = "github"`、`reply_target = "<owner>/<repo>#<n>"` 时才评论到那个 Issue。`[outbound] reply_to_origin` 列出允许自动回到来源的渠道（默认只有飞书）。
+- **回写评论**：`.env` 填 `SWITCHBOARD_GITHUB_APP_ID` 和 `SWITCHBOARD_GITHUB_APP_PRIVATE_KEY`（PEM 整体 base64 成一行），`[outbound] github_app_owners` 列出允许签令牌的账号。Switchboard 每次按仓库签一个只含 Issues、Pull requests 写权限、只覆盖该仓库的安装令牌（缓存到过期前 10 分钟），评论作者是 App 的 bot；名单外的仓库直接拒绝，不调 GitHub。启动日志出现 `[switchboard] GitHub comments as App <id> for <owners>`。私钥能给 App 的所有安装签令牌，只放在 Switchboard 的环境变量里。
+- **接入新仓库**：本机在 Hibernaut 检出里执行 `python3 scripts/onboard_project.py <owner>/<repo>`，它克隆仓库到 Hibernaut 检出旁边、建 `hibernaut` 标签、在 `hibernaut.toml` 追加 `[projects.<repo>]`（默认开 PR 供人合并，`--auto-merge` 改为自动合并），守护进程热加载后生效。重复执行不改动已有内容，`--dry-run` 只打印将做的事。
 
 ## 本机 Hibernaut 配对
 
@@ -130,17 +195,17 @@ export SWITCHBOARD_MCP_TOKEN=<VPS .env 里的 SWITCHBOARD_MCP_WEBHOOK_SECRET>
 
 ## 灰度切流
 
-Hibernaut 现有的 GitHub / 飞书 / MCP 通道在 Stage B 仍然保留，可以逐个入口切换，每步都能单独回退。
+GitHub Webhook 只能投到 Switchboard。Hibernaut 通过 Relay 接收公网 Hub 的事件，飞书与 MCP 也可继续走原有的本地入口。
 
 1. 部署 VPS 并完成冒烟验收 1–5。此时还没有外部事件发到 VPS。
 2. 本机 Hibernaut 改为 `mode = "relay"`（见上文）并重启。确认启动日志无报错、没有明文告警；用冒烟第 6 步确认 `delivery_log` 中 `hibernaut` 的投递为 `acked`、没有积压的 `pending` / `retry`。
-3. 切一个入口：先在一个仓库的 GitHub Webhook 里把 Payload URL 改为 `https://sb.example.com/webhooks/github`（Content type `application/json`，Secret 用 `SWITCHBOARD_GITHUB_WEBHOOK_SECRET`），在 Recent Deliveries 确认 2xx，再发一个带 `hibernaut` 标签的测试 Issue 确认 Hibernaut 收到并回写评论（回写的评论末尾有隐藏标记 `<!-- switchboard:outbound -->`，回流时被丢弃，不会再触发 Run）。同时把该项目 `hibernaut.toml` 的 `poll_labels` 改为 `[]`：轮询和 Webhook 的 `external_id` 不同，两路都开时同一个 Issue 会跑两次。
+3. 切一个入口：先在一个仓库的 GitHub Webhook 里把 Payload URL 改为 `https://sb.example.com/webhooks/github`（Content type `application/json`，Secret 用 `SWITCHBOARD_GITHUB_WEBHOOK_SECRET`），在 Recent Deliveries 确认 2xx。给一个测试 Issue 加上 `[github] require_label` 指定的标签，确认 Switchboard 的 `delivery_log` 显示 `hibernaut` 已 ACK，并在 Hibernaut 中查到对应的 `sb:github` 事件。
 4. 观察一段时间（建议至少一天）没有 `dead_letter` 后，再切飞书事件订阅地址到 `https://sb.example.com/webhooks/feishu`，以及其余仓库。
 
 ## 回滚
 
-- **单个入口**：把 GitHub Webhook / 飞书事件订阅地址改回原来的 Hibernaut 地址。
-- **Hibernaut 侧**：`hibernaut.toml` 的 `[switchboard]` 改回原来的 `mode = "in_process"` 或 `enabled = false`，重启 Hibernaut。切换前先确认 VPS 上没有发给 `hibernaut` 的 `pending` 投递，否则这些事件要等重新连上才会推送。
+- **单个入口**：GitHub Webhook 可切回此前可用的 Switchboard 监听地址。飞书事件订阅可切回 Hibernaut 的本地 Webhook。
+- **Hibernaut 侧**：`hibernaut.toml` 的 `[switchboard]` 改回原来的 `mode = "in_process"` 并设置原有 `config_path`，重启 Hibernaut，同时把 GitHub Webhook 切到该 Switchboard。`enabled = false` 会暂停 GitHub 入站。切换前先确认 VPS 上没有发给 `hibernaut` 的 `pending` 投递，否则这些事件要等重新连上才会推送。
 - **VPS 版本**：升级前先备份数据卷，回滚时检出上一个版本重新构建：
 
   ```bash

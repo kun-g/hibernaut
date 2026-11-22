@@ -222,7 +222,6 @@ class TestIndependentEventsTalk(unittest.TestCase):
             "CLAUDE_CONFIG_DIR": str(config_dir), "FAKE_PEER_REGISTRY": str(config_dir / "sessions"),
         }))
         stderr = self.enterContext(patch("sys.stderr", new_callable=_Capture))
-        self.enterContext(patch("agent_runtime.adapters.channels.github_poller.GitHubIssuePoller.poll_once", return_value=0))
 
         def post(external_id, correlation_key, payload):
             body = {"inbox_id": "proj:demo", "external_id": external_id, "correlation_key": correlation_key,

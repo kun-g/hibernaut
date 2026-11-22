@@ -422,7 +422,6 @@ class TestTwoProjectsThroughTheDaemon(unittest.TestCase):
         )
         self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(log), "FAKE_PLAN": str(plan)}))
         stderr = self.enterContext(patch("sys.stderr", new_callable=_Capture))
-        self.enterContext(patch("agent_runtime.adapters.channels.github_poller.GitHubIssuePoller.poll_once", return_value=0))
 
         def post(project):
             body = {"inbox_id": f"proj:{project}", "external_id": f"t-{project}", "correlation_key": f"{project}:7",

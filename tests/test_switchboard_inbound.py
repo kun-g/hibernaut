@@ -96,6 +96,36 @@ class GitHubInboundTests(unittest.TestCase):
         status, body = send_github(self.h.url, bot, event="issue_comment", delivery="c2")
         self.assertEqual((status, body["status"]), (200, "ignored"))
 
+    def test_comments_record_whether_they_are_on_an_issue_or_a_pull_request(self) -> None:
+        base = {
+            "action": "created",
+            "comment": {"id": 600, "body": "x", "user": {"login": "kun", "type": "User"}},
+            "repository": {"full_name": "kun-g/hibernaut"},
+            "sender": {"login": "kun", "type": "User"},
+        }
+        cases = [
+            ("issue_comment", {"issue": {"number": 42, "title": "t"}}, "issue"),
+            ("issue_comment", {"issue": {"number": 43, "title": "t", "pull_request": {"url": "u"}}}, "pull_request"),
+            ("pull_request_review_comment", {"pull_request": {"number": 44, "title": "t"}}, "pull_request"),
+        ]
+        for n, (github_event, item, kind) in enumerate(cases):
+            with self.subTest(github_event=github_event, kind=kind):
+                payload = {**base, **item, "comment": {**base["comment"], "id": 600 + n}}
+                status, body = send_github(self.h.url, payload, event=github_event, delivery=f"wk{n}")
+                self.assertEqual(status, 202, body)
+                event = self.h.board.store.get_inbound(body["event_id"])
+                assert event is not None
+                self.assertEqual(event.metadata["work_kind"], kind)
+        review = {"action": "submitted", "review": {"id": 700, "body": "", "state": "APPROVED",
+                                                    "user": {"login": "kun", "type": "User"}},
+                  "pull_request": {"number": 45, "title": "t"}, "repository": base["repository"],
+                  "sender": base["sender"]}
+        status, body = send_github(self.h.url, review, event="pull_request_review", delivery="wk-review")
+        self.assertEqual(status, 202, body)
+        event = self.h.board.store.get_inbound(body["event_id"])
+        assert event is not None
+        self.assertEqual(event.metadata["work_kind"], "pull_request")
+
     def test_comment_carrying_the_outbound_marker_is_dropped(self) -> None:
         # Comments Switchboard posts with a user token come back as User-authored webhooks.
         comment = {

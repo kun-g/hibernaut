@@ -106,7 +106,7 @@ class OutboundGateway:
             if address:
                 target = address_target(channel, str(address))
             else:
-                origin = reply_target(key)
+                origin = self._origin(key)
                 if origin is not None and origin[0] == channel:
                     target = origin[1]
             if target is None:
@@ -142,7 +142,7 @@ class OutboundGateway:
             channel = str(override_channel)
             target = address_target(channel, str(override_address))
         else:
-            origin = reply_target(key)
+            origin = self._origin(key)
             if origin is None:
                 return None
             channel, target = origin
@@ -161,6 +161,12 @@ class OutboundGateway:
             title=event.subject,
             body_md=event.body,
         )
+
+    def _origin(self, key: str | None) -> tuple[str, dict[str, Any]] | None:
+        origin = reply_target(key)
+        if origin is None or origin[0] not in self._config.reply_to_origin:
+            return None
+        return origin
 
     def wake(self) -> None:
         self._wake.set()

@@ -7,9 +7,11 @@ import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from switchboard.config import SwitchboardConfig, load_config
-from switchboard.credentials import EnvCredentialBroker
+from switchboard.config import ConfigError, SwitchboardConfig, load_config
+from switchboard.credentials import EnvCredentialBroker, feishu_app_credentials, github_app_credentials
 from switchboard.envelope import utc_now
+from switchboard.feishu_auth import FeishuTenantTokenSource, FeishuTokenSource
+from switchboard.github_app import GitHubAppTokenSource, GitHubTokenSource
 from switchboard.http_client import HttpClient, UrllibHttpClient
 from switchboard.http_server import SwitchboardHTTPServer, UpgradeHandler
 from switchboard.inbound.feishu import FeishuInboundAdapter
@@ -36,6 +38,7 @@ from switchboard.ports import (
 )
 from switchboard.relay_hub import RelayHub
 from switchboard.router import OUTBOUND_CONSUMER, Router, ScopeResolver
+from switchboard.rs256 import load_private_key
 from switchboard.store_sqlite import SwitchboardStore
 
 __all__ = ["EnvCredentialBroker", "Switchboard", "build_switchboard", "main"]
@@ -99,13 +102,19 @@ def build_switchboard(
     clock: Clock = utc_now,
     router: Router | None = None,
     port: int | None = None,
+    github_tokens: GitHubTokenSource | None = None,
+    feishu_tokens: FeishuTokenSource | None = None,
 ) -> Switchboard:
     sink: AuditSinkPort = audit or NoopAuditSink()
     store = SwitchboardStore(config.sqlite.path, busy_timeout_ms=config.sqlite.busy_timeout_ms)
     client: HttpClient = http_client or UrllibHttpClient()
     adapters: Mapping[str, OutboundChannelAdapter] = outbound_adapters or {
-        "feishu": FeishuOutboundAdapter(client, credentials, api_base=config.feishu.api_base),
-        "github": GitHubOutboundAdapter(client, credentials, api_base=config.outbound.github_api_base),
+        "feishu": FeishuOutboundAdapter(
+            client, credentials, api_base=config.feishu.api_base, tokens=feishu_tokens
+        ),
+        "github": GitHubOutboundAdapter(
+            client, credentials, api_base=config.outbound.github_api_base, tokens=github_tokens
+        ),
     }
     gateway = OutboundGateway(store, adapters, config=config.outbound, audit=sink, clock=clock)
     pipeline = InboundPipeline(
@@ -184,11 +193,46 @@ def build_switchboard(
     )
 
 
+def _github_app_tokens(config: SwitchboardConfig) -> GitHubTokenSource | None:
+    app = github_app_credentials()
+    if app is None:
+        return None
+    owners = config.outbound.github_app_owners
+    if not owners:
+        raise ConfigError("SWITCHBOARD_GITHUB_APP_ID is set but [outbound] github_app_owners is empty")
+    app_id, pem = app
+    print(f"[switchboard] GitHub comments as App {app_id} for {', '.join(owners)}", file=sys.stderr)
+    return GitHubAppTokenSource(
+        UrllibHttpClient(),
+        app_id=app_id,
+        key=load_private_key(pem),
+        allowed_owners=owners,
+        api_base=config.outbound.github_api_base,
+    )
+
+
+def _feishu_tokens(config: SwitchboardConfig) -> FeishuTokenSource | None:
+    app = feishu_app_credentials()
+    if app is None:
+        return None
+    app_id, app_secret = app
+    print(f"[switchboard] Feishu messages as app {app_id}", file=sys.stderr)
+    return FeishuTenantTokenSource(
+        UrllibHttpClient(), app_id=app_id, app_secret=app_secret, api_base=config.feishu.api_base
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="switchboard")
     parser.add_argument("--config", required=True)
     args = parser.parse_args(argv)
-    board = build_switchboard(load_config(args.config), credentials=EnvCredentialBroker())
+    config = load_config(args.config)
+    board = build_switchboard(
+        config,
+        credentials=EnvCredentialBroker(),
+        github_tokens=_github_app_tokens(config),
+        feishu_tokens=_feishu_tokens(config),
+    )
     stopped = threading.Event()
 
     def _stop(signum: int, frame: object) -> None:

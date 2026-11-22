@@ -47,10 +47,8 @@ STATIC_DEPS: dict[str, tuple[str, ...]] = {
     ),
     "tests/test_switchboard_relay.py": ("src/switchboard/relay_agent.py",),
     "tests/test_switchboard_bridge.py": ("src/switchboard/app.py",),
-    "tests/test_github_poller_resilience.py": ("src/agent_runtime/adapters/channels/github_poller.py",),
     "tests/test_webhooks.py": (
         "src/agent_runtime/adapters/channels/channels.py",
-        "src/agent_runtime/adapters/channels/github_webhook.py",
         "src/agent_runtime/adapters/channels/feishu_webhook.py",
         "src/agent_runtime/adapters/channels/http_types.py",
     ),

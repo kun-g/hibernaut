@@ -50,3 +50,6 @@ class EventHandler:
             status=stored.status,
             duplicate=is_duplicate,
         )
+
+    def has_open_event(self, *, inbox_id: str, source: str, external_id: str) -> bool:
+        return self._inbox.has_open_event(inbox_id, source, external_id)

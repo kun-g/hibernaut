@@ -309,11 +309,6 @@ class TestProjectDispatch(_DispatchCase):
         self.assertEqual(len({daemon.partitions.binding_for(i).memory_dir for i in inboxes}), 3)
         self.assertEqual(self.rows("SELECT COUNT(*) FROM worker_leases"), [(0,)])
 
-        # One poll and one webhook route per project, to the primary inbox.
-        assert daemon.github_poller is not None
-        self.assertEqual([(t.repo, t.inbox_id) for t in daemon.github_poller._targets],
-                         [("kun-g/hibernaut", "proj:hibernaut")])
-
         # Reclaim through MCP goes to the closing inbox's own worktree.
         assert daemon.mcp_server is not None
         (drive_session,) = self.rows("SELECT session_id FROM sessions WHERE inbox_id = 'proj:hibernaut:drive'")
