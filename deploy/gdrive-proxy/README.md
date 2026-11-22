@@ -73,7 +73,7 @@ A task references attachments in two ways; Hibernaut takes the union, each file 
 - frontmatter `attachments: <ID or name>, <ID or name>`: a Drive file ID, or the exact name of a file in `附件/` (a name two files share must be given by ID);
 - the file's Drive ID anywhere in the task text, such as a link `https://drive.google.com/file/d/<ID>/view`, as long as a file directly in `附件/` has that ID. An ID of a file anywhere else is not an attachment.
 
-When the task's Run starts, Hibernaut downloads them to `gdrive.attachments_dir/<task file ID>/<attachment file ID>/<name>` (outside every worktree, directories 0700, files 0600) and appends a `## 附件` section to the task text the executor gets: name, absolute local path, size and sha256 of each file. A reference that is not in `附件/`, too large or refused is listed there with its reason, and the task starts anyway. A Google Doc is saved as its Markdown export (`.md`). The directory is removed when the task's session closes (checked after every Run) or the task fails.
+When the task's Run starts, Hibernaut downloads them to `gdrive.attachments_dir/<task file ID>/<attachment file ID>/<name>` (outside every worktree, directories 0700, files 0600) and appends a `## 附件` section to the task text the executor gets: name, absolute local path, size and sha256 of each file. A reference that is not in `附件/`, too large or refused is listed there with its reason, and the task starts anyway. When `附件/` cannot be listed at all, each frontmatter reference gets that reason, and one more line says the IDs in the task text could not be resolved. A Google Doc is saved as its Markdown export (`.md`). The directory is removed when the task's session closes (checked after every Run) or the task fails.
 
 ### Upload `.md` task files without converting them
 
@@ -86,7 +86,7 @@ Every request is `POST /proxy/gdrive-queue/<operation>` with a JSON body and `Au
 | Operation | Body | Allowed when |
 | :--- | :--- | :--- |
 | `subfolders` | `parent_id` | `parent_id` is the configured queue root; returns only the four queue folders and `附件` when there is one |
-| `list` | `folder_id` | `folder_id` is one of the four queue folders or `附件` |
+| `list` | `folder_id` | `folder_id` is one of the four queue folders or `附件`; returns every file, following Drive's pages |
 | `meta` | `file_id` | the file sits directly in a queue folder (not `附件`) and is not a folder |
 | `read` | `file_id` | as `meta`, and it is Markdown, text or a Google Doc; at most 2 MiB |
 | `append` | `file_id`, `text` | as `read`; `text` at most 256 KiB |

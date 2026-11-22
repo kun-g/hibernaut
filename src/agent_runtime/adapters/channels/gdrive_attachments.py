@@ -23,11 +23,13 @@ _DRIVE_ID = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
 _ID_CHARS = "A-Za-z0-9_-"
 _UNSAFE_NAME_CHARS = re.compile(r"[/\\\x00-\x1f]")
 _LOG = logging.getLogger(__name__)
+BODY_IDS = ""
 
 
 @dataclass(frozen=True, slots=True)
 class FetchedAttachment:
-    # The reference as the task wrote it (an ID or a name), or the ID found in its body.
+    # The reference as the task wrote it (an ID or a name), the ID found in its body, or BODY_IDS for the body's
+    # IDs as a whole when they could not be resolved.
     ref: str
     name: str = ""
     path: str = ""
@@ -120,11 +122,12 @@ class DriveAttachmentStore:
         try:
             listing = self._client.list_files(folder_id)
         except Exception as exc:  # noqa: BLE001
-            if refs:
-                reason = f"无法列出 {ATTACHMENTS_FOLDER_NAME}/ 目录：{_describe(exc)}"
-                return [FetchedAttachment(ref=r, error=reason) for r in refs]
+            # Without the listing no body ID can be matched, so that gap is reported too, not only the named refs.
             _LOG.warning("Drive task %s: listing %s/ failed: %s", task_file_id, ATTACHMENTS_FOLDER_NAME, exc)
-            return []
+            reason = f"无法列出 {ATTACHMENTS_FOLDER_NAME}/ 目录：{_describe(exc)}"
+            return [FetchedAttachment(ref=r, error=reason) for r in refs] + [
+                FetchedAttachment(ref=BODY_IDS, error=f"{reason}，未能识别正文引用的附件")
+            ]
         chosen, failed = select_attachments(refs, body, listing)
         fetched = [self._fetch_one(task_file_id, ref, meta) for ref, meta in chosen]
         return fetched + failed
@@ -195,6 +198,7 @@ def render_attachment_section(results: Sequence[FetchedAttachment]) -> str:
     if failed:
         lines.append("以下附件没有拿到，任务照常开始：")
         lines.append("")
-        lines.extend(f"- `{r.ref}`：{r.error}" for r in failed)
+        lines.extend(f"- 正文里的 Drive 文件 ID：{r.error}" if r.ref == BODY_IDS else f"- `{r.ref}`：{r.error}"
+                     for r in failed)
         lines.append("")
     return "\n".join(lines).rstrip()

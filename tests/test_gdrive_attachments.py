@@ -34,6 +34,13 @@ class _AttachmentDrive(_FakeDriveClient):
         self.blobs: dict[str, bytes] = {}
         self.refusals: dict[str, DriveProxyError] = {}
         self.downloads: list[str] = []
+        # Set: listing 附件/ fails with it, as a proxy timeout or a 502 would.
+        self.list_error: Exception | None = None
+
+    def list_files(self, folder_id: str) -> list[DriveFileMeta]:
+        if folder_id == ATTACH and self.list_error is not None:
+            raise self.list_error
+        return super().list_files(folder_id)
 
     def add_attachment(self, file_id: str, name: str, content: bytes, *, folder_id: str = ATTACH,
                        mime_type: str = "application/zip") -> None:
@@ -197,6 +204,25 @@ class DriveAttachmentTests(unittest.IsolatedAsyncioTestCase):
         await self.run_once()
         # Neither ID appears as a whole token of a file in 附件/, so there is no 附件 section at all.
         self.assertEqual(self.executor.bodies[0], f"See {OTHER_ID} and {BUNDLE_ID}x for context.")
+        self.assertEqual(self.drive.downloads, [])
+
+    async def test_a_listing_failure_is_reported_for_body_ids_and_each_frontmatter_ref(self) -> None:
+        self.drive.add_attachment(BUNDLE_ID, "b.zip", BUNDLE_BYTES)
+        self.drive.list_error = DriveProxyError("list", 502, "Drive returned HTTP 503")
+        self.drive.add_file("task-1", "task.md", f"Use {BUNDLE_ID}.")
+        self.drive.add_file("task-2", "task2.md", f"---\nattachments: b.zip, other.zip\n---\nUse {BUNDLE_ID}.",
+                            modified_time="2026-11-22T03:01:00Z")
+        executor = _RecordingExecutor(close=False)
+        self.build(executor=executor)
+        await self.run_once()
+
+        only_body, with_refs = executor.bodies
+        failure = "无法列出 附件/ 目录：Drive 代理拒绝（HTTP 502）：Drive returned HTTP 503"
+        self.assertIn("## 附件", only_body)
+        self.assertIn(f"- 正文里的 Drive 文件 ID：{failure}，未能识别正文引用的附件", only_body)
+        for ref in ("b.zip", "other.zip"):
+            self.assertIn(f"- `{ref}`：{failure}", with_refs)
+        self.assertIn(f"- 正文里的 Drive 文件 ID：{failure}，未能识别正文引用的附件", with_refs)
         self.assertEqual(self.drive.downloads, [])
 
     async def test_duplicate_names_must_be_referenced_by_id(self) -> None:

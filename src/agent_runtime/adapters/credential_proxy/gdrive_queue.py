@@ -193,24 +193,33 @@ class GoogleDriveHTTPClient:
     def _get_json(self, url: str) -> Any:
         return json.loads(self._http("GET", url, self._auth_headers(), None).decode("utf-8"))
 
+    def _list_all(self, params: Mapping[str, str]) -> list[Any]:
+        # Drive answers at most pageSize files at a time; the rest sit behind nextPageToken.
+        items: list[Any] = []
+        token = ""
+        while True:
+            query = dict(params, pageSize="100", **({"pageToken": token} if token else {}))
+            data = self._get_json(f"{self._files_url}?{urllib.parse.urlencode(query)}")
+            items.extend(data.get("files", []))
+            token = str(data.get("nextPageToken") or "")
+            if not token:
+                return items
+
     def find_subfolders(self, parent_id: str) -> dict[str, str]:
         query = f"'{parent_id}' in parents and mimeType = '{_GOOGLE_FOLDER_MIME}' and trashed = false"
-        params = urllib.parse.urlencode({"q": query, "fields": "files(id,name)", "pageSize": "100"})
-        data = self._get_json(f"{self._files_url}?{params}")
-        return {str(item["name"]): str(item["id"]) for item in data.get("files", [])}
+        items = self._list_all({"q": query, "fields": "nextPageToken,files(id,name)"})
+        return {str(item["name"]): str(item["id"]) for item in items}
 
     def list_files(self, folder_id: str) -> list[DriveFileMeta]:
         query = f"'{folder_id}' in parents and mimeType != '{_GOOGLE_FOLDER_MIME}' and trashed = false"
-        params = urllib.parse.urlencode(
+        items = self._list_all(
             {
                 "q": query,
-                "fields": "files(id,name,mimeType,modifiedTime,parents,size)",
+                "fields": "nextPageToken,files(id,name,mimeType,modifiedTime,parents,size)",
                 "orderBy": "modifiedTime asc",
-                "pageSize": "100",
             }
         )
-        data = self._get_json(f"{self._files_url}?{params}")
-        return [_meta_from_drive(item) for item in data.get("files", [])]
+        return [_meta_from_drive(item) for item in items]
 
     def get_file_meta(self, file_id: str) -> DriveFileMeta:
         params = urllib.parse.urlencode({"fields": "id,name,mimeType,modifiedTime,parents,size"})

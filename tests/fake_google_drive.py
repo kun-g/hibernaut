@@ -191,7 +191,13 @@ class FakeGoogleDrive:
                             for it in drive.items.values()
                             if parent in it.parents and (it.mime_type == FOLDER_MIME) == want_folders
                         ]
-                        self._json(200, {"files": files})
+                        # Paged like Drive: at most pageSize per response, the rest behind nextPageToken.
+                        size = int(query.get("pageSize", ["100"])[0])
+                        start = int(query.get("pageToken", ["0"])[0])
+                        page: dict[str, Any] = {"files": files[start : start + size]}
+                        if start + size < len(files):
+                            page["nextPageToken"] = str(start + size)
+                        self._json(200, page)
                         return
                     parts = parsed.path.split("/")
                     if len(parts) >= 5 and parts[:4] == ["", "drive", "v3", "files"]:

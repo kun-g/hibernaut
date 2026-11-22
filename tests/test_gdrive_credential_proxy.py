@@ -282,6 +282,17 @@ class DriveCredentialProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m.file_id for m in self.client.list_files("dir-attach")], ["att-zip"])
         self.assertIn("附件 = dir-attach (1 files)", self.guard.check())
 
+    def test_listing_follows_every_page_of_a_large_folder(self) -> None:
+        # Drive returns at most pageSize files per response; the newest uploads sit past the first page.
+        for i in range(250):
+            self.google.add_blob(f"att-{i:03d}", f"file-{i:03d}.zip", b"x", "dir-attach")
+        listed = self.client.list_files("dir-attach")
+        self.assertEqual(len(listed), 250)
+        self.assertEqual(listed[-1].name, "file-249.zip")
+        self.assertIn("附件 = dir-attach (250 files)", self.guard.check())
+        pages = [p for _m, p in self.google.requests if p.startswith("/drive/v3/files?") and "dir-attach" in p]
+        self.assertTrue(any("pageToken=" in p for p in pages), pages)
+
     def test_client_errors_carry_status_and_reason_without_upstream_bodies(self) -> None:
         with self.assertRaisesRegex(DriveProxyError, "403.*outside the task queue"):
             self.client.list_files("dir-private")
