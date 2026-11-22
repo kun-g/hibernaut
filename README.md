@@ -115,6 +115,6 @@ src/switchboard/  # 独立包，不依赖 agent_runtime
 ```bash
 pip install -e ".[dev]"
 lint-imports   # 分层与反向依赖检查
-pytest -v      # 契约、并发、端到端测试
+pytest -v      # 契约、并发、端到端测试（本地快检可用 pytest -n auto $(python scripts/select_tests.py)）
 pyright        # core/、engine/、switchboard/ 的 strict 类型检查
 ```
