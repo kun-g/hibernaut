@@ -141,7 +141,7 @@
 
 ## 6. 三道防腐化门禁与术语基准
 
-提交前与 `.github/workflows/ci.yml` 强制执行：`lint-imports`、`pytest -v`、`pyright`（strict，覆盖 `agent_runtime/core`、`agent_runtime/engine` 与 `switchboard`）。PR 上由 `scripts/select_tests.py` 按 Python AST 反向依赖图与资源映射仅跑受影响测试（加 `full-ci` 标签或合入 `main` 时跑全量兜底）。
+提交前与 `.github/workflows/ci.yml` 强制执行：`lint-imports`、`pytest -v`、`pyright`（strict，覆盖 `agent_runtime/core`、`agent_runtime/engine`、`switchboard` 与 `ccpeer`）。PR 上由 `scripts/select_tests.py` 按 Python AST 反向依赖图与资源映射仅跑受影响测试（加 `full-ci` 标签或合入 `main` 时跑全量兜底）。
 
 术语定义以 [`docs/glossary.md`](glossary.md) 为唯一基准，本文不再重复定义。以下是术语在当前实现中的落地约束：
 
@@ -213,3 +213,14 @@
 ## 8. 架构决策记录（ADR）
 
 - [ADR-0001：跨项目协议采用 JSON Schema（暂不引入 Protobuf）](adr/0001-cross-project-protocol-schema.md)
+
+## 9. ccpeer：与本机 Claude Code 会话收发消息
+
+`src/ccpeer/` 是与 `agent_runtime`、`switchboard` 并列的独立包，只依赖标准库；`.importlinter` 契约 `ccpeer-zero-business-deps` 禁止它导入 `agent_runtime`、`switchboard`、`taskboard`、`runner`、`memory_hub`，`tests/test_ccpeer.py` 另用 AST 检查。它实现 Claude Code 2.1.x 的跨会话消息协议（逆向所得，验证于 `VERIFIED_CLAUDE_CODE_VERSIONS` = 2.1.316 / 2.1.330），供 Hibernaut 与 Orca 终端里的会话直接通信；本包尚未接入 daemon。
+
+- **会话发现**（`sessions.py`）：扫描各配置目录的 `sessions/*.json`（默认 `~/.claude`，加上 `$CLAUDE_CONFIG_DIR`；可传多个），只保留 pid 存活且 `messagingSocketPath` 存在的登记，同一 pid 出现在多个目录时合并。`resolve()` 按 pid、`sessionId`、会话名（精确匹配）或 `uds:` 地址 / socket 路径解析，匹配多个时抛 `AmbiguousTarget` 并列出候选。
+- **帧格式**（`protocol.py`）：连上目标 socket 后先写 `{"type":"auth","token":<peerToken>}`（密钥在 `<pid>.<sha256(socket)>.key`），再写一行 `{"msgV":1,"msg_id","type":"user","message":{"role":"user","content":<信封>},"priority":"next","from"}`。信封是 `<cross-session-message from="uds:…" from-name="…" from-mode="…">\n正文\n</cross-session-message>`；Claude Code 用锚定首尾的贪婪正则解析，所以正文原样放入、不转义、不 strip，正文里出现闭合标签也不会截断。2.1.330 实测：82 KB 中英文混排正文送达后，接收方会话转录里只有正文内的 `</cross-session-message>` 被 Claude Code 自己记成 `<\/cross-session-message>`，其余逐字节一致。`from-mode` 只接受 `bypass` / `prompting`，默认 `prompting`（Orca 里 `dontAsk` 会话对外声明的模式，声明一致时不被扣留）。
+- **发送**（`sender.send()`）：库函数直接写 socket，不起子进程。会话登记的 `peerProtocol` 不在 `SUPPORTED_PEER_PROTOCOLS`（当前 `{1}`）时先抛 `UnsupportedProtocol`，报出对方 Claude Code 版本；socket 不存在抛 `TargetNotFound`，拒绝连接或写到一半被断抛 `PeerRefused`，连接或写入超时抛 `SendTimeout`。返回 `SendResult(msg_id, pid, name, session_id, socket_path, bytes_sent)`，只代表本地写入完成，不代表对方已读或已回复。
+- **接收端**（`receiver.py`，`python -m ccpeer serve --as <名字>`）：前台进程，不 fork、不绑定 owner、无空闲超时，由 launchd `KeepAlive` 监督（`deploy/ccpeer/`）。在每个配置目录写 `standalone: true` 的登记与密钥（0600），监听 `/tmp/cc-socks/<pid>.sock`（0600），每 `--heartbeat` 秒重写登记以自愈；SIGTERM / SIGINT / SIGHUP 时清理登记、密钥、socket 后退出 0。认证行 token 不符的连接整条丢弃。同名冲突：存活且 socket 可连的同名会话在先则拒绝启动（退出码 2）；残留的 standalone 登记（进程已死或 socket 不通）删除后接管；同一状态目录另有 `flock` 文件锁。
+- **收件箱**（`inbox.py`）：`~/.ccpeer/<名字>/inbox.jsonl` 存消息（`msg_id`、`ts`、`type`、`from_addr`、`from_name`、`from_mode`、`body`；无信封的消息另带 `unwrapped: true`），`control.jsonl` 单列控制回执（如 `held`）。按 `msg_id` 去重（跨重启有效），每条记录一次 `write` 加 `fsync`；接收端启动时截掉被杀时写了一半的尾行。`JsonlLog.read(cursor)` 只返回完整行，游标是字节偏移或 `msg_id`，返回下一游标；偏移不在行边界或超出文件、`msg_id` 不存在时抛 `CursorError`。读取方保存游标，接收端重启后续读不丢不重。
+- **测试**：`tests/test_ccpeer.py`（信封与 Claude Code 字节级一致、长正文与特殊标签往返、多目录发现与死进程/残留 socket、解析歧义、三类发送错误、协议版本拒绝、收件箱游标与断尾修复、launchd 模板）；`tests/test_ccpeer_receiver.py` 起真实接收端进程，由 `FakeSession` 按 Claude Code 帧格式回复，覆盖「发送 → 回复 → 收件箱可读」、`held` 分流、错误 token 丢弃、SIGKILL 后重启接管与游标续读、同名拒绝、登记自愈。
