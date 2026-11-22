@@ -2,6 +2,8 @@
 
 本文档整合原基准设计方案与已落地的全部架构演进，作为 `kun-g/hibernaut` 仓库内唯一随代码同步演进的最新架构说明（Google Drive 原基准文档《Always-on Agent 整洁架构设计方案（Task 交接文档）》保持只读存档）。参考原文：[Building always-on agents (Anthropic)](https://claude.com/resources/articles/building-always-on-agents)。
 
+术语（Event Inbox、Inbox、`inbox_id`、Session、`work_key`、Runner、Executor 等）以 [`docs/glossary.md`](glossary.md) 为唯一基准。
+
 ## 1. 核心运行心智：休眠—唤醒周期
 
 常驻型 Agent 绝大多数时间处于休眠状态（**Asleep, no tokens spent**），仅在外部事件或到期定时器到达时短暂唤醒执行一轮工作（**Run**），结束后状态落盘（**Stored state**）继续休眠。
@@ -117,18 +119,16 @@
 - **HTTP 入站与 SQLite 并发**：`WebhookHTTPServer`（`ThreadingHTTPServer`，`request_queue_size=128`）每请求一线程；`shutdown()` 等待在途请求全部写完 Inbox 后返回，Worker 停止与配置热加载据此排空。`SQLiteDatabase` 只有一条连接，所有语句经同一把可重入锁串行；写操作走 `transaction()`（`BEGIN IMMEDIATE`），去重、租约等先读后写在线程间和共享同一文件的进程间保持原子；租约时钟在拿到写锁后读取，等锁时间不计入 TTL；`mark_done()` 按 SQLite 参数上限分段更新；文件库开启 WAL 与 `busy_timeout`。回收 worktree 时，`claim_for_reclaim()` 以读到的 `updated_at` 做比较并交换：进行中的 `reclaiming` 认领是排他的，只有超过 `reclaim_stale_after_seconds`（默认 600 秒，认领方已崩溃）的认领才可被接管；删除期间心跳线程定期续期认领（遇到临时的 `SQLITE_BUSY`/`SQLITE_LOCKED` 缩短间隔重试，不退出），慢删除不会被当作过期而被接管；删除成功后 `finish_reclaim()` 同样按认领做比较并交换，认领已失效时不删除被他人重新登记的记录；删除失败时 `release_reclaim()` 恢复原状态，可直接重试。
 - **`NewEventPolicy` 三策略**：`defer`（默认，推迟到下一轮）、`fold`（回合间隙通过 `poll_folded_events()` 增量注入同会话/同关联键事件并统一 `mark_done()`）、`interrupt`（安全取消当前 Run/CLI 子进程，绝不向 Outbox 写半成品，原批次保持 `pending` 与新事件同租约合并重启）。
 
-## 6. 三道防腐化门禁与核心词汇表（Glossary）
+## 6. 三道防腐化门禁与术语基准
 
 提交前与 `.github/workflows/ci.yml` 强制执行：`lint-imports`、`pytest -v`、`pyright`（strict，覆盖 `agent_runtime/core`、`agent_runtime/engine` 与 `switchboard`）。
 
-| 术语 | 精确定义 | 范围 / 约束 |
-| :--- | :--- | :--- |
-| **Event Inbox** | 全局共享的物理事件表（SQLite `event_inbox`） | 全局 1 套，存放所有 `inbox_id` 的事件 |
-| **Inbox / `inbox_id`** | 逻辑并发队列（Actor Mailbox）及其一等路由键 / `worker_leases` 主键 | 同分区串行、跨分区并发；禁跨 `inbox_id` 共享同一本地代码目录；经项目的 `inbox_id` 规则（精确 ID 或 `re:` 正则）解析到至多一个项目，多个 inbox 可属同一项目，但各自持有 worktree |
-| **Event** | 进入 Event Inbox 的输入信封（4 态 `pending` / `processing` / `done` / `failed`，重复标 `dropped`；认领计数 `attempts` 与 `last_error` 只存于 L3 `event_inbox` 内部列，跨重启保留，供毒丸止血与排障） | 必属某个 `inbox_id`，执行前立即 `bind_session()`；抢锁先恢复孤儿 `processing` |
-| **`session_id`** | 隶属于某个 `inbox_id` 的跨 Run 对话转录与 `Suspend` 断点上下文单元（4 态 `active` / `suspended` / `archived` / `closed`） | 一个 `inbox_id` 下可有多个 `session_id`，绑定 `executor_id` / `executor_session_id` / `work_key`，委派出的子会话另记 `parent_session_id`；轮换标 `archived`（新会话继承 `parent_session_id`），结案标 `closed` 且引用归零触发回收 |
-| **`correlation_key`** | 外部业务实体的确定性关联键（如 `github:kun-g/hibernaut#42`、`feishu:<chat>:<thread>`） | 经 `SessionStorePort.find_by_correlation_key()` 映射到当前活跃 `session_id`，同时作为 `workspaces` 表动态 worktree 复用键 |
-| **Run / Lease** | 单次唤醒执行周期 / 以 `inbox_id` 为主键的限时互斥租约 | `Suspend` 立即释放租约；进程崩溃后租约到期自动接管 |
+术语定义以 [`docs/glossary.md`](glossary.md) 为唯一基准，本文不再重复定义。以下是术语在当前实现中的落地约束：
+
+- **Inbox / `inbox_id`**：经项目的 `inbox_id` 规则（精确 ID 或 `re:` 正则）解析到至多一个项目；多个 inbox 可属同一项目，但各自持有 worktree。
+- **Event**：认领计数 `attempts` 与 `last_error` 只存于 L3 `event_inbox` 内部列，跨重启保留，供毒丸止血与排障；执行前立即 `bind_session()`；抢锁先恢复孤儿 `processing`。
+- **`session_id`**：委派出的子会话另记 `parent_session_id`；轮换标 `archived`（新会话继承 `parent_session_id`），结案标 `closed` 且引用归零触发回收。
+- **`correlation_key`**：同时作为 `workspaces` 表动态 worktree 复用键。
 
 ## 7. Switchboard（Phase 1）：外部事件归一化交换机
 

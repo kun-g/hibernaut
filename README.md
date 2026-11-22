@@ -4,7 +4,8 @@ Clean Architecture (L0–L3) Python runtime for **Always-on Agents** built aroun
 
 > Asleep by default (no tokens spent), wakes only when events, polled GitHub Issues, MCP tool calls, or timers arrive, runs in isolated dynamic worktrees, and exits cleanly with explicit `Silent | Emit | Suspend` outcomes.
 
-- Full up-to-date architecture & glossary: [`docs/architecture.md`](docs/architecture.md)
+- Full up-to-date architecture: [`docs/architecture.md`](docs/architecture.md)
+- Glossary (single source of truth for terms): [`docs/glossary.md`](docs/glossary.md)
 - Contributor & coding-agent rules: [`AGENTS.md`](AGENTS.md)
 - Declarative config template: [`hibernaut.example.toml`](hibernaut.example.toml)
 
