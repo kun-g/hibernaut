@@ -99,7 +99,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 | [`AGENTS.md`](AGENTS.md) | 开发规范与提交门禁 |
 | [`docs/dispatch/`](docs/dispatch) | 派单模板：SDE 任务（`/events`、Drive）、独立评审 |
 | [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md) | Drive 队列凭据代理的安装与维护 |
-| [`deploy/switchboard/`](deploy/switchboard/README.md) | Switchboard 公网 VPS 容器部署（Docker Compose + Caddy 自动 TLS）、Hibernaut 配对、冒烟验收、灰度切流与回滚 |
+| [`deploy/switchboard/`](deploy/switchboard/README.md) | Switchboard 公网 VPS 容器部署（Docker Compose + Caddy 自动 TLS，或接入 Dokploy / Traefik 等已有反向代理）、Hibernaut 配对、冒烟验收、灰度切流与回滚 |
 | [`docs/adr/`](docs/adr) | 架构决策记录 |
 
 ## 开发
