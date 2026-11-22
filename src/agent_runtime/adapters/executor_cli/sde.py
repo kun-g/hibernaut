@@ -57,12 +57,14 @@ from agent_runtime.adapters.executor_cli.reviewer import (
 )
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
 from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
-from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Suspend, new_id
+from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Silent, Suspend, new_id
 from agent_runtime.core.ports import RunCapabilities
 
 SDE_ROLE = "sde"
 SDE_OPTION_KEYS = frozenset({"review", "reviewer", "max_review_rounds"})
 _CHECKPOINT_KEY = "sde"
+# Sources whose events carry no task of their own (the GitHub webhook keeps a comment's payload as GitHub sent it).
+_FOLLOW_UP_SOURCES = frozenset({"github:issue_comment"})
 _DEV_TOOLS = ("Read", "Grep", "Glob", "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash")
 # Force-pushing rewrites shared branch history and is always denied. A reviewer is its own task, never a subagent
 # the developer starts.
@@ -356,6 +358,9 @@ class SDEExecutor:
                 await asyncio.to_thread(self._worktrees.assert_writable, inbox_id=state.inbox_id,
                                         work_key=state.work_key, workdir=state.workdir)
             else:
+                if all(e.source in _FOLLOW_UP_SOURCES for e in targets) and not _task_text(targets):
+                    # A comment only follows up a task waiting for a person; with none waiting it starts nothing.
+                    return Silent(executor_session_id=native)
                 state = await self._new_state(events, targets, session)
                 prompt = await self._first_prompt(state, caps)
             return await self._run(session_id, native, state, caps, prompt, approved_launch=approved_launch)
@@ -921,14 +926,15 @@ def _validate_report(raw: object) -> dict[str, Any]:
 
 
 def _task_text(events: Sequence[Event]) -> str:
-    # requirements or text; a GitHub issue or Drive task carries title and body instead.
+    # requirements or text; a GitHub issue or Drive task carries title and body instead (the issue adapters lift
+    # them to the top level), and an issue with an empty body is its title alone.
     parts: list[str] = []
     for evt in events:
         text = join_text([evt], ("requirements", "text"))
-        body, title = evt.payload.get("body"), evt.payload.get("title")
-        if not text and isinstance(body, str) and body.strip():
-            heading = f"# {title.strip()}\n\n" if isinstance(title, str) and title.strip() else ""
-            text = heading + body.strip()
+        if not text:
+            title, body = (evt.payload.get(k) for k in ("title", "body"))
+            heading = f"# {title.strip()}" if isinstance(title, str) and title.strip() else ""
+            text = "\n\n".join(p for p in (heading, body.strip() if isinstance(body, str) else "") if p)
         if text:
             parts.append(text)
     return "\n\n".join(parts)

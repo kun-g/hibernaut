@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from agent_runtime.adapters.channels.github_issue import task_fields
 from agent_runtime.engine.handler import EventHandler
 
 PollMode = Literal["gh", "api"]
@@ -119,6 +120,7 @@ class GitHubIssuePoller:
                     external_id=external_id,
                     correlation_key=correlation_key,
                     payload={
+                        **task_fields(issue),
                         "repository": {"full_name": target.repo},
                         "issue": {
                             "number": number,

@@ -23,6 +23,10 @@ class Router:
     def __init__(self, routes: Mapping[str, tuple[str, ...]] = DEFAULT_ROUTES) -> None:
         self._routes = dict(routes)
 
+    @classmethod
+    def from_config(cls, config: RoutingConfig) -> Router:
+        return cls({**DEFAULT_ROUTES, **config.event_consumers})
+
     def resolve(self, event: CanonicalEvent) -> tuple[str, ...]:
         return self._routes.get(event.event_type, ())
 

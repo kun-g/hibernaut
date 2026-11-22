@@ -5,7 +5,7 @@ import hmac
 from collections.abc import Mapping
 from typing import Any
 
-from switchboard.addressing import github_correlation_key
+from switchboard.addressing import GITHUB_OUTBOUND_MARKER, github_correlation_key
 from switchboard.envelope import CanonicalEvent, EventType, normalize_utc, utc_now
 from switchboard.inbound._util import ignored, items, lower_headers, obj, parse_json_object, reject, text
 from switchboard.pipeline import Clock
@@ -23,11 +23,19 @@ class GitHubInboundAdapter:
         credentials: CredentialBrokerPort,
         scopes: ScopeResolver,
         *,
+        require_label: str | None = None,
         clock: Clock = utc_now,
     ) -> None:
         self._credentials = credentials
         self._scopes = scopes
+        self._require_label = require_label.lower() if require_label else None
         self._clock = clock
+
+    def _missing_label(self, item: Mapping[str, Any]) -> bool:
+        if self._require_label is None:
+            return False
+        names = {text(obj(label).get("name")).lower() for label in items(item.get("labels"))}
+        return self._require_label not in names
 
     def verify_signature(self, raw_body: bytes, signature: str | None) -> bool:
         secret = self._credentials.get_webhook_secret("github")
@@ -75,6 +83,8 @@ class GitHubInboundAdapter:
         # Issues events also fire for PRs; such deliveries are reported once via pull_request.
         if not is_pr and "pull_request" in item:
             return ignored("issue event for a pull request")
+        if self._missing_label(item):
+            return ignored(f"{github_event} #{number} lacks label {self._require_label}")
         event_type: EventType
         if action in _OPENED_ACTIONS:
             event_type = "work.opened"
@@ -137,6 +147,10 @@ class GitHubInboundAdapter:
         # Our own outbound comments come back as webhooks; dropping bot authors breaks the loop.
         if text(sender.get("type")) == "Bot" or text(obj(comment.get("user")).get("type")) == "Bot":
             return ignored("bot comment")
+        if GITHUB_OUTBOUND_MARKER in text(comment.get("body")):
+            return ignored("switchboard outbound comment")
+        if self._missing_label(item):
+            return ignored(f"{github_event} on #{item.get('number')} lacks label {self._require_label}")
         comment_id = comment.get("id")
         number = item.get("number")
         if comment_id is None or number is None:

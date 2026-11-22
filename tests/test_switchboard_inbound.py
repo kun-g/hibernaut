@@ -4,6 +4,7 @@ import json
 import unittest
 from typing import Any
 
+from switchboard.addressing import GITHUB_OUTBOUND_MARKER
 from tests.switchboard_support import (
     FEISHU_TOKEN,
     Harness,
@@ -125,6 +126,23 @@ class GitHubInboundTests(unittest.TestCase):
         assert event is not None
         self.assertEqual(event.metadata["work_kind"], "pull_request")
 
+    def test_comment_carrying_the_outbound_marker_is_dropped(self) -> None:
+        # Comments Switchboard posts with a user token come back as User-authored webhooks.
+        comment = {
+            "action": "created",
+            "issue": {"number": 42, "title": "t"},
+            "comment": {
+                "id": 557,
+                "body": f"**Done**\n\nPR opened\n\n{GITHUB_OUTBOUND_MARKER}",
+                "user": {"login": "kun", "type": "User"},
+            },
+            "repository": {"full_name": "kun-g/hibernaut"},
+            "sender": {"login": "kun", "type": "User"},
+        }
+        status, body = send_github(self.h.url, comment, event="issue_comment", delivery="c3")
+        self.assertEqual((status, body["status"]), (200, "ignored"))
+        self.assertEqual(self.h.board.store.count_inbound(), 0)
+
     def test_unlisted_events_are_ignored(self) -> None:
         status, body = send_github(self.h.url, {"ref": "main"}, event="push")
         self.assertEqual((status, body["status"]), (200, "ignored"))
@@ -172,6 +190,58 @@ class GitHubInboundTests(unittest.TestCase):
 
         with urllib.request.urlopen(f"{self.h.url}/healthz", timeout=5) as resp:
             self.assertEqual(json.loads(resp.read()), {"status": "ok"})
+
+
+class GitHubRequiredLabelTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.h: Harness = make_harness(github={"require_label": "Hibernaut"})
+
+    def tearDown(self) -> None:
+        self.h.close()
+
+    def _labeled(self, payload: dict[str, Any], *names: str) -> dict[str, Any]:
+        item = payload.get("issue") or payload["pull_request"]
+        item["labels"] = [{"name": name} for name in names]
+        return payload
+
+    def test_unlabeled_issue_is_ignored(self) -> None:
+        status, body = send_github(self.h.url, issue_payload())
+        self.assertEqual((status, body["status"]), (200, "ignored"))
+        self.assertEqual(self.h.board.store.count_inbound(), 0)
+
+    def test_labeled_issue_is_accepted_case_insensitively(self) -> None:
+        status, body = send_github(self.h.url, self._labeled(issue_payload(), "P1", "hibernaut"))
+        self.assertEqual((status, body["status"]), (202, "accepted"))
+
+    def test_removing_the_label_stops_updates(self) -> None:
+        status, body = send_github(self.h.url, self._labeled(issue_payload("unlabeled"), "P1"))
+        self.assertEqual((status, body["status"]), (200, "ignored"))
+
+    def test_comments_follow_the_label_of_their_issue_or_pr(self) -> None:
+        comment: dict[str, Any] = {
+            "action": "created",
+            "issue": {"number": 42, "title": "t", "labels": [{"name": "P1"}]},
+            "comment": {"id": 600, "body": "go", "user": {"login": "stranger", "type": "User"}},
+            "repository": {"full_name": "kun-g/hibernaut"},
+            "sender": {"login": "stranger", "type": "User"},
+        }
+        status, body = send_github(self.h.url, comment, event="issue_comment", delivery="c-unlabeled")
+        self.assertEqual((status, body["status"]), (200, "ignored"))
+
+        labeled = self._labeled(json.loads(json.dumps(comment)), "hibernaut")
+        labeled["comment"]["id"] = 601
+        status, body = send_github(self.h.url, labeled, event="issue_comment", delivery="c-labeled")
+        self.assertEqual((status, body["status"]), (202, "accepted"))
+
+        review: dict[str, Any] = {
+            "action": "submitted",
+            "pull_request": {"number": 7, "title": "PR", "labels": []},
+            "review": {"id": 700, "body": "lgtm", "state": "APPROVED", "user": {"login": "kun", "type": "User"}},
+            "repository": {"full_name": "kun-g/hibernaut"},
+            "sender": {"login": "kun", "type": "User"},
+        }
+        status, body = send_github(self.h.url, review, event="pull_request_review", delivery="r-unlabeled")
+        self.assertEqual((status, body["status"]), (200, "ignored"))
 
 
 class UnmatchedPolicyTests(unittest.TestCase):
