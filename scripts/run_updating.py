@@ -44,10 +44,10 @@ def candidate() -> tuple[str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the daemon and fast-forward from origin/main. Extra flags go to the daemon.", allow_abbrev=False)
-    parser.add_argument("--interval", type=int, default=300, help="seconds between checks (default: 300)")
+    parser.add_argument("--interval", type=float, default=300, help="seconds between checks (default: 300)")
     args, daemon_args = parser.parse_known_args()
-    if args.interval < 1:
-        parser.error("--interval must be at least one second")
+    if args.interval <= 0:
+        parser.error("--interval must be positive")
 
     stopping = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):

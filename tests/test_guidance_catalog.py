@@ -1,5 +1,8 @@
+import atexit
+import functools
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -68,8 +71,11 @@ CITES_VERSIONING = {
 }
 
 
-def make_project(root: Path, name: str = "proj") -> Path:
-    repo = root / name
+@functools.lru_cache(maxsize=1)
+def _template_project() -> Path:
+    tmp = tempfile.TemporaryDirectory(prefix="guidance_proj_tmpl_")
+    atexit.register(tmp.cleanup)
+    repo = Path(tmp.name) / "proj"
     repo.mkdir(parents=True)
     git(repo, "init", "-q", "-b", "main")
     git(repo, "config", "user.email", "t@example.invalid")
@@ -85,6 +91,12 @@ def make_project(root: Path, name: str = "proj") -> Path:
         (repo / rel).write_text(text)
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "base")
+    return repo
+
+
+def make_project(root: Path, name: str = "proj") -> Path:
+    repo = root / name
+    shutil.copytree(_template_project(), repo)
     return repo
 
 

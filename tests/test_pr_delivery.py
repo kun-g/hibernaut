@@ -1,6 +1,9 @@
+import atexit
 import dataclasses
+import functools
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,19 +59,43 @@ class TestVersionRules(unittest.TestCase):
                 parse_delivery("d", raw, repo="o/r")
 
 
+@functools.lru_cache(maxsize=1)
+def _delivery_template() -> tuple[Path, Path]:
+    tmp = tempfile.TemporaryDirectory(prefix="delivery_tmpl_")
+    atexit.register(tmp.cleanup)
+    root = Path(tmp.name)
+    bare = root / "remote.git"
+    seed = root / "seed"
+    git(root, "init", "-q", "--bare", "-b", "main", str(bare))
+    git(root, "clone", "-q", str(bare), str(seed))
+    git(seed, "config", "user.email", "t@example.invalid")
+    git(seed, "config", "user.name", "t")
+    (seed / "pkg").mkdir()
+    (seed / VERSION_FILE).write_text('"""pkg"""\n__version__ = "0.4.0"\n')
+    (seed / "calc.py").write_text("def divide(a, b):\n    return a\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-qm", "base")
+    git(seed, "push", "-q", "origin", "main")
+    return bare, seed
+
+
+def _repoint_origin(repo: Path, old_bare: Path, new_bare: Path) -> None:
+    cfg = repo / ".git" / "config"
+    cfg.write_text(cfg.read_text(encoding="utf-8").replace(str(old_bare), str(new_bare)), encoding="utf-8")
+
+
 class DeliveryCase(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        tmpl_bare, tmpl_seed = _delivery_template()
+        self._tmpl_bare = tmpl_bare
+        self._tmpl_seed = tmpl_seed
+        self._main_moved = False
         self.bare = self.root / "remote.git"
-        git(self.root, "init", "-q", "--bare", "-b", "main", str(self.bare))
-        seed = self.clone("seed", None)
-        (seed / "pkg").mkdir()
-        (seed / VERSION_FILE).write_text('"""pkg"""\n__version__ = "0.4.0"\n')
-        (seed / "calc.py").write_text("def divide(a, b):\n    return a\n")
-        git(seed, "add", "-A")
-        git(seed, "commit", "-qm", "base")
-        git(seed, "push", "-q", "origin", "main")
-        self.seed = seed
+        self.seed = self.root / "seed"
+        shutil.copytree(tmpl_bare, self.bare)
+        shutil.copytree(tmpl_seed, self.seed)
+        _repoint_origin(self.seed, tmpl_bare, self.bare)
         self.state_file = self.root / "gh-state.json"
         self.state_file.write_text(json.dumps({"bare": str(self.bare)}))
         gh = self.root / "gh"
@@ -77,7 +104,7 @@ class DeliveryCase(unittest.TestCase):
         self.check_log = self.root / "checks.log"
         self.config = DeliveryConfig(
             repo="o/r", open_pr=True, version_file=VERSION_FILE, title_template="Pkg {version}: {title}",
-            checks=((sys.executable, "-c", f"open({str(self.check_log)!r}, 'a').write('ran\\n')"),),
+            checks=(("/bin/sh", "-c", f'printf "ran\\n" >> "{self.check_log}"'),),
             gh_command=str(gh), ci_poll_seconds=1, ci_timeout_seconds=5,
         )
         self.db = SQLiteDatabase(":memory:")
@@ -86,11 +113,24 @@ class DeliveryCase(unittest.TestCase):
         self.env = {**os.environ, "FAKE_GH_STATE": str(self.state_file), "GH_TOKEN": "leak", "GITHUB_TOKEN": "leak"}
         self.sleeps: list[float] = []
 
+    def _bare_unchanged(self) -> bool:
+        if self._main_moved:
+            return False
+        heads = self.bare / "refs" / "heads"
+        files = [p for p in heads.rglob("*") if p.is_file()]
+        if len(files) != 1 or files[0] != heads / "main":
+            return False
+        return files[0].read_bytes() == (self._tmpl_bare / "refs" / "heads" / "main").read_bytes()
+
     def clone(self, name, branch):
         path = self.root / name
-        git(self.root, "clone", "-q", str(self.bare), str(path))
-        git(path, "config", "user.email", "t@example.invalid")
-        git(path, "config", "user.name", "t")
+        if self._bare_unchanged():
+            shutil.copytree(self._tmpl_seed, path)
+            _repoint_origin(path, self._tmpl_bare, self.bare)
+        else:
+            git(self.root, "clone", "-q", str(self.bare), str(path))
+            git(path, "config", "user.email", "t@example.invalid")
+            git(path, "config", "user.name", "t")
         if branch:
             git(path, "checkout", "-qb", branch)
         return path
@@ -110,6 +150,7 @@ class DeliveryCase(unittest.TestCase):
         git(self.seed, "add", "-A")
         git(self.seed, "commit", "-qm", message)
         git(self.seed, "push", "-q", "origin", "main")
+        self._main_moved = True
 
     def delivery(self, sleep=None, **overrides):
         return PRDelivery(dataclasses.replace(self.config, **overrides), self.store, env=self.env,

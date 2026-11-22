@@ -1,7 +1,10 @@
 import asyncio
+import atexit
+import functools
 import http.client
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import sys
@@ -47,8 +50,11 @@ FIXED = {"calc.py": "def divide(a, b):\n    if b == 0:\n        raise ValueError
 EVIDENCE = "red: test_zero FAILED (ZeroDivisionError)\ngreen: 4 passed; lint-imports ok; pyright 0 errors"
 
 
-def make_base_repo(root: Path) -> Path:
-    repo = root / "repo"
+@functools.lru_cache(maxsize=1)
+def _template_base_repo() -> Path:
+    tmp = tempfile.TemporaryDirectory(prefix="sde_base_tmpl_")
+    atexit.register(tmp.cleanup)
+    repo = Path(tmp.name) / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
     git(repo, "config", "user.email", "t@example.invalid")
@@ -56,6 +62,12 @@ def make_base_repo(root: Path) -> Path:
     (repo / "calc.py").write_text("def divide(a, b):\n    return a\n")
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "base")
+    return repo
+
+
+def make_base_repo(root: Path) -> Path:
+    repo = root / "repo"
+    shutil.copytree(_template_base_repo(), repo)
     return repo
 
 
@@ -582,7 +594,7 @@ class TestSDEDispatchAndHotReload(unittest.TestCase):
             config = load_config(path)
             daemon = build_daemon_from_config(config)
             stop = asyncio.Event()
-            server = asyncio.create_task(serve_configured(path, config, daemon, stop))
+            server = asyncio.create_task(serve_configured(path, config, daemon, stop, reload_interval=0.02))
 
             async def wait_for(check):
                 deadline = time.monotonic() + 20
@@ -593,7 +605,7 @@ class TestSDEDispatchAndHotReload(unittest.TestCase):
                             return
                     except (ConnectionRefusedError, OSError):
                         pass
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.01)
                 self.fail(f"timed out; calls={[c['role'] for c in calls()]} outbox={outbox()} {stderr.getvalue()}")
 
             try:
