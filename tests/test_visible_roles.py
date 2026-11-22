@@ -18,7 +18,7 @@ from agent_runtime.adapters.executor_cli.claude_code import PROXY_PLACEHOLDER_KE
 from agent_runtime.adapters.executor_cli.orca import HANDOFF_SCRIPT, HANDOFF_TOOLS, OrcaVisibleRunner
 from agent_runtime.adapters.executor_cli.reviewer import REVIEW_SCHEMA, CoderReviewerExecutor, worktree_fingerprint
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions
-from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteSessionStoreAdapter
+from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteSessionStoreAdapter, SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.app.config import load_config, parse_config
@@ -119,6 +119,7 @@ class VisibleCase(unittest.IsolatedAsyncioTestCase):
         self.db = SQLiteDatabase(":memory:")
         self.addCleanup(self.db.close)
         self.workspaces = SQLiteWorkspaceStore(self.db)
+        self.tasks = SQLiteTaskMetadataStore(self.db)
         self.bindings = SQLiteTerminalBindingStore(self.db)
         self.runner = OrcaVisibleRunner(bindings=self.bindings, poll_interval=0.02, liveness_interval=0.2,
                                         handoff_root=self.root / "handoff")
@@ -139,7 +140,7 @@ class VisibleCase(unittest.IsolatedAsyncioTestCase):
         return CoderReviewerExecutor(
             profile=ClaudeCodeProfile(name="coder-reviewer", launcher=self.launcher(), model="claude-sonnet-5-5",
                                       effort="medium"),
-            workspaces=self.workspaces, visible=self.runner if visible else None,
+            workspaces=self.workspaces, tasks=self.tasks, visible=self.runner if visible else None,
         )
 
     def sde(self, review=True, timeout=30.0, **overrides):
@@ -150,7 +151,7 @@ class VisibleCase(unittest.IsolatedAsyncioTestCase):
             reviewer=self.reviewer() if review else None,
             worktree_manager=OrcaWorktreeManager(workspace_store=self.workspaces,
                                                  session_store=SQLiteSessionStoreAdapter(self.db), backend="git"),
-            inbox_checkout_map={},
+            inbox_checkout_map={}, tasks=self.tasks,
             visible=self.runner,
         )
 
@@ -191,7 +192,8 @@ class TestVisibleSDE(VisibleCase):
         self.assertEqual(arg(dev_call, "--permission-mode"), "dontAsk")
         self.assertIn("Edit", arg(dev_call, "--allowedTools").split(","))
         self.assertIn("Bash(git push:*)", arg(dev_call, "--disallowedTools"))
-        self.assertIn("failing test", dev_call["prompt"])
+        self.assertIn("failing test", arg(dev_call, "--append-system-prompt"))
+        self.assertIn("Review only", arg(review_call, "--append-system-prompt"))
         self.assertIn("divide must reject a zero divisor", dev_call["prompt"])
         self.assertEqual(arg(dev_call, "--session-id"), outcome.executor_session_id)
         self.assertIn(f"Orca terminal: {dev_handle} (Claude Code session {outcome.executor_session_id})", text)

@@ -122,7 +122,7 @@ class HibernautConfig:
 
 def load_config(path: str | Path) -> HibernautConfig:
     raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
-    return parse_config(raw)
+    return parse_config(raw, base_dir=Path(path).resolve().parent)
 
 
 async def config_changes(
@@ -157,7 +157,7 @@ async def config_changes(
             raw = tomllib.loads(contents.decode("utf-8"))
             if not raw:
                 raise ValueError("empty configuration")
-            config = parse_config(raw)
+            config = parse_config(raw, base_dir=path.resolve().parent)
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
             detail = f": {exc}" if type(exc) is ValueError else ""
             print(
@@ -169,7 +169,8 @@ async def config_changes(
         yield config
 
 
-def parse_config(raw: dict[str, Any]) -> HibernautConfig:
+def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> HibernautConfig:
+    # base_dir anchors relative paths such as role skills; load_config passes the config file's directory.
     rt_raw = raw.get("runtime", {})
     policy = str(rt_raw.get("new_event_policy", "defer"))
     if policy not in ("defer", "fold", "interrupt"):
@@ -236,7 +237,7 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
             extra = (SDE_OPTION_KEYS if role == SDE_ROLE else frozenset[str]()) | ROLE_DEPLOYMENT_KEYS
             profile = parse_profile(
                 str(name), item, role=str(role), launchers=launchers, credential_proxy_url=anthropic_url,
-                extra_keys=extra,
+                extra_keys=extra, base_dir=base_dir,
             )
             options = _sde_options(str(name), item) if role == SDE_ROLE else None
             visible = item.get("visible", True)

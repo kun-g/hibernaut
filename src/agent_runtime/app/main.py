@@ -37,7 +37,8 @@ from agent_runtime.adapters.executor_cli import (
     OrcaWorktreeManager,
     SDEExecutor,
 )
-from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner
+from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, default_transcript_roots
+from agent_runtime.adapters.executor_cli.peer import DeveloperPeerResolver, registry_dirs
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
     RuleBasedDemoLLM,
@@ -53,6 +54,7 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteOutboxAdapter,
     SQLiteSessionStoreAdapter,
     SQLiteTimerAdapter,
+    SQLiteTaskMetadataStore,
     SQLiteWorkspaceStore,
 )
 from agent_runtime.app.config import HibernautConfig, config_changes, load_config
@@ -591,13 +593,22 @@ def build_daemon_from_config(
         # Role executors are rebuilt with each config reload, so the next run uses the new profile and launcher.
         terminal_bindings = SQLiteTerminalBindingStore(daemon.db)
         visible_runner = OrcaVisibleRunner(bindings=terminal_bindings)
+        # An independently dispatched review finds its developer only through bindings this runtime recorded.
+        developer_peers = DeveloperPeerResolver(
+            sessions=daemon.sessions,
+            bindings=terminal_bindings,
+            developer_executors=[name for name, role in config.roles.items() if role.sde is not None],
+            registry=registry_dirs(default_transcript_roots()),
+        )
+        tasks = SQLiteTaskMetadataStore(daemon.db)
 
         def _role_executors(wt_mgr: OrcaWorktreeManager, orca: bool) -> dict[str, ExecutorPort]:
             # Orca worktree projects run roles in visible terminals unless the role sets visible = false.
             # Each SDE run reviews through the reviewer built for the same project and config generation.
             reviewers: dict[str, CoderReviewerExecutor] = {
                 name: CoderReviewerExecutor(profile=role.profile, workspaces=daemon.workspaces,
-                                            visible=visible_runner if orca and role.visible else None)
+                                            visible=visible_runner if orca and role.visible else None,
+                                            peers=developer_peers, tasks=tasks)
                 for name, role in config.roles.items()
                 if role.role == CODER_REVIEWER_ROLE
             }
@@ -612,6 +623,7 @@ def build_daemon_from_config(
                     worktree_manager=wt_mgr,
                     inbox_checkout_map=inbox_checkout_map,
                     visible=visible_runner if orca and role.visible else None,
+                    tasks=tasks,
                 )
             return built
 

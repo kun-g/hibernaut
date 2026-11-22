@@ -6,6 +6,7 @@ from agent_runtime.adapters.storage_sqlite.stores import (
     SQLiteSessionStoreAdapter,
     SQLiteTimerAdapter,
 )
+from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore, TaskMetadata
 from agent_runtime.adapters.storage_sqlite.workspaces import (
     SQLiteWorkspaceStore,
     WorkspaceRecord,
@@ -18,8 +19,10 @@ __all__ = [
     "SQLiteLeaseLockAdapter",
     "SQLiteOutboxAdapter",
     "SQLiteSessionStoreAdapter",
+    "SQLiteTaskMetadataStore",
     "SQLiteTimerAdapter",
     "SQLiteWorkspaceStore",
+    "TaskMetadata",
     "WorkspaceRecord",
     "WorkspaceStatus",
 ]

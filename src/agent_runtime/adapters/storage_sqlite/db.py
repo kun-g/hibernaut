@@ -107,6 +107,17 @@ CREATE TABLE IF NOT EXISTS terminal_bindings (
 
 CREATE INDEX IF NOT EXISTS idx_terminal_bindings_native
     ON terminal_bindings (executor_id, native_session_id);
+
+-- Per-task facts that outlive one session and are read by other executors (keyed like workspaces).
+CREATE TABLE IF NOT EXISTS task_metadata (
+    work_key TEXT PRIMARY KEY,
+    workdir TEXT NOT NULL,
+    guidance_commit TEXT NOT NULL,
+    activities_json TEXT NOT NULL DEFAULT '[]',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 

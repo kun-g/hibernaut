@@ -57,6 +57,10 @@ model = "claude-opus-5-5"       # Claude 模型全名或别名 opus / sonnet / h
 effort = "high"                 # low | medium | high | xhigh | max
 timeout_seconds = 1800.0        # 可见模式下含等人回答的时间
 visible = true                  # worktree_backend = "orca" 的项目在 worktree 内开可交互的 Orca 终端；false 保持 headless
+# 可选：本角色的有序 Skill（本地 SKILL.md 或含该文件的目录；相对路径以本文件所在目录为准，可用 ~）。
+# 省略时用安装包内置的 "builtin:coder-reviewer"；写了则只用所列各项，可把 "builtin:coder-reviewer" 列进去再追加。
+# 正文与资源目录经 --append-system-prompt 传给评审者；只读权限、结论 schema 与契约由程序控制，Skill 改不了。
+# skills = ["builtin:coder-reviewer", "./skills/team-review"]
 
 # SDE 执行器：派单时设 payload.executor_id = "sde"。在任务 worktree 内按测试先行开发，交付实现、红绿测试证据与仓库检查结果。
 # harness / launcher / billing / model / effort 与评审者各自独立配置；review 为运行时开关，保存后下一次执行即使用新值。
@@ -72,6 +76,10 @@ review = true                   # true：送 reviewer 评审，changes_requested
 reviewer = "coder-reviewer"     # review = true 时必须指向 role = "coder-reviewer" 的执行器
 max_review_rounds = 3           # 超过轮数仍未通过则保持待处理（Suspend），批准再修一轮，拒绝则标注未评审交付
 visible = true                  # Orca 项目开发对话在可见终端里续接（存活终端或 --resume）；false 保持 headless
+# 可选：同上，省略时用内置 "builtin:sde"（测试先行）。各角色只读自己这一节的 skills，SDE 内置评审用评审者那一节的。
+# 项目自己的流程不写在这里：放在项目仓库根目录，AGENTS.md 写简短通用约束，guidance.toml 登记各规范文档的路径、适用活动、标签和匹配的文件路径。
+# SDE 按派单 payload 的 activities（优先）或 tags / labels 选规范，评审再按 diff 路径补选；规范一律从任务开始时记录的 commit 读取（见 README「Project Guidance」）。
+# skills = ["builtin:sde", "~/team-skills/release-notes"]
 
 [executors.cursor-agent]
 command = "cursor-agent"
