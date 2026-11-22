@@ -211,6 +211,7 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
         dev_system = self.arg(dev_call, "--append-system-prompt")
         self.assertIn("failing test", dev_system)
         self.assertIn("open a pull request", dev_system)
+        self.assertIn("--delete-branch", dev_system)
         self.assertIn("Never force-push", dev_system)
         self.assertIn("divide must reject a zero divisor", dev_call["prompt"])
         self.assertIn("Edit", self.arg(review_call, "--disallowedTools"))
