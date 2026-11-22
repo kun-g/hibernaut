@@ -50,6 +50,9 @@ class TestOutboxBackoffMigration(unittest.TestCase):
                     );
                     INSERT INTO outbox (message_id, inbox_id, created_at, content, status, attempts, metadata_json)
                     VALUES ('m1', 'i1', '2026-11-01T00:00:00+00:00', 'old reply', 'pending', 1, '{}');
+                    -- The old dispatcher gave up after 3 attempts but left the row pending.
+                    INSERT INTO outbox (message_id, inbox_id, created_at, content, status, attempts, metadata_json)
+                    VALUES ('m_given_up', 'i1', '2026-10-01T00:00:00+00:00', 'stale reply', 'pending', 3, '{}');
                 """)
             for _ in range(2):
                 with closing(SQLiteDatabase(path)) as db:
@@ -59,3 +62,5 @@ class TestOutboxBackoffMigration(unittest.TestCase):
                     self.assertEqual([col["name"] for col in index], ["status", "next_retry_at", "seq"])
                     (msg,) = SQLiteOutboxAdapter(db).fetch_pending()
                     self.assertEqual((msg.message_id, msg.attempts, msg.next_retry_at), ("m1", 1, None))
+                    given_up = db.fetchone("SELECT status, attempts FROM outbox WHERE message_id = 'm_given_up'")
+                    self.assertEqual(tuple(given_up), ("failed", 3))

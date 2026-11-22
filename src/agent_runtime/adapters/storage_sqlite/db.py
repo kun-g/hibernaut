@@ -248,6 +248,9 @@ class SQLiteDatabase:
         if "next_retry_at" not in outbox_cols:
             # Existing rows get NULL, so whatever was pending before the upgrade is due at once.
             conn.execute("ALTER TABLE outbox ADD COLUMN next_retry_at TEXT")
+            # The old dispatcher gave up at 3 attempts but left those rows pending; the new default cap is
+            # higher, so without this they would be resent long after they were abandoned.
+            conn.execute("UPDATE outbox SET status = 'failed' WHERE status = 'pending' AND attempts >= 3")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_outbox_sched
