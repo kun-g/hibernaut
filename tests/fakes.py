@@ -275,11 +275,13 @@ class InMemorySessionStore:
         matches.sort(key=lambda s: s.updated_at, reverse=True)
         return matches[0]
 
-    def count_active_by_work_key(self, work_key: str) -> int:
+    def count_active_by_work_key(self, work_key: str, inbox_id: str | None = None) -> int:
         return sum(
             1
             for s in self._sessions.values()
-            if s.work_key == work_key and s.status in ("active", "suspended")
+            if s.work_key == work_key
+            and s.status in ("active", "suspended")
+            and (inbox_id is None or s.inbox_id == inbox_id)
         )
 
     def list_sessions(

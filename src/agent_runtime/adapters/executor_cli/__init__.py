@@ -20,6 +20,7 @@ from agent_runtime.adapters.executor_cli.worktree import (
     CommandResult,
     OrcaWorktreeManager,
     ReclaimResult,
+    WorkspaceIsolationError,
     derive_worktree_names,
 )
 
@@ -37,5 +38,6 @@ __all__ = [
     "SDE_ROLE",
     "SDEExecutor",
     "SDEOptions",
+    "WorkspaceIsolationError",
     "derive_worktree_names",
 ]

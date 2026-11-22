@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, TextIO
 
 from agent_runtime import __version__
@@ -121,8 +121,11 @@ class MCPServerAdapter:
         worktree_manager: OrcaWorktreeManager | None = None,
         outbox: OutboxPort | None = None,
         bearer_token: str | None = None,
+        worktree_manager_for: Callable[[str | None, str], OrcaWorktreeManager | None] | None = None,
     ) -> None:
         self._handler = handler
+        # (inbox_id or None, work_key) -> the manager of the project that owns that workspace, if any.
+        self._worktree_manager_for = worktree_manager_for
         self._sessions = sessions
         self._workspaces = workspaces
         self._inbox = inbox
@@ -365,10 +368,7 @@ class MCPServerAdapter:
 
         if tool_name == "hibernaut_reclaim_workspace":
             work_key = str(args["work_key"])
-            mgr = self._worktree_manager or OrcaWorktreeManager(
-                workspace_store=self._workspaces,
-                session_store=self._sessions,
-            )
+            mgr = self._manager_for(None, work_key)
             res = mgr.reclaim(work_key, notify_outbox=self._outbox)
             return {
                 "reclaimed": res.reclaimed,
@@ -383,13 +383,10 @@ class MCPServerAdapter:
                 raise ValueError(f"Session not found: {session_id}")
             self._sessions.close_session(session_id)
             work_key = existing.work_key
-            active_refs = self._sessions.count_active_by_work_key(work_key) if work_key else 0
+            active_refs = self._sessions.count_active_by_work_key(work_key, existing.inbox_id) if work_key else 0
             reclaim_payload: dict[str, Any] | None = None
             if work_key and active_refs == 0:
-                mgr = self._worktree_manager or OrcaWorktreeManager(
-                    workspace_store=self._workspaces,
-                    session_store=self._sessions,
-                )
+                mgr = self._manager_for(existing.inbox_id, work_key)
                 res = mgr.reclaim(work_key, notify_outbox=self._outbox, inbox_id=existing.inbox_id)
                 reclaim_payload = {
                     "reclaimed": res.reclaimed,
@@ -405,6 +402,13 @@ class MCPServerAdapter:
             }
 
         raise KeyError(tool_name)
+
+    def _manager_for(self, inbox_id: str | None, work_key: str) -> OrcaWorktreeManager:
+        chosen = self._worktree_manager_for(inbox_id, work_key) if self._worktree_manager_for is not None else None
+        return chosen or self._worktree_manager or OrcaWorktreeManager(
+            workspace_store=self._workspaces,
+            session_store=self._sessions,
+        )
 
     def _ok_response(self, req_id: Any, result: dict[str, Any]) -> dict[str, Any]:
         return {"jsonrpc": "2.0", "id": req_id, "result": result}

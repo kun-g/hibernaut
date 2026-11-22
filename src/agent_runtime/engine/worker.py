@@ -408,7 +408,9 @@ class AgentWorker:
             return None
         self._sessions.close_session(target.session_id)
         if target.work_key and self._on_worktree_reclaim is not None:
-            if self._sessions.count_active_by_work_key(target.work_key) == 0:
+            # Counted within the inbox: another inbox with the same work_key has its own worktree, and the
+            # reclaim callback re-checks whatever its workspace is shared with.
+            if self._sessions.count_active_by_work_key(target.work_key, target.inbox_id) == 0:
                 self._on_worktree_reclaim(target.work_key)
         return target.session_id
 

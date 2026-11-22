@@ -9,7 +9,7 @@ from pathlib import Path
 
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout, last_text, supervise, target_events
-from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
+from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager, WorkspaceIsolationError
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.core.models import (
     Emit,
@@ -62,9 +62,8 @@ class LocalCLIExecutor:
         self._orca_workspace = orca_workspace
         self._visible = visible_runner or OrcaVisibleRunner(bindings=terminal_bindings)
         self._worktree_manager = worktree_manager
-        self._inbox_checkout_map: dict[str, Path] = {
-            k: Path(v).resolve() for k, v in inbox_checkout_map.items()
-        }
+        # Looked up per run: the configured map also answers inboxes matched by a project's pattern.
+        self._inbox_checkout_map = inbox_checkout_map
         merged = dict(DEFAULT_CLI_TEMPLATES)
         if templates:
             merged.update(templates)
@@ -95,19 +94,24 @@ class LocalCLIExecutor:
             or (session.correlation_key if session is not None else None)
             or f"task:{inbox_id}:{events[0].event_id}"
         )
-        primary_checkout = self._inbox_checkout_map.get(inbox_id)
+        configured = self._inbox_checkout_map.get(inbox_id)
+        primary_checkout = Path(configured).resolve() if configured is not None else None
         if explicit_workdir is None and primary_checkout is None:
             return Emit(
                 messages=(f"[LocalCLIExecutor] No primary checkout configured for '{inbox_id}'",),
                 session_id=session_id,
             )
 
-        workdir = await asyncio.to_thread(
-            self._worktree_manager.resolve_workdir,
-            work_key=work_key,
-            primary_checkout=primary_checkout or Path(str(explicit_workdir)),
-            explicit_workdir=explicit_workdir,
-        )
+        try:
+            workdir = await asyncio.to_thread(
+                self._worktree_manager.resolve_workdir,
+                work_key=work_key,
+                primary_checkout=primary_checkout or Path(str(explicit_workdir)),
+                explicit_workdir=explicit_workdir,
+                inbox_id=inbox_id,
+            )
+        except WorkspaceIsolationError as exc:
+            return Emit(messages=(f"[LocalCLIExecutor] refused: {exc}",), session_id=session_id)
 
         executor_name = self._extract_executor(targets) or self._default_executor
         template = self._templates.get(executor_name)
