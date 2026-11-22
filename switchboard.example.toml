@@ -28,7 +28,6 @@ group_require_mention = true
 
 [delivery]
 retry_backoff_seconds = [5, 15, 45, 135, 405]
-max_attempts = 5
 # dead_letter_alert_channel = "feishu"
 # dead_letter_alert_target = "oc_xxx"
 

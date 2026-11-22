@@ -7,7 +7,7 @@ from tests.switchboard_support import MCP_TOKEN, Harness, make_harness, mcp_call
 
 class MCPToolTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.h: Harness = make_harness(delivery={"max_attempts": 1})
+        self.h: Harness = make_harness(delivery={"retry_backoff_seconds": [0]})
 
     def tearDown(self) -> None:
         self.h.close()

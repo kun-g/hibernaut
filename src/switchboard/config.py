@@ -40,7 +40,6 @@ class FeishuConfig:
 @dataclass(frozen=True, slots=True)
 class DeliveryConfig:
     retry_backoff_seconds: tuple[float, ...] = (5, 15, 45, 135, 405)
-    max_attempts: int = 5
     dead_letter_alert_channel: str | None = None
     dead_letter_alert_target: str | None = None
 
@@ -119,7 +118,6 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
         ),
         delivery=DeliveryConfig(
             retry_backoff_seconds=delivery_backoff or _DELIVERY.retry_backoff_seconds,
-            max_attempts=int(delivery.get("max_attempts", _DELIVERY.max_attempts)),
             dead_letter_alert_channel=_optional(delivery.get("dead_letter_alert_channel")),
             dead_letter_alert_target=_optional(delivery.get("dead_letter_alert_target")),
         ),

@@ -64,10 +64,10 @@ class FanOutIsolationTests(unittest.TestCase):
         self.board.worker.run_once()
         self.assertEqual(self._status(e1.event_id, "hibernaut"), ("retry", 2))
 
-        for delay in (15, 45, 135):
+        for delay in (15, 45, 135, 405):
             self.h.clock.advance(delay)
             self.board.worker.run_once()
-        self.assertEqual(self._status(e1.event_id, "hibernaut"), ("dead_letter", 5))
+        self.assertEqual(self._status(e1.event_id, "hibernaut"), ("dead_letter", 6))
         row = self.board.store.get_delivery(e1.event_id, "hibernaut")
         assert row is not None
         self.assertIn("hibernaut unavailable", row.last_error or "")
@@ -75,7 +75,7 @@ class FanOutIsolationTests(unittest.TestCase):
         # Head-of-line: e2 waits behind the dead letter in the same scope.
         self.assertEqual(self._status(e2.event_id, "hibernaut"), ("pending", 0))
         self.assertNotIn(e2.event_id, self.hibernaut_seen)
-        self.assertEqual(self.hibernaut_seen.count(e1.event_id), 5)
+        self.assertEqual(self.hibernaut_seen.count(e1.event_id), 6)
 
         # Other scopes keep flowing.
         e4 = closed_event(4, "proj:b")

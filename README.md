@@ -323,7 +323,7 @@ PYTHONPATH=src python3 -m switchboard.app --config switchboard.toml
 Secrets are read through `CredentialBrokerPort`; the default `EnvCredentialBroker` reads the variables above and nothing goes in the TOML file. Endpoints on one port: `POST /webhooks/github`, `POST /webhooks/feishu`, `POST /mcp` (tools `submit_work`, `post_message`, `decide_approval`, `replay_delivery`) and `GET /healthz`.
 
 - A GitHub redelivery with a new `X-GitHub-Delivery` is still a duplicate: events are deduplicated by business fingerprint (`issue:{repo}#{num}:{action}:{updated_at}`, `pr:...`, `comment:{id}`).
-- A consumer that fails 5 times (backoff 5/15/45/135/405 s) goes to `dead_letter` and an alert is sent to `[delivery] dead_letter_alert_channel/target`; later events for the same consumer and scope wait, other scopes and consumers continue. Replay with the MCP tool `replay_delivery`.
+- A consumer that still fails after the last retry (one retry per `retry_backoff_seconds` entry, default 5/15/45/135/405 s) goes to `dead_letter` and an alert is sent to `[delivery] dead_letter_alert_channel/target`; later events for the same consumer and scope wait, other scopes and consumers continue. Replay with the MCP tool `replay_delivery`.
 - An `execution.reported` event with outcome `suspend` becomes a Feishu approval card at `[outbound] approval_target`. The button click returns a read-only card at once and is recorded as `approval.decided` with the original `correlation_key` (for example `github:kun-g/hibernaut#42`); a second click on the same request is dropped.
 - Phase 1 delivers in-process only. Consumers register with `board.bus.subscribe(consumer_id, handler)`; an unregistered consumer counts as offline and its deliveries stay pending.
 

@@ -256,7 +256,8 @@ class DeliveryWorker:
 
         attempts = row.attempts + 1
         error = outcome.error or outcome.status
-        if attempts >= self._config.max_attempts:
+        # Each backoff entry is one retry; failing after the last one dead-letters.
+        if attempts > len(self._config.retry_backoff_seconds):
             self._store.update_delivery(
                 row.event_id,
                 row.consumer_id,
