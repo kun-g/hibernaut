@@ -201,9 +201,17 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
         # Developer: write tools under an explicit mode; reviewer: its own read-only settings.
         self.assertEqual(self.arg(dev_call, "--permission-mode"), "dontAsk")
         self.assertIn("Edit", self.arg(dev_call, "--allowedTools"))
-        self.assertIn("Bash(git push:*)", self.arg(dev_call, "--disallowedTools"))
+        disallowed = self.arg(dev_call, "--disallowedTools").split(",")
+        for denied in ("Bash(git push --force*)", "Bash(git push * --force*)", "Bash(git push -f)",
+                       "Bash(git push -f *)", "Bash(git push * -f)", "Bash(git push * -f *)", "Bash(git push * +*)"):
+            self.assertIn(denied, disallowed)
+        for allowed_cmd in ("Bash(git push:*)", "Bash(gh pr create:*)", "Bash(gh pr merge:*)"):
+            self.assertNotIn(allowed_cmd, disallowed)
         self.assertEqual((self.arg(dev_call, "--model"), self.arg(dev_call, "--effort")), ("claude-opus-5-5", "high"))
-        self.assertIn("failing test", self.arg(dev_call, "--append-system-prompt"))
+        dev_system = self.arg(dev_call, "--append-system-prompt")
+        self.assertIn("failing test", dev_system)
+        self.assertIn("open a pull request", dev_system)
+        self.assertIn("Never force-push", dev_system)
         self.assertIn("divide must reject a zero divisor", dev_call["prompt"])
         self.assertIn("Edit", self.arg(review_call, "--disallowedTools"))
         self.assertEqual(self.arg(review_call, "--model"), "claude-sonnet-5-5")
