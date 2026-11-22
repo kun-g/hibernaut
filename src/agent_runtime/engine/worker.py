@@ -83,6 +83,7 @@ class AgentWorker:
         project_default_executor: str | None = None,
         global_default_executor: str | None = None,
         on_worktree_reclaim: Callable[[str], object] | None = None,
+        hold: Callable[[Event], str | None] | None = None,
         lease_ttl_seconds: float = 60.0,
         max_retries: int = 2,
         new_event_policy: NewEventPolicy = "defer",
@@ -110,6 +111,7 @@ class AgentWorker:
         self._project_default_executor = project_default_executor
         self._global_default_executor = resolved_global
         self._on_worktree_reclaim = on_worktree_reclaim
+        self._hold = hold
         self._lock = lock
         self._sessions = sessions
         self._lease_ttl_seconds = lease_ttl_seconds
@@ -144,7 +146,7 @@ class AgentWorker:
                 self._inbox.requeue_processing([evt.event_id for evt in orphans])
 
             while True:
-                claimed = self._inbox.claim_pending(inbox_id)
+                claimed = self._claim(inbox_id)
                 if not claimed:
                     break
 
@@ -232,7 +234,7 @@ class AgentWorker:
                             if self._new_event_policy != "fold" or _target_key is None or _has_decision:
                                 return []
                             newly_folded: list[Event] = []
-                            for candidate in self._inbox.fetch_pending(_inbox_id):
+                            for candidate in self._runnable(self._inbox.fetch_pending(_inbox_id)):
                                 if candidate.event_id in _consumed:
                                     continue
                                 cand_session = self._resolve_session(candidate)
@@ -354,6 +356,20 @@ class AgentWorker:
             self._lock.release(inbox_id, self._worker_id)
 
         return reports
+
+    def _claim(self, inbox_id: str) -> list[Event]:
+        if self._hold is None:
+            return self._inbox.claim_pending(inbox_id)
+        # Held events are never claimed: they stay pending with their attempts, session and order untouched,
+        # and the worker returns instead of waiting so the pool slot serves other inboxes.
+        runnable = [evt.event_id for evt in self._runnable(self._inbox.fetch_pending(inbox_id))]
+        return self._inbox.claim_pending(inbox_id, runnable) if runnable else []
+
+    def _runnable(self, events: list[Event]) -> list[Event]:
+        if self._hold is None:
+            return events
+        hold = self._hold
+        return [evt for evt in events if hold(evt) is None]
 
     def _ensure_active_session(
         self,
@@ -508,7 +524,8 @@ class AgentWorker:
     ) -> None:
         while not exec_task.done():
             has_new = any(
-                evt.event_id not in known_ids for evt in self._inbox.fetch_pending(inbox_id)
+                evt.event_id not in known_ids
+                for evt in self._runnable(self._inbox.fetch_pending(inbox_id))
             )
             if has_new:
                 interrupted_flag.set()

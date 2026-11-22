@@ -7,7 +7,7 @@ import os
 import signal
 import sys
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -60,7 +60,7 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteWorkspaceStore,
 )
 from agent_runtime.app.config import HibernautConfig, RoleConfig, config_changes, load_config
-from agent_runtime.app.projects import ProjectRouter
+from agent_runtime.app.projects import ProjectRouter, UnmatchedProjectHold
 from agent_runtime.core.models import NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, RunCapabilities
 from agent_runtime.engine import (
@@ -81,6 +81,7 @@ class AsyncWorkerPool:
         max_concurrency: int = 4,
         on_run_reports: Callable[[list[RunReport]], None] | None = None,
         on_inbox_failed: Callable[[str], None] | None = None,
+        pending_inboxes: Callable[[], Iterable[str]] | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be >= 1")
@@ -88,6 +89,7 @@ class AsyncWorkerPool:
         self._max_concurrency = max_concurrency
         self._on_run_reports = on_run_reports
         self._on_inbox_failed = on_inbox_failed
+        self._pending_inboxes = pending_inboxes
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._queued: set[str] = set()
         self._active: dict[str, AgentWorker] = {}
@@ -167,6 +169,11 @@ class AsyncWorkerPool:
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
         self._loop = asyncio.get_running_loop()
+        if self._pending_inboxes is not None:
+            # Events left pending by an earlier process or config generation (e.g. held for a missing project)
+            # are re-matched once against this generation's rules; nothing re-polls them afterwards.
+            for inbox_id in self._pending_inboxes():
+                self._wake_on_loop(inbox_id)
         tasks = [
             asyncio.create_task(self._worker_loop(idx, stop_event))
             for idx in range(self._max_concurrency)
@@ -704,6 +711,9 @@ def build_daemon_from_config(
                 project = next((p for p in config.projects.values() if Path(p.checkout).resolve() == checkout), None)
             return wt_mgr_by_project[project.name] if project is not None else default_mgr
 
+        # One per config generation, so a held event is logged once each time it enters the wait.
+        unmatched_hold = UnmatchedProjectHold(daemon.sessions)
+
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
             # Raises AmbiguousProjectMatch before any lease, executor or workspace exists for the inbox.
             project = router.resolve(inbox_id)
@@ -719,6 +729,7 @@ def build_daemon_from_config(
                 project_default_executor=project.executor if project is not None else None,
                 global_default_executor=config.runtime.default_executor,
                 on_worktree_reclaim=lambda wk: wt_mgr.reclaim(wk, notify_outbox=daemon.outbox, inbox_id=inbox_id),
+                hold=unmatched_hold if project is None else None,
                 lock=daemon.lock,
                 sessions=daemon.sessions,
                 new_event_policy=config.runtime.new_event_policy,
@@ -740,6 +751,7 @@ def build_daemon_from_config(
             max_concurrency=config.runtime.max_concurrency,
             on_run_reports=_cli_on_reports if daemon.gdrive_result_writer is not None else None,
             on_inbox_failed=_cli_on_failed if daemon.gdrive_result_writer is not None else None,
+            pending_inboxes=daemon.inbox.pending_inbox_ids,
         )
         daemon.handler = EventHandler(inbox=daemon.inbox, on_wake=daemon.pool.wake)
         daemon.scheduler = TimerScheduler(

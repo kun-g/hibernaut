@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
@@ -99,6 +99,12 @@ class SQLiteInboxAdapter:
         )
         return [self._row_to_event(row) for row in rows]
 
+    def pending_inbox_ids(self) -> list[str]:
+        rows = self._db.fetchall(
+            "SELECT inbox_id FROM event_inbox WHERE status = 'pending' GROUP BY inbox_id ORDER BY MIN(seq)"
+        )
+        return [str(row["inbox_id"]) for row in rows]
+
     def fetch_processing(self, inbox_id: str) -> list[Event]:
         rows = self._db.fetchall(
             f"""
@@ -111,7 +117,8 @@ class SQLiteInboxAdapter:
         )
         return [self._row_to_event(row) for row in rows]
 
-    def claim_pending(self, inbox_id: str) -> list[Event]:
+    def claim_pending(self, inbox_id: str, event_ids: Collection[str] | None = None) -> list[Event]:
+        wanted = set(event_ids) if event_ids is not None else None
         with self._db.transaction() as conn:
             rows = conn.execute(
                 f"""
@@ -122,6 +129,8 @@ class SQLiteInboxAdapter:
                 """,
                 (inbox_id,),
             ).fetchall()
+            if wanted is not None:
+                rows = [row for row in rows if str(row["event_id"]) in wanted]
             if not rows:
                 return []
             ids = [str(row["event_id"]) for row in rows]
