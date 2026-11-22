@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkReadyMetadata",
+  "type": "object",
+  "required": [
+    "task_id",
+    "dispatch_seq",
+    "assignee",
+    "task_type",
+    "priority",
+    "trace_id",
+    "hop_count"
+  ],
+  "properties": {
+    "work_kind": {
+      "type": "string",
+      "enum": ["issue", "pr", "task"]
+    },
+    "state": {
+      "type": "string",
+      "enum": ["ready"]
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "dispatch_seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "assignee": {
+      "type": "string",
+      "pattern": "^agent:[a-z0-9.:_-]+$"
+    },
+    "task_type": {
+      "type": "string"
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3
+    },
+    "trace_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "hop_count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 8
+    },
+    "preferred_executor": {
+      "type": "string"
+    },
+    "artifact_ref": {
+      "type": "string"
+    },
+    "reply_target": {
+      "type": "string"
+    },
+    "parent_task_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}
