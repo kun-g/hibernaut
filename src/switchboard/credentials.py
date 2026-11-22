@@ -18,6 +18,15 @@ class EnvCredentialBroker:
         return self._environ.get(f"SWITCHBOARD_{channel.upper()}_TOKEN") or None
 
 
+def feishu_app_credentials(environ: Mapping[str, str] | None = None) -> tuple[str, str] | None:
+    env = os.environ if environ is None else environ
+    app_id = (env.get("SWITCHBOARD_FEISHU_APP_ID") or "").strip()
+    app_secret = (env.get("SWITCHBOARD_FEISHU_APP_SECRET") or "").strip()
+    if not app_id or not app_secret:
+        return None
+    return app_id, app_secret
+
+
 def github_app_credentials(environ: Mapping[str, str] | None = None) -> tuple[str, str] | None:
     env = os.environ if environ is None else environ
     app_id = (env.get("SWITCHBOARD_GITHUB_APP_ID") or "").strip()

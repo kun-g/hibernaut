@@ -36,7 +36,7 @@ chmod 600 .env
 
 1. `Caddyfile`：把 `sb.example.com` 换成你的域名。
 2. `switchboard.toml`：按需改 `[routing]`（仓库、飞书群到 `inbox_id` 的映射）、`[github]`、`[feishu]`、`[outbound]`。`[github] require_label`（默认 `hibernaut`）决定哪些 Issue/PR 及其评论会入站，公开仓库不要清空；`[routing.event_consumers]` 在没有 Taskboard 时把 Issue/PR 事件直接投给 Hibernaut，部署了 Taskboard 再删掉。不要改 `[http] host/port`、`[sqlite] path` 和 `[relay] path`，它们与 Dockerfile、Compose、Caddyfile 对应；不要设置 `[relay] listen_port`，Caddy 只转发 8790。
-3. `.env`：填六个变量，令牌可用 `openssl rand -hex 32` 生成。
+3. `.env`：填下表中的变量，令牌可用 `openssl rand -hex 32` 生成。
 
    | 变量 | 内容 |
    | :--- | :--- |
@@ -45,7 +45,7 @@ chmod 600 .env
    | `SWITCHBOARD_GITHUB_WEBHOOK_SECRET` | GitHub Webhook 的 Secret |
    | `SWITCHBOARD_GITHUB_TOKEN` | 发 GitHub 评论用的 Token |
    | `SWITCHBOARD_FEISHU_WEBHOOK_SECRET` | 飞书事件订阅的 Verification Token |
-   | `SWITCHBOARD_FEISHU_TOKEN` | 飞书 tenant access token |
+   | `SWITCHBOARD_FEISHU_APP_ID`、`SWITCHBOARD_FEISHU_APP_SECRET` | 飞书应用凭证，Switchboard 自己换取并刷新 tenant access token；不接飞书可留空 |
 
 4. 构建并启动：
 
@@ -64,7 +64,7 @@ chmod 600 .env
 - 只部署 `switchboard` 服务，不要 `caddy` 服务，也不映射宿主机端口。
 - 由反向代理把域名转发到容器的 8790，并负责 TLS。Traefik 能直接透传 WebSocket，`/ws/relay` 不需要额外规则。
 
-`switchboard.toml` 的内容和约束与上文「部署」第 2 步相同，六个变量与第 3 步相同。
+`switchboard.toml` 的内容和约束与上文「部署」第 2 步相同，变量与第 3 步相同。
 
 ### Dokploy
 
@@ -84,7 +84,8 @@ chmod 600 .env
          SWITCHBOARD_GITHUB_WEBHOOK_SECRET: ${SWITCHBOARD_GITHUB_WEBHOOK_SECRET}
          SWITCHBOARD_GITHUB_TOKEN: ${SWITCHBOARD_GITHUB_TOKEN}
          SWITCHBOARD_FEISHU_WEBHOOK_SECRET: ${SWITCHBOARD_FEISHU_WEBHOOK_SECRET}
-         SWITCHBOARD_FEISHU_TOKEN: ${SWITCHBOARD_FEISHU_TOKEN}
+         SWITCHBOARD_FEISHU_APP_ID: ${SWITCHBOARD_FEISHU_APP_ID:-}
+         SWITCHBOARD_FEISHU_APP_SECRET: ${SWITCHBOARD_FEISHU_APP_SECRET:-}
        configs:
          - source: switchboard_toml
            target: /etc/switchboard/switchboard.toml
@@ -104,7 +105,7 @@ chmod 600 .env
    - `switchboard.toml` 用 `configs.<name>.content` 内联，挂到 `/etc/switchboard/switchboard.toml`，不需要在主机上放文件。内容里的 `$` 会被 compose 当作变量插值，要写成 `$$`。
    - 不写 `ports:`。
 
-2. 在 Dokploy 该服务的 Environment 里填六个变量（`NAME=value` 每行一个），compose 里的 `${...}` 从这里取值。
+2. 在 Dokploy 该服务的 Environment 里填下表中的变量（`NAME=value` 每行一个），compose 里的 `${...}` 从这里取值。
 3. 在 Domains 里给 compose 的 `switchboard` 服务绑域名：Service Name 选 `switchboard`，Container Port 填 `8790`，打开 HTTPS，证书选 Let's Encrypt。
 4. Deploy。服务日志出现 `[switchboard] relay endpoint ... (transport=hybrid)` 后，按下文「冒烟验收」检查；其中第 5 步的端口检查同样适用，第 6 步的 `docker compose exec` 改在 Dokploy 的容器终端里执行。
 
