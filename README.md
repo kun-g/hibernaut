@@ -86,6 +86,8 @@ python3 scripts/run_updating.py --config hibernaut.toml
 
 停机（SIGINT / SIGTERM，自动更新也走这条路）分两步：先只停止认领新事件，进行中的 Run 照常跑完并写回结果，期间 HTTP 入口（`/events`、Webhook、`/mcp`）照常接收入库并返回 202、留给下一个进程处理，Outbox 投递、定时器和轮询照常运行；Run 全部结束后才关闭 HTTP（等已接收的请求写完）、停后台服务并退出。入口只在旧进程退出到新进程开始监听之间中断，以秒计。再发一次 SIGINT / SIGTERM（直接发给 daemon，或发给 `run_updating.py`，它会转给 daemon）则不再等待：进行中的 Run 按中断处理，不写半成品，事件回到 `pending`，由下一个进程重跑。
 
+`run_updating.py` 把 daemon 放在独立会话里运行，终端的 Ctrl-C 只到监督进程、由它转给 daemon。监督进程收到 SIGHUP（如关闭终端、断开 SSH）也按停机处理，排空后连同 daemon 一起退出。SIGKILL 无法捕获：监督进程被 `kill -9` 时 daemon 不会收到信号，会继续运行，需另行停止（`pgrep -f agent_runtime.app.main` 查找）。
+
 查看版本：`PYTHONPATH=src python3 -m agent_runtime.app.main --version`。版本规则见 [`docs/process/versioning.md`](docs/process/versioning.md)。
 
 ## 文档

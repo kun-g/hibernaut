@@ -47,6 +47,30 @@ def post(port: int, inbox_id: str, text: str, workdir: Path, external_id: str | 
         conn.close()
 
 
+def processes_under(root: Path) -> list[tuple[int, str]]:
+    listing = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "command="], stdout=subprocess.PIPE, text=True,
+                             check=True).stdout
+    found = []
+    for line in listing.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if str(root) in command and int(pid) != os.getpid():
+            found.append((int(pid), command))
+    return found
+
+
+def kill_processes_under(root: Path, timeout: float = 10.0) -> None:
+    # run_updating.py starts the daemon in its own session, so neither killing the supervisor nor its process group
+    # reaches it; every process this case started (supervisor, daemon, gated CLI) names the case's temp root instead.
+    deadline = time.monotonic() + timeout
+    while found := processes_under(root):
+        for pid, _ in found:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        if time.monotonic() > deadline:
+            raise AssertionError(f"processes still running under {root}: {found}")
+        time.sleep(0.05)
+
+
 class GatedDaemonCase(unittest.TestCase):
     # A daemon process whose Runs on text "block..." wait for the gate file, standing in for a long SDE Run.
     def setUp(self):
@@ -80,6 +104,7 @@ class GatedDaemonCase(unittest.TestCase):
             if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=10)
+            kill_processes_under(self.root)
 
         self.addCleanup(cleanup)
         return proc
@@ -245,6 +270,21 @@ class TestUpdateWaitsForDrain(GatedDaemonCase):
         self.assertEqual(self.event_status(blocked_id), "pending")
         self.assertEqual(self.rows("SELECT COUNT(*) FROM worker_leases"), [(0,)])
 
+    def test_sighup_to_the_supervisor_drains_and_stops_the_daemon(self):
+        # The daemon runs in its own session, so a closed terminal's SIGHUP reaches only the supervisor.
+        proc = self.spawn([sys.executable, str(run_updating.ROOT / "scripts/run_updating.py"), "--interval", "300",
+                           "--config", str(self.config), "--outbox-interval", "0.02"], cwd=self.root)
+        blocked_id = self.start_blocked_run(proc)
+        proc.send_signal(signal.SIGHUP)
+        time.sleep(0.5)
+        self.assertIsNone(proc.poll())
+
+        self.gate.touch()
+        proc.wait(timeout=20)
+        self.assertEqual(proc.returncode, 0, self.log_path.read_text())
+        self.assertEqual(self.event_status(blocked_id), "done")
+        self.assertEqual(processes_under(self.root), [])
+
 
 class _GatedExecutor:
     executor_id = "gated"
@@ -259,6 +299,29 @@ class _GatedExecutor:
         if text.startswith("block"):
             await self.release.wait()
         return Emit(messages=(f"{text} done",))
+
+
+class TestCaseCleanupLeavesNoProcesses(unittest.TestCase):
+    def run_case(self, case: GatedDaemonCase, failures: int) -> Path:
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertEqual((len(result.errors), len(result.failures)), (0, failures), result.errors + result.failures)
+        return case.root
+
+    def test_a_supervisor_case_that_fails_mid_run_leaves_no_process(self):
+        class FailsMidRun(GatedDaemonCase):
+            def fail_with_a_run_in_progress(self):
+                proc = self.spawn([sys.executable, str(run_updating.ROOT / "scripts/run_updating.py"), "--interval",
+                                   "300", "--config", str(self.config), "--outbox-interval", "0.02"], cwd=self.root)
+                self.start_blocked_run(proc)
+                self.fail("deliberate failure while the daemon runs")
+
+        root = self.run_case(FailsMidRun("fail_with_a_run_in_progress"), failures=1)
+        self.assertEqual(processes_under(root), [])
+
+    def test_a_passing_supervisor_case_leaves_no_process(self):
+        case = TestUpdateWaitsForDrain("test_a_second_signal_to_the_supervisor_reaches_the_draining_daemon")
+        self.assertEqual(processes_under(self.run_case(case, failures=0)), [])
 
 
 class TestDaemonRunDrains(unittest.IsolatedAsyncioTestCase):
