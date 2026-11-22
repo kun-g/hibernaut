@@ -50,8 +50,24 @@ def main() -> int:
         parser.error("--interval must be positive")
 
     stopping = threading.Event()
+    child: subprocess.Popen[bytes] | None = None
+    signals = 0
+
+    def on_signal(*_: object) -> None:
+        # The first signal stops the daemon, which drains its Runs in progress; a second one is passed on so the
+        # daemon exits without waiting for them.
+        nonlocal signals
+        signals += 1
+        stopping.set()
+        if signals > 1 and child is not None and child.returncode is None:
+            log("Second stop signal: asking the daemon to exit without waiting for runs in progress.")
+            try:
+                child.send_signal(signal.SIGTERM)
+            except OSError:
+                pass
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: stopping.set())
+        signal.signal(sig, on_signal)
 
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")}
     errors = (OSError, subprocess.SubprocessError)
@@ -77,6 +93,7 @@ def main() -> int:
                 next_check = time.monotonic() + args.interval
         finally:
             if child.poll() is None:
+                # The daemon keeps serving ingress while it drains; the update starts only once it has exited.
                 child.terminate()
                 child.wait()
 
