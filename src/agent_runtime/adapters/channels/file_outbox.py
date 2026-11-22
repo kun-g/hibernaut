@@ -30,6 +30,7 @@ _STATUS_LABELS = {
     "stopped": "已停止",
     "refused": "已拒绝",
     "awaiting_approval": "等待审批",
+    "awaiting_merge": "待合并",
 }
 _ACTIONS = {
     "done": "无需操作，查看结果即可",
@@ -37,7 +38,10 @@ _ACTIONS = {
     "stopped": "查看停止原因，需要时重新提交任务",
     "refused": "查看拒绝原因（权限或工作区规则），调整后重新提交任务",
     "awaiting_approval": "批准或拒绝审批请求 {request_id}，命令见下方「审批」",
+    "awaiting_merge": "查看 PR {pr_url}，未合并原因：{merge_reason}；处理后手动合并或重新提交任务",
 }
+_REVIEW_PR_ACTION = "审阅并合并 PR {pr_url}"
+_HOLD_LABELS = {"review": "评审不通过", "ci": "CI 失败", "other": "其他"}
 _SOURCE_LABELS = (
     ("github:", "GitHub"),
     ("gdrive:", "Drive"),
@@ -61,6 +65,9 @@ class OutboxContext:
     # A run status key from _STATUS_LABELS, or "" for a message no Worker run produced.
     status: str
     approval_request_id: str
+    # Set only while the delivered PR is open; merged and local deliveries show as before.
+    open_pr_url: str = ""
+    merge_reason: str = ""
 
     @property
     def status_label(self) -> str:
@@ -68,8 +75,13 @@ class OutboxContext:
 
     @property
     def action(self) -> str:
+        if self.status == "done" and self.open_pr_url:
+            return _REVIEW_PR_ACTION.format(pr_url=self.open_pr_url)
         template = _ACTIONS.get(self.status)
-        return template.format(request_id=self.approval_request_id or NONE) if template else NONE
+        if not template:
+            return NONE
+        return template.format(request_id=self.approval_request_id or NONE, pr_url=self.open_pr_url or NONE,
+                               merge_reason=self.merge_reason or "未记录")
 
 
 def outbox_context(inbox_id: str, metadata: Mapping[str, Any]) -> OutboxContext:
@@ -80,6 +92,15 @@ def outbox_context(inbox_id: str, metadata: Mapping[str, Any]) -> OutboxContext:
     request_id = _text(metadata.get("approval_request_id")) or (_text(metadata.get("request_id")) if approval else "")
     status = _text(context.get("status")) or ("awaiting_approval" if approval else "")
     correlation_key = _text(metadata.get("correlation_key"))
+    open_pr_url, merge_reason = "", ""
+    raw_delivery = context.get("delivery")
+    if status == "done" and isinstance(raw_delivery, Mapping):
+        delivery = cast(Mapping[str, Any], raw_delivery)
+        if delivery.get("state") == "pr_open":
+            open_pr_url = _text(delivery.get("pr_url"))
+            if delivery.get("auto_merge") is True:
+                # Merging was authorized and did not happen: the PR waits for a person.
+                status, merge_reason = "awaiting_merge", _merge_reason(delivery)
     return OutboxContext(
         inbox_id=_text(inbox_id),
         title=_text(context.get("title")) or correlation_key,
@@ -89,7 +110,17 @@ def outbox_context(inbox_id: str, metadata: Mapping[str, Any]) -> OutboxContext:
         executor_id=_text(context.get("executor_id")),
         status=status if status in _STATUS_LABELS else "",
         approval_request_id=request_id,
+        open_pr_url=open_pr_url,
+        merge_reason=merge_reason,
     )
+
+
+def _merge_reason(delivery: Mapping[str, Any]) -> str:
+    label = _HOLD_LABELS.get(_text(delivery.get("hold")), "")
+    detail = _text(delivery.get("hold_detail"))
+    if label and detail:
+        return f"{label}（{detail}）"
+    return label or detail
 
 
 def source_label(source: str) -> str:
