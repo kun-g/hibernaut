@@ -9,13 +9,14 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
 from agent_runtime.adapters.storage_sqlite.deliveries import SQLiteDeliveryStore
+from agent_runtime.core.models import Event
 from agent_runtime.core.ports import PermissionPort
 
 ChangeKind = Literal["breaking", "feature", "fix", "test_docs"]
@@ -25,6 +26,12 @@ BUMP_FOR_KIND: dict[str, Bump] = {"breaking": "major", "feature": "minor", "fix"
 DeliveryState = Literal["local", "pr_open", "merged"]
 MergeMethod = Literal["squash", "merge", "rebase"]
 MERGE_METHODS: tuple[MergeMethod, ...] = ("squash", "merge", "rebase")
+IssueLink = Literal["closes", "refs", "none"]
+ISSUE_LINKS: tuple[IssueLink, ...] = ("closes", "refs", "none")
+_ISSUE_SOURCES = frozenset({"github:issue_poll", "github:issues", "github:issue_comment"})
+_REPO = r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+"
+_ISSUE_KEY = re.compile(rf"github:(?P<repo>{_REPO})#(?P<number>[1-9][0-9]*)")
+_ISSUE_REF = re.compile(rf"(?P<repo>{_REPO})#(?P<number>[1-9][0-9]*)")
 OPEN_PR_TOOL = "delivery.open_pr"
 MERGE_TOOL = "delivery.merge"
 DEFAULT_VERSION_PATTERN = r"""__version__\s*=\s*["'](?P<version>[0-9]+\.[0-9]+\.[0-9]+)["']"""
@@ -80,6 +87,8 @@ class DeliveryConfig:
     max_handbacks: int = 2
     # After a merge, delete the source branch on the remote and, when the worktree is reclaimed, locally.
     delete_branch: bool = True
+    # How a PR for a task from a GitHub Issue names that issue: closes it on merge, only refers to it, or neither.
+    issue_link: IssueLink = "refs"
 
 
 _DELIVERY_KEYS = frozenset(f.name for f in dataclasses.fields(DeliveryConfig)) - {"repo"}
@@ -155,6 +164,9 @@ def parse_delivery(where: str, raw: object, *, repo: str) -> DeliveryConfig:
     method = item.get("merge_method", d.merge_method)
     if method not in MERGE_METHODS:
         raise ValueError(f"{where}: merge_method must be one of {', '.join(MERGE_METHODS)}")
+    issue_link = item.get("issue_link", d.issue_link)
+    if not isinstance(issue_link, str) or issue_link not in ISSUE_LINKS:
+        raise ValueError(f"{where}: issue_link must be one of {', '.join(ISSUE_LINKS)}, got {issue_link!r}")
     return DeliveryConfig(
         repo=repo,
         open_pr=open_pr,
@@ -176,7 +188,69 @@ def parse_delivery(where: str, raw: object, *, repo: str) -> DeliveryConfig:
         close_terminal=_flag(where, item, "close_terminal", d.close_terminal),
         max_handbacks=_count(where, item, "max_handbacks", d.max_handbacks),
         delete_branch=_flag(where, item, "delete_branch", d.delete_branch),
+        issue_link=cast(IssueLink, issue_link),
     )
+
+
+def _issue_number(raw: object) -> int | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if isinstance(raw, str) and raw.strip().isdigit():
+        number = int(raw.strip())
+        return number if number > 0 else None
+    return None
+
+
+def _key_issue(correlation_key: str | None) -> str:
+    m = _ISSUE_KEY.fullmatch(correlation_key or "")
+    return f"{m.group('repo')}#{m.group('number')}" if m else ""
+
+
+def _event_issue(evt: Event) -> str:
+    from_key = _key_issue(evt.correlation_key)
+    if evt.source not in _ISSUE_SOURCES:
+        return from_key
+    issue = evt.payload.get("issue")
+    number = _issue_number(cast(dict[str, Any], issue).get("number")) if isinstance(issue, dict) else None
+    repo_obj = evt.payload.get("repository")
+    repo = cast(dict[str, Any], repo_obj).get("full_name") if isinstance(repo_obj, dict) else None
+    if number is None:
+        return ""
+    if not isinstance(repo, str):
+        return f"{from_key.split('#', 1)[0]}#{number}" if from_key else ""
+    ref = f"{repo}#{number}"
+    return ref if _ISSUE_REF.fullmatch(ref) else ""
+
+
+def _about_pull_request(evt: Event) -> bool:
+    # GitHub sends issues / issue_comment events for pull requests too (issue.pull_request is set), and Switchboard
+    # marks relayed PR events in its metadata; all of them carry the PR's number in the github:<repo>#<n> key.
+    if evt.source.startswith("github:pull_request"):
+        return True
+    issue = evt.payload.get("issue")
+    if isinstance(issue, dict) and "pull_request" in issue:
+        return True
+    meta = evt.payload.get("metadata")
+    if isinstance(meta, dict):
+        info = cast(dict[str, Any], meta)
+        event = info.get("github_event")
+        return info.get("work_kind") == "pull_request" or (isinstance(event, str)
+                                                            and event.startswith("pull_request"))
+    return False
+
+
+def source_issue(events: Sequence[Event], correlation_key: str | None = None) -> str:
+    # The GitHub Issue a task came from, as "owner/repo#n", or "" when the task did not come from one. A task
+    # started by events about a pull request names no issue, and its key is not read as one.
+    if any(_about_pull_request(e) for e in events):
+        return ""
+    for evt in events:
+        ref = _event_issue(evt)
+        if ref:
+            return ref
+    return _key_issue(correlation_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +265,8 @@ class DeliveryRequest:
     # pass | off | pending, as the SDE delivered it
     review: str
     review_detail: str = ""
+    # "owner/repo#n" of the GitHub Issue the task came from (source_issue); "" for any other source.
+    issue: str = ""
 
 
 def _strs() -> list[str]:
@@ -675,6 +751,16 @@ class PRDelivery:
             return self._config.title_template.format(title=title, version=rec.version)
         return title
 
+    def _issue_line(self, issue: str) -> str:
+        # GitHub closes the issue on merge for "Closes", and only links it for "Refs".
+        cfg = self._config
+        m = _ISSUE_REF.fullmatch(issue)
+        if cfg.issue_link == "none" or m is None:
+            return ""
+        same_repo = bool(cfg.repo) and m.group("repo").lower() == cfg.repo.lower()
+        ref = f"#{m.group('number')}" if same_repo else issue
+        return f"{'Closes' if cfg.issue_link == 'closes' else 'Refs'} {ref}"
+
     def _body(self, req: DeliveryRequest, rec: DeliveryRecord) -> str:
         cfg = self._config
         checks = "\n".join(
@@ -687,7 +773,9 @@ class PRDelivery:
                         f"{rec.base_sha[:12]}. If another pull request changes the version first, Hibernaut "
                         "recomputes it before merging.")
         review = f"review={req.review}" + (f"\n\n{req.review_detail}" if req.review_detail else "")
+        issue = self._issue_line(req.issue)
         return "\n\n".join([
+            *([issue] if issue else []),
             f"## Summary\n{req.summary or '(none)'}",
             f"## Change\nKind: {req.change_kind}\n\nRationale: {req.rationale or '(none)'}",
             f"## Version\n{version}",

@@ -171,6 +171,9 @@ class GitHubInboundAdapter:
                 body=comment_body,
                 metadata={
                     "channel": "github",
+                    # An issue_comment on a pull request carries issue.pull_request; its number is the PR's.
+                    "work_kind": "issue" if github_event == "issue_comment" and "pull_request" not in item
+                    else "pull_request",
                     "repo": repo,
                     "number": number,
                     "comment_id": comment_id,
