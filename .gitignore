@@ -19,6 +19,8 @@ venv/
 *.db-shm
 agent_memory/
 outbox/
+# Drive task attachments (gdrive.attachments_dir defaults next to the database)
+/attachments/
 .env
 .env.*
 

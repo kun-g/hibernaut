@@ -28,7 +28,9 @@ from pathlib import Path
 from typing import Any
 
 from agent_runtime.adapters.channels.gdrive_tasks import (
+    ATTACHMENTS_FOLDER_NAME,
     DriveClientProtocol,
+    DriveDownload,
     DriveFileMeta,
     DriveQueueFolders,
     resolve_queue_folders,
@@ -38,6 +40,7 @@ _GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 _GOOGLE_API_BASE = "https://www.googleapis.com"
 _GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 _GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
+_GOOGLE_APPS_PREFIX = "application/vnd.google-apps."
 _QUEUE_FOLDER_NAMES = ("待执行", "执行中", "已完成", "失败")
 # Drive IDs are URL-safe base64-ish; anything else could break out of the quoted Drive query.
 _DRIVE_ID = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
@@ -45,6 +48,9 @@ _SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _MAX_REQUEST_BYTES = 1024 * 1024
 _MAX_DRAIN_BYTES = 16 * 1024 * 1024
 _MIN_TOKEN_CHARS = 16
+# 100 MiB: room for a code bundle or a scanned PDF. The proxy holds a download in memory while relaying it, and
+# Hibernaut holds it again while writing it out, so the bound is per-request memory as much as transfer size.
+DEFAULT_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 
 HttpRequestFn = Callable[[str, str, Mapping[str, str], bytes | None], bytes]
 
@@ -161,6 +167,7 @@ def _meta_from_drive(item: Mapping[str, Any]) -> DriveFileMeta:
         mime_type=str(item.get("mimeType", "text/markdown")),
         modified_time=str(item.get("modifiedTime", "")),
         parents=tuple(str(p) for p in item.get("parents", ())),
+        size=int(item["size"]) if str(item.get("size", "")).isdigit() else None,
     )
 
 
@@ -197,7 +204,7 @@ class GoogleDriveHTTPClient:
         params = urllib.parse.urlencode(
             {
                 "q": query,
-                "fields": "files(id,name,mimeType,modifiedTime,parents)",
+                "fields": "files(id,name,mimeType,modifiedTime,parents,size)",
                 "orderBy": "modifiedTime asc",
                 "pageSize": "100",
             }
@@ -206,19 +213,43 @@ class GoogleDriveHTTPClient:
         return [_meta_from_drive(item) for item in data.get("files", [])]
 
     def get_file_meta(self, file_id: str) -> DriveFileMeta:
-        params = urllib.parse.urlencode({"fields": "id,name,mimeType,modifiedTime,parents"})
+        params = urllib.parse.urlencode({"fields": "id,name,mimeType,modifiedTime,parents,size"})
         return _meta_from_drive(self._get_json(f"{self._files_url}/{urllib.parse.quote(file_id)}?{params}"))
 
+    def _export(self, file_id: str, mime_type: str) -> bytes:
+        query = urllib.parse.urlencode({"mimeType": mime_type})
+        url = f"{self._files_url}/{urllib.parse.quote(file_id)}/export?{query}"
+        return self._http("GET", url, self._auth_headers(), None)
+
+    def _export_doc(self, file_id: str) -> tuple[bytes, str]:
+        # Markdown keeps a task's frontmatter and headings; plain text turns `---` into a rule of underscores. Drive
+        # can refuse the newer Markdown export, and then plain text is still a readable task.
+        try:
+            return self._export(file_id, "text/markdown"), "text/markdown"
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            return self._export(file_id, "text/plain"), "text/plain"
+
+    def _media(self, file_id: str) -> bytes:
+        return self._http("GET", f"{self._files_url}/{urllib.parse.quote(file_id)}?alt=media", self._auth_headers(), None)
+
     def read_text(self, file_meta: DriveFileMeta) -> str:
-        quoted = urllib.parse.quote(file_meta.file_id)
         if file_meta.mime_type == _GOOGLE_DOC_MIME:
-            url = f"{self._files_url}/{quoted}/export?mimeType=text%2Fplain"
-        else:
-            url = f"{self._files_url}/{quoted}?alt=media"
-        return self._http("GET", url, self._auth_headers(), None).decode("utf-8")
+            return self._export_doc(file_meta.file_id)[0].decode("utf-8")
+        return self._media(file_meta.file_id).decode("utf-8")
+
+    def download(self, file_meta: DriveFileMeta) -> DriveDownload:
+        if file_meta.mime_type == _GOOGLE_DOC_MIME:
+            content, export = self._export_doc(file_meta.file_id)
+            return DriveDownload(name=file_meta.name, mime_type=export, content=content, export_mime_type=export)
+        return DriveDownload(name=file_meta.name, mime_type=file_meta.mime_type, content=self._media(file_meta.file_id))
 
     def append_text(self, file_id: str, mime_type: str, addition: str) -> None:
-        existing = self.read_text(DriveFileMeta(file_id=file_id, name="", mime_type=mime_type, modified_time=""))
+        # Read back as plain text: the update below uploads text/plain, which Drive converts into the Google Doc.
+        if mime_type == _GOOGLE_DOC_MIME:
+            existing = self._export(file_id, "text/plain").decode("utf-8")
+        else:
+            existing = self._media(file_id).decode("utf-8")
         combined = existing.rstrip() + "\n\n" + addition.strip() + "\n"
         upload_mime = "text/plain; charset=utf-8" if mime_type == _GOOGLE_DOC_MIME else "text/markdown; charset=utf-8"
         url = f"{self._upload_url}/{urllib.parse.quote(file_id)}?uploadType=media"
@@ -244,6 +275,7 @@ def _meta_json(meta: DriveFileMeta) -> dict[str, Any]:
         "mimeType": meta.mime_type,
         "modifiedTime": meta.modified_time,
         "parents": list(meta.parents),
+        "size": meta.size,
     }
 
 
@@ -255,8 +287,9 @@ def _drive_id(args: Mapping[str, Any], key: str) -> str:
 
 
 class DriveQueueGuard:
-    # The allow-list: six operations, only on the four queue folders and the files directly inside them.
-    OPS = ("subfolders", "list", "meta", "read", "append", "move")
+    # The allow-list: six operations on the four queue folders and the files directly inside them, plus 'list' and
+    # the read-only 'download' on the 附件/ folder and the files directly inside it.
+    OPS = ("subfolders", "list", "meta", "read", "append", "move", "download")
 
     def __init__(
         self,
@@ -267,14 +300,18 @@ class DriveQueueGuard:
         in_progress_folder_id: str = "",
         done_folder_id: str = "",
         failed_folder_id: str = "",
+        attachments_folder_id: str = "",
         max_read_bytes: int = 2 * 1024 * 1024,
         max_append_bytes: int = 256 * 1024,
+        max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
     ) -> None:
         self._drive = drive
         self._root = root_folder_id
         self._explicit = (pending_folder_id, in_progress_folder_id, done_folder_id, failed_folder_id)
+        self._explicit_attachments = attachments_folder_id
         self._max_read = max_read_bytes
         self._max_append = max_append_bytes
+        self._max_download = max_download_bytes
         self._folders: DriveQueueFolders | None = None
 
     def folders(self) -> DriveQueueFolders:
@@ -286,6 +323,7 @@ class DriveQueueGuard:
                 in_progress_folder_id=self._explicit[1] or None,
                 done_folder_id=self._explicit[2] or None,
                 failed_folder_id=self._explicit[3] or None,
+                attachments_folder_id=self._explicit_attachments or None,
             )
         return self._folders
 
@@ -293,11 +331,29 @@ class DriveQueueGuard:
         f = self.folders()
         return (f.pending_id, f.in_progress_id, f.done_id, f.failed_id)
 
-    def _queue_folder(self, args: Mapping[str, Any], key: str) -> str:
+    def _queue_folder(self, args: Mapping[str, Any], key: str, *, attachments: bool = False) -> str:
         folder_id = _drive_id(args, key)
-        if folder_id not in self._queue_ids():
+        allowed = self._queue_ids() + ((self.folders().attachments_id,) if attachments else ())
+        if not folder_id or folder_id not in allowed:
             raise ProxyRefused(403, f"'{key}' is outside the task queue")
         return folder_id
+
+    def download(self, args: Mapping[str, Any]) -> DriveDownload:
+        attachments_id = self.folders().attachments_id
+        if not attachments_id:
+            raise ProxyRefused(403, f"the task queue has no {ATTACHMENTS_FOLDER_NAME}/ folder")
+        meta = self._drive.get_file_meta(_drive_id(args, "file_id"))
+        if meta.mime_type == _GOOGLE_FOLDER_MIME or attachments_id not in meta.parents:
+            raise ProxyRefused(403, f"file is not in the {ATTACHMENTS_FOLDER_NAME}/ folder")
+        if meta.mime_type.startswith(_GOOGLE_APPS_PREFIX) and meta.mime_type != _GOOGLE_DOC_MIME:
+            raise ProxyRefused(415, "only Google Docs among Google files can be downloaded; export it to a file first")
+        # Checked from metadata first, so an oversized file is never fetched; exports have no size until fetched.
+        if meta.size is not None and meta.size > self._max_download:
+            raise ProxyRefused(413, f"attachment is larger than {self._max_download} bytes")
+        got = self._drive.download(meta)
+        if len(got.content) > self._max_download:
+            raise ProxyRefused(413, f"attachment is larger than {self._max_download} bytes")
+        return got
 
     def _queue_file(self, args: Mapping[str, Any]) -> DriveFileMeta:
         meta = self._drive.get_file_meta(_drive_id(args, "file_id"))
@@ -318,9 +374,12 @@ class DriveQueueGuard:
         if op == "subfolders":
             if _drive_id(args, "parent_id") != self._root:
                 raise ProxyRefused(403, "'parent_id' is not the task queue root")
-            return {"folders": dict(zip(_QUEUE_FOLDER_NAMES, self._queue_ids(), strict=True))}
+            folders = dict(zip(_QUEUE_FOLDER_NAMES, self._queue_ids(), strict=True))
+            if self.folders().attachments_id:
+                folders[ATTACHMENTS_FOLDER_NAME] = self.folders().attachments_id
+            return {"folders": folders}
         if op == "list":
-            folder_id = self._queue_folder(args, "folder_id")
+            folder_id = self._queue_folder(args, "folder_id", attachments=True)
             return {"files": [_meta_json(m) for m in self._drive.list_files(folder_id)]}
         if op == "meta":
             return {"file": _meta_json(self._queue_file(args))}
@@ -356,10 +415,15 @@ class DriveQueueGuard:
     def check(self) -> list[str]:
         f = self.folders()
         ids = (f.pending_id, f.in_progress_id, f.done_id, f.failed_id)
-        return [
+        lines = [
             f"{name} = {fid} ({len(self._drive.list_files(fid))} files)"
             for name, fid in zip(_QUEUE_FOLDER_NAMES, ids, strict=True)
         ]
+        if f.attachments_id:
+            lines.append(f"{ATTACHMENTS_FOLDER_NAME} = {f.attachments_id} ({len(self._drive.list_files(f.attachments_id))} files)")
+        else:
+            lines.append(f"{ATTACHMENTS_FOLDER_NAME} = (none: tasks cannot reference attachments)")
+        return lines
 
 
 def _log(message: str) -> None:
@@ -394,6 +458,19 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _reply_file(self, got: DriveDownload) -> None:
+        # The body is the file as stored (or as exported); name and types travel in headers.
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(got.content)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Drive-File-Name", urllib.parse.quote(got.name, safe=""))
+        self.send_header("X-Drive-Mime-Type", got.mime_type)
+        if got.export_mime_type:
+            self.send_header("X-Drive-Export-Mime-Type", got.export_mime_type)
+        self.end_headers()
+        self.wfile.write(got.content)
 
     def _refuse(self, status: int, reason: str, op: str = "-") -> None:
         _log(f"{op} -> {status}: {reason}")
@@ -458,6 +535,11 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             self._refuse(400, "body must be a JSON object", op)
             return
         try:
+            if op == "download":
+                got = self.server.guard.download(args)
+                _log(f"{op} -> 200 ({len(got.content)} bytes)")
+                self._reply_file(got)
+                return
             result = self.server.guard.handle(op, args)
         except ProxyRefused as exc:
             self._refuse(exc.status, exc.reason, op)
@@ -523,6 +605,8 @@ _CONFIG_KEYS = frozenset(
         "in_progress_folder_id",
         "done_folder_id",
         "failed_folder_id",
+        "attachments_folder_id",
+        "max_download_bytes",
     }
 )
 
@@ -539,6 +623,8 @@ class DriveProxyConfig:
     in_progress_folder_id: str = ""
     done_folder_id: str = ""
     failed_folder_id: str = ""
+    attachments_folder_id: str = ""
+    max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES
 
 
 def load_proxy_config(path: str | Path) -> DriveProxyConfig:
@@ -557,8 +643,13 @@ def load_proxy_config(path: str | Path) -> DriveProxyConfig:
     if not _SERVICE_NAME.fullmatch(service):
         raise ValueError("service_name must be lowercase letters, digits and '-'")
 
+    max_download = raw.get("max_download_bytes", DEFAULT_MAX_DOWNLOAD_BYTES)
+    if isinstance(max_download, bool) or not isinstance(max_download, int) or max_download <= 0:
+        raise ValueError("max_download_bytes must be a positive integer")
+
     ids: dict[str, str] = {}
-    for key in ("root_folder_id", "pending_folder_id", "in_progress_folder_id", "done_folder_id", "failed_folder_id"):
+    for key in ("root_folder_id", "pending_folder_id", "in_progress_folder_id", "done_folder_id", "failed_folder_id",
+                "attachments_folder_id"):
         value = str(raw.get(key, "")).strip()
         if value and not _DRIVE_ID.fullmatch(value):
             raise ValueError(f"{key} must be a Drive folder ID")
@@ -585,6 +676,7 @@ def load_proxy_config(path: str | Path) -> DriveProxyConfig:
         listen_host=host,
         listen_port=port,
         service_name=service,
+        max_download_bytes=max_download,
         **ids,
     )
 
@@ -601,6 +693,8 @@ def build_guard(config: DriveProxyConfig, *, api_base: str = _GOOGLE_API_BASE) -
         in_progress_folder_id=config.in_progress_folder_id,
         done_folder_id=config.done_folder_id,
         failed_folder_id=config.failed_folder_id,
+        attachments_folder_id=config.attachments_folder_id,
+        max_download_bytes=config.max_download_bytes,
     )
 
 

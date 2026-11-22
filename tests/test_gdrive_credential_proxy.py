@@ -61,12 +61,13 @@ class DriveCredentialProxyTests(unittest.IsolatedAsyncioTestCase):
         self.google.add_folder("root-q", "任务队列", "my-drive")
         for fid, name in (("dir-pending", "待执行"), ("dir-progress", "执行中"), ("dir-done", "已完成"), ("dir-failed", "失败")):
             self.google.add_folder(fid, name, "root-q")
+        self.google.add_folder("dir-attach", "附件", "root-q")
         self.google.add_folder("dir-private", "私人", "my-drive")
         self.google.add_file("private-1", "salary.md", "SECRET SALARY DATA", "dir-private")
 
         provider = ServiceAccountTokenProvider(key_path=self.key_path)
         drive = GoogleDriveHTTPClient(token_provider=provider, api_base=google_base)
-        guard = DriveQueueGuard(drive, root_folder_id="root-q")
+        self.guard = guard = DriveQueueGuard(drive, root_folder_id="root-q", max_download_bytes=4096)
         self.proxy_server = build_proxy_server(
             guard, host="127.0.0.1", port=0, service_name="gdrive-queue", client_token=CLIENT_TOKEN
         )
@@ -85,6 +86,11 @@ class DriveCredentialProxyTests(unittest.IsolatedAsyncioTestCase):
 
     def _raw(self, op: str, body: Any, *, token: str | None = CLIENT_TOKEN, method: str = "POST",
              headers: dict[str, str] | None = None, path: str | None = None) -> tuple[int, str]:
+        status, data, _ = self._raw_bytes(op, body, token=token, method=method, headers=headers, path=path)
+        return status, data.decode("utf-8")
+
+    def _raw_bytes(self, op: str, body: Any, *, token: str | None = CLIENT_TOKEN, method: str = "POST",
+                   headers: dict[str, str] | None = None, path: str | None = None) -> tuple[int, bytes, dict[str, str]]:
         data = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
         hdrs = {"Content-Type": "application/json", **(headers or {})}
         if token is not None:
@@ -93,9 +99,10 @@ class DriveCredentialProxyTests(unittest.IsolatedAsyncioTestCase):
         req = urllib.request.Request(url, data=data if method != "GET" else None, headers=hdrs, method=method)
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status, resp.read().decode("utf-8")
+                return resp.status, resp.read(), dict(resp.headers.items())
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read().decode("utf-8")
+            with exc:
+                return exc.code, exc.read(), dict(exc.headers.items())
 
     async def test_queue_round_trip_through_the_proxy_lists_reads_moves_and_writes_back(self) -> None:
         self.google.add_file(
@@ -191,6 +198,90 @@ class DriveCredentialProxyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self._raw("list", {"folder_id": bad})[0], 400)
         self.assertEqual(self._raw("read", {"file_id": 7})[0], 400)
 
+    def test_download_returns_attachment_bytes_unchanged(self) -> None:
+        blob = b"PK\x03\x04" + bytes(range(256)) * 8
+        self.google.add_blob("att-zip", "taskboard_phase1_bundle.zip", blob, "dir-attach")
+        meta = next(m for m in self.client.list_files("dir-attach") if m.file_id == "att-zip")
+        self.assertEqual(meta.size, len(blob))
+        got = self.client.download(meta)
+        self.assertEqual(got.content, blob)
+        self.assertEqual(got.name, "taskboard_phase1_bundle.zip")
+        self.assertEqual(got.mime_type, "application/zip")
+        self.assertEqual(got.export_mime_type, "")
+        status, raw, headers = self._raw_bytes("download", {"file_id": "att-zip"})
+        self.assertEqual((status, raw, headers["Content-Type"]), (200, blob, "application/octet-stream"))
+
+    def test_google_docs_export_as_markdown_and_fall_back_to_plain_text(self) -> None:
+        self.google.add_doc("att-doc", "设计文档", plain="设计\n________________", markdown="# 设计\n\n---", parent="dir-attach")
+        self.google.add_doc("task-doc", "任务", plain="________________\nscope: proj:x", markdown="---\n\n## scope: proj:x",
+                            parent="dir-pending")
+        doc = self.client.download(next(m for m in self.client.list_files("dir-attach") if m.file_id == "att-doc"))
+        self.assertEqual((doc.content.decode(), doc.export_mime_type, doc.mime_type), ("# 设计\n\n---", "text/markdown", "text/markdown"))
+        self.assertEqual(self.client.read_text(self.client.get_file_meta("task-doc")), "---\n\n## scope: proj:x")
+
+        self.google.markdown_export_status = 500
+        doc = self.client.download(next(m for m in self.client.list_files("dir-attach") if m.file_id == "att-doc"))
+        self.assertEqual((doc.content.decode(), doc.export_mime_type), ("设计\n________________", "text/plain"))
+        self.assertEqual(self.client.read_text(self.client.get_file_meta("task-doc")), "________________\nscope: proj:x")
+        exports = [path for _m, path in self.google.requests if "/export?" in path]
+        self.assertTrue(any("mimeType=text%2Fmarkdown" in path for path in exports))
+        self.assertTrue(any("mimeType=text%2Fplain" in path for path in exports))
+
+    def test_download_is_limited_to_files_directly_in_the_attachments_folder(self) -> None:
+        self.google.add_file("task-1", "t.md", "body", "dir-pending")
+        self.google.add_folder("dir-nested", "nested", "dir-attach")
+        self.google.add_blob("nested-file", "n.zip", b"x", "dir-nested")
+        self.google.add_blob("att-big", "big.zip", b"x" * 5000, "dir-attach")
+        self.google.add_blob("att-sheet", "表格", b"", "dir-attach", mime_type="application/vnd.google-apps.spreadsheet")
+        cases = {
+            "a task file": ({"file_id": "task-1"}, 403),
+            "a private file": ({"file_id": "private-1"}, 403),
+            "a file in a subfolder of 附件": ({"file_id": "nested-file"}, 403),
+            "the attachments folder itself": ({"file_id": "dir-attach"}, 403),
+            "a nested folder": ({"file_id": "dir-nested"}, 403),
+            "a file over the limit": ({"file_id": "att-big"}, 413),
+            "a Google Sheet": ({"file_id": "att-sheet"}, 415),
+            "a missing file": ({"file_id": "no-such-file"}, 404),
+            "a malformed id": ({"file_id": "../x"}, 400),
+        }
+        for label, (body, expected) in cases.items():
+            with self.subTest(label):
+                status, text = self._raw("download", body)
+                self.assertEqual(status, expected, text)
+                self.assertIn("error", json.loads(text))
+        self.assertNotIn("SECRET SALARY DATA", self._raw("download", {"file_id": "private-1"})[1])
+        # Refusals are decided from metadata: no file content was fetched for any of them.
+        self.assertFalse(any("alt=media" in path for _m, path in self.google.requests))
+        with self.assertRaisesRegex(DriveProxyError, "413"):
+            self.client.download(next(m for m in self.client.list_files("dir-attach") if m.file_id == "att-big"))
+        # Attachments are not task files: no meta, read, append or move on them.
+        for op, body in (("meta", {"file_id": "att-big"}), ("read", {"file_id": "att-big"}),
+                         ("move", {"file_id": "att-big", "add_parent": "dir-done", "remove_parent": "dir-attach"})):
+            with self.subTest(op):
+                self.assertEqual(self._raw(op, body)[0], 403)
+
+    def test_an_export_over_the_limit_is_refused_after_the_fetch(self) -> None:
+        self.google.add_doc("att-doc", "长文档", plain="x" * 5000, markdown="x" * 5000, parent="dir-attach")
+        self.assertEqual(self._raw("download", {"file_id": "att-doc"})[0], 413)
+
+    def test_download_keeps_the_http_layer_rules(self) -> None:
+        self.google.add_blob("att-zip", "a.zip", b"zip", "dir-attach")
+        self.assertEqual(self._raw("download", {"file_id": "att-zip"}, method="GET")[0], 405)
+        self.assertEqual(self._raw("download", {"file_id": "att-zip"}, token=None)[0], 401)
+        self.assertEqual(self._raw("download", {"file_id": "att-zip"}, headers={"Origin": "https://evil.example"})[0], 403)
+        self.google.add_doc("att-doc", "d", plain="p", markdown="m", parent="dir-attach")
+        # Both exports fail upstream: the proxy answers 502 and relays none of Google's body.
+        self.google.export_status = 500
+        status, text = self._raw("download", {"file_id": "att-doc"})
+        self.assertEqual(status, 502, text)
+        self.assertNotIn("exportFailed", text)
+
+    def test_subfolders_and_list_include_the_attachments_folder(self) -> None:
+        self.google.add_blob("att-zip", "a.zip", b"zip", "dir-attach")
+        self.assertEqual(self.client.find_subfolders("root-q")["附件"], "dir-attach")
+        self.assertEqual([m.file_id for m in self.client.list_files("dir-attach")], ["att-zip"])
+        self.assertIn("附件 = dir-attach (1 files)", self.guard.check())
+
     def test_client_errors_carry_status_and_reason_without_upstream_bodies(self) -> None:
         with self.assertRaisesRegex(DriveProxyError, "403.*outside the task queue"):
             self.client.list_files("dir-private")
@@ -236,8 +327,16 @@ class DriveProxyStartupTests(unittest.TestCase):
         self.assertEqual(cfg.service_name, "gdrive-queue")
         self.assertEqual(cfg.root_folder_id, "root-q")
 
+    def test_attachment_settings(self) -> None:
+        cfg = load_proxy_config(self._write())
+        self.assertEqual((cfg.attachments_folder_id, cfg.max_download_bytes), ("", 100 * 1024 * 1024))
+        cfg = load_proxy_config(self._write(attachments_folder_id="dir-attach", max_download_bytes=1024))
+        self.assertEqual((cfg.attachments_folder_id, cfg.max_download_bytes), ("dir-attach", 1024))
+
     def test_rejects_unsafe_settings(self) -> None:
         cases: dict[str, dict[str, Any]] = {
+            "max_download_bytes must be a positive integer": {"max_download_bytes": 0},
+            "attachments_folder_id must be a Drive folder ID": {"attachments_folder_id": "a/b"},
             "listen_host must be a loopback": {"listen_host": "0.0.0.0"},
             "root_folder_id": {"root_folder_id": ""},
             "unknown key": {"upstream_url": "https://example.com"},
@@ -294,6 +393,22 @@ class HibernautDriveProxyConfigTests(unittest.TestCase):
             self.assertIsInstance(daemon.gdrive_poller._client, ProxiedDriveClient)  # pyright: ignore[reportPrivateUsage]
         finally:
             daemon.close()
+
+    def test_attachments_land_next_to_the_database_unless_configured(self) -> None:
+        cfg = parse_config(self._cfg())
+        self.assertEqual((cfg.gdrive.attachments_dir, cfg.gdrive.attachments_folder_id), ("", ""))
+        daemon = build_daemon_from_config(cfg, demo=True)
+        try:
+            writer = daemon.gdrive_result_writer
+            assert writer is not None
+            store = writer._attachments  # pyright: ignore[reportPrivateUsage]
+            assert store is not None
+            self.assertEqual(store.root, (self.root / "attachments").resolve())
+        finally:
+            daemon.close()
+        cfg = parse_config(self._cfg(attachments_dir="att", attachments_folder_id="dir-attach"), base_dir=self.root)
+        self.assertEqual((cfg.gdrive.attachments_dir, cfg.gdrive.attachments_folder_id),
+                         (str(self.root / "att"), "dir-attach"))
 
     def test_proxy_url_defaults_to_the_credential_proxy(self) -> None:
         raw = self._cfg(proxy_url="")

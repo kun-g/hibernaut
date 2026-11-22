@@ -1,6 +1,6 @@
 # Google Drive queue credential proxy
 
-The Drive task queue runs through an external credential proxy. The proxy runs as its own system user, is the only process that can read the service account key, and calls Google Drive itself. Hibernaut sends queue operations to it on `127.0.0.1` with a local client token and receives only results: file metadata, task text, `ok`.
+The Drive task queue runs through an external credential proxy. The proxy runs as its own system user, is the only process that can read the service account key, and calls Google Drive itself. Hibernaut sends queue operations to it on `127.0.0.1` with a local client token and receives only results: file metadata, task text, attachment content, `ok`.
 
 ## Install
 
@@ -21,7 +21,7 @@ The installer:
 2. Copies `src/agent_runtime` to `/opt/hibernaut-drive-proxy/src`, owned by root, and installs the launcher `/opt/hibernaut-drive-proxy/bin/hibernaut-drive-proxy`. The proxy never runs code from the checkout Hibernaut can edit.
 3. Installs into `/etc/hibernaut-drive-proxy/`: `sa.json` (the key, mode 0400, owned by the service user), `client.token` (random, 0400, owned by the service user) and `config.toml` (root, readable by the service user).
 4. Copies the client token to `~<hb-user>/.config/hibernaut/gdrive-proxy.token` (mode 0600).
-5. Checks as the service user: the Python and code load; the Hibernaut user cannot read `sa.json`; `--check` finds the four queue folders and counts their files (read-only; skip with `--no-check`).
+5. Checks as the service user: the Python and code load; the Hibernaut user cannot read `sa.json`; `--check` finds the four queue folders and the optional `附件` folder and counts their files (read-only; skip with `--no-check`).
 6. Starts the service: LaunchDaemon `/Library/LaunchDaemons/ai.hibernaut.drive-proxy.plist` (log `/var/log/hibernaut-drive-proxy.log`) or systemd unit `hibernaut-drive-proxy.service` (`journalctl -u hibernaut-drive-proxy`).
 
 It prints the `[gdrive]` section for `hibernaut.toml`. Then delete the original key file and unset `HIBERNAUT_GDRIVE_SA_KEY`; Hibernaut no longer reads either.
@@ -37,18 +37,45 @@ default_inbox_id = "proj:hibernaut"
 
 Restart Hibernaut to start polling.
 
+The proxy runs its own copy of the code. After a Hibernaut update that changes `adapters/credential_proxy/` or `adapters/channels/gdrive_tasks.py`, rerun the installer so the proxy picks it up; until then Hibernaut talks to the old proxy (for example, no attachments).
+
+## Queue folder layout
+
+```
+<queue folder>/
+  待执行/   task files waiting to run
+  执行中/   tasks whose Run has started (and suspended ones)
+  已完成/   finished tasks, result appended
+  失败/     failed tasks, error appended
+  附件/     optional: files tasks reference (zip, PDF, Google Docs, ...)
+```
+
+A task references attachments in two ways; Hibernaut takes the union, each file once:
+
+- frontmatter `attachments: <ID or name>, <ID or name>`: a Drive file ID, or the exact name of a file in `附件/` (a name two files share must be given by ID);
+- the file's Drive ID anywhere in the task text, such as a link `https://drive.google.com/file/d/<ID>/view`, as long as a file directly in `附件/` has that ID. An ID of a file anywhere else is not an attachment.
+
+When the task's Run starts, Hibernaut downloads them to `gdrive.attachments_dir/<task file ID>/<attachment file ID>/<name>` (outside every worktree, directories 0700, files 0600) and appends a `## 附件` section to the task text the executor gets: name, absolute local path, size and sha256 of each file. A reference that is not in `附件/`, too large or refused is listed there with its reason, and the task starts anyway. A Google Doc is saved as its Markdown export (`.md`). The directory is removed when the task's session closes (checked after every Run) or the task fails.
+
+### Upload `.md` task files without converting them
+
+A task file converted to a Google Doc loses its layout: the opening `---` becomes a horizontal rule and the metadata lines become one paragraph or heading. Hibernaut now exports Google Docs as Markdown and reads such metadata back (`scope: … priority: … title: …` on one line, or as a heading), but the plain `.md` file is the reliable form. In Drive on the web, open Settings → General → Uploads and turn off "Convert uploaded files to Google Docs editor format"; Google Drive for desktop uploads `.md` files unconverted.
+
 ## What the proxy allows
 
 Every request is `POST /proxy/gdrive-queue/<operation>` with a JSON body and `Authorization: Bearer <client token>`. There is no pass-through URL, method or header.
 
 | Operation | Body | Allowed when |
 | :--- | :--- | :--- |
-| `subfolders` | `parent_id` | `parent_id` is the configured queue root; returns only the four queue folders |
-| `list` | `folder_id` | `folder_id` is one of the four queue folders |
-| `meta` | `file_id` | the file sits directly in a queue folder and is not a folder |
-| `read` | `file_id` | as `meta`, and it is Markdown, text or a Google Doc (exported as text); at most 2 MiB |
+| `subfolders` | `parent_id` | `parent_id` is the configured queue root; returns only the four queue folders and `附件` when there is one |
+| `list` | `folder_id` | `folder_id` is one of the four queue folders or `附件` |
+| `meta` | `file_id` | the file sits directly in a queue folder (not `附件`) and is not a folder |
+| `read` | `file_id` | as `meta`, and it is Markdown, text or a Google Doc; at most 2 MiB |
 | `append` | `file_id`, `text` | as `read`; `text` at most 256 KiB |
-| `move` | `file_id`, `add_parent`, `remove_parent` | both folders are queue folders, they differ, and the file is in `remove_parent` |
+| `move` | `file_id`, `add_parent`, `remove_parent` | both folders are queue folders (not `附件`), they differ, and the file is in `remove_parent` |
+| `download` | `file_id` | the file sits directly in `附件` (not in a subfolder) and is not a folder; at most `max_download_bytes` |
+
+`read` and `download` export a Google Doc as `text/markdown`, falling back to `text/plain` when Drive refuses the Markdown export. `append` reads the Doc as plain text and writes plain text back, as before. `download` answers 200 with the file's bytes unchanged (`Content-Type: application/octet-stream`) and the name (percent-encoded), type and export type in the `X-Drive-File-Name`, `X-Drive-Mime-Type` and `X-Drive-Export-Mime-Type` headers; its refusals are JSON like every other operation. It refuses other Google files (Sheets, Slides: 415; export them to a file first), and a file over the limit with 413, from Drive's size before fetching anything (a Doc export, which has no size, after the export).
 
 Refusals: 401 without the right token, 403 for a request carrying `Origin` (browsers) or a target outside the queue, 404 for any other path or operation, 405 for methods other than POST, 413 above 1 MiB of request body. IDs must be Drive IDs (`[A-Za-z0-9_-]`), so they cannot change the Drive query. Google error bodies are not passed on, only `Drive returned HTTP <status>`.
 
@@ -67,6 +94,8 @@ The proxy listens only on a loopback address and refuses to start when the key o
 | `client_token_file` | required | at least 16 characters |
 | `root_folder_id` | required | queue folder; subfolders found by name |
 | `pending_folder_id`, `in_progress_folder_id`, `done_folder_id`, `failed_folder_id` | found by name | explicit queue folder IDs |
+| `attachments_folder_id` | found by name (`附件`) | explicit attachments folder ID; without one and without a `附件` folder, `download` is refused |
+| `max_download_bytes` | `104857600` (100 MiB) | largest attachment `download` returns. Big enough for a code bundle or a scanned PDF; the proxy and Hibernaut each hold one download in memory while passing it on, so this also bounds their memory per request |
 
 ## Operating
 

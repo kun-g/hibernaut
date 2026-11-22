@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncGenerator, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Never, assert_never, cast
 
 from agent_runtime.core.models import (
@@ -313,11 +313,11 @@ class AgentWorker:
                         )
                         try:
                             async with self._lease_heartbeat(inbox_id):
-                                await self._notify_run_started(inbox_id, batch, batch_correlation_key)
+                                run_batch = await self._notify_run_started(inbox_id, batch, batch_correlation_key)
                                 outcome = await self._execute_batch(
                                     executor=selected_executor,
                                     inbox_id=inbox_id,
-                                    batch=batch,
+                                    batch=run_batch,
                                     session_ref=active_session,
                                     caps=caps,
                                     known_ids=snapshot_ids,
@@ -430,17 +430,27 @@ class AgentWorker:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-    async def _notify_run_started(self, inbox_id: str, batch: list[Event], correlation_key: str | None) -> None:
+    async def _notify_run_started(
+        self, inbox_id: str, batch: list[Event], correlation_key: str | None
+    ) -> list[Event]:
+        # Returns the batch the executor runs: the listener's replacement payloads applied, ids and order unchanged.
         listener = self._run_start_listener
         if listener is None:
-            return
+            return batch
         try:
             # In a thread: listeners such as the Drive queue make blocking network calls.
-            await asyncio.to_thread(listener.on_run_started, inbox_id, tuple(batch), correlation_key)
+            replaced = await asyncio.to_thread(listener.on_run_started, inbox_id, tuple(batch), correlation_key)
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).warning(
                 "Run-start listener failed for inbox %s; the Run continues", inbox_id, exc_info=True
             )
+            return batch
+        if not replaced:
+            return batch
+        return [
+            replace(evt, payload=dict(replaced[evt.event_id])) if evt.event_id in replaced else evt
+            for evt in batch
+        ]
 
     def _claim(self, inbox_id: str) -> list[Event]:
         if self._hold is None:
