@@ -1,7 +1,8 @@
 {
   "include": [
     "src/agent_runtime/core",
-    "src/agent_runtime/engine"
+    "src/agent_runtime/engine",
+    "src/switchboard"
   ],
   "extraPaths": [
     "src"

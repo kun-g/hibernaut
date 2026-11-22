@@ -10,6 +10,7 @@
 - **L1 (`core/ports.py`)**：仅允许 Python 标准库 + `core/models.py`。
 - **L2 (`engine/`)**：仅允许 Python 标准库 + `core/`；**严禁反向 `import adapters/` 或 `app/`**。
 - **L3 (`adapters/` + `app/`)**：实现 L1 `Protocol` 端口；禁止绕过 L1 端口让 L2 直接耦合具体数据库、LLM SDK 或外部通道。
+- **`src/switchboard/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`taskboard`、`runner`、`memory_hub`（`.importlinter` 契约 `switchboard-zero-business-deps`）。
 
 ## 2. 核心词汇表与并发红线
 
@@ -52,7 +53,7 @@ pyright
 
 - `lint-imports`：验证 `.importlinter` 全部架构分层与反向依赖契约（0 broken）。
 - `pytest -v`：验证 AST 静态边界测试、Port 契约测试、多 `inbox_id` 并发隔离及 `NewEventPolicy`（`defer`/`fold`/`interrupt`）端到端测试。
-- `pyright`：对 `src/agent_runtime/core` 与 `src/agent_runtime/engine` 执行 strict 静态类型检查（0 errors, 0 warnings）。
+- `pyright`：对 `src/agent_runtime/core`、`src/agent_runtime/engine` 与 `src/switchboard` 执行 strict 静态类型检查（0 errors, 0 warnings）。
 
 ## 6. 文档增量协作闭环规范
 

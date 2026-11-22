@@ -307,6 +307,28 @@ Hibernaut never holds the service account key. An external credential proxy, run
 - `service_account_key_env` is no longer accepted: the config fails with a message pointing to the proxy. `HIBERNAUT_GDRIVE_SA_KEY` is ignored.
 - A proxy refusal or Drive error reaches the poller as `DriveProxyError` with the HTTP status and reason; the poll logs it and retries on the next interval.
 
+## Switchboard (Phase 1)
+
+`src/switchboard/` is a separate package in this repository: a passive exchange that normalizes inbound GitHub webhooks, Feishu events and card callbacks, and MCP tool calls into one `CanonicalEvent` envelope, stores them in its own SQLite database, delivers them to consumers (`taskboard`, `hibernaut`, `switchboard.outbound`) and sends replies through one outbound gateway. It imports nothing from `agent_runtime`, `taskboard`, `runner` or `memory_hub` (enforced by `.importlinter`), and it has no pollers or timers: external cron jobs call the MCP tool `submit_work` with `source="timer"`.
+
+```bash
+cp switchboard.example.toml switchboard.toml
+export SWITCHBOARD_GITHUB_WEBHOOK_SECRET=...   # GitHub webhook HMAC secret
+export SWITCHBOARD_FEISHU_WEBHOOK_SECRET=...   # Feishu verification token
+export SWITCHBOARD_MCP_WEBHOOK_SECRET=...      # Bearer token for /mcp
+export SWITCHBOARD_GITHUB_TOKEN=... SWITCHBOARD_FEISHU_TOKEN=...   # outbound API tokens
+PYTHONPATH=src python3 -m switchboard.app --config switchboard.toml
+```
+
+Secrets are read through `CredentialBrokerPort`; the default `EnvCredentialBroker` reads the variables above and nothing goes in the TOML file. Endpoints on one port: `POST /webhooks/github`, `POST /webhooks/feishu`, `POST /mcp` (tools `submit_work`, `post_message`, `decide_approval`, `replay_delivery`) and `GET /healthz`.
+
+- A GitHub redelivery with a new `X-GitHub-Delivery` is still a duplicate: events are deduplicated by business fingerprint (`issue:{repo}#{num}:{action}:{updated_at}`, `pr:...`, `comment:{id}`).
+- A consumer that fails 5 times (backoff 5/15/45/135/405 s) goes to `dead_letter` and an alert is sent to `[delivery] dead_letter_alert_channel/target`; later events for the same consumer and scope wait, other scopes and consumers continue. Replay with the MCP tool `replay_delivery`.
+- An `execution.reported` event with outcome `suspend` becomes a Feishu approval card at `[outbound] approval_target`. The button click returns a read-only card at once and is recorded as `approval.decided` with the original `correlation_key` (for example `github:kun-g/hibernaut#42`); a second click on the same request is dropped.
+- Phase 1 delivers in-process only. Consumers register with `board.bus.subscribe(consumer_id, handler)`; an unregistered consumer counts as offline and its deliveries stay pending.
+
+See `docs/architecture.md` section 7 for the full design.
+
 ## Anti-Corruption Gates (CI)
 
 ```bash
@@ -314,5 +336,5 @@ pip install -e ".[dev]"
 
 lint-imports   # Gate 1: Static import boundary checks
 pytest -v      # Gate 2: Contract, concurrency, NewEventPolicy, correlation_key, Webhook, Bootstrap, MCP & Executor binding tests
-pyright        # Gate 3: Strict static type checking on core/ and engine/
+pyright        # Gate 3: Strict static type checking on core/, engine/ and switchboard/
 ```

@@ -107,7 +107,7 @@
 
 ## 6. 三道防腐化门禁与核心词汇表（Glossary）
 
-提交前与 `.github/workflows/ci.yml` 强制执行：`lint-imports`、`pytest -v`、`pyright`（strict）。
+提交前与 `.github/workflows/ci.yml` 强制执行：`lint-imports`、`pytest -v`、`pyright`（strict，覆盖 `agent_runtime/core`、`agent_runtime/engine` 与 `switchboard`）。
 
 | 术语 | 精确定义 | 范围 / 约束 |
 | :--- | :--- | :--- |
@@ -118,6 +118,20 @@
 | **`correlation_key`** | 外部业务实体的确定性关联键（如 `github:kun-g/hibernaut#42`、`feishu:<chat>:<thread>`） | 经 `SessionStorePort.find_by_correlation_key()` 映射到当前活跃 `session_id`，同时作为 `workspaces` 表动态 worktree 复用键 |
 | **Run / Lease** | 单次唤醒执行周期 / 以 `inbox_id` 为主键的限时互斥租约 | `Suspend` 立即释放租约；进程崩溃后租约到期自动接管 |
 
-## 7. 架构决策记录（ADR）
+## 7. Switchboard（Phase 1）：外部事件归一化交换机
+
+`src/switchboard/` 是与 `agent_runtime` 并列的独立包（过渡期单仓多包）。`.importlinter` 的 `switchboard-zero-business-deps` 契约禁止它导入 `taskboard`、`agent_runtime`、`runner`、`memory_hub`，`tests/test_switchboard_core.py` 另用 AST 检查它只依赖标准库与自身。
+
+- **纯被动入站（Pure Push-in）**：只接收推送（GitHub Webhook、飞书事件与卡片回调、MCP 工具调用），不内置 Poller 或 Cron；定时任务由外部 Cron 调 MCP `submit_work(source="timer")`。命名统一为 Inbound / Outbound。
+- **统一信封 `CanonicalEvent`**（`envelope.py`）：`@dataclass(frozen=True, slots=True)`，`event_id = "evt_" + ULID`，`metadata` 构造期冻结为 `MappingProxyType`（浅层只读，必须可 JSON 序列化）。`validate_envelope()` 按 `event_type` 校验必填顶层字段与 metadata 键；`execution.reported` 的 `outcome_kind` 只允许 `emit/suspend/error/done`（Silent 不上报）。
+- **去重键是业务指纹**：`inbound_events` 的 `UNIQUE(source, external_id)`。GitHub 用 `issue:{repo}#{num}:{action}:{updated_at}` / `pr:...` / `comment:{id}`（PR review 为 `review:{id}`，review comment 为 `review_comment:{id}`），不用 `X-GitHub-Delivery`，所以 Redeliver 换新 UUID 仍判重；飞书卡片审批用 `approval:{approval_request_id}`（不含 decision），二次点击（即使改点拒绝）被丢弃并返回首个决定的只读卡片。
+- **入站管道**（`pipeline.InboundPipeline`）：校验信封 → 同一事务内 `INSERT OR IGNORE` 入 `inbound_events` 并按路由表写 `delivery_log` → 唤醒投递线程。401（验签失败）、400（缺字段/信封不合法）、413（超过 `max_body_bytes`）只写旁路审计与 stderr，不落表。`AuditSinkPort` 异常降级为 stderr，不中断主链路。
+- **声明式路由**（`router.py`）：`work.opened/updated → taskboard`；`work.closed → taskboard + hibernaut`；`work.ready / conversation.message / approval.decided → hibernaut`；`execution.reported → taskboard + switchboard.outbound`。scope 由 `[routing]` 的 `github_repos` / `feishu_chats` 映射，未命中按 `unmatched_policy` 回落 `default_scope` 或忽略。
+- **投递**（`DeliveryWorker` + `InProcessTransport`，预留 `ConsumerTransport` 供 Phase 2 RelayHub）：同 `(consumer_id, scope)` 严格队头保序，队头处于 `retry`/`dead_letter` 时只阻塞该队列。`nack`/`timeout`/异常按 `retry_backoff_seconds`（默认 5/15/45/135/405 秒）退避，第 `max_attempts`（默认 5）次失败转 `dead_letter`，并经出站网关向 `dead_letter_alert_channel/target` 发告警；`offline` 保持 `pending` 且不计次数。`replay_delivery(event_id, consumer_id)` 只接受 `dead_letter`/`retry`，重置为 `pending, attempts=0, next_retry_at=now`。
+- **出站网关**（`outbound/gateway.py`）：`outbound_messages` 的 `UNIQUE(idempotency_key)` 防重发；每个 `(channel, target)` 一个令牌桶（`rate_limit_per_target_rpm`），限流只推迟不计次数；可重试失败（5xx/429/网络）退避，超过 `max_retry_attempts` 或 4xx 标 `failed`。`execution.reported` 自动转换：`suspend` → `approval_channel`（默认飞书 `approval_target`）审批卡，按钮 value 打包 `approval_request_id/decision/correlation_key/scope/session_id`；其余回复到 `correlation_key` 的来源（GitHub Issue/PR 评论，支持 `add_labels`/`remove_labels`；飞书单聊或话题回复）。渠道插件经 `CredentialBrokerPort.issue_ephemeral()` 取短期令牌，HTTP client 可注入。
+- **SQLite**（`store_sqlite.py`）：WAL、`busy_timeout=5000`、`foreign_keys=ON`；一条连接在一把进程内锁下串行，写入用 `BEGIN IMMEDIATE`。三张表 `inbound_events`、`delivery_log`、`outbound_messages` 及索引 `idx_inbound_corr`、`idx_delivery_sched`、`idx_delivery_order`、`idx_outbound_sched`。
+- **HTTP**（`http_server.py`）：单端口 `ThreadingHTTPServer` 挂 `/webhooks/github`、`/webhooks/feishu`、`/mcp`、`/healthz`；按 `Content-Length` 先拒超限请求，入库后立即返回，不等下游。组装根是 `switchboard/app.py`（`python -m switchboard.app --config switchboard.toml`）。
+
+## 8. 架构决策记录（ADR）
 
 - [ADR-0001：跨项目协议采用 JSON Schema（暂不引入 Protobuf）](adr/0001-cross-project-protocol-schema.md)
