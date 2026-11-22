@@ -183,8 +183,28 @@ def render_header(ctx: OutboxContext, *, stamp: datetime, events_url: str) -> st
     return "\n".join(lines)
 
 
-def render_summary(ctx: OutboxContext, *, stamp: datetime, path: Path) -> str:
-    return f"[OUTBOX] {format_stamp(stamp)} {ctx.status_label} | {_value(ctx.title)} | {path}"
+def render_summary(ctx: OutboxContext, *, stamp: datetime, path: Path, base: Path | None = None) -> str:
+    return f"[OUTBOX] {format_stamp(stamp)} {ctx.status_label} | {_value(ctx.title)} | {display_path(path, base)}"
+
+
+def display_path(path: Path, base: Path | None) -> str:
+    # Console only: relative to base (the config file's directory), else ~/... under home, else absolute.
+    # Without a base the path stays absolute, so callers that never had a config file see no change.
+    if base is None:
+        return str(path)
+    try:
+        candidates = [(Path(os.path.normpath(path.absolute())), Path(os.path.normpath(base.absolute())))]
+        candidates.append((path.resolve(), base.resolve()))
+        for target, root in candidates:
+            if target.is_relative_to(root):
+                return str(target.relative_to(root))
+        home = Path.home()
+        for target, root in ((candidates[0][0], home), (candidates[1][0], home.resolve())):
+            if target.is_relative_to(root):
+                return str(Path("~") / target.relative_to(root))
+    except (OSError, RuntimeError):
+        pass
+    return str(path)
 
 
 def file_stem(stamp: datetime) -> str:
@@ -202,8 +222,10 @@ class FileOutboxChannel:
         events_url: str,
         clock: Callable[[], datetime] = datetime.now,
         announce: Callable[[str], None] | None = None,
+        display_base: str | Path | None = None,
     ) -> None:
         self._dir = Path(directory)
+        self._display_base = Path(display_base) if display_base is not None else None
         self._inner = inner
         self._events_url = events_url
         self._clock = clock
@@ -231,7 +253,7 @@ class FileOutboxChannel:
                 # Rows that exhausted their attempts never come back; forget the oldest.
                 self._written.pop(next(iter(self._written)))
             self._written[key] = path
-            self._announce(render_summary(ctx, stamp=stamp, path=path))
+            self._announce(render_summary(ctx, stamp=stamp, path=path, base=self._display_base))
         await self._inner.send(inbox_id, content, metadata)
         self._written.pop(key, None)
 

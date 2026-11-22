@@ -23,7 +23,8 @@ mcp_enabled = false
 mcp_token_env = "HIBERNAUT_MCP_TOKEN"
 # 文件 Outbox：每条投递的 Outbox 消息另存为该目录下一个 Markdown 文件（文件名为本地时间到毫秒，按名排序即时间顺序），
 # 开头是任务上下文头（任务、来源、inbox_id、会话、执行器、状态、需要人做什么；审批消息附批准 / 拒绝命令）。
-# 相对路径以本文件所在目录为准，支持 ~。设置后控制台每条只打一行摘要；飞书 / Drive / Switchboard 照常投递。
+# 相对路径以本文件所在目录为准，支持 ~。设置后控制台每条只打一行摘要，文件路径相对本文件所在目录显示
+# （目录外在 home 下显示为 ~/...，否则为绝对路径）；飞书 / Drive / Switchboard 照常投递。
 # outbox_dir = "outbox"
 
 [executors.claude]
