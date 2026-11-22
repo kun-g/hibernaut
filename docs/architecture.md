@@ -22,11 +22,11 @@
 | 层级 | 路径 | 职责定位 | 依赖规则 |
 | :--- | :--- | :--- | :--- |
 | **L0 领域契约层** | `core/models.py` | 不可变领域数据结构（含 `Event.correlation_key`、`SessionRef.correlation_key / executor_id / executor_session_id / parent_session_id`；`Event` 只承载事件事实与 `status`，认领次数与失败原因属 L3 存储内部）、强类型终态 `RunOutcome`（仅携带 `executor_session_id`）、`NewEventPolicy` 与 4 级粘滞路由纯函数 `resolve_executor_id()` | 零外部依赖，仅 Python 标准库 |
-| **L1 核心端口层** | `core/ports.py` | 定义 10 个纯抽象 `Protocol` 端口（含 `ExecutorPort.executor_id` 与可选的 `RunStartListener`）及 `RunCapabilities` 控制钩子 | 仅依赖 Python 标准库 + L0 |
+| **L1 核心端口层** | `core/ports.py` | 定义纯抽象 `Protocol` 端口（含 `ExecutorPort.executor_id`、可选的 `RunStartListener` 与可接回的 `ResumableExecutorPort`）及 `RunCapabilities` / `RunContext` 控制钩子 | 仅依赖 Python 标准库 + L0 |
 | **L2 生命周期编排层** | `engine/` | `EventHandler`、`AgentWorker`（支持 `executors: Mapping[str, ExecutorPort]` 查表路由）、`TimerScheduler`、`OutboxDispatcher` | 仅依赖 L0 + L1，严禁 `import adapters/` 或 `app/` |
 | **L3 基础设施与组装层** | `adapters/` + `app/` | SQLite 存储（含 `workspaces` 表与旧库兼容迁移）、分区 Memory、Auto Mode + Credential Proxy、外置 Drive 队列凭据代理（独立进程）、SDE 交付步骤 `PRDelivery`、白盒执行器、`LocalCLIExecutor` + `OrcaWorktreeManager`、Switchboard 入站桥、Drive 轮询、`MCPServerAdapter`、Switchboard 出站桥、`config.py`、`bootstrap.py`、`main.py` | 实现 L1 端口或驱动 L2 `EventHandler`，仅在 `app/` 组装注入 |
 
-### L1 全部 10 个核心端口与 RunCapabilities
+### L1 核心端口与 RunCapabilities
 
 | 端口 / 契约 | 职责 |
 | :--- | :--- |
@@ -40,6 +40,9 @@
 | `ChannelPort` | 外部投递通道（`SwitchboardChannelAdapter`、`ConsoleChannelAdapter`、`WebhookChannelAdapter`；`FileOutboxChannel` 包在最外层） |
 | `ExecutorPort` | Agent 单轮推理边界（声明只读属性 `executor_id`；白盒 `WhiteboxExecutor` 或黑盒 `LocalCLIExecutor`），输入批次事件与 `RunCapabilities`，输出 `RunOutcome` |
 | `RunStartListener` | 可选的 Run 开始通知 `on_run_started(inbox_id, events, correlation_key)`：`AgentWorker(run_start_listener=...)` 对每个执行批次，在认领、绑定会话之后、调用执行器之前，在线程里调用一次（关闭会话批次和被 `hold` 的事件不触发）；抛错只记 `WARNING` 日志，不让 Run 失败、不阻塞执行。可返回按 `event_id` 的替换 payload（`Mapping[str, Mapping[str, Any]] | None`）：执行器在本次 Run 里收到替换后的事件（id 与顺序不变），库里的事件 payload 不变，被中断重跑时重新调用。组装根注入 `DriveResultWriter` |
+| `OpenRunPort` | 进行中 Run 的登记（SQLite `open_runs`：`session_id`、`inbox_id`、`executor_id`、`run_dir`、事件 ID、`started_at`、`code_version`），只存通用信息。`open()` 在 Run 开始时登记并建 0700 的 `<state_dir>/runs/<session_id>/<run_id>/`；`add_events()` 记 `fold` 并入的事件；`finish()` 在同一事务里把事件标 `done` 并删登记，再删目录；`discard()` 删登记与目录（失败、中断、无法接回时） |
+| `ResumableExecutorPort` | 可选（`runtime_checkable`）：在 `ExecutorPort` 之外提供 `execute_resumable(events, session, caps, run)` 与 `resume(...)`。配置了 `OpenRunPort` 且执行器实现它时，`AgentWorker` 走这条路径；其余执行器不变 |
+| `RunContext` | 给可接回执行器的 Run 句柄：`run_dir`（执行器私有状态，如 `state.json`）、`detachable()`（包住可脱离的等待段）、`should_detach()`（阻塞线程工作的检查点）、`detached()` |
 | `RunCapabilities` | 注入单轮 Run 的受控能力集合：`memory`、`timers`、`permissions`、`poll_folded_events()`、`is_interrupted()` |
 
 ## 3. 外部关联键 `correlation_key`、多执行器粘滞路由与 L3 通道
@@ -148,6 +151,12 @@
 
 - **多 `inbox_id` 并发**：`AsyncWorkerPool` 跨 `inbox_id` 并行、同 `inbox_id` 单活互斥（`worker_leases` 主键即 `inbox_id`）、`Suspend` 立即放锁；`WorkspacePartitionRegistry` 强制禁止不同 `inbox_id` 挂载同一本地代码目录，全局 `global/instructions.md` 只读共享。
 - **HTTP 入站与 SQLite 并发**：`WebhookHTTPServer`（`ThreadingHTTPServer`，`request_queue_size=128`）每请求一线程；`shutdown()` 等待在途请求全部写完 Inbox 后返回，停机（Worker 排空之后）与热加载换端口时关闭旧监听据此排空。`SQLiteDatabase` 只有一条连接，所有语句经同一把可重入锁串行；写操作走 `transaction()`（`BEGIN IMMEDIATE`），去重、租约等先读后写在线程间和共享同一文件的进程间保持原子；租约时钟在拿到写锁后读取，等锁时间不计入 TTL；`mark_done()` 按 SQLite 参数上限分段更新；文件库开启 WAL 与 `busy_timeout`。回收 worktree 时，`claim_for_reclaim()` 以读到的 `updated_at` 做比较并交换：进行中的 `reclaiming` 认领是排他的，只有超过 `reclaim_stale_after_seconds`（默认 600 秒，认领方已崩溃）的认领才可被接管；删除期间心跳线程定期续期认领（遇到临时的 `SQLITE_BUSY`/`SQLITE_LOCKED` 缩短间隔重试，不退出），慢删除不会被当作过期而被接管；删除成功后 `finish_reclaim()` 同样按认领做比较并交换，认领已失效时不删除被他人重新登记的记录；删除失败时 `release_reclaim()` 恢复原状态，可直接重试。
+- **停机脱离与重启接回**（#26）：选用独立的 `ResumableExecutorPort` 而非给 `execute()` 加 `run_dir` 参数，旧执行器和测试替身无需改动，Worker 用 `isinstance` 判断能否接回。
+  - **登记**：可接回执行器的 Run 开始时 `OpenRunPort.open()`；正常结束 `finish()`（事件 `done` 与删登记同一事务，随后删目录）；失败、`interrupt` 中断或无法接回时 `discard()` 并按原规则处理事件。启动时 `sweep()` 删除没有登记、超过 7 天的孤儿 run 目录，只删 `runs` 根目录之内的路径。
+  - **停机**：`AsyncWorkerPool.drain()` 先 `retire()` 停止认领，再对每个在跑的 Worker 调 `detach()`。正停在 `detachable()` 段里的 Run（等 Orca 终端里 Claude Code 的 peer 结果、等 `terminal = "orca"` 的 CLI 评审命令）立即取消：不关终端、不删 run 目录、不写 Outbox，事件留在 `processing`，登记保留，租约照常释放，旧进程马上退出。阻塞的子进程步骤不打断，等到下一个检查点：交付的检查命令最长 `check_timeout_seconds`（默认 1800 秒），单条 git / gh 命令最长 300 秒，CI 等待按 1 秒切片检查 `should_detach()` 后抛 `DeliveryDetached`。MCP 交接模式与子进程 CLI 评审不可脱离，停机照旧等它结束。再发一次停机信号仍按中断处理，登记随之删除、事件回 `pending`。
+  - **接回**：启动时 `startup_inboxes()` 把有登记的 `inbox_id` 一并唤醒。拿到租约后，Worker 先对该 Inbox 的每个登记调 `resume()`（不重排其事件、`code_version` 变化不阻止接回），其余孤儿 `processing` 事件照旧重排，新事件随后按 `NewEventPolicy` 处理。登记的执行器已不存在时，事件回 `pending`、删登记，并写一条 Outbox 说明。
+  - **执行器状态**：`run_state.py` 原子写 `run_dir/state.json`（临时文件 + `fsync` + `os.replace`，带 `format`）。`TurnSlot` 在发任务前记下当前一轮（peer：`task_id`、`attempt_id`、终端句柄与代次、收件地址、开始时刻、截止时刻；CLI：终端句柄、命令目录、截止时刻），轮次文件放在 `run_dir/turns/`。SDE 在每次阶段切换（`develop` / `review` / `deliver`）写 `state.json`；`resume()` 按阶段续跑：终端还活着就继续等同一 `attempt_id` 的结果（不重发，超时仍按原截止时刻）；结果已在接收端收件箱里就直接用；终端已不在且没有结果则重跑这一轮并在结果里注明；`state.json` 缺失、损坏或格式未知时从开发阶段重新开始，Outbox 消息带 `Restart:` 说明原因。
+  - **交付**：`DeliveryRecord` 记 `ci_head` 与 `ci_since`（墙钟），同一 head 的 CI 等待接回后沿用原起点计超时；推送、开 PR 等步骤本就按记录幂等，不会重推或重开。
 - **`NewEventPolicy` 三策略**：`defer`（默认，推迟到下一轮）、`fold`（回合间隙通过 `poll_folded_events()` 增量注入同会话/同关联键事件并统一 `mark_done()`）、`interrupt`（安全取消当前 Run/CLI 子进程，绝不向 Outbox 写半成品，原批次保持 `pending` 与新事件同租约合并重启）。
 
 ## 6. 三道防腐化门禁与术语基准

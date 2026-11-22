@@ -163,6 +163,20 @@ CREATE TABLE IF NOT EXISTS deliveries (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Unfinished Runs of resumable executors, at most one per session; the executor's own state is in run_dir.
+CREATE TABLE IF NOT EXISTS open_runs (
+    session_id TEXT PRIMARY KEY,
+    inbox_id TEXT NOT NULL,
+    executor_id TEXT NOT NULL,
+    run_dir TEXT NOT NULL,
+    event_ids_json TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    code_version TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_open_runs_inbox
+    ON open_runs (inbox_id, started_at);
 """
 
 

@@ -68,6 +68,7 @@ from agent_runtime.adapters.executor_whitebox import (
 from agent_runtime.adapters.memory_fs import WorkspacePartitionRegistry
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter, CredentialProxyClient, read_private_token
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
+from agent_runtime.adapters.storage_sqlite.open_runs import SQLiteOpenRunStore
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
     SQLiteDeliveryStore,
@@ -190,7 +191,10 @@ class AsyncWorkerPool:
     def drain(self) -> None:
         # Called on the event loop when the process stops: Runs in progress finish and write their results, nothing
         # new is claimed, and wakes are dropped; their events stay pending for the next process's startup scan.
+        # Resumable Runs waiting on an Orca terminal are detached instead: the next process resumes them.
         self.retire(lambda _inbox_id: None, interruptible=False)
+        for worker in self._active.values():
+            worker.detach()
 
     async def _worker_loop(self, worker_idx: int, stop_event: asyncio.Event) -> None:
         worker_id = f"{self._pool_id}-worker-{worker_idx}"
@@ -291,6 +295,7 @@ class AlwaysOnDaemon:
     worktree_sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS
     gdrive_poll_interval_seconds: float = 30.0
     ingest_only: bool = False
+    open_runs: SQLiteOpenRunStore | None = None
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def register_partition(
@@ -434,6 +439,13 @@ async def drain_pools(
             forced.cancel()
 
 
+def startup_inboxes(inbox: SQLiteInboxAdapter, open_runs: SQLiteOpenRunStore | None) -> Callable[[], list[str]]:
+    def scan() -> list[str]:
+        ids = inbox.pending_inbox_ids()
+        return [*ids, *(i for i in (open_runs.inbox_ids() if open_runs is not None else []) if i not in ids)]
+    return scan
+
+
 def worktree_reclaimer(
     manager: OrcaWorktreeManager,
     *,
@@ -493,8 +505,15 @@ def build_daemon(
     outbox_dir: str | Path | None = None,
     outbox_display_base: str | Path | None = None,
     approval_events_url: str = "http://127.0.0.1:8080/events",
+    runs_root: str | Path | None = None,
 ) -> AlwaysOnDaemon:
     db = database if database is not None else SQLiteDatabase(db_path)
+    if runs_root is None and database is None and str(db_path) != ":memory:":
+        runs_root = Path(db_path).expanduser().resolve().parent / "runs"
+    # Directories of Runs that a stop detached; orphans past the retention period are removed at startup.
+    open_runs = SQLiteOpenRunStore(db, runs_root) if runs_root is not None else None
+    if open_runs is not None:
+        open_runs.sweep()
     inbox = SQLiteInboxAdapter(db)
     timers = SQLiteTimerAdapter(db)
     outbox = SQLiteOutboxAdapter(db)
@@ -545,6 +564,8 @@ def build_daemon(
                 lock=lock,
                 sessions=sessions,
                 run_start_listener=gdrive_writer,
+                open_runs=open_runs,
+                code_version=__version__,
                 lease_ttl_seconds=lease_ttl_seconds,
                 new_event_policy=new_event_policy,
             )
@@ -563,6 +584,8 @@ def build_daemon(
             lock=lock,
             sessions=sessions,
             run_start_listener=gdrive_writer,
+            open_runs=open_runs,
+            code_version=__version__,
             lease_ttl_seconds=lease_ttl_seconds,
             new_event_policy=new_event_policy,
         )
@@ -609,8 +632,8 @@ def build_daemon(
         max_concurrency=max_concurrency,
         on_run_reports=_on_reports if gdrive_writer is not None else None,
         on_inbox_failed=_on_failed if gdrive_writer is not None else None,
-        # Events a stopped process accepted while draining are picked up here.
-        pending_inboxes=inbox.pending_inbox_ids,
+        # Events a stopped process accepted while draining, and Runs it detached, are picked up here.
+        pending_inboxes=startup_inboxes(inbox, open_runs),
     )
     # An ingest-only pool never runs but still collects wakes, so a config reload can hand them to a running pool.
     handler = EventHandler(inbox=inbox, on_wake=pool.wake)
@@ -662,6 +685,7 @@ def build_daemon(
         mcp_server=mcp_server,
         gdrive_poll_interval_seconds=gdrive_poll_interval_seconds,
         ingest_only=ingest_only,
+        open_runs=open_runs,
     )
 
 
@@ -751,6 +775,7 @@ def build_daemon_from_config(
         outbox_dir=config.channels.outbox_dir or None,
         outbox_display_base=config.config_dir or None,
         approval_events_url=local_events_url(config.channels.host, config.channels.port),
+        runs_root=Path(config.runtime.db_path).expanduser().resolve().parent / "runs",
     )
 
     if has_configured_executor and not demo:
@@ -927,6 +952,8 @@ def build_daemon_from_config(
                 on_worktree_reclaim=reclaim,
                 hold=unmatched_hold if project is None else None,
                 run_start_listener=daemon.gdrive_result_writer,
+                open_runs=daemon.open_runs,
+                code_version=__version__,
                 lock=daemon.lock,
                 sessions=daemon.sessions,
                 new_event_policy=config.runtime.new_event_policy,
@@ -948,7 +975,7 @@ def build_daemon_from_config(
             max_concurrency=config.runtime.max_concurrency,
             on_run_reports=_cli_on_reports if daemon.gdrive_result_writer is not None else None,
             on_inbox_failed=_cli_on_failed if daemon.gdrive_result_writer is not None else None,
-            pending_inboxes=daemon.inbox.pending_inbox_ids,
+            pending_inboxes=startup_inboxes(daemon.inbox, daemon.open_runs),
         )
         daemon.handler = EventHandler(inbox=daemon.inbox, on_wake=daemon.pool.wake)
         daemon.scheduler = TimerScheduler(

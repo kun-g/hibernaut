@@ -4,13 +4,14 @@ import asyncio
 import json
 import os
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from agent_runtime.adapters.delivery import (
     CHANGE_KINDS,
+    DeliveryDetached,
     DeliveryInterrupted,
     DeliveryRecord,
     DeliveryRequest,
@@ -55,14 +56,18 @@ from agent_runtime.adapters.executor_cli.reviewer import (
     snapshot_diff,
     worktree_fingerprint,
 )
+from agent_runtime.adapters.executor_cli.run_state import TurnSlot, read_state, write_state
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
 from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
-from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Silent, Suspend, new_id
-from agent_runtime.core.ports import RunCapabilities
+from agent_runtime.core.models import Emit, Event, RunDetached, RunOutcome, SessionRef, Silent, Suspend, new_id
+from agent_runtime.core.ports import RunCapabilities, RunContext
 
 SDE_ROLE = "sde"
 SDE_OPTION_KEYS = frozenset({"review", "reviewer", "max_review_rounds"})
 _CHECKPOINT_KEY = "sde"
+# Version of the state.json layout in a Run's directory; another value is not read, and the Run starts over.
+STATE_FORMAT = 1
+_PHASES = ("develop", "review", "deliver")
 # Sources whose events carry no task of their own (the GitHub webhook keeps a comment's payload as GitHub sent it).
 _FOLLOW_UP_SOURCES = frozenset({"github:issue_comment"})
 _DEV_TOOLS = ("Read", "Grep", "Glob", "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash")
@@ -210,9 +215,14 @@ class _State:
     recheck: str = ""
     # The GitHub Issue the task came from ("owner/repo#n"), named in the PR body; "" for any other source.
     issue: str = ""
+    # What happened when a Run was resumed after a restart and could not simply continue (a turn sent again).
+    resume_log: list[str] = field(default_factory=_no_history)
+
+    def fields(self) -> dict[str, Any]:
+        return {f: getattr(self, f) for f in self.__slots__}
 
     def dump(self) -> str:
-        return json.dumps({_CHECKPOINT_KEY: {f: getattr(self, f) for f in self.__slots__}}, ensure_ascii=False)
+        return json.dumps({_CHECKPOINT_KEY: self.fields()}, ensure_ascii=False)
 
     @staticmethod
     def load(checkpoint: str | None) -> _State | None:
@@ -229,6 +239,70 @@ class _State:
             return _State(**cast(dict[str, Any], data))
         except TypeError:
             return None
+
+
+class _Progress:
+    # The SDE's state.json in the Run's directory: rewritten at every phase switch and whenever a turn is recorded,
+    # so a Run resumed after a restart continues from the phase and turn it was in.
+    def __init__(self, run: RunContext, session_id: str, saved_turn: Mapping[str, Any] | None = None) -> None:
+        self.run = run
+        self._session_id = session_id
+        self._saved_turn = dict(saved_turn) if saved_turn else None
+        self._doc: dict[str, Any] = {}
+        self._state: _State | None = None
+
+    def phase(
+        self, phase: str, state: _State, native: str | None, *, prompt: str | None = None,
+        approved: frozenset[str] = frozenset(),
+    ) -> None:
+        self._state = state
+        self._doc = {"format": STATE_FORMAT, "phase": phase, "session_id": self._session_id, "native": native,
+                     "prompt": prompt, "approved": sorted(approved), "turn": None}
+        self._write()
+
+    def slot(self) -> TurnSlot:
+        # The recorded turn goes to the first slot of the resumed phase only.
+        assert self._state is not None
+        saved, self._saved_turn = self._saved_turn, None
+        return TurnSlot(self.run, saved, self._record, notes=self._state.resume_log)
+
+    def _record(self, turn: dict[str, Any] | None) -> None:
+        self._doc["turn"] = turn
+        self._write()
+
+    def _write(self) -> None:
+        assert self._state is not None
+        write_state(self.run.run_dir, {**self._doc, "state": self._state.fields()})
+
+
+@dataclass(frozen=True, slots=True)
+class _Resumed:
+    phase: str
+    session_id: str
+    native: str | None
+    state: _State
+    prompt: str | None
+    approved: frozenset[str]
+    turn: dict[str, Any] | None
+
+
+def _restore(data: Mapping[str, Any]) -> tuple[_Resumed | None, str]:
+    phase, sid, native, prompt = (data.get(k) for k in ("phase", "session_id", "native", "prompt"))
+    raw_state, turn, approved = data.get("state"), data.get("turn"), data.get("approved")
+    if phase not in _PHASES or not isinstance(sid, str) or not sid or not isinstance(raw_state, dict):
+        return None, "state.json names no phase, session or state"
+    try:
+        state = _State(**cast(dict[str, Any], raw_state))
+    except TypeError as exc:
+        return None, f"the state in state.json does not fit this version ({exc})"
+    if phase == "develop" and not (isinstance(prompt, str) and prompt):
+        return None, "state.json records a development turn without its prompt"
+    return _Resumed(
+        phase=str(phase), session_id=sid, native=native if isinstance(native, str) and native else None, state=state,
+        prompt=prompt if isinstance(prompt, str) else None,
+        approved=frozenset(str(a) for a in cast(list[object], approved)) if isinstance(approved, list) else frozenset(),
+        turn=cast(dict[str, Any], turn) if isinstance(turn, dict) else None,
+    ), ""
 
 
 def _approval(events: Sequence[Event], request_id: str | None) -> tuple[bool, str] | None:
@@ -291,84 +365,155 @@ class SDEExecutor:
         session: SessionRef | None,
         caps: RunCapabilities,
     ) -> RunOutcome:
-        session_id = session.session_id if session is not None else new_id("sess")
-        native = session.executor_session_id if session is not None and session.executor_id == self.executor_id else None
-        pending_id = session.pending_request_id if session is not None else None
-        targets = target_events(events)
+        return await self._execute(events, session, caps, None)
+
+    async def execute_resumable(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+        run: RunContext,
+    ) -> RunOutcome:
+        return await self._execute(events, session, caps, run)
+
+    async def resume(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+        run: RunContext,
+    ) -> RunOutcome:
+        # Continues a Run a stopped process detached, from the phase and turn in its state.json. Without a usable
+        # state it starts the task over, and the result says so.
+        data, problem = await asyncio.to_thread(read_state, run.run_dir, STATE_FORMAT)
+        restored, why = _restore(data) if data is not None else (None, problem)
+        if restored is None:
+            note = f"Resumed after a restart without a usable state ({why}); development started again from the task."
+            return await self._execute(events, session, caps, run, restart_note=note)
+        r = restored
+        progress = _Progress(run, r.session_id, saved_turn=r.turn)
+        if r.phase == "develop":
+            assert r.prompt is not None
+            work = self._run(r.session_id, r.native, r.state, caps, r.prompt, approved_launch=True, progress=progress)
+        elif r.phase == "review":
+            work = self._run(r.session_id, r.native, r.state, caps, None, progress=progress)
+        else:
+            work = self._finish(r.session_id, r.native, r.state, caps, review=r.state.review_status,
+                                note=r.state.review_note, approved=r.approved, progress=progress)
+        return await self._guarded(r.session_id, r.native, work, r.state.resume_log)
+
+    async def _guarded(
+        self, session_id: str, native: str | None, work: Awaitable[RunOutcome], notes: Sequence[str] = ()
+    ) -> RunOutcome:
         try:
-            resumed = _State.load(session.checkpoint) if session is not None and pending_id else None
-            prompt: str | None
-            approved_launch = False
-            if resumed is not None:
-                state = resumed
-                state.inbox_id = state.inbox_id or events[0].inbox_id
-                answer = _approval(events, pending_id)
-                if answer is None:
-                    # Not the awaited decision: record it and keep the same request open.
-                    text = _task_text(targets)
-                    if text:
-                        state.followups.append(text)
-                    return self._suspend(session_id, native, state, request_id=pending_id)
-                approved, comment = answer
-                # Messages claimed in the same batch as the decision count as follow-ups too.
-                batched = _task_text([e for e in events if not is_approval(e)])
-                if batched:
-                    state.followups.append(batched)
-                if not approved:
-                    if state.stage == "review_pending":
-                        return await self._finish(session_id, native, state, caps, review="pending",
-                                                  note=f"retry declined; {state.reason}")
-                    if state.stage == "delivery_pending":
-                        return self._deliver(session_id, native, state, self._record(state),
-                                             declined=f"delivery declined: {state.reason}")
-                    why = {"needs_input": "question declined", "terminal_pending": "interactive session declined",
-                           "incomplete": "incomplete work left in place"}.get(state.stage, "launch declined")
-                    return self._stopped(session_id, native, state, why)
-                followups = self._take_followups(state)
-                if state.stage == "delivery_pending":
-                    # A person decided: the developer may be sent back again up to the limit.
-                    state.handbacks = 0
-                if state.stage == "delivery_pending" and not followups:
-                    # Only the delivery step is retried; an approved permission counts for this attempt.
-                    granted = frozenset({state.delivery_approval}) - {""}
-                    return await self._finish(session_id, native, state, caps, review=state.review_status,
-                                              note=state.review_note, approved=granted)
-                if state.stage == "needs_input":
-                    reply = "\n\n".join(p for p in (comment, followups) if p)
-                    prompt = f"## Answer from a person\n{reply or '(approved without comment)'}"
-                elif state.stage in ("launch_pending", "terminal_pending"):
-                    prompt = state.pending_prompt + (f"\n\n## Follow-up from a person\n{followups}" if followups else "")
-                    # Approving a missing terminal only retries; the launch gate still runs.
-                    approved_launch = state.stage == "launch_pending"
-                elif state.stage == "incomplete":
-                    state.nudged = True
-                    reply = "\n\n".join(p for p in (comment, followups) if p)
-                    prompt = _unfinished_prompt(state.reason) + (f"\n\n## From a person\n{reply}" if reply else "")
-                elif state.stage == "delivery_pending":
-                    # New requirements arrived with the approval: develop them, then review and deliver again.
-                    state.rounds = 0
-                    prompt = f"## Follow-up from a person\n{followups}"
-                else:
-                    state.rounds = 0
-                    prompt = await self._fix_prompt(state) if state.blocking else None
-                    if followups:
-                        # New requirements must be developed before the retried review sees them.
-                        prompt = (prompt + "\n\n" if prompt else "") + f"## Follow-up from a person\n{followups}"
-                # The checkpoint names the workdir; it must still be this inbox's own worktree before any launch.
-                await asyncio.to_thread(self._worktrees.assert_writable, inbox_id=state.inbox_id,
-                                        work_key=state.work_key, workdir=state.workdir)
-            else:
-                if all(e.source in _FOLLOW_UP_SOURCES for e in targets) and not _task_text(targets):
-                    # A comment only follows up a task waiting for a person; with none waiting it starts nothing.
-                    return Silent(executor_session_id=native)
-                state = await self._new_state(events, targets, session)
-                prompt = await self._first_prompt(state, caps)
-            return await self._run(session_id, native, state, caps, prompt, approved_launch=approved_launch)
+            return await work
         except DeliveryInterrupted as exc:
             # Same contract as an interrupted CLI run: nothing is written and the batch restarts.
             raise asyncio.CancelledError(str(exc)) from exc
+        except DeliveryDetached as exc:
+            raise RunDetached(str(exc)) from exc
         except (ClaudeCodeError, ReviewAborted, RuntimeError, OSError) as exc:
-            return self._fail(session_id, native, str(exc))
+            return self._fail(session_id, native, str(exc), notes)
+
+    async def _execute(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+        run: RunContext | None,
+        *,
+        restart_note: str = "",
+    ) -> RunOutcome:
+        session_id = session.session_id if session is not None else new_id("sess")
+        native = session.executor_session_id if session is not None and session.executor_id == self.executor_id else None
+        notes: list[str] = [restart_note] if restart_note else []
+        return await self._guarded(session_id, native, self._start(events, session, caps, run, session_id, native, notes),
+                                   notes)
+
+    async def _start(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+        run: RunContext | None,
+        session_id: str,
+        native: str | None,
+        notes: list[str],
+    ) -> RunOutcome:
+        pending_id = session.pending_request_id if session is not None else None
+        targets = target_events(events)
+        progress = _Progress(run, session_id) if run is not None else None
+        resumed = _State.load(session.checkpoint) if session is not None and pending_id else None
+        prompt: str | None
+        approved_launch = False
+        if resumed is not None:
+            state = resumed
+            state.inbox_id = state.inbox_id or events[0].inbox_id
+            state.resume_log += notes
+            answer = _approval(events, pending_id)
+            if answer is None:
+                # Not the awaited decision: record it and keep the same request open.
+                text = _task_text(targets)
+                if text:
+                    state.followups.append(text)
+                return self._suspend(session_id, native, state, request_id=pending_id)
+            approved, comment = answer
+            # Messages claimed in the same batch as the decision count as follow-ups too.
+            batched = _task_text([e for e in events if not is_approval(e)])
+            if batched:
+                state.followups.append(batched)
+            if not approved:
+                if state.stage == "review_pending":
+                    return await self._finish(session_id, native, state, caps, review="pending",
+                                              note=f"retry declined; {state.reason}", progress=progress)
+                if state.stage == "delivery_pending":
+                    return self._deliver(session_id, native, state, self._record(state),
+                                         declined=f"delivery declined: {state.reason}")
+                why = {"needs_input": "question declined", "terminal_pending": "interactive session declined",
+                       "incomplete": "incomplete work left in place"}.get(state.stage, "launch declined")
+                return self._stopped(session_id, native, state, why)
+            followups = self._take_followups(state)
+            if state.stage == "delivery_pending":
+                # A person decided: the developer may be sent back again up to the limit.
+                state.handbacks = 0
+            if state.stage == "delivery_pending" and not followups:
+                # Only the delivery step is retried; an approved permission counts for this attempt.
+                granted = frozenset({state.delivery_approval}) - {""}
+                return await self._finish(session_id, native, state, caps, review=state.review_status,
+                                          note=state.review_note, approved=granted, progress=progress)
+            if state.stage == "needs_input":
+                reply = "\n\n".join(p for p in (comment, followups) if p)
+                prompt = f"## Answer from a person\n{reply or '(approved without comment)'}"
+            elif state.stage in ("launch_pending", "terminal_pending"):
+                prompt = state.pending_prompt + (f"\n\n## Follow-up from a person\n{followups}" if followups else "")
+                # Approving a missing terminal only retries; the launch gate still runs.
+                approved_launch = state.stage == "launch_pending"
+            elif state.stage == "incomplete":
+                state.nudged = True
+                reply = "\n\n".join(p for p in (comment, followups) if p)
+                prompt = _unfinished_prompt(state.reason) + (f"\n\n## From a person\n{reply}" if reply else "")
+            elif state.stage == "delivery_pending":
+                # New requirements arrived with the approval: develop them, then review and deliver again.
+                state.rounds = 0
+                prompt = f"## Follow-up from a person\n{followups}"
+            else:
+                state.rounds = 0
+                prompt = await self._fix_prompt(state) if state.blocking else None
+                if followups:
+                    # New requirements must be developed before the retried review sees them.
+                    prompt = (prompt + "\n\n" if prompt else "") + f"## Follow-up from a person\n{followups}"
+            # The checkpoint names the workdir; it must still be this inbox's own worktree before any launch.
+            await asyncio.to_thread(self._worktrees.assert_writable, inbox_id=state.inbox_id,
+                                    work_key=state.work_key, workdir=state.workdir)
+        else:
+            if all(e.source in _FOLLOW_UP_SOURCES for e in targets) and not _task_text(targets):
+                # A comment only follows up a task waiting for a person; with none waiting it starts nothing.
+                return Silent(executor_session_id=native)
+            state = await self._new_state(events, targets, session)
+            state.resume_log += notes
+            prompt = await self._first_prompt(state, caps)
+        return await self._run(session_id, native, state, caps, prompt, approved_launch=approved_launch,
+                               progress=progress)
 
     @staticmethod
     def _take_followups(state: _State) -> str:
@@ -505,7 +650,8 @@ class SDEExecutor:
         )
 
     async def _develop(
-        self, session_id: str, native: str | None, state: _State, prompt: str, caps: RunCapabilities
+        self, session_id: str, native: str | None, state: _State, prompt: str, caps: RunCapabilities,
+        progress: _Progress | None = None,
     ) -> tuple[dict[str, Any], str | None]:
         p = self._profile
         managed = self._delivery is not None
@@ -518,6 +664,9 @@ class SDEExecutor:
             raise ClaudeCodeError(f"interactive session unavailable: {self._terminal.reason}")
         if self._terminal is not None:
             # Fix rounds and later events continue the task's conversation: its live terminal, else --resume.
+            resumable: dict[str, Any] = (
+                {"slot": progress.slot(), "slot_label": "develop"} if progress is not None else {}
+            )
             reply = await self._terminal.converse(
                 p,
                 title=terminal_title(p.name, SDE_ROLE, state.work_key or Path(state.workdir).name),
@@ -530,6 +679,7 @@ class SDEExecutor:
                 native=native,
                 schema_name="sde-report",
                 inbox_id=state.inbox_id or None,
+                **resumable,
             )
             state.terminal = reply.handle
             return _validate_report(reply.data), reply.native_session_id
@@ -559,8 +709,10 @@ class SDEExecutor:
         prompt: str | None,
         *,
         approved_launch: bool = False,
+        progress: _Progress | None = None,
     ) -> RunOutcome:
-        # prompt=None goes straight to review (retrying one that could not complete).
+        # prompt=None goes straight to review (retrying one that could not complete). With progress every phase is
+        # recorded in the Run's state.json before it starts.
         while True:
             if prompt is not None:
                 if isinstance(self._terminal, TerminalUnavailable):
@@ -577,7 +729,9 @@ class SDEExecutor:
                         return self._suspend(session_id, native, state)
                 approved_launch = False
                 state.pending_prompt = ""
-                report, native = await self._develop(session_id, native, state, prompt, caps)
+                if progress is not None:
+                    progress.phase("develop", state, native, prompt=prompt)
+                report, native = await self._develop(session_id, native, state, prompt, caps, progress)
                 if report["status"] == "needs_input":
                     state.stage, state.reason = "needs_input", report["question"]
                     return self._suspend(session_id, native, state)
@@ -598,7 +752,7 @@ class SDEExecutor:
                 state.nudged = False
             reviewer = self._reviewer
             if not self._options.review or reviewer is None:
-                return await self._finish(session_id, native, state, caps, review="off")
+                return await self._finish(session_id, native, state, caps, review="off", progress=progress)
             workdir = Path(state.workdir)
             decision = reviewer.check_launch(caps, workdir)
             if decision.action != "allow":
@@ -617,6 +771,8 @@ class SDEExecutor:
                         previous = _recheck_section(state.recheck, state.last_review, delta)
                 pin, selection = await asyncio.to_thread(self._guidance_inputs, state)
                 subject = state.work_key or workdir.name
+                if progress is not None:
+                    progress.phase("review", state, native)
                 review = await reviewer.review(
                     ReviewRequest(workdir=workdir, requirements=state.requirements,
                                   test_evidence=state.test_evidence, base_ref=state.base_ref,
@@ -624,6 +780,7 @@ class SDEExecutor:
                                   label=f"review of {subject} round {len(state.history) + 1}",
                                   inbox_id=state.inbox_id),
                     caps,
+                    slot=progress.slot() if progress is not None else None,
                 )
             except (ReviewAborted, ClaudeCodeError, ValueError) as exc:
                 return self._pending(session_id, native, state, f"the review could not complete: {exc}")
@@ -639,7 +796,7 @@ class SDEExecutor:
             state.blocking = blocking
             state.recheck = ""
             if review["verdict"] == "pass":
-                return await self._finish(session_id, native, state, caps, review="pass")
+                return await self._finish(session_id, native, state, caps, review="pass", progress=progress)
             if state.rounds >= self._options.max_review_rounds:
                 return self._pending(
                     session_id, native, state,
@@ -719,6 +876,8 @@ class SDEExecutor:
             )
         if state.handback_log:
             prompt += "\n" + "\n".join(state.handback_log)
+        if state.resume_log:
+            prompt += "\n" + "\n".join(f"Restart: {n}" for n in state.resume_log)
         return Suspend(
             request_id=request_id or new_id("req"),
             prompt=prompt,
@@ -754,10 +913,13 @@ class SDEExecutor:
         review: str,
         note: str = "",
         approved: frozenset[str] = frozenset(),
+        progress: _Progress | None = None,
     ) -> RunOutcome:
         state.review_status, state.review_note = review, note
         if self._delivery is None:
             return self._deliver(session_id, native, state)
+        if progress is not None:
+            progress.phase("deliver", state, native, approved=approved)
         first_line = next((ln.strip("# ").strip() for ln in state.requirements.splitlines() if ln.strip()), "")
         request = DeliveryRequest(
             work_key=self._work_key(state),
@@ -771,14 +933,16 @@ class SDEExecutor:
             review_detail="; ".join([self._review_status(state), *state.history]),
             issue=state.issue,
         )
+        # A stop ends the delivery at its next checkpoint; a resumed Run delivers again from the stored record.
         record = await asyncio.to_thread(
             self._delivery.deliver, request, permissions=caps.permissions, approved=approved,
             is_interrupted=caps.is_interrupted,
+            should_detach=progress.run.should_detach if progress is not None else _stays,
         )
         if record.problem:
             limit = self._delivery.config.max_handbacks
             if record.handback and state.handbacks < limit:
-                return await self._hand_back(session_id, native, state, caps, record.handback, limit)
+                return await self._hand_back(session_id, native, state, caps, record.handback, limit, progress)
             # Recoverable: the record keeps what already happened, so approval resumes from there.
             reason = record.problem
             if record.handback and state.handbacks:
@@ -792,7 +956,7 @@ class SDEExecutor:
 
     async def _hand_back(
         self, session_id: str, native: str | None, state: _State, caps: RunCapabilities, handback: dict[str, Any],
-        limit: int,
+        limit: int, progress: _Progress | None = None,
     ) -> RunOutcome:
         # Same developer session, branch and worktree; the fix is reviewed (as a delta) and delivery runs again.
         state.handbacks += 1
@@ -802,7 +966,7 @@ class SDEExecutor:
         state.rounds = 0
         if state.review_status == "pass":
             state.recheck = what
-        return await self._run(session_id, native, state, caps, _handback_prompt(handback))
+        return await self._run(session_id, native, state, caps, _handback_prompt(handback), progress=progress)
 
     async def _exit_terminal(self, session_id: str, native: str | None, state: _State, record: DeliveryRecord) -> str:
         notes = [await self._exit_dev_terminal(session_id, native, state, record),
@@ -858,6 +1022,7 @@ class SDEExecutor:
             f"Change: {state.change_kind or '(not reported)'} ({state.change_rationale or 'no rationale'})",
             *(delivery.render() if delivery is not None else []),
             *state.handback_log,
+            *(f"Restart: {n}" for n in state.resume_log),
             *([declined] if declined else []),
             *([exit_note] if exit_note else []),
             *([f"Worktree: the PR is merged, so this session closes and {state.workdir} is reclaimed after this "
@@ -881,6 +1046,7 @@ class SDEExecutor:
             lines.append(f"Unfinished: {state.reason}")
             lines.append("Nothing was delivered; the worktree, this session and its terminal are kept.")
         lines += state.handback_log
+        lines += [f"Restart: {n}" for n in state.resume_log]
         if state.summary:
             lines.append(f"Summary so far: {state.summary}")
         if state.test_evidence:
@@ -891,9 +1057,13 @@ class SDEExecutor:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
         return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native, status="stopped")
 
-    def _fail(self, session_id: str, native: str | None, detail: str) -> Emit:
-        return Emit(messages=(f"[{self._profile.name}] development failed: {detail}",),
-                    session_id=session_id, executor_session_id=native, status="failed")
+    def _fail(self, session_id: str, native: str | None, detail: str, notes: Sequence[str] = ()) -> Emit:
+        text = "\n".join([f"[{self._profile.name}] development failed: {detail}", *(f"Restart: {n}" for n in notes)])
+        return Emit(messages=(text,), session_id=session_id, executor_session_id=native, status="failed")
+
+
+def _stays() -> bool:
+    return False
 
 
 def _validate_report(raw: object) -> dict[str, Any]:

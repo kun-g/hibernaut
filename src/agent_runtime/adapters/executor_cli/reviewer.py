@@ -22,6 +22,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, terminal_title
 from agent_runtime.adapters.executor_cli.peer import PEER_TOOLS, DeveloperPeerResolver, PeerLookup
 from agent_runtime.adapters.executor_cli.process import join_text, last_text, target_events
+from agent_runtime.adapters.executor_cli.run_state import TurnSlot
 from agent_runtime.adapters.executor_cli.project_guidance import (
     GuidancePin,
     Selection,
@@ -58,6 +59,7 @@ _READ_ONLY_TOOLS = (
 )
 _WRITE_TOOLS = ("Edit", "Write", "NotebookEdit", "MultiEdit")
 _MAX_DIFF_CHARS = 200_000
+_REVIEW_TURN = "review"
 
 REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -202,8 +204,11 @@ class Reviewer(Protocol):
 
     def check_launch(self, caps: RunCapabilities, workdir: Path) -> PermissionDecision: ...
 
-    # Raises ReviewAborted (or ClaudeCodeError) when no valid verdict is reached.
-    async def review(self, request: ReviewRequest, caps: RunCapabilities) -> dict[str, Any]: ...
+    # Raises ReviewAborted (or ClaudeCodeError) when no valid verdict is reached. With a slot, a review that waits on
+    # an Orca terminal records it there and picks a recorded one back up after a restart.
+    async def review(
+        self, request: ReviewRequest, caps: RunCapabilities, slot: TurnSlot | None = None
+    ) -> dict[str, Any]: ...
 
     def format_review(self, review: Mapping[str, Any]) -> str: ...
 
@@ -300,16 +305,22 @@ class CoderReviewerExecutor:
                 f"project or interactive = false on executors.{self._profile.name}"
             )
 
-    async def review(self, request: ReviewRequest, caps: RunCapabilities) -> dict[str, Any]:
+    async def review(
+        self, request: ReviewRequest, caps: RunCapabilities, slot: TurnSlot | None = None
+    ) -> dict[str, Any]:
         # Callers run check_launch() first; raises ReviewAborted or ClaudeCodeError when no verdict is reached.
         self._require_terminal()
         p = self._profile
         env = child_env(p, os.environ)
         system = role_system_prompt(p, role=CODE_REVIEWER_ROLE, contract=_REVIEW_CONTRACT)
         evidence, guidance = await review_inputs(request)
-        before = await asyncio.to_thread(worktree_fingerprint, request.workdir)
-        extra: dict[str, str] = {}
         terminal = self._terminal
+        resumable = slot if isinstance(terminal, OrcaVisibleRunner) and terminal.handoff == "peer" else None
+        saved = resumable.peek(_REVIEW_TURN) if resumable is not None else None
+        # A resumed review is judged against the worktree as it was when the reviewer started.
+        recorded = saved.get("before") if saved is not None else None
+        before = recorded if isinstance(recorded, str) else await asyncio.to_thread(worktree_fingerprint, request.workdir)
+        extra: dict[str, str] = {}
         if isinstance(terminal, OrcaVisibleRunner):
             # A fresh conversation every time: a re-review gets the earlier findings in its prompt, not its context.
             peer = request.peer.peer if request.peer is not None else None
@@ -323,6 +334,9 @@ class CoderReviewerExecutor:
                 is_interrupted=caps.is_interrupted,
                 schema_name="code-review",
                 inbox_id=request.inbox_id or None,
+                slot=resumable,
+                slot_label=_REVIEW_TURN,
+                slot_extra={"before": before},
             )
             raw: object = reply.data
             extra = {"terminal": reply.handle, "native_session_id": reply.native_session_id}

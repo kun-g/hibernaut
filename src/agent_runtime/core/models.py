@@ -138,3 +138,22 @@ class Suspend:
 
 
 RunOutcome: TypeAlias = Silent | Emit | Suspend
+
+
+@dataclass(frozen=True, slots=True)
+class OpenRun:
+    # A Run that has started and not yet written its result. One per session; its events stay 'processing' while
+    # it is registered, so a new process resumes it instead of requeueing them.
+    session_id: str
+    inbox_id: str
+    executor_id: str
+    run_dir: str
+    event_ids: tuple[str, ...]
+    started_at: str
+    code_version: str = ""
+
+
+class RunDetached(Exception):
+    # Raised by a resumable executor that stopped at a resumable point because the process is stopping; the work
+    # outside this process goes on and the next process resumes the Run from its run directory.
+    pass

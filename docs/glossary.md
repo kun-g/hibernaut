@@ -14,6 +14,7 @@
 | **Session / session_id** | 跨多次 Run 的逻辑会话与挂起断点上下文单元 | 隶属于某个 `inbox_id` | 显式 4 态（`active / suspended / archived / closed`）；绑定 `executor_id`、`executor_session_id`、`work_key` 与可选 `parent_session_id` |
 | **work_key** | 托管动态 `hb-*` worktree 的复用与引用计数键（默认沿用 `correlation_key`） | 单件活（Task / Issue） | 仅当某 `work_key` 下 `active / suspended` 会话引用数归零（`ref=0`）且过三关检查才允许安全回收目录 |
 | **Run** | Worker 被唤醒后执行的一轮短生命周期推理与工具循环（一次 `ExecutorPort.execute` 调用） | 单次唤醒周期 | 消费同一 `inbox_id` 的一批事件，结束时产出 `RunOutcome` 并落盘休眠 |
+| **Open Run / 脱离（detach）** | 进行中、可在进程重启后接回的 Run：`open_runs` 表里的登记加 `<state_dir>/runs/<session_id>/<run_id>/` 目录（执行器的 `state.json`）。停机时正在等 Orca 终端的 Run 被脱离：旧进程不等它、不关终端，新进程用 `resume()` 接着等结果 | 单个 Run | 正常结束时登记与目录一起删除；同一会话至多 1 个登记 |
 | **Worker / Lease** | 消费事件并拉起 Run 的无状态调度协程 / 以 `inbox_id` 为主键的限时互斥租约锁（`worker_leases`） | 每 `inbox_id` 单活 | 保证同一 `inbox_id` 同一时刻最多 1 个活跃 Run；进程崩溃后租约到期自动释放接管 |
 
 ## 2. 五大原语与运行终态

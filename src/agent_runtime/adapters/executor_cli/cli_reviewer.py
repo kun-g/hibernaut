@@ -19,6 +19,7 @@ from agent_runtime.adapters.executor_cli.orca import (
     terminal_title,
 )
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout, supervise
+from agent_runtime.adapters.executor_cli.run_state import TurnSlot
 from agent_runtime.adapters.executor_cli.reviewer import (
     CODE_REVIEWER_ROLE,
     REVIEW_LAUNCH_TOOL,
@@ -37,6 +38,8 @@ from agent_runtime.core.ports import RunCapabilities
 
 _FENCE = re.compile(r"```[ \t]*(?:json)?[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
 _MAX_STDERR_CHARS = 500
+_FIRST_TURN = "review"
+_RETRY_TURN = "review-retry"
 _COMPACT_SCHEMA = json.dumps(REVIEW_SCHEMA, separators=(",", ":"))
 _log = logging.getLogger(__name__)
 
@@ -77,13 +80,27 @@ class CLIReviewer:
             REVIEW_LAUNCH_TOOL, {"executor": t.name, "workdir": str(workdir), "command": t.command},
         )
 
-    async def review(self, request: ReviewRequest, caps: RunCapabilities) -> dict[str, Any]:
+    async def review(
+        self, request: ReviewRequest, caps: RunCapabilities, slot: TurnSlot | None = None
+    ) -> dict[str, Any]:
+        # A slot applies only to runs in an Orca terminal; a subprocess run is waited for when the process stops.
         evidence, guidance = await review_inputs(request)
         prompt = f"{review_prompt(request, guidance, evidence)}\n\n{plain_review_contract()}"
         subject = request.label or request.workdir.name
         where = self._where()
-        before = await asyncio.to_thread(worktree_fingerprint, request.workdir)
-        stdout = await self._run(prompt, request.workdir, caps, where, subject)
+        saved = (slot.peek(_RETRY_TURN) or slot.peek(_FIRST_TURN)) if slot is not None else None
+        recorded = saved.get("before") if saved is not None else None
+        before = recorded if isinstance(recorded, str) else await asyncio.to_thread(worktree_fingerprint, request.workdir)
+        if slot is not None and slot.peek(_RETRY_TURN) is not None:
+            # The format retry was running when the process stopped; if it cannot be picked up, start over.
+            stdout = await self._picked_up(slot, _RETRY_TURN, request.workdir, caps, where)
+            if stdout is not None:
+                await self._unchanged(request.workdir, before)
+                try:
+                    return {**validate_review(extract_verdict(stdout)), **self._extras(where)}
+                except ReviewAborted as exc:
+                    raise ReviewAborted(f"{self._template.name} returned no valid verdict after one retry: {exc}") from exc
+        stdout = await self._run(prompt, request.workdir, caps, where, subject, slot, _FIRST_TURN, before)
         await self._unchanged(request.workdir, before)
         try:
             return {**validate_review(extract_verdict(stdout)), **self._extras(where)}
@@ -91,12 +108,34 @@ class CLIReviewer:
             # One retry with the reason: a model that wrapped or misshaped its JSON usually fixes it when told.
             retry = (f"{prompt}\n\n## Your previous output was rejected\n{exc}. Output exactly one JSON object that "
                      "matches the schema above, and nothing else.")
-        stdout = await self._run(retry, request.workdir, caps, where, f"{subject} format retry")
+        stdout = await self._run(retry, request.workdir, caps, where, f"{subject} format retry", slot, _RETRY_TURN,
+                                 before)
         await self._unchanged(request.workdir, before)
         try:
             return {**validate_review(extract_verdict(stdout)), **self._extras(where)}
         except ReviewAborted as exc:
             raise ReviewAborted(f"{self._template.name} returned no valid verdict after one retry: {exc}") from exc
+
+    async def _picked_up(
+        self, slot: TurnSlot, label: str, workdir: Path, caps: RunCapabilities, where: _Where | None
+    ) -> str | None:
+        terminal = self._terminal
+        if where is None or where.fallback or not isinstance(terminal, OrcaCommandTerminal):
+            slot.take(label)
+            return None
+        t = self._template
+        try:
+            run = await terminal.pick_up(slot, label, workdir, caps.is_interrupted)
+        except ProcessTimeout as exc:
+            raise ReviewAborted(f"{t.name}: '{t.command}' {exc}") from exc
+        except TerminalRunFailed as exc:
+            raise ReviewAborted(f"{t.name}: {exc}") from exc
+        if run is None:
+            return None
+        where.handles.append(run.handle)
+        if run.exit_code is None:
+            raise ReviewAborted(f"{t.name}: {run.error or f'no exit code from Orca terminal {run.handle}'}")
+        return self._stdout(run.exit_code, run.stdout, run.stderr)
 
     def _where(self) -> _Where | None:
         if self._template.terminal != "orca":
@@ -122,10 +161,18 @@ class CLIReviewer:
                 "discarded, check the change and submit again"
             )
 
-    async def _run(self, prompt: str, workdir: Path, caps: RunCapabilities, where: _Where | None, subject: str) -> str:
+    async def _run(
+        self, prompt: str, workdir: Path, caps: RunCapabilities, where: _Where | None, subject: str,
+        slot: TurnSlot | None = None, label: str = _FIRST_TURN, before: str = "",
+    ) -> str:
         if where is not None and not where.fallback and isinstance(self._terminal, OrcaCommandTerminal):
+            if slot is not None:
+                picked = await self._picked_up(slot, label, workdir, caps, where)
+                if picked is not None:
+                    return picked
             try:
-                return await self._run_in_terminal(self._terminal, prompt, workdir, caps, where, subject)
+                return await self._run_in_terminal(self._terminal, prompt, workdir, caps, where, subject, slot, label,
+                                                   before)
             except TerminalStartFailed as exc:
                 # Nothing ran: the same run goes to a subprocess, and later runs of this review follow it.
                 _log.warning("%s: Orca could not open a terminal, running as a subprocess: %s", self._template.name, exc)
@@ -134,7 +181,7 @@ class CLIReviewer:
 
     async def _run_in_terminal(
         self, terminal: OrcaCommandTerminal, prompt: str, workdir: Path, caps: RunCapabilities, where: _Where,
-        subject: str,
+        subject: str, slot: TurnSlot | None = None, label: str = _FIRST_TURN, before: str = "",
     ) -> str:
         t = self._template
         try:
@@ -143,6 +190,7 @@ class CLIReviewer:
                 argv=[t.command, *render_cli_args(t.args, prompt=prompt, review_schema=_COMPACT_SCHEMA)],
                 env=t.env,
                 timeout_seconds=t.timeout_seconds, is_interrupted=caps.is_interrupted,
+                slot=slot, slot_label=label, slot_extra={"before": before},
             )
         except ProcessTimeout as exc:
             raise ReviewAborted(f"{t.name}: '{t.command}' {exc}") from exc

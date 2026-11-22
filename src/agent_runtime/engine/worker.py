@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncGenerator, Callable, Mapping
+from collections.abc import AsyncGenerator, Callable, Generator, Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Never, assert_never, cast
 
@@ -11,6 +11,8 @@ from agent_runtime.core.models import (
     Emit,
     Event,
     NewEventPolicy,
+    OpenRun,
+    RunDetached,
     RunOutcome,
     TASK_CONTEXT_KEY,
     SessionRef,
@@ -25,8 +27,10 @@ from agent_runtime.core.ports import (
     InboxPort,
     LockPort,
     MemoryPort,
+    OpenRunPort,
     OutboxPort,
     PermissionPort,
+    ResumableExecutorPort,
     RunCapabilities,
     RunStartListener,
     SessionStorePort,
@@ -65,6 +69,64 @@ class ExecutorFailed(RuntimeError):
 
 class _RunInterrupted(Exception):
     pass
+
+
+class _RunDetached(Exception):
+    pass
+
+
+class _RunHandle:
+    # RunContext of one resumable Run. A stop detaches the Run only where it is parked (waiting on work outside this
+    # process) or where it polls should_detach(); anywhere else the stop waits for it as for any other Run.
+    def __init__(self, run_dir: str, detaching: Callable[[], bool]) -> None:
+        self._run_dir = run_dir
+        self._detaching = detaching
+        self._task: asyncio.Task[RunOutcome] | None = None
+        self._parked = 0
+        self._detached = False
+
+    @property
+    def run_dir(self) -> str:
+        return self._run_dir
+
+    def bind(self, task: asyncio.Task[RunOutcome]) -> None:
+        self._task = task
+
+    @contextlib.contextmanager
+    def detachable(self) -> Generator[None]:
+        self._parked += 1
+        try:
+            if self._detaching():
+                self.detach()
+            yield
+        finally:
+            self._parked -= 1
+
+    def should_detach(self) -> bool:
+        if self._detaching():
+            self._detached = True
+            return True
+        return False
+
+    def detached(self) -> bool:
+        return self._detached
+
+    def mark_detached(self) -> None:
+        self._detached = True
+
+    def detach(self) -> None:
+        # Cancels the Run's task only while it is parked; the cancellation surfaces at its next await.
+        if self._parked and self._task is not None and not self._task.done():
+            self._detached = True
+            self._task.cancel()
+
+
+@dataclass(slots=True)
+class _BatchEnd:
+    ids: list[str]
+    report: RunReport | None = None
+    interrupted: bool = False
+    detached: bool = False
 
 
 # Payload keys that pick where/how an executor runs (e.g. LocalCLIExecutor's workdir and CLI
@@ -109,6 +171,8 @@ class AgentWorker:
         on_worktree_reclaim: Callable[[str], object] | None = None,
         hold: Callable[[Event], str | None] | None = None,
         run_start_listener: RunStartListener | None = None,
+        open_runs: OpenRunPort | None = None,
+        code_version: str = "",
         lease_ttl_seconds: float = 60.0,
         max_retries: int = 2,
         new_event_policy: NewEventPolicy = "defer",
@@ -138,6 +202,9 @@ class AgentWorker:
         self._on_worktree_reclaim = on_worktree_reclaim
         self._hold = hold
         self._run_start_listener = run_start_listener
+        # Without a registry every executor runs as a plain ExecutorPort and a stop waits for its Runs.
+        self._open_runs = open_runs
+        self._code_version = code_version
         self._lock = lock
         self._sessions = sessions
         self._lease_ttl_seconds = lease_ttl_seconds
@@ -148,6 +215,8 @@ class AgentWorker:
         self._wake_signals: dict[str, asyncio.Event] = {}
         self._retired = False
         self._interruptible = True
+        self._detaching = False
+        self._handles: set[_RunHandle] = set()
 
     @property
     def new_event_policy(self) -> NewEventPolicy:
@@ -166,6 +235,23 @@ class AgentWorker:
         if not interruptible:
             self._interruptible = False
 
+    def detach(self) -> None:
+        # A process stop: resumable Runs parked on work outside this process are cancelled without ending that work,
+        # keep their registration and run directory, and leave their events 'processing' for the next process.
+        # Runs that are not parked go on until they park or finish; the second stop signal still cancels them.
+        self.retire(interruptible=False)
+        self._detaching = True
+        for handle in list(self._handles):
+            handle.detach()
+
+    def _is_detaching(self) -> bool:
+        return self._detaching
+
+    def _resumable(self, executor: ExecutorPort) -> ResumableExecutorPort | None:
+        if self._open_runs is None or not isinstance(executor, ResumableExecutorPort):
+            return None
+        return executor
+
     async def process_inbox(self, inbox_id: str) -> list[RunReport]:
         if not self._lock.acquire(inbox_id, self._worker_id, self._lease_ttl_seconds):
             return []
@@ -176,10 +262,25 @@ class AgentWorker:
         self._wake_signals[inbox_id] = wake_signal
 
         try:
-            # Recover any orphaned 'processing' events left by a crashed prior lease holder.
-            orphans = self._inbox.fetch_processing(inbox_id)
+            # Runs a stopped process detached are resumed first; their events stay 'processing' meanwhile, so nothing
+            # claims them as a new batch. Any other 'processing' event was orphaned by a crashed lease holder.
+            open_runs = self._open_runs.list_open(inbox_id) if self._open_runs is not None else []
+            held = {eid for run in open_runs for eid in run.event_ids}
+            orphans = [evt.event_id for evt in self._inbox.fetch_processing(inbox_id) if evt.event_id not in held]
             if orphans:
-                self._inbox.requeue_processing([evt.event_id for evt in orphans])
+                self._inbox.requeue_processing(orphans)
+            for open_run in open_runs:
+                if self._retired:
+                    break
+                end = await self._resume_open_run(inbox_id, open_run, wake_signal, interrupt_restarts)
+                if end is None:
+                    continue
+                if end.report is not None:
+                    reports.append(end.report)
+                if end.interrupted:
+                    interrupt_restarts += 1
+                if end.detached:
+                    break
 
             while not self._retired:
                 claimed = self._claim(inbox_id)
@@ -261,95 +362,26 @@ class AgentWorker:
                         )
                         self._inbox.bind_session(batch_ids, active_session.session_id)
 
-                        consumed_ids: set[str] = set(batch_ids)
                         folded_events: list[Event] = []
-                        target_batch_key = self._batch_key(batch[0], active_session)
-                        has_decision = any(self._is_approval_decision(evt) for evt in batch)
-                        batch_target = self._batch_target(batch)
-                        interrupted_flag = asyncio.Event()
-
-                        def _poll_folded(
-                            _inbox_id: str = inbox_id,
-                            _consumed: set[str] = consumed_ids,
-                            _folded: list[Event] = folded_events,
-                            _target_key: tuple[str, str] | None = target_batch_key,
-                            _has_decision: bool = has_decision,
-                            _batch_target: tuple[object, ...] | None = batch_target,
-                            _active_sid: str = active_session.session_id,
-                        ) -> list[Event]:
-                            if (
-                                self._new_event_policy != "fold"
-                                or _target_key is None
-                                or _has_decision
-                                or self._retired
-                            ):
-                                return []
-                            newly_folded: list[Event] = []
-                            for candidate in self._runnable(self._inbox.fetch_pending(_inbox_id)):
-                                if candidate.event_id in _consumed:
-                                    continue
-                                cand_session = self._resolve_session(candidate)
-                                if self._batch_key(candidate, cand_session) != _target_key:
-                                    continue
-                                if self._is_approval_decision(candidate) or (
-                                    _batch_target is not None
-                                    and self._execution_target(candidate) != _batch_target
-                                ):
-                                    break
-                                _consumed.add(candidate.event_id)
-                                _folded.append(candidate)
-                                newly_folded.append(candidate)
-                            if newly_folded:
-                                self._inbox.bind_session(
-                                    [e.event_id for e in newly_folded],
-                                    _active_sid,
-                                )
-                            return newly_folded
-
-                        caps: RunCapabilities = _ScopedCapabilities(
-                            memory=self._memory,
-                            timers=self._timers,
-                            permissions=self._permissions,
-                            _poll_folded=_poll_folded,
-                            _is_interrupted=interrupted_flag.is_set,
-                        )
-
                         allow_interrupt = (
                             self._new_event_policy == "interrupt"
                             and interrupt_restarts < self._max_interrupt_restarts
-                            and not has_decision
+                            and not any(self._is_approval_decision(evt) for evt in batch)
                         )
                         try:
-                            async with self._lease_heartbeat(inbox_id):
-                                run_batch = await self._notify_run_started(inbox_id, batch, batch_correlation_key)
-                                outcome = await self._execute_batch(
-                                    executor=selected_executor,
-                                    inbox_id=inbox_id,
-                                    batch=run_batch,
-                                    session_ref=active_session,
-                                    caps=caps,
-                                    known_ids=snapshot_ids,
-                                    interrupted_flag=interrupted_flag,
-                                    wake_signal=wake_signal,
-                                    allow_interrupt=allow_interrupt,
-                                )
-                        except _RunInterrupted:
-                            # Never write Outbox on interrupt; requeue current & remaining batches.
-                            requeue_ids = (
-                                batch_ids
-                                + [e.event_id for e in folded_events]
-                                + [evt.event_id for _, rem in batches[batch_idx + 1 :] for evt in rem]
-                                + unscheduled_ids
+                            end = await self._run_batch(
+                                inbox_id=inbox_id,
+                                batch=batch,
+                                active_session=active_session,
+                                executor=selected_executor,
+                                known_ids=snapshot_ids,
+                                wake_signal=wake_signal,
+                                allow_interrupt=allow_interrupt,
+                                folded_events=folded_events,
+                                open_run=None,
                             )
-                            self._inbox.requeue_processing(requeue_ids)
-                            completed_or_failed_ids.update(requeue_ids)
-                            interrupt_restarts += 1
-                            restarted = True
-                            break
-                        except ExecutorFailed as exc:
-                            all_failed_ids = batch_ids + [e.event_id for e in folded_events]
-                            self._inbox.mark_failed(all_failed_ids, str(exc.__cause__ or exc))
-                            completed_or_failed_ids.update(all_failed_ids)
+                        except ExecutorFailed:
+                            completed_or_failed_ids.update(batch_ids + [e.event_id for e in folded_events])
                             # Requeue remaining unexecuted batches so they are not stranded in processing.
                             remaining_ids = [
                                 evt.event_id
@@ -360,46 +392,22 @@ class AgentWorker:
                                 self._inbox.requeue_processing(remaining_ids)
                                 completed_or_failed_ids.update(remaining_ids)
                             raise
-
-                        final_corr = self._extract_correlation_key(
-                            batch + folded_events,
-                            active_session,
-                        )
-                        final_work_key = self._extract_work_key(
-                            batch + folded_events,
-                            active_session,
-                            final_corr,
-                            active_session.parent_session_id,
-                        )
-                        final_session_id = self._apply_outcome(
-                            inbox_id,
-                            active_session,
-                            outcome,
-                            final_corr,
-                            final_work_key,
-                            selected_executor,
-                            report_metadata=self._report_metadata(
-                                batch + folded_events, final_corr, selected_executor.executor_id
-                            ),
-                        )
-                        all_done_ids = batch_ids + [evt.event_id for evt in folded_events]
-                        if final_session_id is not None and final_session_id != active_session.session_id:
-                            self._inbox.bind_session(all_done_ids, final_session_id)
-                        self._inbox.mark_done(all_done_ids)
-                        completed_or_failed_ids.update(all_done_ids)
-                        reports.append(
-                            RunReport(
-                                inbox_id=inbox_id,
-                                session_id=final_session_id,
-                                event_ids=tuple(all_done_ids),
-                                outcome=outcome,
-                                correlation_key=final_corr,
-                            )
-                        )
-                        if isinstance(outcome, Emit) and outcome.close_session and final_session_id is not None:
-                            # After the result and its events are written, so the reclaim gates no longer see them.
-                            async with self._lease_heartbeat(inbox_id):
-                                await self._close_finished(final_session_id)
+                        completed_or_failed_ids.update(end.ids)
+                        if end.report is not None:
+                            reports.append(end.report)
+                        if end.interrupted:
+                            # Never write Outbox on interrupt; requeue current & remaining batches.
+                            requeue_ids = [
+                                evt.event_id for _, rem in batches[batch_idx + 1 :] for evt in rem
+                            ] + unscheduled_ids
+                            self._inbox.requeue_processing(requeue_ids)
+                            completed_or_failed_ids.update(requeue_ids)
+                            interrupt_restarts += 1
+                            restarted = True
+                            break
+                        if end.detached:
+                            # Its events stay 'processing' under the registration; later batches return to pending below.
+                            break
                 finally:
                     # Any held-back or unfinished claimed events return to pending for the next pass.
                     straggler_ids = [
@@ -585,6 +593,209 @@ class AgentWorker:
             raise ExecutorFailed(f"Executor '{target_id}' is not registered")
         return selected
 
+    async def _resume_open_run(
+        self, inbox_id: str, open_run: OpenRun, wake_signal: asyncio.Event, interrupt_restarts: int
+    ) -> _BatchEnd | None:
+        registry = self._open_runs
+        assert registry is not None
+        wanted = set(open_run.event_ids)
+        events = [evt for evt in self._inbox.fetch_processing(inbox_id) if evt.event_id in wanted]
+        if not events:
+            registry.discard(open_run.session_id)
+            return None
+        ids = [evt.event_id for evt in events]
+        executor = self._executors.get(open_run.executor_id)
+        session = self._sessions.get(open_run.session_id)
+        if executor is None or self._resumable(executor) is None or session is None:
+            # Nothing here can resume it: its events run again as a new batch under the existing routing rules,
+            # which hold them for a person when the executor is gone.
+            self._inbox.requeue_processing(ids)
+            registry.discard(open_run.session_id)
+            if executor is None:
+                self._outbox.enqueue(
+                    inbox_id=inbox_id,
+                    content=(
+                        f"[hibernaut] A stopped process left a Run of session {open_run.session_id} in progress, but "
+                        f"executor '{open_run.executor_id}' is no longer registered, so it cannot be resumed. Its "
+                        f"{len(ids)} event(s) are pending again; register the executor or recover the session."
+                    ),
+                    metadata={"kind": "resume_failed", "session_id": open_run.session_id},
+                )
+            return None
+        self._lock.renew(inbox_id, self._worker_id, self._lease_ttl_seconds)
+        wake_signal.clear()
+        folded_events: list[Event] = []
+        allow_interrupt = (
+            self._new_event_policy == "interrupt"
+            and interrupt_restarts < self._max_interrupt_restarts
+            and not any(self._is_approval_decision(evt) for evt in events)
+        )
+        try:
+            return await self._run_batch(
+                inbox_id=inbox_id,
+                batch=events,
+                active_session=session,
+                executor=executor,
+                known_ids=wanted,
+                wake_signal=wake_signal,
+                allow_interrupt=allow_interrupt,
+                folded_events=folded_events,
+                open_run=open_run,
+            )
+        except asyncio.CancelledError:
+            # A forced stop while resuming: the events return to pending like any cancelled Run's.
+            self._inbox.requeue_processing(ids + [e.event_id for e in folded_events])
+            raise
+
+    async def _run_batch(
+        self,
+        *,
+        inbox_id: str,
+        batch: list[Event],
+        active_session: SessionRef,
+        executor: ExecutorPort,
+        known_ids: set[str],
+        wake_signal: asyncio.Event,
+        allow_interrupt: bool,
+        folded_events: list[Event],
+        open_run: OpenRun | None,
+    ) -> _BatchEnd:
+        # Runs one batch to its result. open_run set means resuming a Run a stopped process detached.
+        batch_ids = [evt.event_id for evt in batch]
+        consumed_ids: set[str] = set(batch_ids)
+        target_batch_key = self._batch_key(batch[0], active_session)
+        has_decision = any(self._is_approval_decision(evt) for evt in batch)
+        batch_target = self._batch_target(batch)
+        interrupted_flag = asyncio.Event()
+        resuming = open_run is not None
+        registry = self._open_runs
+        if registry is not None and open_run is None and self._resumable(executor) is not None:
+            open_run = registry.open(
+                session_id=active_session.session_id,
+                inbox_id=inbox_id,
+                executor_id=executor.executor_id,
+                event_ids=batch_ids,
+                code_version=self._code_version,
+            )
+        registered = open_run
+
+        def _poll_folded() -> list[Event]:
+            if (
+                self._new_event_policy != "fold"
+                or target_batch_key is None
+                or has_decision
+                or self._retired
+            ):
+                return []
+            newly_folded: list[Event] = []
+            for candidate in self._runnable(self._inbox.fetch_pending(inbox_id)):
+                if candidate.event_id in consumed_ids:
+                    continue
+                cand_session = self._resolve_session(candidate)
+                if self._batch_key(candidate, cand_session) != target_batch_key:
+                    continue
+                if self._is_approval_decision(candidate) or (
+                    batch_target is not None and self._execution_target(candidate) != batch_target
+                ):
+                    break
+                consumed_ids.add(candidate.event_id)
+                folded_events.append(candidate)
+                newly_folded.append(candidate)
+            if newly_folded:
+                new_ids = [e.event_id for e in newly_folded]
+                self._inbox.bind_session(new_ids, active_session.session_id)
+                if registered is not None and registry is not None:
+                    registry.add_events(registered.session_id, new_ids)
+            return newly_folded
+
+        caps: RunCapabilities = _ScopedCapabilities(
+            memory=self._memory,
+            timers=self._timers,
+            permissions=self._permissions,
+            _poll_folded=_poll_folded,
+            _is_interrupted=interrupted_flag.is_set,
+        )
+        handle = _RunHandle(registered.run_dir, self._is_detaching) if registered is not None else None
+        batch_correlation_key = self._extract_correlation_key(batch, active_session)
+
+        def _drop_registration() -> None:
+            if registered is not None and registry is not None:
+                registry.discard(registered.session_id)
+
+        if handle is not None:
+            self._handles.add(handle)
+        try:
+            async with self._lease_heartbeat(inbox_id):
+                run_batch = await self._notify_run_started(inbox_id, batch, batch_correlation_key)
+                outcome = await self._execute_batch(
+                    executor=executor,
+                    inbox_id=inbox_id,
+                    batch=run_batch,
+                    session_ref=active_session,
+                    caps=caps,
+                    known_ids=known_ids,
+                    interrupted_flag=interrupted_flag,
+                    wake_signal=wake_signal,
+                    allow_interrupt=allow_interrupt,
+                    handle=handle,
+                    resume=resuming,
+                )
+        except _RunInterrupted:
+            requeue_ids = batch_ids + [e.event_id for e in folded_events]
+            self._inbox.requeue_processing(requeue_ids)
+            _drop_registration()
+            return _BatchEnd(ids=requeue_ids, interrupted=True)
+        except _RunDetached:
+            return _BatchEnd(ids=batch_ids + [e.event_id for e in folded_events], detached=True)
+        except ExecutorFailed as exc:
+            all_failed_ids = batch_ids + [e.event_id for e in folded_events]
+            self._inbox.mark_failed(all_failed_ids, str(exc.__cause__ or exc))
+            _drop_registration()
+            raise
+        except BaseException:
+            _drop_registration()
+            raise
+        finally:
+            if handle is not None:
+                self._handles.discard(handle)
+
+        final_corr = self._extract_correlation_key(batch + folded_events, active_session)
+        final_work_key = self._extract_work_key(
+            batch + folded_events,
+            active_session,
+            final_corr,
+            active_session.parent_session_id,
+        )
+        final_session_id = self._apply_outcome(
+            inbox_id,
+            active_session,
+            outcome,
+            final_corr,
+            final_work_key,
+            executor,
+            report_metadata=self._report_metadata(batch + folded_events, final_corr, executor.executor_id),
+        )
+        all_done_ids = batch_ids + [evt.event_id for evt in folded_events]
+        if final_session_id is not None and final_session_id != active_session.session_id:
+            self._inbox.bind_session(all_done_ids, final_session_id)
+        if registered is not None and registry is not None:
+            # The events become 'done' in the same transaction that drops the registration.
+            registry.finish(registered.session_id, all_done_ids)
+        else:
+            self._inbox.mark_done(all_done_ids)
+        report = RunReport(
+            inbox_id=inbox_id,
+            session_id=final_session_id,
+            event_ids=tuple(all_done_ids),
+            outcome=outcome,
+            correlation_key=final_corr,
+        )
+        if isinstance(outcome, Emit) and outcome.close_session and final_session_id is not None:
+            # After the result and its events are written, so the reclaim gates no longer see them.
+            async with self._lease_heartbeat(inbox_id):
+                await self._close_finished(final_session_id)
+        return _BatchEnd(ids=all_done_ids, report=report)
+
     async def _execute_batch(
         self,
         *,
@@ -597,37 +808,57 @@ class AgentWorker:
         interrupted_flag: asyncio.Event,
         wake_signal: asyncio.Event,
         allow_interrupt: bool,
+        handle: _RunHandle | None = None,
+        resume: bool = False,
     ) -> RunOutcome:
-        if not allow_interrupt:
+        if not allow_interrupt and handle is None:
             return await self._execute_with_retry(executor, batch, session_ref, caps)
 
+        # A resumable Run gets its own task, so a stop can cancel it without cancelling this worker.
         exec_task = asyncio.create_task(
-            self._execute_with_retry(executor, batch, session_ref, caps)
+            self._execute_with_retry(executor, batch, session_ref, caps, handle=handle, resume=resume)
         )
-        watcher_task = asyncio.create_task(
-            self._watch_for_interrupt(
-                inbox_id=inbox_id,
-                known_ids=known_ids,
-                interrupted_flag=interrupted_flag,
-                wake_signal=wake_signal,
-                exec_task=exec_task,
+        if handle is not None:
+            handle.bind(exec_task)
+            if self._detaching:
+                handle.detach()
+        watcher_task = (
+            asyncio.create_task(
+                self._watch_for_interrupt(
+                    inbox_id=inbox_id,
+                    known_ids=known_ids,
+                    interrupted_flag=interrupted_flag,
+                    wake_signal=wake_signal,
+                    exec_task=exec_task,
+                )
             )
+            if allow_interrupt
+            else None
         )
         try:
             outcome = await exec_task
             if interrupted_flag.is_set():
                 raise _RunInterrupted()
             return outcome
+        except RunDetached:
+            if handle is None:
+                raise
+            handle.mark_detached()
+            raise _RunDetached() from None
         except asyncio.CancelledError:
             if interrupted_flag.is_set():
                 raise _RunInterrupted() from None
+            current = asyncio.current_task()
+            if handle is not None and handle.detached() and not (current is not None and current.cancelling()):
+                raise _RunDetached() from None
             raise
         finally:
-            watcher_task.cancel()
-            try:
-                await watcher_task
-            except asyncio.CancelledError:
-                pass
+            if watcher_task is not None:
+                watcher_task.cancel()
+                try:
+                    await watcher_task
+                except asyncio.CancelledError:
+                    pass
 
     async def _watch_for_interrupt(
         self,
@@ -863,12 +1094,20 @@ class AgentWorker:
         batch: list[Event],
         session_ref: SessionRef | None,
         caps: RunCapabilities,
+        *,
+        handle: _RunHandle | None = None,
+        resume: bool = False,
     ) -> RunOutcome:
         last_exc: Exception | None = None
+        resumable = self._resumable(executor) if handle is not None else None
         for attempt in range(self._max_retries + 1):
             try:
+                if resumable is not None and handle is not None:
+                    if resume:
+                        return await resumable.resume(batch, session_ref, caps, handle)
+                    return await resumable.execute_resumable(batch, session_ref, caps, handle)
                 return await executor.execute(batch, session_ref, caps)
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, RunDetached):
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc

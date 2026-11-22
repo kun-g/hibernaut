@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
-from typing import Any, Protocol
+from contextlib import AbstractContextManager
+from typing import Any, Protocol, runtime_checkable
 
 from agent_runtime.core.models import (
     Event,
+    OpenRun,
     OutboxMessage,
     PermissionDecision,
     RunOutcome,
@@ -141,4 +143,65 @@ class ExecutorPort(Protocol):
         events: Sequence[Event],
         session: SessionRef | None,
         caps: RunCapabilities,
+    ) -> RunOutcome: ...
+
+
+class OpenRunPort(Protocol):
+    # Registers Runs of resumable executors while they are unfinished. The runtime knows only who runs them and where
+    # their directory is; what is inside the directory belongs to the executor.
+    def open(
+        self, *, session_id: str, inbox_id: str, executor_id: str, event_ids: Sequence[str], code_version: str
+    ) -> OpenRun: ...
+    def list_open(self, inbox_id: str) -> list[OpenRun]: ...
+    def add_events(self, session_id: str, event_ids: Sequence[str]) -> None: ...
+    # The Run wrote its result: its events become 'done' and its registration goes in one transaction, then its
+    # directory is deleted.
+    def finish(self, session_id: str, done_event_ids: Sequence[str]) -> None: ...
+    # The Run ended without a result to keep (failed, interrupted, cancelled, or not resumable here).
+    def discard(self, session_id: str) -> None: ...
+
+
+class RunContext(Protocol):
+    @property
+    def run_dir(self) -> str: ...
+
+    # A stretch in which the Run only waits for work outside this process (an agent in an Orca terminal). A stop
+    # cancels the Run inside it; cleanup then checks detached() and leaves that work and the run directory alone.
+    def detachable(self) -> AbstractContextManager[None]: ...
+
+    # Polled at resumable points of blocking work (such as delivery steps in a thread): True means a stop is
+    # waiting, and the executor stops there by raising RunDetached.
+    def should_detach(self) -> bool: ...
+
+    def detached(self) -> bool: ...
+
+
+@runtime_checkable
+class ResumableExecutorPort(Protocol):
+    # An executor whose Runs survive a restart: it keeps its own state in run.run_dir, and resume() continues a Run
+    # that a stopped process detached, without sending the agent its task again.
+    @property
+    def executor_id(self) -> str: ...
+
+    async def execute(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+    ) -> RunOutcome: ...
+
+    async def execute_resumable(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+        run: RunContext,
+    ) -> RunOutcome: ...
+
+    async def resume(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+        run: RunContext,
     ) -> RunOutcome: ...
