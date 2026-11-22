@@ -46,6 +46,9 @@ retry_backoff_seconds = [5, 15, 45, 135, 405]
 # dead_letter_alert_target = "oc_xxx"
 
 [outbound]
+# Results go back to the issue/chat that started a task only for these channels; GitHub replies need an
+# explicit reply_channel/reply_target on the task.
+reply_to_origin = ["feishu"]
 rate_limit_per_target_rpm = 30
 max_retry_attempts = 5
 approval_channel = "feishu"

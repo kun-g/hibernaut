@@ -82,6 +82,9 @@ class OutboundConfig:
     approval_channel: str = "feishu"
     approval_target: str | None = None
     github_api_base: str = "https://api.github.com"
+    # Channels whose origin gets an execution report without an explicit reply_channel/reply_target. GitHub is
+    # left out: a run's result goes to an issue only when the task named it, not because the issue started it.
+    reply_to_origin: tuple[str, ...] = ("feishu",)
     # Accounts the GitHub App may mint comment tokens for; only used when the App credentials are set.
     github_app_owners: tuple[str, ...] = ()
 
@@ -175,6 +178,7 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
             approval_target=_optional(outbound.get("approval_target")),
             github_api_base=str(outbound.get("github_api_base", _OUTBOUND.github_api_base)),
             github_app_owners=_strings(outbound, "github_app_owners"),
+            reply_to_origin=_strings(outbound, "reply_to_origin") if "reply_to_origin" in outbound else _OUTBOUND.reply_to_origin,
         ),
         relay=_relay(_section(raw, "relay")),
     )
