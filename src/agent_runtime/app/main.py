@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import logging
 import os
 import signal
@@ -95,6 +96,9 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 # in_process: the whole Switchboard runs here. relay (Stage B): a link to a remote hub.
 SwitchboardHandle = Switchboard | SwitchboardRelayLink
 
+# Lease holders must differ across pools: a config reload runs the old pool's last Runs beside the new pool.
+_POOL_IDS = itertools.count(1)
+
 
 class AsyncWorkerPool:
     def __init__(
@@ -120,7 +124,13 @@ class AsyncWorkerPool:
         self._idle_event = asyncio.Event()
         self._idle_event.set()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._pool_id = f"pool-{next(_POOL_IDS)}"
+        self._handoff: Callable[[str], None] | None = None
         self.reports: list[RunReport] = []
+
+    def bind(self, loop: asyncio.AbstractEventLoop) -> None:
+        # Bind before ingress can reach the pool, so wakes from HTTP threads are marshalled from the first request.
+        self._loop = loop
 
     def wake(self, inbox_id: str) -> None:
         # HTTP webhook threads call wake() off-loop; marshal safely onto the event loop.
@@ -134,6 +144,9 @@ class AsyncWorkerPool:
         self._wake_on_loop(inbox_id)
 
     def _wake_on_loop(self, inbox_id: str) -> None:
+        if self._handoff is not None:
+            self._handoff(inbox_id)
+            return
         active_worker = self._active.get(inbox_id)
         if active_worker is not None:
             active_worker.notify_new_event(inbox_id)
@@ -145,15 +158,35 @@ class AsyncWorkerPool:
         self._idle_event.clear()
         self._queue.put_nowait(inbox_id)
 
+    def retire(self, handoff: Callable[[str], None]) -> None:
+        # Called on the event loop when a config reload replaces this pool. Runs in progress finish with this
+        # generation's executors; queued inboxes, later wakes and each inbox whose lease is released go to handoff,
+        # which wakes the current pool. worker_leases keeps the two pools off the same inbox.
+        self._handoff = handoff
+        for worker in self._active.values():
+            worker.retire()
+        self._requeue.clear()
+        while not self._queue.empty():
+            inbox_id = self._queue.get_nowait()
+            self._queue.task_done()
+            self._queued.discard(inbox_id)
+            handoff(inbox_id)
+        if not self._active:
+            self._idle_event.set()
+
     async def _worker_loop(self, worker_idx: int, stop_event: asyncio.Event) -> None:
-        worker_id = f"pool-worker-{worker_idx}"
-        while not stop_event.is_set() or not self._queue.empty():
+        worker_id = f"{self._pool_id}-worker-{worker_idx}"
+        while self._handoff is None and (not stop_event.is_set() or not self._queue.empty()):
             try:
                 inbox_id = await asyncio.wait_for(self._queue.get(), timeout=0.05)
             except asyncio.TimeoutError:
                 continue
 
             self._queued.discard(inbox_id)
+            if self._handoff is not None:
+                self._queue.task_done()
+                self._handoff(inbox_id)
+                break
             try:
                 # Inside the try: a factory that refuses the inbox (AmbiguousProjectMatch) leaves its events pending.
                 worker = self._worker_factory(inbox_id, worker_id)
@@ -184,7 +217,12 @@ class AsyncWorkerPool:
             finally:
                 self._active.pop(inbox_id, None)
                 self._queue.task_done()
-                if inbox_id in self._requeue:
+                if self._handoff is not None:
+                    # The lease is released now; the current pool picks up whatever arrived meanwhile.
+                    self._handoff(inbox_id)
+                    if not self._active:
+                        self._idle_event.set()
+                elif inbox_id in self._requeue:
                     self._requeue.discard(inbox_id)
                     self._wake_on_loop(inbox_id)
                 elif not self._queued and not self._active:
@@ -281,30 +319,16 @@ class AlwaysOnDaemon:
         async with asyncio.TaskGroup() as tasks:
             if not self.ingest_only:
                 tasks.create_task(self.pool.run_forever(workers_stop))
-            tasks.create_task(self.scheduler.run_forever(timer_interval_seconds, stopper))
-            tasks.create_task(self.dispatcher.run_forever(outbox_interval_seconds, stopper))
-            poll_task = None
-            if self.github_poller is not None:
-                poll_task = tasks.create_task(
-                    self.github_poller.run_forever(
-                        interval_seconds=self.poll_interval_seconds,
-                        stop_event=stopper,
-                    )
+            services = tasks.create_task(
+                self.run_services(
+                    stopper,
+                    timer_interval_seconds=timer_interval_seconds,
+                    outbox_interval_seconds=outbox_interval_seconds,
                 )
-            gdrive_task = None
-            if self.gdrive_poller is not None:
-                gdrive_task = tasks.create_task(
-                    self.gdrive_poller.run_forever(
-                        interval_seconds=self.gdrive_poll_interval_seconds,
-                        stop_event=stopper,
-                    )
-                )
+            )
             try:
                 await stopper.wait()
-                if poll_task is not None:
-                    await poll_task
-                if gdrive_task is not None:
-                    await gdrive_task
+                await services
             finally:
                 # Keep workers available until the last accepted webhook has queued its wake.
                 if server is not None:
@@ -314,6 +338,32 @@ class AlwaysOnDaemon:
                 if server_thread is not None:
                     server_thread.join()
                 workers_stop.set()
+
+    async def run_services(
+        self,
+        stop_event: asyncio.Event,
+        *,
+        timer_interval_seconds: float = 5.0,
+        outbox_interval_seconds: float = 1.0,
+    ) -> None:
+        # Everything but HTTP ingress and the worker pool; each loop finishes its current tick once stop_event is set.
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(self.scheduler.run_forever(timer_interval_seconds, stop_event))
+            tasks.create_task(self.dispatcher.run_forever(outbox_interval_seconds, stop_event))
+            if self.github_poller is not None:
+                tasks.create_task(
+                    self.github_poller.run_forever(
+                        interval_seconds=self.poll_interval_seconds,
+                        stop_event=stop_event,
+                    )
+                )
+            if self.gdrive_poller is not None:
+                tasks.create_task(
+                    self.gdrive_poller.run_forever(
+                        interval_seconds=self.gdrive_poll_interval_seconds,
+                        stop_event=stop_event,
+                    )
+                )
 
     def close(self) -> None:
         self.db.close()
@@ -930,77 +980,130 @@ async def serve_configured(
     reload_interval: float = 1.0,
     outbox_interval_seconds: float = 1.0,
 ) -> None:
+    # A reload never waits for Runs in progress: the listener stays up and takes the new handler, services restart
+    # within one tick, and the old worker pool is retired (no new claims) while its last Runs finish in the
+    # background. worker_leases keeps the old and new pools off the same inbox.
     server = WebhookHTTPServer((config.channels.host, config.channels.port), daemon.http_handler())
     changes = config_changes(path, stop, interval=reload_interval)
-    next_server = server
-    try:
-        while not stop.is_set():
-            drain = asyncio.Event()
-            async with asyncio.TaskGroup() as tasks:
-                tasks.create_task(
-                    daemon.run(
-                        server=server,
-                        stop_event=drain,
-                        outbox_interval_seconds=outbox_interval_seconds,
+
+    async with asyncio.TaskGroup() as tasks:
+        generation = _Generation.start(daemon, tasks, outbox_interval_seconds=outbox_interval_seconds)
+        server_thread = _serve_in_thread(server)
+
+        def wake_current(inbox_id: str) -> None:
+            generation.daemon.pool.wake(inbox_id)
+
+        try:
+            async for candidate in changes:
+                if candidate == config:
+                    continue
+                if (candidate.runtime.db_path, candidate.runtime.memory_root) != (
+                    config.runtime.db_path,
+                    config.runtime.memory_root,
+                ):
+                    print(
+                        "[config] Storage path changes require a restart.",
+                        file=sys.stderr,
+                        flush=True,
                     )
-                )
+                    continue
+                if candidate.switchboard != config.switchboard:
+                    print(
+                        "[config] [switchboard] changes require a restart.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                address = (candidate.channels.host, candidate.channels.port)
+                next_server: WebhookHTTPServer | None = None
                 try:
-                    async for candidate in changes:
-                        if candidate == config:
-                            continue
-                        if (candidate.runtime.db_path, candidate.runtime.memory_root) != (
-                            config.runtime.db_path,
-                            config.runtime.memory_root,
-                        ):
-                            print(
-                                "[config] Storage path changes require a restart.",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-                            continue
-                        if candidate.switchboard != config.switchboard:
-                            print(
-                                "[config] [switchboard] changes require a restart.",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-                            continue
-                        address = (candidate.channels.host, candidate.channels.port)
-                        try:
-                            replacement = build_daemon_from_config(
-                                candidate,
-                                database=daemon.db,
-                                demo=demo,
-                                switchboard=switchboard,
-                            )
-                            handler = replacement.http_handler()
-                            if address != (config.channels.host, config.channels.port):
-                                next_server = WebhookHTTPServer(address, handler)
-                        except (OSError, ValueError, OverflowError) as exc:
-                            print(
-                                f"[config] Cannot activate settings ({type(exc).__name__}); "
-                                "keeping current settings.",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-                            continue
-                        break
-                    else:
-                        return
-                finally:
-                    drain.set()
-            # Accepted requests finish against the old adapters before the handover.
-            if next_server is not server:
-                server.server_close()
-                server = next_server
-            server.RequestHandlerClass = handler
-            daemon, config = replacement, candidate
-            print(f"[config] Reloaded {path}", file=sys.stderr, flush=True)
-    finally:
-        await changes.aclose()
-        if next_server is not server:
-            next_server.server_close()
-        server.server_close()
+                    replacement = build_daemon_from_config(
+                        candidate,
+                        database=daemon.db,
+                        demo=demo,
+                        switchboard=switchboard,
+                    )
+                    handler = replacement.http_handler()
+                    if address != (config.channels.host, config.channels.port):
+                        next_server = WebhookHTTPServer(address, handler)
+                except (OSError, ValueError, OverflowError) as exc:
+                    print(
+                        f"[config] Cannot activate settings ({type(exc).__name__}); "
+                        "keeping current settings.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+
+                previous = generation
+                # Stop the old services first so two dispatchers never send the same Outbox row.
+                await previous.stop_services()
+                generation = _Generation.start(replacement, tasks, outbox_interval_seconds=outbox_interval_seconds)
+                # From here every wake reaching the old pool, from its in-flight requests or released leases,
+                # is forwarded to the new one.
+                previous.retire_pool(wake_current)
+                if next_server is None:
+                    server.RequestHandlerClass = handler
+                else:
+                    next_thread = _serve_in_thread(next_server)
+                    # Accepted requests finish against the old adapters before the old listener closes.
+                    await _close_server(server, server_thread)
+                    server, server_thread = next_server, next_thread
+                daemon, config = replacement, candidate
+                print(f"[config] Reloaded {path}", file=sys.stderr, flush=True)
+        finally:
+            await changes.aclose()
+            await generation.stop_services()
+            await _close_server(server, server_thread)
+            # Exit keeps its old semantics: the TaskGroup waits for the Runs every pool, retired or current, holds.
+            generation.pool_stop.set()
+
+
+@dataclass
+class _Generation:
+    daemon: AlwaysOnDaemon
+    services: asyncio.Task[None]
+    services_stop: asyncio.Event
+    pool_stop: asyncio.Event
+    pool_running: bool
+
+    @classmethod
+    def start(
+        cls,
+        daemon: AlwaysOnDaemon,
+        tasks: asyncio.TaskGroup,
+        *,
+        outbox_interval_seconds: float,
+    ) -> _Generation:
+        services_stop = asyncio.Event()
+        pool_stop = asyncio.Event()
+        if not daemon.ingest_only:
+            daemon.pool.bind(asyncio.get_running_loop())
+            tasks.create_task(daemon.pool.run_forever(pool_stop))
+        services = tasks.create_task(
+            daemon.run_services(services_stop, outbox_interval_seconds=outbox_interval_seconds)
+        )
+        return cls(daemon, services, services_stop, pool_stop, not daemon.ingest_only)
+
+    async def stop_services(self) -> None:
+        self.services_stop.set()
+        await self.services
+
+    def retire_pool(self, handoff: Callable[[str], None]) -> None:
+        if self.pool_running:
+            self.daemon.pool.retire(handoff)
+
+
+def _serve_in_thread(server: WebhookHTTPServer) -> threading.Thread:
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+    thread.start()
+    return thread
+
+
+async def _close_server(server: WebhookHTTPServer, thread: threading.Thread) -> None:
+    await asyncio.to_thread(server.shutdown)
+    server.server_close()
+    thread.join()
 
 
 def main() -> None:
