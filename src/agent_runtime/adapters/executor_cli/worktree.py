@@ -319,7 +319,7 @@ class OrcaWorktreeManager:
         )
         try:
             if self._backend == "orca":
-                rm_res = self._runner(["orca", "worktree", "remove", str(workdir)], primary)
+                rm_res = self._runner(["orca", "worktree", "rm", "--worktree", f"path:{workdir}"], primary)
             else:
                 rm_res = self._runner(["git", "worktree", "remove", str(workdir)], primary)
         except BaseException:
