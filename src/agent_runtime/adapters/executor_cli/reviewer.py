@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -164,6 +164,10 @@ class ReviewRequest:
     peer: PeerLookup | None = None
 
 
+def _bare_key(_inbox_id: str, work_key: str) -> str:
+    return work_key
+
+
 class CoderReviewerExecutor:
     def __init__(
         self,
@@ -174,10 +178,13 @@ class CoderReviewerExecutor:
         interrupt_poll_interval: float = 0.05,
         terminal: OrcaVisibleRunner | TerminalUnavailable | None = None,
         peers: DeveloperPeerResolver | None = None,
+        workspace_key: Callable[[str, str], str] | None = None,
     ) -> None:
         self._profile = profile
         self._workspaces = workspaces
         self._tasks = tasks
+        # (inbox_id, work_key) -> workspaces/task_metadata key; a project serving several inboxes keys them per inbox.
+        self._workspace_key = workspace_key or _bare_key
         self._interrupt_poll_interval = interrupt_poll_interval
         # None: non-interactive. A runner: every review runs in its own terminal. Unavailable: the role is
         # interactive but this inbox has no terminal backend, so reviews stop with the reason.
@@ -311,12 +318,13 @@ class CoderReviewerExecutor:
             or target[0].correlation_key
             or (session.correlation_key if session is not None else None)
         )
-        task = self._tasks.get(work_key) if work_key else None
+        key = self._workspace_key(target[0].inbox_id, work_key) if work_key else None
+        task = self._tasks.get(key) if key else None
         if explicit is not None:
             workdir = Path(explicit).resolve()
         else:
             # A review must never create a worktree; it reads the one the developer already used.
-            record = self._workspaces.get(work_key) if work_key else None
+            record = self._workspaces.get(key) if key else None
             if record is not None and record.status == "ready":
                 workdir = Path(record.workdir)
             elif task is not None:

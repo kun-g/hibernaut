@@ -47,7 +47,8 @@ class FeishuChannelAdapter:
         self._app_id = app_id
         self._app_secret = app_secret
         self._default_chat_id = default_chat_id
-        self._inbox_chat_map: dict[str, str] = dict(inbox_chat_map or {})
+        # Kept as given: a configured map also answers inboxes matched by a project's pattern.
+        self._inbox_chat_map: Mapping[str, str] = inbox_chat_map if inbox_chat_map is not None else {}
         self._http_post: HttpRequester = http_post or _default_http_post
         self._clock = clock
         self._cached_token: str | None = None
@@ -71,8 +72,9 @@ class FeishuChannelAdapter:
         return token
 
     def _resolve_chat_id(self, inbox_id: str) -> str:
-        if inbox_id in self._inbox_chat_map:
-            return self._inbox_chat_map[inbox_id]
+        chat_id = self._inbox_chat_map.get(inbox_id)
+        if chat_id is not None:
+            return chat_id
         if inbox_id.startswith("feishu:"):
             return inbox_id.removeprefix("feishu:")
         if self._default_chat_id:

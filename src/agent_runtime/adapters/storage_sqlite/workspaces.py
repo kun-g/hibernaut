@@ -19,6 +19,8 @@ class WorkspaceRecord:
     created_at: str
     updated_at: str
     seq: int = 0
+    # Owning inbox; None for rows recorded before ownership existed.
+    inbox_id: str | None = None
 
 
 class SQLiteWorkspaceStore:
@@ -36,12 +38,13 @@ class SQLiteWorkspaceStore:
             status=cast(WorkspaceStatus, str(r["status"])),
             created_at=str(r["created_at"]),
             updated_at=str(r["updated_at"]),
+            inbox_id=str(r["inbox_id"]) if r["inbox_id"] is not None else None,
         )
 
     def get(self, work_key: str) -> WorkspaceRecord | None:
         row = self._db.fetchone(
             """
-            SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at
+            SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at, inbox_id
             FROM workspaces
             WHERE work_key = ?
             """,
@@ -52,7 +55,7 @@ class SQLiteWorkspaceStore:
     def list_by_repo(self, repo_checkout: str) -> list[WorkspaceRecord]:
         rows = self._db.fetchall(
             """
-            SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at
+            SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at, inbox_id
             FROM workspaces
             WHERE repo_checkout = ?
             ORDER BY seq ASC
@@ -64,7 +67,7 @@ class SQLiteWorkspaceStore:
     def list_all(self) -> list[WorkspaceRecord]:
         rows = self._db.fetchall(
             """
-            SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at
+            SELECT seq, work_key, repo_checkout, workdir, branch, status, created_at, updated_at, inbox_id
             FROM workspaces
             ORDER BY seq ASC
             """
@@ -82,23 +85,25 @@ class SQLiteWorkspaceStore:
         repo_checkout: str,
         workdir: str,
         branch: str,
+        inbox_id: str | None = None,
     ) -> WorkspaceRecord:
         now = utc_now_iso()
         with self._db.transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO workspaces (
-                    work_key, repo_checkout, workdir, branch, status, created_at, updated_at
+                    work_key, repo_checkout, workdir, branch, status, created_at, updated_at, inbox_id
                 )
-                VALUES (?, ?, ?, ?, 'creating', ?, ?)
+                VALUES (?, ?, ?, ?, 'creating', ?, ?, ?)
                 ON CONFLICT(work_key) DO UPDATE SET
                     repo_checkout = excluded.repo_checkout,
                     workdir = excluded.workdir,
                     branch = excluded.branch,
                     status = 'creating',
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    inbox_id = excluded.inbox_id
                 """,
-                (work_key, repo_checkout, workdir, branch, now, now),
+                (work_key, repo_checkout, workdir, branch, now, now, inbox_id),
             )
         rec = self.get(work_key)
         assert rec is not None
@@ -118,6 +123,21 @@ class SQLiteWorkspaceStore:
         rec = self.get(work_key)
         assert rec is not None
         return rec
+
+    def claim_owner(self, work_key: str, inbox_id: str) -> bool:
+        # Records an owner on a row that has none; True when inbox_id owns the row afterwards.
+        with self._db.transaction() as conn:
+            conn.execute(
+                "UPDATE workspaces SET inbox_id = ? WHERE work_key = ? AND inbox_id IS NULL",
+                (inbox_id, work_key),
+            )
+            row = conn.execute("SELECT inbox_id FROM workspaces WHERE work_key = ?", (work_key,)).fetchone()
+        return row is not None and row["inbox_id"] == inbox_id
+
+    def session_inboxes(self, work_key: str) -> set[str]:
+        # Inboxes whose sessions (any status) used work_key; tells who created an ownerless legacy row.
+        rows = self._db.fetchall("SELECT DISTINCT inbox_id FROM sessions WHERE work_key = ?", (work_key,))
+        return {str(row["inbox_id"]) for row in rows}
 
     def claim_for_reclaim(
         self,

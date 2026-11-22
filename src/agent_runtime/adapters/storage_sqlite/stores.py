@@ -525,26 +525,26 @@ class SQLiteSessionStoreAdapter:
         )
         return self._row_to_session(row) if row is not None else None
 
-    def count_active_by_work_key(self, work_key: str) -> int:
+    def count_active_by_work_key(self, work_key: str, inbox_id: str | None = None) -> int:
         row = self._db.fetchone(
             """
             SELECT COUNT(*) AS cnt
             FROM sessions
-            WHERE work_key = ? AND status IN ('active', 'suspended')
+            WHERE work_key = ? AND status IN ('active', 'suspended') AND (? IS NULL OR inbox_id = ?)
             """,
-            (work_key,),
+            (work_key, inbox_id, inbox_id),
         )
         return int(row["cnt"]) if row is not None else 0
 
-    def list_active_by_work_key(self, work_key: str) -> list[str]:
+    def list_active_by_work_key(self, work_key: str, inbox_id: str | None = None) -> list[str]:
         rows = self._db.fetchall(
             """
             SELECT session_id
             FROM sessions
-            WHERE work_key = ? AND status IN ('active', 'suspended')
+            WHERE work_key = ? AND status IN ('active', 'suspended') AND (? IS NULL OR inbox_id = ?)
             ORDER BY updated_at DESC
             """,
-            (work_key,),
+            (work_key, inbox_id, inbox_id),
         )
         return [str(row["session_id"]) for row in rows]
 

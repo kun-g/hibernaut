@@ -176,6 +176,8 @@ class _State:
     code_change: bool = True
     # Unfinished work was already sent back once automatically; the next time a person decides.
     nudged: bool = False
+    # Inbox that owns the task's worktree; empty in checkpoints from before it was recorded.
+    inbox_id: str = ""
 
     def dump(self) -> str:
         return json.dumps({_CHECKPOINT_KEY: {f: getattr(self, f) for f in self.__slots__}}, ensure_ascii=False)
@@ -226,7 +228,8 @@ class SDEExecutor:
         self._options = options
         self._reviewer = reviewer
         self._worktrees = worktree_manager
-        self._checkouts = {k: Path(v).resolve() for k, v in inbox_checkout_map.items()}
+        # Looked up per task: the configured map also answers inboxes matched by a project's pattern.
+        self._checkouts = inbox_checkout_map
         self._tasks = tasks
         self._poll = interrupt_poll_interval
         # None: non-interactive. A runner: development runs in a terminal bound to the task session. Unavailable:
@@ -261,6 +264,7 @@ class SDEExecutor:
             approved_launch = False
             if resumed is not None:
                 state = resumed
+                state.inbox_id = state.inbox_id or events[0].inbox_id
                 answer = _approval(events, pending_id)
                 if answer is None:
                     # Not the awaited decision: record it and keep the same request open.
@@ -310,6 +314,9 @@ class SDEExecutor:
                     if followups:
                         # New requirements must be developed before the retried review sees them.
                         prompt = (prompt + "\n\n" if prompt else "") + f"## Follow-up from a person\n{followups}"
+                # The checkpoint names the workdir; it must still be this inbox's own worktree before any launch.
+                await asyncio.to_thread(self._worktrees.assert_writable, inbox_id=state.inbox_id,
+                                        work_key=state.work_key, workdir=state.workdir)
             else:
                 state = await self._new_state(events, targets, session)
                 prompt = await self._first_prompt(state, caps)
@@ -344,7 +351,8 @@ class SDEExecutor:
             or (session.correlation_key if session is not None else None)
             or f"task:{inbox_id}:{events[0].event_id}"
         )
-        checkout = self._checkouts.get(inbox_id)
+        configured = self._checkouts.get(inbox_id)
+        checkout = Path(configured).resolve() if configured is not None else None
         if explicit is None and checkout is None:
             raise ReviewAborted(f"no primary checkout configured for '{inbox_id}' and no 'explicit_workdir'")
         workdir = await asyncio.to_thread(
@@ -352,11 +360,12 @@ class SDEExecutor:
             work_key=work_key,
             primary_checkout=checkout or Path(str(explicit)),
             explicit_workdir=explicit,
+            inbox_id=inbox_id,
         )
         if not workdir.is_dir():
             raise ReviewAborted(f"workdir {workdir} does not exist")
         state = _State(stage="develop", workdir=str(workdir), base_ref=last_text(targets, "base_ref") or "",
-                       requirements=requirements, work_key=work_key, title=last_text(targets, "title") or "")
+                       requirements=requirements, work_key=work_key, inbox_id=inbox_id, title=last_text(targets, "title") or "")
         try:
             await asyncio.to_thread(self._pin, state, Selection.from_events(targets))
         except ValueError as exc:
@@ -365,14 +374,15 @@ class SDEExecutor:
 
     def _pin(self, state: _State, selection: Selection) -> None:
         # One commit per task: a later task on the same work_key and workdir keeps the recorded one.
-        record = self._tasks.get(state.work_key)
+        task_key = self._worktrees.workspace_key(state.inbox_id or None, state.work_key)
+        record = self._tasks.get(task_key)
         root = str(repo_root(state.workdir))
         if record is not None and record.workdir == state.workdir and resolve_commit(root, record.guidance_commit):
             pin = GuidancePin(workdir=root, commit=record.guidance_commit,
                               origin=f"recorded at the start of task {state.work_key}")
         else:
             pin = pin_head(state.workdir, origin=f"start of task {state.work_key}")
-        self._tasks.save(state.work_key, workdir=state.workdir, guidance_commit=pin.commit,
+        self._tasks.save(task_key, workdir=state.workdir, guidance_commit=pin.commit,
                          activities=selection.activities, tags=selection.tags)
         state.project = {**pin.to_dict(), "activities": list(selection.activities), "tags": list(selection.tags),
                          "sent": []}
@@ -664,9 +674,8 @@ class SDEExecutor:
     def _record(self, state: _State) -> DeliveryRecord | None:
         return self._delivery.record(self._work_key(state)) if self._delivery is not None else None
 
-    @staticmethod
-    def _work_key(state: _State) -> str:
-        return state.work_key or Path(state.workdir).name
+    def _work_key(self, state: _State) -> str:
+        return self._worktrees.workspace_key(state.inbox_id or None, state.work_key or Path(state.workdir).name)
 
     def _review_status(self, state: _State) -> str:
         if state.review_status == "pass":
@@ -725,7 +734,7 @@ class SDEExecutor:
         if not native:
             holds.append("no resumable Claude Code session ID")
         if self._live_peers is not None:
-            holds += await asyncio.to_thread(self._live_peers, self._work_key(state))
+            holds += await asyncio.to_thread(self._live_peers, state.work_key or Path(state.workdir).name)
         if holds:
             return f"Terminal: kept {state.terminal} ({'; '.join(holds)})"
         assert native is not None

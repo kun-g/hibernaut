@@ -22,6 +22,7 @@ from agent_runtime.adapters.executor_cli.reviewer import CODER_REVIEWER_ROLE
 from agent_runtime.adapters.executor_cli.sde import SDE_OPTION_KEYS, SDE_ROLE, SDEOptions
 from agent_runtime.adapters.executor_cli.worktree import WorktreeBackend
 from agent_runtime.adapters.permissions.security import proxy_service_url
+from agent_runtime.app.projects import InboxRule, parse_inbox_rules, validate_project_rules
 from agent_runtime.core.models import NewEventPolicy
 
 
@@ -57,6 +58,7 @@ TERMINAL_BACKENDS: tuple[TerminalBackend, ...] = ("orca", "none")
 @dataclass(frozen=True, slots=True)
 class ProjectConfig:
     name: str
+    # The primary inbox: the first literal of inbox_id. GitHub and Feishu ingress for this project deliver here.
     inbox_id: str
     repo: str
     checkout: str
@@ -69,6 +71,19 @@ class ProjectConfig:
     executor: str | None = None
     # Hibernaut's PR delivery step for finished SDE tasks; None ends a task with local commits.
     delivery: DeliveryConfig | None = None
+    # Every rule routing an inbox to this project; empty means just the primary inbox_id.
+    rules: tuple[InboxRule, ...] = ()
+
+    @property
+    def inbox_rules(self) -> tuple[InboxRule, ...]:
+        return self.rules or (InboxRule.exact(self.inbox_id),)
+
+    @property
+    def serves_multiple_inboxes(self) -> bool:
+        # Such a project shares one checkout between concurrent inboxes, so every writable task needs its own
+        # managed worktree.
+        rules = self.inbox_rules
+        return len(rules) > 1 or any(r.pattern is not None for r in rules)
 
 
 ROLES = (CODER_REVIEWER_ROLE, SDE_ROLE)
@@ -315,9 +330,12 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         delivery = (
             parse_delivery(f"projects.{name}.delivery", item["delivery"], repo=repo) if "delivery" in item else None
         )
+        rules = parse_inbox_rules(str(name), item.get("inbox_id"))
+        primary = next(r.literal for r in rules if r.literal is not None)
         projects[str(name)] = ProjectConfig(
             name=str(name),
-            inbox_id=str(item.get("inbox_id", f"proj:{name}")),
+            inbox_id=primary,
+            rules=rules,
             repo=repo,
             checkout=str(item["checkout"]),
             poll_labels=tuple(str(lbl) for lbl in item.get("poll_labels", ())),
@@ -328,6 +346,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             executor=proj_exec or None,
             delivery=delivery,
         )
+    validate_project_rules(projects.values())
 
     gd_raw = raw.get("gdrive", {})
     gd_interval = float(gd_raw.get("poll_interval_seconds", 30.0))

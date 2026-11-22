@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS workspaces (
     branch TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('creating', 'ready', 'reclaiming')),
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    inbox_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_workspaces_repo
@@ -235,6 +236,14 @@ class SQLiteDatabase:
                     ON event_inbox (inbox_id, source, external_id, status)
                 """
             )
+
+        workspace_cols = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(workspaces)").fetchall()
+        }
+        if "inbox_id" not in workspace_cols:
+            # The inbox that owns the worktree; NULL for rows created before ownership was recorded.
+            conn.execute("ALTER TABLE workspaces ADD COLUMN inbox_id TEXT")
 
         session_cols = {
             str(row["name"])
