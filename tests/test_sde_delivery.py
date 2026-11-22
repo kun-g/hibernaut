@@ -197,6 +197,31 @@ class TestSDEDelivery(SDEDeliveryCase):
         assert isinstance(outcome, Emit), outcome
         self.assertIn("# Reject zero\n\ndivide must raise on zero", self.calls("sde")[0]["prompt"])
 
+    async def test_a_merged_delivery_closes_the_session(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
+        outcome = await self.executor(delivery=self.delivery(auto_merge=True)).execute(
+            [event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertTrue(outcome.close_session)
+        text = outcome.messages[0]
+        self.assertIn("Delivery: merged", text)
+        self.assertIn("deleted origin/hb/task-1", text)
+        self.assertIn("Worktree: the PR is merged", text)
+
+    async def test_an_open_pr_keeps_the_session(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})], reviewer=[PASS])
+        outcome = await self.executor(delivery=self.delivery()).execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertFalse(outcome.close_session)
+        self.assertNotIn("Worktree: the PR is merged", outcome.messages[0])
+
+    async def test_local_delivery_keeps_the_session(self):
+        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])
+        outcome = await self.executor(review=False, delivery=self.delivery(open_pr=False)).execute(
+            [event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertFalse(outcome.close_session)
+
 
 MERGE_MAIN = [["git", "merge", "--no-edit", "origin/main"]]
 TASK_CALC = "def divide(a, b):\n    return a / b\n"

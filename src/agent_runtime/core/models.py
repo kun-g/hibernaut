@@ -124,6 +124,8 @@ class Emit:
     session_id: str | None = None
     executor_session_id: str | None = None
     status: EmitStatus = "done"
+    # The task is finished: once the result is written, the session closes as a close-session event closes it.
+    close_session: bool = False
 
 
 @dataclass(frozen=True, slots=True)

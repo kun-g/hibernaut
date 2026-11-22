@@ -41,6 +41,8 @@ class ReclaimResult:
     reclaimed: bool
     reason: str
     workdir: str | None = None
+    # What happened to the task's local branch when a merged head was given; empty otherwise.
+    branch: str = ""
 
 
 def _default_runner(cmd: Sequence[str], cwd: Path | None) -> CommandResult:
@@ -266,10 +268,12 @@ class OrcaWorktreeManager:
         *,
         notify_outbox: OutboxPort | None = None,
         inbox_id: str | None = None,
+        merged_head: str | None = None,
     ) -> ReclaimResult:
         # Safety 3: dual ownership check (DB record + 'hb-' basename prefix) + 3 safety gates.
         # work_key is the sessions' key; with inbox_id it maps to the inbox's workspace, without it it is the
         # workspaces-table key itself (as hibernaut_list_workspaces shows it).
+        # merged_head: the head a delivery saw merged; given, the task's local branch goes with the worktree.
         key = self.workspace_key(inbox_id, work_key)
         record = self._store.get(key)
         if record is None:
@@ -319,7 +323,8 @@ class OrcaWorktreeManager:
         )
         try:
             if self._backend == "orca":
-                rm_res = self._runner(["orca", "worktree", "rm", "--worktree", f"path:{workdir}"], primary)
+                rm_cmd = ["orca", "worktree", "rm", "--worktree", f"path:{workdir}"]
+                rm_res = self._runner([*rm_cmd, "--delete-branch"] if merged_head else rm_cmd, primary)
             else:
                 rm_res = self._runner(["git", "worktree", "remove", str(workdir)], primary)
         except BaseException:
@@ -337,7 +342,28 @@ class OrcaWorktreeManager:
             msg = f"Reclaim of '{workdir}' lost its claim; record left to its new owner"
             self._alert(notify_outbox, inbox_id, msg)
             return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
-        return ReclaimResult(reclaimed=True, reason="reclaimed", workdir=record.workdir)
+        branch = ""
+        if merged_head:
+            deleted, branch = self._delete_local_branch(primary, record.branch, merged_head)
+            if not deleted:
+                self._alert(notify_outbox, inbox_id, f"Reclaimed '{workdir}'; {branch}")
+        return ReclaimResult(reclaimed=True, reason="reclaimed", workdir=record.workdir, branch=branch)
+
+    def _delete_local_branch(self, primary: Path, branch: str, merged_head: str) -> tuple[bool, str]:
+        # Orca keeps a branch it cannot prove merged, and `git branch -d` refuses a squash-merged one; the delivery's
+        # merged head is that proof, so only a branch still at exactly that head is force-deleted.
+        tip_res = self._runner(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"], primary)
+        tip = tip_res.stdout.strip() if tip_res.returncode == 0 else ""
+        if not tip:
+            return True, f"deleted local branch {branch}"
+        if self._runner(["git", "branch", "-d", branch], primary).returncode == 0:
+            return True, f"deleted local branch {branch}"
+        if tip != merged_head:
+            return False, f"local branch {branch} kept: it is at {tip[:12]}, not the merged head {merged_head[:12]}"
+        res = self._runner(["git", "branch", "-D", branch], primary)
+        if res.returncode != 0:
+            return False, f"local branch {branch} kept: {res.stderr.strip()}"
+        return True, f"deleted local branch {branch} (merged as {merged_head[:12]})"
 
     def _refusal(self, work_key: str, branch: str, repo_checkout: str, workdir: Path, owner: str | None, storage_key: str) -> str | None:
         # Gate 0: no active or suspended session, child included, still references work_key.

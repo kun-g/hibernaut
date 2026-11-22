@@ -78,6 +78,8 @@ class DeliveryConfig:
     close_terminal: bool = False
     # Merge conflicts with the base and failing checks go back to the developer this many times per delivery.
     max_handbacks: int = 2
+    # After a merge, delete the source branch on the remote and, when the worktree is reclaimed, locally.
+    delete_branch: bool = True
 
 
 _DELIVERY_KEYS = frozenset(f.name for f in dataclasses.fields(DeliveryConfig)) - {"repo"}
@@ -173,6 +175,7 @@ def parse_delivery(where: str, raw: object, *, repo: str) -> DeliveryConfig:
         gh_command=_text(where, item, "gh_command", d.gh_command),
         close_terminal=_flag(where, item, "close_terminal", d.close_terminal),
         max_handbacks=_count(where, item, "max_handbacks", d.max_handbacks),
+        delete_branch=_flag(where, item, "delete_branch", d.delete_branch),
     )
 
 
@@ -316,6 +319,15 @@ def _never() -> bool:
     return False
 
 
+def merged_head(config: DeliveryConfig | None, store: SQLiteDeliveryStore, work_key: str) -> str | None:
+    # The head this delivery saw GitHub merge: the evidence that lets a worktree reclaim delete the task's local
+    # branch. None when branches are kept or nothing was merged.
+    if config is None or not config.delete_branch:
+        return None
+    rec = DeliveryRecord.from_dict(store.get(work_key))
+    return rec.pushed_sha if rec.state == "merged" and rec.pushed_sha else None
+
+
 class PRDelivery:
     # Hibernaut's delivery step for a finished SDE task: merge the latest remote base into the task branch, set the
     # SemVer version from the reported change kind, run the configured checks, push without force, create or reuse
@@ -401,27 +413,9 @@ class PRDelivery:
             self._store.save(req.work_key, rec.to_dict())
             return rec
         try:
-            if req.change_kind not in BUMP_FOR_KIND:
-                raise _Problem(f"unknown change kind {req.change_kind!r} (expected {', '.join(CHANGE_KINDS)})")
-            rec.change_kind, rec.bump = req.change_kind, BUMP_FOR_KIND[req.change_kind]
-            if not cfg.open_pr:
-                rec.notes.append("not pushed: this project does not authorize opening pull requests "
-                                 "(delivery.open_pr = false)")
-                return rec
-            if not self._gate(OPEN_PR_TOOL, req, rec, permissions, approved):
-                return rec
-            if rec.pushed_sha and self._merged_elsewhere(req, rec):
-                return rec
-            self._prepare(req, rec, is_interrupted)
-            self._push(req, rec)
-            self._open_pr(req, rec)
-            self._confirm(req, rec)
-            if rec.state != "pr_open":
-                return rec
-            if not cfg.auto_merge:
-                rec.notes.append("not merged: this project does not authorize merging (delivery.auto_merge = false)")
-                return rec
-            self._merge(req, rec, permissions, approved, is_interrupted)
+            self._publish(req, rec, permissions, approved, is_interrupted)
+            if rec.state == "merged":
+                self._delete_remote_branch(req, rec)
         except _Problem as exc:
             rec.problem = str(exc)
             if isinstance(exc, _Handback):
@@ -429,6 +423,33 @@ class PRDelivery:
         finally:
             self._store.save(req.work_key, rec.to_dict())
         return rec
+
+    def _publish(
+        self, req: DeliveryRequest, rec: DeliveryRecord, permissions: PermissionPort, approved: frozenset[str],
+        is_interrupted: Callable[[], bool],
+    ) -> None:
+        cfg = self._config
+        if req.change_kind not in BUMP_FOR_KIND:
+            raise _Problem(f"unknown change kind {req.change_kind!r} (expected {', '.join(CHANGE_KINDS)})")
+        rec.change_kind, rec.bump = req.change_kind, BUMP_FOR_KIND[req.change_kind]
+        if not cfg.open_pr:
+            rec.notes.append("not pushed: this project does not authorize opening pull requests "
+                             "(delivery.open_pr = false)")
+            return
+        if not self._gate(OPEN_PR_TOOL, req, rec, permissions, approved):
+            return
+        if rec.pushed_sha and self._merged_elsewhere(req, rec):
+            return
+        self._prepare(req, rec, is_interrupted)
+        self._push(req, rec)
+        self._open_pr(req, rec)
+        self._confirm(req, rec)
+        if rec.state != "pr_open":
+            return
+        if not cfg.auto_merge:
+            rec.notes.append("not merged: this project does not authorize merging (delivery.auto_merge = false)")
+            return
+        self._merge(req, rec, permissions, approved, is_interrupted)
 
     # --- permission ---
 
@@ -795,6 +816,37 @@ class PRDelivery:
             if rec.state == "merged":
                 return
         raise _Problem(f"{cfg.remote}/{cfg.base_branch} kept changing its version; approve to retry the merge")
+
+    def _delete_remote_branch(self, req: DeliveryRequest, rec: DeliveryRecord) -> None:
+        # Runs only once GitHub reports the PR MERGED. A failure never undoes the merge: it is a note in the message.
+        cfg = self._config
+        if not cfg.delete_branch or not rec.branch:
+            return
+        label = f"{cfg.remote}/{rec.branch}"
+
+        def remote_tip() -> str:
+            listed = self._git(req.workdir, "ls-remote", cfg.remote, f"refs/heads/{rec.branch}").stdout.split()
+            return listed[0] if listed else ""
+
+        try:
+            tip = remote_tip()
+            if not tip:
+                rec.history.append(f"{label} was already deleted")
+                return
+            if tip != rec.pushed_sha:
+                # Commits pushed after the merged head would be lost with the branch.
+                rec.notes.append(f"branch kept: {label} is at {tip[:12]}, not the merged head {rec.pushed_sha[:12]}")
+                return
+            proc = self._git(req.workdir, "push", "--quiet", cfg.remote, "--delete", rec.branch, check=False)
+            if proc.returncode != 0:
+                if not remote_tip():
+                    rec.history.append(f"{label} was already deleted")
+                    return
+                rec.notes.append(f"branch kept: deleting {label} failed: {_tail(proc.stderr or proc.stdout, 800)}")
+                return
+            rec.history.append(f"deleted {label}")
+        except _Problem as exc:
+            rec.notes.append(f"branch kept: {exc}")
 
     def _pr_checks(self, cwd: Path, number: int) -> list[dict[str, Any]]:
         proc = self._gh(cwd, "pr", "checks", str(number), "--json", "name,state,bucket", check=False)

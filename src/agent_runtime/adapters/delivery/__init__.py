@@ -9,6 +9,7 @@ from agent_runtime.adapters.delivery.pr_delivery import (
     DeliveryRequest,
     PRDelivery,
     bump_version,
+    merged_head,
     parse_delivery,
 )
 
@@ -23,5 +24,6 @@ __all__ = [
     "DeliveryRequest",
     "PRDelivery",
     "bump_version",
+    "merged_head",
     "parse_delivery",
 ]
