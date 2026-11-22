@@ -143,8 +143,8 @@ class TestReviewerChannel(VisibleCase):
         dev_term, review_term = self.orca.created()
         # Each side is told the other's exact session name; the reviewer's name is its terminal title.
         # Claude Code puts the sender's socket in `from` and its session name in `from-name`.
-        self.assertIn('from-name="coder-reviewer · review of task:1"', dev_call["prompt"])
-        self.assertEqual(review_term["title"], "coder-reviewer · review of task:1")
+        self.assertIn('from-name="coder-reviewer (code-reviewer) · review of task:1"', dev_call["prompt"])
+        self.assertEqual(review_term["title"], "coder-reviewer (code-reviewer) · review of task:1")
         self.assertIn(f'the Claude Code session "sde · task:1" (native session {developed.executor_session_id})',
                       review_call["prompt"])
         self.assertIn('`to` exactly "sde · task:1"', review_call["prompt"])
@@ -188,7 +188,7 @@ class TestDeveloperTools(VisibleCase):
         self.assertIn("Never start a reviewer yourself", dev_call["prompt"])
         # Claude Code suffixes a name another live session holds (a second review of the same task), so that form
         # is accepted too; the exact task tag is what tells tasks apart.
-        self.assertIn('"coder-reviewer · review of task:1-<words>"', dev_call["prompt"])
+        self.assertIn('"coder-reviewer (code-reviewer) · review of task:1-<words>"', dev_call["prompt"])
         self.assertIn("starts with exactly `[review of task:1]`", dev_call["prompt"])
 
 
@@ -295,8 +295,8 @@ class TestIndependentEventsTalk(unittest.TestCase):
                 self.assertIn(f"Developer channel: sde · task-42 (Claude Code session {sde_native}, "
                               f"Hibernaut session {sde_session})", verdict)
                 dev_prompts = {c["cwd"]: c["prompt"] for c in calls("sde")}
-                self.assertIn('from-name="coder-reviewer · review of task-42"', dev_prompts[str(workdirs[42])])
-                self.assertIn('from-name="coder-reviewer · review of task-43"', dev_prompts[str(workdirs[43])])
+                self.assertIn('from-name="coder-reviewer (code-reviewer) · review of task-42"', dev_prompts[str(workdirs[42])])
+                self.assertIn('from-name="coder-reviewer (code-reviewer) · review of task-43"', dev_prompts[str(workdirs[43])])
             finally:
                 stop.set()
                 await server

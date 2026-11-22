@@ -32,10 +32,13 @@ from agent_runtime.adapters.channels.channels import webhook_request_handler
 from agent_runtime.adapters.channels.switchboard_bridge import SwitchboardChannelAdapter, SwitchboardInboundBridge
 from agent_runtime.adapters.delivery import DeliveryConfig, PRDelivery
 from agent_runtime.adapters.executor_cli import (
-    CODER_REVIEWER_ROLE,
+    CODE_REVIEWER_ROLE,
+    DEFAULT_CLI_TEMPLATES,
+    CLIReviewer,
     CoderReviewerExecutor,
     LocalCLIExecutor,
     OrcaWorktreeManager,
+    Reviewer,
     SDEExecutor,
 )
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, default_transcript_roots
@@ -652,8 +655,17 @@ def build_daemon_from_config(
                                             terminal=terminal(role), peers=developer_peers, tasks=tasks,
                                             workspace_key=wt_mgr.workspace_key)
                 for name, role in config.roles.items()
-                if role.role == CODER_REVIEWER_ROLE
+                if role.role == CODE_REVIEWER_ROLE
             }
+            templates = {**DEFAULT_CLI_TEMPLATES, **config.executors}
+
+            def reviewer_for(name: str) -> Reviewer | None:
+                # Config parsing guarantees the name is a code-reviewer executor or a CLI template.
+                if name in reviewers:
+                    return reviewers[name]
+                template = templates.get(name)
+                return CLIReviewer(template=template) if template is not None else None
+
             built: dict[str, ExecutorPort] = dict(reviewers)
             for name, role in config.roles.items():
                 if role.sde is None:
@@ -661,7 +673,9 @@ def build_daemon_from_config(
                 built[name] = SDEExecutor(
                     profile=role.profile,
                     options=role.sde,
-                    reviewer=reviewers.get(role.sde.reviewer) if role.sde.review else None,
+                    reviewer=reviewer_for(role.sde.reviewer) if role.sde.review else None,
+                    # An independently dispatched review always comes from a code-reviewer executor.
+                    peer_reviewer=role.sde.reviewer if role.sde.reviewer in reviewers else next(iter(reviewers), None),
                     worktree_manager=wt_mgr,
                     inbox_checkout_map=inbox_checkout_map,
                     terminal=terminal(role),

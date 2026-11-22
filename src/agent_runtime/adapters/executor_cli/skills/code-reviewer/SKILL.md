@@ -1,6 +1,6 @@
 ---
-name: coder-reviewer
-description: Hibernaut's default review method for the coder-reviewer role — judge a change against the requirements, the diff and the test evidence.
+name: code-reviewer
+description: Hibernaut's default review method for the code-reviewer role — judge a change against the requirements, the diff and the test evidence.
 ---
 
 # Independent code review

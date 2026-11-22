@@ -102,7 +102,7 @@ class TestSDEConfig(unittest.TestCase):
         role = cfg.roles["sde"]
         p = role.profile
         self.assertEqual((p.launcher.command, p.billing, p.model, p.effort), ("claude-sg", "api", "sonnet", "max"))
-        self.assertEqual(role.sde, SDEOptions(review=False, reviewer="coder-reviewer", max_review_rounds=5))
+        self.assertEqual(role.sde, SDEOptions(review=False, reviewer="code-reviewer", max_review_rounds=5))
 
     def test_invalid_settings_fail_with_a_reason(self):
         reviewer = {"coder-reviewer": {"role": "coder-reviewer"}}
@@ -112,17 +112,18 @@ class TestSDEConfig(unittest.TestCase):
             "executors.sde: unsupported harness 'codex'": {"harness": "codex"},
             "executors.sde: unsupported effort 'ultra'": {"effort": "ultra"},
             "executors.sde: command not supported": {"command": "claude"},
-            "executors.sde: reviewer 'ghost' is not a coder-reviewer executor": {"reviewer": "ghost"},
+            "executors.sde: reviewer 'ghost' is not a declared executor; choose a code-reviewer executor or a "
+            r"CLI executor \(claude, coder-reviewer, cursor-agent, dsh, grok\)": {"reviewer": "ghost"},
         }
         for message, override in cases.items():
             with self.subTest(message), self.assertRaisesRegex(ValueError, message):
                 parse_config({"executors": {"sde": {"role": "sde", **override}, **reviewer}})
-        with self.assertRaisesRegex(ValueError, "reviewer 'coder-reviewer' is not a coder-reviewer executor"):
+        with self.assertRaisesRegex(ValueError, "reviewer 'code-reviewer' is not a declared executor"):
             parse_config({"executors": {"sde": {"role": "sde"}}})
         # With review off no reviewer is needed.
         cfg = parse_config({"executors": {"sde": {"role": "sde", "review": False}}})
         self.assertFalse(cfg.roles["sde"].sde.review)  # type: ignore[union-attr]
-        with self.assertRaisesRegex(ValueError, "executors.reviewer: review not supported for role 'coder-reviewer'"):
+        with self.assertRaisesRegex(ValueError, "executors.reviewer: review not supported for role 'code-reviewer'"):
             parse_config({"executors": {"reviewer": {"role": "coder-reviewer", "review": True}}})
 
     def test_sde_alone_is_enough_to_leave_ingest_only(self):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import math
 import sys
 import tomllib
@@ -17,8 +18,9 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     parse_launchers,
     parse_profile,
 )
-from agent_runtime.adapters.executor_cli.executor import CLITemplate
-from agent_runtime.adapters.executor_cli.reviewer import CODER_REVIEWER_ROLE
+from agent_runtime.adapters.executor_cli.executor import DEFAULT_CLI_TEMPLATES, CLITemplate
+from agent_runtime.adapters.executor_cli.reviewer import CODE_REVIEWER_ROLE
+from agent_runtime.adapters.executor_cli.role_skills import ROLE_ALIASES, canonical_role
 from agent_runtime.adapters.executor_cli.sde import SDE_OPTION_KEYS, SDE_ROLE, SDEOptions
 from agent_runtime.adapters.executor_cli.worktree import WorktreeBackend
 from agent_runtime.adapters.permissions.security import proxy_service_url
@@ -86,7 +88,9 @@ class ProjectConfig:
         return len(rules) > 1 or any(r.literal is None for r in rules)
 
 
-ROLES = (CODER_REVIEWER_ROLE, SDE_ROLE)
+ROLES = (CODE_REVIEWER_ROLE, SDE_ROLE)
+# Before code-reviewer the review role and its usual executor were both named coder-reviewer.
+_LEGACY_REVIEWER = "coder-reviewer"
 # Deployment mode shared by every role executor; visible is the old name of interactive.
 ROLE_DEPLOYMENT_KEYS = frozenset({"interactive", "visible"})
 
@@ -122,6 +126,33 @@ def _sde_options(name: str, item: dict[str, Any]) -> SDEOptions:
         raise ValueError(f"{where}: max_review_rounds must be a positive integer")
     reviewer = str(item.get("reviewer", defaults.reviewer)).strip()
     return SDEOptions(review=review, reviewer=reviewer, max_review_rounds=rounds)
+
+
+def _resolve_reviewer(
+    name: str, opts: SDEOptions, *, explicit: bool, roles: dict[str, RoleConfig], executors: dict[str, CLITemplate],
+) -> SDEOptions:
+    # A reviewer is a code-reviewer role executor or any CLI template, built-in ones included.
+    templates = {**DEFAULT_CLI_TEMPLATES, **executors}
+    target = opts.reviewer
+    if not explicit and target not in roles and target not in templates:
+        legacy = roles.get(_LEGACY_REVIEWER)
+        if legacy is not None and legacy.role == CODE_REVIEWER_ROLE:
+            # Deployments from before the rename keep working without naming their reviewer.
+            target = _LEGACY_REVIEWER
+    resolved = SDEOptions(review=opts.review, reviewer=target, max_review_rounds=opts.max_review_rounds)
+    if not opts.review:
+        return resolved
+    choices = sorted({n for n, r in roles.items() if r.role == CODE_REVIEWER_ROLE} | set(templates))
+    hint = f"choose a {CODE_REVIEWER_ROLE} executor or a CLI executor ({', '.join(choices)}) or set review = false"
+    where = f"executors.{name}: reviewer '{target}'"
+    if target == name:
+        raise ValueError(f"{where} is this executor itself; {hint}")
+    role = roles.get(target)
+    if role is not None and role.role != CODE_REVIEWER_ROLE:
+        raise ValueError(f"{where} has role '{role.role}', which cannot review; {hint}")
+    if role is None and target not in templates:
+        raise ValueError(f"{where} is not a declared executor; {hint}")
+    return resolved
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,10 +340,11 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
     executors: dict[str, CLITemplate] = {}
     roles: dict[str, RoleConfig] = {}
     for name, item in raw.get("executors", {}).items():
-        role = item.get("role")
-        if role is not None:
-            if role not in ROLES:
-                raise ValueError(f"executors.{name}: unsupported role '{role}' (supported: {', '.join(ROLES)})")
+        raw_role = item.get("role")
+        if raw_role is not None:
+            if raw_role not in ROLES and raw_role not in ROLE_ALIASES:
+                raise ValueError(f"executors.{name}: unsupported role '{raw_role}' (supported: {', '.join(ROLES)})")
+            role = canonical_role(str(raw_role))
             extra = (SDE_OPTION_KEYS if role == SDE_ROLE else frozenset[str]()) | ROLE_DEPLOYMENT_KEYS
             profile = parse_profile(
                 str(name), item, role=str(role), launchers=launchers, credential_proxy_url=anthropic_url,
@@ -342,16 +374,12 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             orca_agent=orca_agent,
         )
 
-    for name, role_cfg in roles.items():
-        opts = role_cfg.sde
-        if opts is None or not opts.review:
+    for name, role_cfg in list(roles.items()):
+        if role_cfg.sde is None:
             continue
-        target = roles.get(opts.reviewer)
-        if target is None or target.role != CODER_REVIEWER_ROLE:
-            raise ValueError(
-                f"executors.{name}: reviewer '{opts.reviewer}' is not a coder-reviewer executor; "
-                f"declare [executors.{opts.reviewer}] with role = \"{CODER_REVIEWER_ROLE}\" or set review = false"
-            )
+        explicit = "reviewer" in raw["executors"][name]
+        options = _resolve_reviewer(name, role_cfg.sde, explicit=explicit, roles=roles, executors=executors)
+        roles[name] = dataclasses.replace(role_cfg, sde=options)
 
     projects: dict[str, ProjectConfig] = {}
     for name, item in raw.get("projects", {}).items():

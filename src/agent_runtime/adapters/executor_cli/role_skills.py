@@ -8,17 +8,23 @@ SKILL_FILE = "SKILL.md"
 BUILTIN_PREFIX = "builtin:"
 # Shipped inside the package (see [tool.setuptools.package-data]); one directory per role.
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().with_name("skills")
+# Old role names still accepted in deployment files and builtin: entries.
+ROLE_ALIASES = {"coder-reviewer": "code-reviewer"}
+
+
+def canonical_role(role: str) -> str:
+    return ROLE_ALIASES.get(role, role)
 
 
 def builtin_skill(role: str) -> Path:
-    return BUILTIN_SKILLS_DIR / role / SKILL_FILE
+    return BUILTIN_SKILLS_DIR / canonical_role(role) / SKILL_FILE
 
 
 def resolve_skill(where: str, role: str, entry: str, base_dir: Path) -> Path:
     raw = entry.strip()
     if raw.startswith(BUILTIN_PREFIX):
         # A role may only name its own built-in skill, so one role's rules never leak into another.
-        if raw != f"{BUILTIN_PREFIX}{role}":
+        if canonical_role(raw.removeprefix(BUILTIN_PREFIX)) != canonical_role(role):
             raise ValueError(f"{where}: '{raw}' is not available for role '{role}' (use '{BUILTIN_PREFIX}{role}')")
         path = builtin_skill(role)
     else:

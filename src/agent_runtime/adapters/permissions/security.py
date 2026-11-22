@@ -19,7 +19,7 @@ class AutoModePermissionAdapter:
             "send_message",
             "fetch_status",
             "orca.agent.launch",
-            "coder_reviewer.launch",
+            "code_reviewer.launch",
             "sde.launch",
             # Each is granted per project in [projects.<name>.delivery] (open_pr, auto_merge); move one to the
             # defer list to also ask a person every time.
@@ -41,6 +41,8 @@ class AutoModePermissionAdapter:
             "dump_env_secrets",
         }
     )
+    # Old tool name -> current name: a rule written for the old name applies to the new one.
+    TOOL_ALIASES: dict[str, str] = {"coder_reviewer.launch": "code_reviewer.launch"}
     DANGEROUS_SUBSTRINGS: tuple[str, ...] = (
         "rm -rf",
         "DROP TABLE",
@@ -54,11 +56,16 @@ class AutoModePermissionAdapter:
         defer_tools: frozenset[str] | None = None,
         block_tools: frozenset[str] | None = None,
     ) -> None:
-        self._allow_tools = allow_tools if allow_tools is not None else self.DEFAULT_ALLOW_TOOLS
-        self._defer_tools = defer_tools if defer_tools is not None else self.DEFAULT_DEFER_TOOLS
-        self._block_tools = block_tools if block_tools is not None else self.DEFAULT_BLOCK_TOOLS
+        self._allow_tools = self._canonical(allow_tools if allow_tools is not None else self.DEFAULT_ALLOW_TOOLS)
+        self._defer_tools = self._canonical(defer_tools if defer_tools is not None else self.DEFAULT_DEFER_TOOLS)
+        self._block_tools = self._canonical(block_tools if block_tools is not None else self.DEFAULT_BLOCK_TOOLS)
+
+    @classmethod
+    def _canonical(cls, tools: frozenset[str]) -> frozenset[str]:
+        return frozenset(cls.TOOL_ALIASES.get(t, t) for t in tools)
 
     def check(self, tool_name: str, args: dict[str, Any]) -> PermissionDecision:
+        tool_name = self.TOOL_ALIASES.get(tool_name, tool_name)
         if tool_name in self._block_tools:
             return PermissionDecision(
                 action="block",

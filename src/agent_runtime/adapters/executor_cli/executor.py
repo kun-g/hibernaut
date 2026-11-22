@@ -46,6 +46,19 @@ DEFAULT_CLI_TEMPLATES: dict[str, CLITemplate] = {
 }
 
 
+def render_cli_args(args: Sequence[str], *, prompt: str, executor_session_id: str = "") -> list[str]:
+    # {prompt} is substituted in place; without one the prompt is the last argument.
+    rendered: list[str] = []
+    prompt_inserted = False
+    for token in args:
+        if "{prompt}" in token:
+            prompt_inserted = True
+        rendered.append(token.replace("{prompt}", prompt).replace("{executor_session_id}", executor_session_id))
+    if not prompt_inserted:
+        rendered.append(prompt)
+    return rendered
+
+
 class LocalCLIExecutor:
     def __init__(
         self,
@@ -184,18 +197,7 @@ class LocalCLIExecutor:
         )
         raw_args = template.resume_args if can_resume else template.args
         exec_sid = session.executor_session_id if (can_resume and session is not None) else ""
-
-        rendered: list[str] = []
-        prompt_inserted = False
-        for token in raw_args:
-            if "{prompt}" in token:
-                prompt_inserted = True
-            rendered.append(
-                token.replace("{prompt}", prompt).replace("{executor_session_id}", exec_sid or "")
-            )
-        if not prompt_inserted:
-            rendered.append(prompt)
-        return rendered
+        return render_cli_args(raw_args, prompt=prompt, executor_session_id=exec_sid or "")
 
     async def _wait_with_interrupt(
         self,

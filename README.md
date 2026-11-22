@@ -28,7 +28,7 @@ src/agent_runtime/
 │   ├── credential_proxy/  # External Drive queue proxy (own OS user holds the service account key; fixed queue operations on loopback)
 │   ├── delivery/          # PRDelivery: SDE task -> version decision, repo gates, pushed branch, PR, separately authorized merge
 │   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
-│   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + resume_args + magpie env), shared Claude Code launch adapter (claude_code.py), CoderReviewerExecutor (read-only review) & OrcaWorktreeManager (3 safety gates)
+│   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + resume_args + magpie env), shared Claude Code launch adapter (claude_code.py), CoderReviewerExecutor & CLIReviewer (read-only review) & OrcaWorktreeManager (3 safety gates)
 │   └── channels/          # Multi-route HTTP (/events, /webhooks/github, /webhooks/feishu, /mcp), MCPServerAdapter, GitHubIssuePoller, FeishuChannelAdapter, Console, Drive queue poller/writer (via ProxiedDriveClient)
 └── app/
     ├── config.py          # Stdlib tomllib loader for hibernaut.toml
@@ -105,7 +105,7 @@ The supervisor checks the configured `origin/main` every 300 seconds. Use `--int
 
 Use an origin you trust to supply executable code. A dirty checkout (including untracked files), another branch, a divergent history, or a failed fetch leaves the running daemon in place. On a fast-forward, the old daemon closes ingress and drains accepted work before the supervisor applies the commit and relaunches. Clients should retry during this short interruption using the same external event ID. Keep runtime state in ignored paths or outside the checkout. The supervisor reuses those paths. If a new daemon fails to start, the supervisor exits with its status for operator recovery.
 
-## Independent Code Review (`coder-reviewer`)
+## Independent Code Review (`code-reviewer`)
 
 Register a reviewer in `hibernaut.toml` (defaults shown; only `role` is required). Role, harness, launcher, billing and model are separate settings:
 
@@ -116,8 +116,8 @@ command = "claude-sg"       # trusted launcher on the deployment host
 [credential_proxy]          # required only for billing = "api"
 url = "http://127.0.0.1:9000"
 
-[executors.coder-reviewer]
-role = "coder-reviewer"
+[executors.code-reviewer]
+role = "code-reviewer"
 harness = "claude-code"    # only claude-code
 launcher = "claude"        # a [launchers.<name>] entry
 billing = "subscription"   # subscription | api
@@ -125,13 +125,15 @@ model = "claude-opus-5-5"  # Claude full name or alias (opus, sonnet, haiku, fab
 effort = "high"            # low | medium | high | xhigh | max
 ```
 
-Dispatch a review with `executor_id = "coder-reviewer"`:
+The old names `role = "coder-reviewer"` and `builtin:coder-reviewer` still work and mean the same role.
+
+Dispatch a review with `executor_id = "code-reviewer"`:
 
 ```bash
 curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
   "inbox_id": "proj:hibernaut", "external_id": "review-42-r1", "correlation_key": "review:task-42",
   "payload": {
-    "executor_id": "coder-reviewer",
+    "executor_id": "code-reviewer",
     "text": "Task requirements the change must meet",
     "test_evidence": "pytest -v: 119 passed; pyright: 0 errors",
     "review_of": "task-42",
@@ -157,13 +159,13 @@ How each role works comes from a skill; what it may do and what it must return s
 role = "sde"
 skills = ["builtin:sde", "./skills/team-tdd", "~/skills/security/SKILL.md"]
 
-[executors.coder-reviewer]
-role = "coder-reviewer"
+[executors.code-reviewer]
+role = "code-reviewer"
 skills = ["./skills/team-review"]   # replaces the built-in review method
 ```
 
 - Entries: a local `SKILL.md`, a directory containing one, or `builtin:<role>` (the skill shipped in the package under `agent_runtime/adapters/executor_cli/skills/<role>/`). Relative paths resolve against the directory of `hibernaut.toml`; `~` expands.
-- Default: without `skills`, the role uses its built-in skill (`sde`: test-first development; `coder-reviewer`: the review method). A listed `skills` replaces the default; list `builtin:<role>` to keep it and add your own. A role can name only its own built-in skill.
+- Default: without `skills`, the role uses its built-in skill (`sde`: test-first development; `code-reviewer`: the review method). A listed `skills` replaces the default; list `builtin:<role>` to keep it and add your own. A role can name only its own built-in skill.
 - Delivery: every launch reads the files again and passes them, in order, with `--append-system-prompt`, each headed by its absolute path and resource directory (`Relative resources are relative to <dir>`). Editing a `SKILL.md` affects the next run without a reload.
 - Fixed by code: the system prompt starts with the role's contract (what to return, no force-push for `sde`, read-only for the reviewer). Tools, permission mode, JSON schema and launcher come from the executor and `hibernaut.toml`. A skill, an event payload or a project document cannot change them or choose a skill.
 - Errors: a missing file, an empty list or another role's `builtin:` entry fails config parsing with the executor name and path (`executors.sde: skill './skills/team-tdd' not found (no file at ...)`); hot reload keeps the running settings. A skill deleted after loading fails that run before launch.
@@ -225,7 +227,7 @@ billing = "subscription"
 model = "claude-opus-5-5"
 effort = "high"
 review = true                # runtime switch: false delivers after tests and repo checks
-reviewer = "coder-reviewer"  # a role = "coder-reviewer" executor; required while review = true
+reviewer = "code-reviewer"   # a role = "code-reviewer" executor or any CLI executor (claude, cursor-agent, grok, dsh, ...)
 max_review_rounds = 3
 ```
 
@@ -244,12 +246,12 @@ curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
 - Guidance selection: optional `activities` (for example `["versioning"]`) and `tags` or `labels` in the payload pick the project documents the developer receives; the commit and selection are recorded for the task when it starts.
 - Development: the launcher starts Claude Code with `--permission-mode dontAsk`, read/edit/write tools and Bash allowed, `git push` and `gh pr create/merge` denied. The system prompt carries the role contract and the role skills (by default: a failing test first, the smallest fix, the repository's full checks); the task message carries the requirements and the project guidance selected for the task from its pinned commit (see Project Guidance). The developer commits on the task branch. The run returns a structured report (`summary`, `test_evidence`, `change_kind`, `change_rationale`); `change_kind` classifies the whole branch as `breaking`, `feature`, `fix` or `test_docs` and `change_rationale` says why. A `done` report without a valid kind and a rationale fails the run; a question for a person becomes a `Suspend`: answer by replying on the task (same `correlation_key`) or with an approval `comment`, then approve. Rejecting stops the task with `[sde] stopped: question declined`.
   With no project delivery configuration, the 0.7.1 SDE workflow handles the version bump, branch push and PR itself (and deletes the source branch with `--delete-branch` when merging a pull request, falling back to deleting the remote branch if a worktree blocks local branch deletion). When a delivery configuration is present, SDE commits locally and HB applies that configuration to publication.
-- Review on: the SDE sends the requirements, the diff it computes from the worktree (not the developer's own description) and the test evidence to the configured `coder-reviewer`, which runs as its own read-only session with its own launcher, billing and model. `changes_requested` sends every blocking item back to the same developer session for a fix; the re-review also gets the previous findings and the diff since that review. `pass` delivers. If the review cannot finish (reviewer error, malformed verdict, model or billing mismatch) or rounds run out, the run suspends as `review pending`: approve to retry (another fix round when changes were requested), reject to deliver marked `review=pending`.
+- Review on: the SDE sends the requirements, the diff it computes from the worktree (not the developer's own description) and the test evidence to the configured `reviewer`. A `code-reviewer` executor runs as its own read-only session with its own launcher, billing and model. A CLI executor (for example `reviewer = "grok"`) runs non-interactively in the worktree and must print one JSON verdict; nothing limits its tools, so read-only is only checked afterwards and a review that changed the worktree is discarded. Without `reviewer`, an existing `coder-reviewer` executor is used when no `code-reviewer` exists. `changes_requested` sends every blocking item back to the same developer session for a fix; the re-review also gets the previous findings and the diff since that review. `pass` delivers. If the review cannot finish (reviewer error, malformed verdict, model or billing mismatch) or rounds run out, the run suspends as `review pending`: approve to retry (another fix round when changes were requested), reject to deliver marked `review=pending`.
 - Review off: the SDE delivers after its own tests and checks (`review=off`).
 - While suspended: messages on the same task are kept with the suspended state (the open approval card is not posted again). Messages that arrive in the same batch as the decision count too. On approval they are added to the requirements, developed first, and shown to the reviewer; a rejected review retry lists them as unprocessed in the delivery.
 - Permission gate `sde.launch` runs before every developer launch, fix rounds included. `defer` suspends with the full state; approval runs that launch, rejection stops with `[sde] stopped: launch declined`; `block` stops with `[sde] stopped: launch blocked`.
 - Delivery: one Outbox message `[sde] delivered (review=pass after N round(s) | review=off | review=pending; harness=... launcher=... billing=... model=... effort=...)` with workdir, summary, `Change: <kind> (<rationale>)`, test evidence, review history and the last review. When the project configures `[projects.<name>.delivery]`, Hibernaut's delivery step runs first and the message adds its state, PR link, version decision, checks, CI and merge commit (see PR Delivery).
-- Hot reload: all four launch settings and `review` take effect on the next run; invalid values keep the running settings. Billing and launcher rules are the same as for `coder-reviewer`. `sde.launch` is allowed by default in the auto-mode permission adapter.
+- Hot reload: all four launch settings and `review` take effect on the next run; invalid values keep the running settings. Billing and launcher rules are the same as for `code-reviewer`. `sde.launch` is allowed by default in the auto-mode permission adapter.
 
 ## PR Delivery (`[projects.<name>.delivery]`)
 
@@ -292,21 +294,21 @@ After the SDE reports `done` (and the review passed, or with `review = false`), 
 Processing an event can finish before the change is delivered: a delivery that waits suspends the task, and the event is done. What counts as delivered is checked separately at each stage.
 
 - Code delivery: after every `done` report Hibernaut inspects the task worktree itself (`git status --porcelain --untracked-files=all` and `git rev-list --count <base>..HEAD`, where the base is the commit pinned when the task started). A tool result, an idle prompt or a clean tree alone is not delivery. Staged, unstaged or untracked files (tests and docs included), or a branch with no commit since the base, send the developer back once automatically; if the work is still unfinished the task suspends as `[sde] incomplete: <what is left>` and keeps the worktree, session and terminal. Approve sends the developer back again; reject stops with `[sde] stopped: incomplete work left in place` and still keeps them. This applies with or without a delivery step.
-- No-code outcome: a task that needs no repository change reports `code_change: false`. With a clean tree and no commit since the base, it ends as `[sde] finished without a code change` with no review and no delivery. Commits on the branch make it a change whatever the report says; a dirty tree makes it incomplete. Reviews (`coder-reviewer`) are read-only and never take this path.
+- No-code outcome: a task that needs no repository change reports `code_change: false`. With a clean tree and no commit since the base, it ends as `[sde] finished without a code change` with no review and no delivery. Commits on the branch make it a change whatever the report says; a dirty tree makes it incomplete. Reviews (`code-reviewer`) are read-only and never take this path.
 - PR evidence: after creating or reusing the PR, Hibernaut reads the remote branch (`git ls-remote`) and the PR head (`gh pr view --json headRefOid`). Both must be the pushed commit, which is the commit the checks passed on; otherwise the delivery suspends with `PR #<n> is not at the pushed commit`. A local commit without a PR keeps the worktree, and approval continues the PR flow from the recorded state.
 - Terminal exit (`close_terminal = true`): the SDE terminal closes only when the delivery target is evidenced (open PR at the checked commit; with `auto_merge = true` the PR must also be merged) and no human question or live reviewer exchange is open (`review:<task>` sessions or queued `review_of` events). Before closing, the SHA, PR URL, Hibernaut session and Claude Code session IDs are saved in the `deliveries` record; the terminal binding keeps the native ID so the next event resumes with `--resume`. The receipt says `Terminal: closed <handle>; resume with Claude Code session <id>` or `Terminal: kept <handle> (<reason>)`. A terminal that fails to close stays bound. Closing a terminal never removes the worktree.
 - Reclamation: runs only when the last session on the work key closes, and rechecks everything immediately before and again right after claiming the worktree. It needs: no active or suspended session or child; no reviewer session, queued or running event on the task, and no unfinished delivery (`SQLiteWorkUsage`); GitHub reporting no open PR for the branch; no staged, unstaged or untracked file; and every commit of the worktree on a remote, or a merged PR whose head is exactly the local `HEAD` and whose merge commit a remote branch contains (a squash merge). A check that cannot run (for example `gh` failing) counts as missing evidence and leaves the worktree in place.
 
 ## Interactive Role Sessions
 
-`interactive` on a role executor (default `true`) means each `sde` or `coder-reviewer` run needs a session a person can join. The project's `terminal_backend` opens it; `interactive = false` runs the role non-interactively (headless), whatever the project.
+`interactive` on a role executor (default `true`) means each `sde` or `code-reviewer` run needs a session a person can join. The project's `terminal_backend` opens it; `interactive = false` runs the role non-interactively (headless), whatever the project.
 
 - Terminal backend: `terminal_backend = "orca"` opens an interactive Claude Code terminal in the target worktree through Orca. It is set per project, independently of `worktree_backend`: it defaults to `"orca"` for `worktree_backend = "orca"` projects (their behaviour is unchanged) and to `"none"` for `worktree_backend = "git"` projects. A Git worktree project can set `terminal_backend = "orca"` to get Orca terminals in its Git worktrees. Orca is the only terminal backend.
-- No backend: an interactive role never falls back to a background run. With `terminal_backend = "none"`, or for an inbox that matches no `[projects]` entry when the task names its own `explicit_workdir` (without one the event waits for a project, see Projects), the SDE suspends with `[sde] interactive session unavailable: <reason>` and starts nothing. Set `terminal_backend = "orca"` on the project or `interactive = false` on the role (the config reloads), then approve to retry; rejecting stops the task with `[sde] stopped: interactive session declined`. An independent review reports `[coder-reviewer] review failed: interactive review not started: <reason>`. A built-in review leaves the SDE task `review pending` with that reason.
-- Attach failure: when Orca cannot open or reach the terminal (no `orca` command, worktree unknown to Orca, a failed session check), the run reports the Orca error (`[sde] development failed: Orca terminal ...`, `[coder-reviewer] review failed: ...`) instead of running headless.
+- No backend: an interactive role never falls back to a background run. With `terminal_backend = "none"`, or for an inbox that matches no `[projects]` entry when the task names its own `explicit_workdir` (without one the event waits for a project, see Projects), the SDE suspends with `[sde] interactive session unavailable: <reason>` and starts nothing. Set `terminal_backend = "orca"` on the project or `interactive = false` on the role (the config reloads), then approve to retry; rejecting stops the task with `[sde] stopped: interactive session declined`. An independent review reports `[code-reviewer] review failed: interactive review not started: <reason>`. A built-in review leaves the SDE task `review pending` with that reason.
+- Attach failure: when Orca cannot open or reach the terminal (no `orca` command, worktree unknown to Orca, a failed session check), the run reports the Orca error (`[sde] development failed: Orca terminal ...`, `[code-reviewer] review failed: ...`) instead of running headless.
 - Migration: `visible` is the old name of `interactive` and is still read. Setting both on one executor is a configuration error. On an existing Git worktree project or unmatched inbox that ran roles headless, add `interactive = false` to keep doing so.
 
-- Terminals: titled `sde · <task>`, `coder-reviewer · review of <task> round <n>` (built-in review) and `coder-reviewer · review of <task>` (independent `review_of` event). Watch progress and answer the agent there. The delivery and review messages list the Orca terminal handle and the Claude Code session ID.
+- Terminals: titled `sde · <task>`, `code-reviewer · review of <task> round <n>` (built-in review) and `code-reviewer · review of <task>` (independent `review_of` event). Watch progress and answer the agent there. The delivery and review messages list the Orca terminal handle and the Claude Code session ID.
 - Settings: the same role prompt, tools, launcher, billing, model and effort as a headless run, with `--permission-mode dontAsk`. A launcher in the terminal first runs the same session check as a headless run (subscription vs. proxy billing, model), then starts the conversation; a failed check closes the terminal and reports the reason.
 - Result: the launcher gives Claude Code a `hibernaut_handoff` MCP server. The agent calls `get_task` to read its task and `submit_result` to return the structured result. The server checks the result against the role schema and rejects a malformed one so the agent can fix it. The agent never reads or writes the handoff directory, so no `--add-dir` trust dialog appears. Claude Code still asks once if the worktree itself is not yet trusted.
 - Continuation: SDE follow-up events, answers after `needs_input` and review fix rounds go back to the task's live terminal, or `--resume` its conversation in a new terminal once the tab is closed. Every review is a new conversation; a re-review receives the previous findings in its prompt.
@@ -354,7 +356,7 @@ Remote clients call `POST https://<your-tunnel-host>/mcp` with header `Authoriza
 
 Run a tunnel-free cloud-to-local task loop via Google Drive (`待执行/` → `执行中/` → `已完成/` / `失败/`), supporting `.md` files with optional YAML frontmatter (`scope`, `executor_id`, `priority`, `title`, and for role executors `activities`, `tags` and `base_ref`, comma-separated) and Google Docs (auto-exported as `text/plain`). Re-editing a file and moving it back to `待执行/` automatically continues the same `Session` and `hb-*` worktree via `correlation_key = "gdrive:<file_id>"`.
 
-A development task names the SDE explicitly (template: [`docs/dispatch/sde-task.drive.md`](docs/dispatch/sde-task.drive.md)); a file without `executor_id` keeps the default routing (session, project, then `runtime.default_executor`), and a review uses `executor_id: coder-reviewer`:
+A development task names the SDE explicitly (template: [`docs/dispatch/sde-task.drive.md`](docs/dispatch/sde-task.drive.md)); a file without `executor_id` keeps the default routing (session, project, then `runtime.default_executor`), and a review uses `executor_id: code-reviewer`:
 
 ```markdown
 ---
