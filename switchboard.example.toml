@@ -23,6 +23,14 @@ unmatched_policy = "fallback"  # or "reject"
 [routing.feishu_chats]
 # "oc_xxx" = "proj:hibernaut"
 
+# Override the consumers of individual event types (defaults: src/switchboard/router.py), e.g. without a Taskboard:
+# [routing.event_consumers]
+# "work.opened" = ["hibernaut"]
+
+[github]
+# Only issues/PRs carrying this label (and comments on them) become events; empty accepts all.
+require_label = "hibernaut"
+
 [feishu]
 group_require_mention = true
 # bot_open_id = "ou_xxx"

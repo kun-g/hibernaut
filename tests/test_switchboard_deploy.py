@@ -23,6 +23,12 @@ class DockerConfigTemplateTests(unittest.TestCase):
         self.assertEqual(config.relay.path, "/ws/relay")
         # The relay must share the [http] port, the only one Caddy forwards to.
         self.assertIsNone(config.relay.listen_port)
+        # A public repo must not let anyone start a Run by opening an issue.
+        self.assertEqual(config.github.require_label, "hibernaut")
+        # No Taskboard is deployed, so work events must reach Hibernaut directly.
+        for event_type in ("work.opened", "work.updated", "work.closed"):
+            self.assertEqual(config.routing.event_consumers[event_type], ("hibernaut",))
+        self.assertEqual(config.routing.event_consumers["execution.reported"], ("switchboard.outbound",))
 
 
 class DockerKitTests(unittest.TestCase):

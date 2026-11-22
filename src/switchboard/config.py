@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from switchboard.envelope import EVENT_TYPES
+
 UnmatchedPolicy = Literal["fallback", "reject"]
 TransportMode = Literal["in_process", "relay", "hybrid"]
 TRANSPORT_MODES: tuple[TransportMode, ...] = ("in_process", "relay", "hybrid")
@@ -30,6 +32,8 @@ class RoutingConfig:
     unmatched_policy: UnmatchedPolicy = "fallback"
     github_repos: Mapping[str, str] = field(default_factory=lambda: {})
     feishu_chats: Mapping[str, str] = field(default_factory=lambda: {})
+    # Replaces the default consumers of the listed event types only.
+    event_consumers: Mapping[str, tuple[str, ...]] = field(default_factory=lambda: {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +41,12 @@ class FeishuConfig:
     group_require_mention: bool = True
     bot_open_id: str | None = None
     api_base: str = "https://open.feishu.cn"
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubConfig:
+    # None accepts every issue, PR and comment of a routed repo.
+    require_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +88,7 @@ class SwitchboardConfig:
     sqlite: SqliteConfig = field(default_factory=SqliteConfig)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     feishu: FeishuConfig = field(default_factory=FeishuConfig)
+    github: GitHubConfig = field(default_factory=GitHubConfig)
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     outbound: OutboundConfig = field(default_factory=OutboundConfig)
     relay: RelayConfig = field(default_factory=RelayConfig)
@@ -133,12 +144,14 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
             unmatched_policy=policy,
             github_repos={k.lower(): str(v) for k, v in _table(routing, "github_repos").items()},
             feishu_chats={k: str(v) for k, v in _table(routing, "feishu_chats").items()},
+            event_consumers=_event_consumers(_table(routing, "event_consumers")),
         ),
         feishu=FeishuConfig(
             group_require_mention=bool(feishu.get("group_require_mention", True)),
             bot_open_id=_optional(feishu.get("bot_open_id")),
             api_base=str(feishu.get("api_base", _FEISHU.api_base)),
         ),
+        github=GitHubConfig(require_label=_optional(str(_section(raw, "github").get("require_label") or "").strip())),
         delivery=DeliveryConfig(
             retry_backoff_seconds=delivery_backoff or _DELIVERY.retry_backoff_seconds,
             dead_letter_alert_channel=_optional(delivery.get("dead_letter_alert_channel")),
@@ -159,6 +172,17 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
         ),
         relay=_relay(_section(raw, "relay")),
     )
+
+
+def _event_consumers(table: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
+    routes: dict[str, tuple[str, ...]] = {}
+    for event_type, consumers in table.items():
+        if event_type not in EVENT_TYPES:
+            raise ConfigError(f"routing.event_consumers: unknown event type {event_type!r}")
+        if not isinstance(consumers, list) or not all(isinstance(c, str) and c for c in cast(list[Any], consumers)):
+            raise ConfigError(f"routing.event_consumers.{event_type!r} must be a list of consumer ids")
+        routes[event_type] = tuple(cast(list[str], consumers))
+    return routes
 
 
 def _relay(relay: Mapping[str, Any]) -> RelayConfig:

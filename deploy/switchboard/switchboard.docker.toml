@@ -21,6 +21,17 @@ unmatched_policy = "fallback"  # or "reject"
 [routing.feishu_chats]
 # "oc_xxx" = "proj:hibernaut"
 
+[routing.event_consumers]
+# Without a Taskboard, issues and PRs go straight to Hibernaut and reports only to the outbound gateway.
+"work.opened" = ["hibernaut"]
+"work.updated" = ["hibernaut"]
+"work.closed" = ["hibernaut"]
+"execution.reported" = ["switchboard.outbound"]
+
+[github]
+# Only issues/PRs carrying this label (and comments on them) become events; empty accepts all.
+require_label = "hibernaut"
+
 [feishu]
 group_require_mention = true
 # bot_open_id = "ou_xxx"

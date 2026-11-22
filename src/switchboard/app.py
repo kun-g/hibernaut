@@ -108,7 +108,9 @@ def build_switchboard(
         "github": GitHubOutboundAdapter(client, credentials, api_base=config.outbound.github_api_base),
     }
     gateway = OutboundGateway(store, adapters, config=config.outbound, audit=sink, clock=clock)
-    pipeline = InboundPipeline(store, router=router, audit=sink, clock=clock)
+    pipeline = InboundPipeline(
+        store, router=router or Router.from_config(config.routing), audit=sink, clock=clock
+    )
     transport = InProcessTransport()
     transport.register(OUTBOUND_CONSUMER, gateway.consume_event)
     relay = RelayHub(config.relay, credentials, audit=sink) if config.relay.enabled else None
@@ -148,7 +150,9 @@ def build_switchboard(
             )
     scopes = ScopeResolver(config.routing)
     routes: dict[str, InboundAdapter] = {
-        "/webhooks/github": GitHubInboundAdapter(credentials, scopes, clock=clock),
+        "/webhooks/github": GitHubInboundAdapter(
+            credentials, scopes, require_label=config.github.require_label, clock=clock
+        ),
         "/webhooks/feishu": FeishuInboundAdapter(
             credentials,
             scopes,
