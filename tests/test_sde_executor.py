@@ -336,6 +336,7 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
             outcome = await self.executor().execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Emit), outcome
         self.assertIn("development failed: billing is 'subscription'", outcome.messages[0])
+        self.assertEqual(outcome.status, "failed")
         self.assertEqual(self.calls("reviewer"), [])
 
     async def test_api_billing_goes_through_the_credential_proxy(self):
@@ -522,6 +523,8 @@ class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
         await self.decide(False)
         text = self.emits()[-1]
         self.assertIn("[sde] stopped: question declined", text)
+        (last,) = [m for m in self.outbox.fetch_pending(100) if m.metadata.get("kind") == "emit"][-1:]
+        self.assertEqual(last.metadata["task_context"]["status"], "stopped")
         self.assertIn("Raise or return None?", text)
         self.assertIn(str(self.repo), text)
         self.assertNotIn("delivered", text)

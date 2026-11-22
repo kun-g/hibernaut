@@ -248,6 +248,7 @@ class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
             outcome = await self.executor().execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Emit)
         self.assertIn("review failed: billing is 'subscription'", outcome.messages[0])
+        self.assertEqual(outcome.status, "failed")
         self.assertIn("apiKeyHelper", outcome.messages[0])
         self.assertNotIn("verdict=", outcome.messages[0])
 

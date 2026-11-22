@@ -175,11 +175,12 @@ def build_feishu_or_console_channel(
     app_secret_env: str = "FEISHU_APP_SECRET",
     default_chat_id: str | None = None,
     inbox_chat_map: Mapping[str, str] | None = None,
+    console_echo: bool = True,
 ) -> ChannelPort:
     app_id = os.environ.get(app_id_env, "").strip()
     app_secret = os.environ.get(app_secret_env, "").strip()
     if not app_id or not app_secret:
-        return ConsoleChannelAdapter()
+        return ConsoleChannelAdapter(echo=console_echo)
     return FeishuChannelAdapter(
         app_id=app_id,
         app_secret=app_secret,

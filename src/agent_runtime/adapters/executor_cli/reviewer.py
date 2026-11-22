@@ -31,7 +31,16 @@ from agent_runtime.adapters.executor_cli.project_guidance import (
 )
 from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
-from agent_runtime.core.models import Emit, Event, PermissionDecision, RunOutcome, SessionRef, Suspend, new_id
+from agent_runtime.core.models import (
+    Emit,
+    EmitStatus,
+    Event,
+    PermissionDecision,
+    RunOutcome,
+    SessionRef,
+    Suspend,
+    new_id,
+)
 from agent_runtime.core.ports import RunCapabilities
 
 CODE_REVIEWER_ROLE = "code-reviewer"
@@ -251,7 +260,7 @@ class CoderReviewerExecutor:
                 request = dataclasses.replace(request, peer=lookup)
             decision = self.check_launch(caps, request.workdir)
             if decision.action == "block":
-                return self._emit(session_id, decision.reason)
+                return self._emit(session_id, decision.reason, status="refused")
             if decision.action == "defer":
                 return Suspend(
                     request_id=new_id("req"),
@@ -336,8 +345,8 @@ class CoderReviewerExecutor:
             )
         return {**validate_review(raw), **extra}
 
-    def _emit(self, session_id: str, detail: str) -> Emit:
-        return Emit(messages=(f"[{self._profile.name}] review failed: {detail}",), session_id=session_id)
+    def _emit(self, session_id: str, detail: str, *, status: EmitStatus = "failed") -> Emit:
+        return Emit(messages=(f"[{self._profile.name}] review failed: {detail}",), session_id=session_id, status=status)
 
     def _review_input(self, events: Sequence[Event], session: SessionRef | None) -> ReviewRequest:
         target = target_events(events)
