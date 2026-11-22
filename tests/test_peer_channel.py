@@ -119,7 +119,7 @@ class TestReviewerChannel(VisibleCase):
         return CoderReviewerExecutor(
             profile=ClaudeCodeProfile(name="coder-reviewer", launcher=self.launcher(), model="claude-sonnet-5-5",
                                       effort="medium"),
-            workspaces=self.workspaces, tasks=self.tasks, visible=self.runner,
+            workspaces=self.workspaces, tasks=self.tasks, terminal=self.runner,
             peers=DeveloperPeerResolver(sessions=self.sessions, bindings=self.bindings,
                                         developer_executors=["sde"], registry=[self.registry]),
         )

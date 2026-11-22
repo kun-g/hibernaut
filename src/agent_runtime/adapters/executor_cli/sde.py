@@ -15,7 +15,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     role_system_prompt,
     run_claude_code,
 )
-from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, terminal_title
+from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, terminal_title
 from agent_runtime.adapters.executor_cli.peer import PEER_TOOLS, SUBAGENT_TOOLS
 from agent_runtime.adapters.executor_cli.process import is_approval, join_text, last_text, target_events
 from agent_runtime.adapters.executor_cli.project_guidance import (
@@ -63,8 +63,8 @@ SDE_SCHEMA: dict[str, Any] = {
     "required": ["status", "summary", "test_evidence"],
 }
 
-# A visible conversation stays open after its result, so an independently dispatched reviewer can message it.
-_VISIBLE_ROLE_ARGS = (
+# An interactive conversation stays open after its result, so an independently dispatched reviewer can message it.
+_INTERACTIVE_ROLE_ARGS = (
     "--allowedTools", ",".join((*_DEV_TOOLS, *PEER_TOOLS)),
     "--disallowedTools", ",".join(_DEV_DENIED),
 )
@@ -129,7 +129,7 @@ def _strs(raw: object) -> tuple[str, ...]:
 
 @dataclass(slots=True)
 class _State:
-    stage: Literal["develop", "launch_pending", "needs_input", "review_pending"]
+    stage: Literal["develop", "launch_pending", "terminal_pending", "needs_input", "review_pending"]
     workdir: str
     base_ref: str
     requirements: str
@@ -145,7 +145,7 @@ class _State:
     followups: list[str] = field(default_factory=_no_history)
     pending_prompt: str = ""
     work_key: str = ""
-    # Orca terminal of the last visible development turn.
+    # Orca terminal of the last interactive development turn.
     terminal: str = ""
     # Guidance pin (workdir, commit, origin), the task's activities and tags, and the documents already
     # sent to the developer session; recorded once per task, reused by reviews, rework and resumes.
@@ -190,7 +190,7 @@ class SDEExecutor:
         inbox_checkout_map: Mapping[str, str | Path],
         tasks: SQLiteTaskMetadataStore,
         interrupt_poll_interval: float = 0.05,
-        visible: OrcaVisibleRunner | None = None,
+        terminal: OrcaVisibleRunner | TerminalUnavailable | None = None,
     ) -> None:
         if options.review and reviewer is None:
             raise ValueError(f"executors.{profile.name}: review is on but no reviewer was given")
@@ -201,8 +201,9 @@ class SDEExecutor:
         self._checkouts = {k: Path(v).resolve() for k, v in inbox_checkout_map.items()}
         self._tasks = tasks
         self._poll = interrupt_poll_interval
-        # Set in Orca worktree deployments: development runs in a visible terminal bound to the task session.
-        self._visible = visible
+        # None: non-interactive. A runner: development runs in a terminal bound to the task session. Unavailable:
+        # the role is interactive but this inbox has no terminal backend, so the run suspends with the reason.
+        self._terminal = terminal
 
     @property
     def executor_id(self) -> str:
@@ -244,15 +245,17 @@ class SDEExecutor:
                     if state.stage == "review_pending":
                         return self._deliver(session_id, native, state, review="pending",
                                              note=f"retry declined; {state.reason}")
-                    why = "question declined" if state.stage == "needs_input" else "launch declined"
+                    why = {"needs_input": "question declined",
+                           "terminal_pending": "interactive session declined"}.get(state.stage, "launch declined")
                     return self._stopped(session_id, native, state, why)
                 followups = self._take_followups(state)
                 if state.stage == "needs_input":
                     reply = "\n\n".join(p for p in (comment, followups) if p)
                     prompt = f"## Answer from a person\n{reply or '(approved without comment)'}"
-                elif state.stage == "launch_pending":
+                elif state.stage in ("launch_pending", "terminal_pending"):
                     prompt = state.pending_prompt + (f"\n\n## Follow-up from a person\n{followups}" if followups else "")
-                    approved_launch = True
+                    # Approving a missing terminal only retries; the launch gate still runs.
+                    approved_launch = state.stage == "launch_pending"
                 else:
                     state.rounds = 0
                     prompt = await self._fix_prompt(state) if state.blocking else None
@@ -347,7 +350,7 @@ class SDEExecutor:
             if text:
                 parts.append(f"## {name}\n{text}")
         parts.append(f"## Task requirements\n{state.requirements}")
-        if self._visible is not None and state.work_key:
+        if self._terminal is not None and state.work_key:
             parts.append(_reviewer_channel(self._options.reviewer, state.work_key))
         guidance, selection = await self._guidance(state)
         selected = guidance.select(selection)
@@ -398,15 +401,17 @@ class SDEExecutor:
     ) -> tuple[dict[str, Any], str | None]:
         p = self._profile
         system = role_system_prompt(p, role=SDE_ROLE, contract=_SDE_CONTRACT)
-        if self._visible is not None:
+        if isinstance(self._terminal, TerminalUnavailable):
+            raise ClaudeCodeError(f"interactive session unavailable: {self._terminal.reason}")
+        if self._terminal is not None:
             # Fix rounds and later events continue the task's conversation: its live terminal, else --resume.
-            reply = await self._visible.converse(
+            reply = await self._terminal.converse(
                 p,
                 title=terminal_title(p.name, SDE_ROLE, state.work_key or Path(state.workdir).name),
                 workdir=Path(state.workdir),
                 prompt=prompt,
                 schema=SDE_SCHEMA,
-                role_args=(*_VISIBLE_ROLE_ARGS, "--append-system-prompt", system),
+                role_args=(*_INTERACTIVE_ROLE_ARGS, "--append-system-prompt", system),
                 is_interrupted=caps.is_interrupted,
                 session_id=session_id,
                 native=native,
@@ -443,6 +448,10 @@ class SDEExecutor:
         # prompt=None goes straight to review (retrying one that could not complete).
         while True:
             if prompt is not None:
+                if isinstance(self._terminal, TerminalUnavailable):
+                    # Interactive work never falls back to a background run.
+                    state.stage, state.reason, state.pending_prompt = "terminal_pending", self._terminal.reason, prompt
+                    return self._suspend(session_id, native, state)
                 # Every developer launch passes the gate, fix rounds included; an approved deferral runs once.
                 if not approved_launch:
                     decision = caps.permissions.check("sde.launch", {**self._launch_args(), "workdir": state.workdir})
@@ -518,6 +527,12 @@ class SDEExecutor:
             prompt = (
                 f"[{name}] launch needs approval: {state.reason}\n"
                 f"Approve to start this development run in {state.workdir}; reject to stop the task."
+            )
+        elif state.stage == "terminal_pending":
+            prompt = (
+                f"[{name}] interactive session unavailable: {state.reason}\n"
+                f"Nothing was started in {state.workdir}. Set terminal_backend = \"orca\" on the project or "
+                f"interactive = false on executors.{name}, then approve to retry; reject to stop the task."
             )
         else:
             retry = "with another fix round" if state.blocking else "the review"

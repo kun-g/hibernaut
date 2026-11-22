@@ -37,7 +37,7 @@ from agent_runtime.adapters.executor_cli import (
     OrcaWorktreeManager,
     SDEExecutor,
 )
-from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, default_transcript_roots
+from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, default_transcript_roots
 from agent_runtime.adapters.executor_cli.peer import DeveloperPeerResolver, registry_dirs
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
@@ -57,7 +57,7 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteTaskMetadataStore,
     SQLiteWorkspaceStore,
 )
-from agent_runtime.app.config import HibernautConfig, config_changes, load_config
+from agent_runtime.app.config import HibernautConfig, RoleConfig, config_changes, load_config
 from agent_runtime.core.models import NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, RunCapabilities
 from agent_runtime.engine import (
@@ -592,7 +592,7 @@ def build_daemon_from_config(
         # Instantiate all configured [executors.<id>] per project so AgentWorker can sticky-route.
         # Role executors are rebuilt with each config reload, so the next run uses the new profile and launcher.
         terminal_bindings = SQLiteTerminalBindingStore(daemon.db)
-        visible_runner = OrcaVisibleRunner(bindings=terminal_bindings)
+        terminal_runner = OrcaVisibleRunner(bindings=terminal_bindings)
         # An independently dispatched review finds its developer only through bindings this runtime recorded.
         developer_peers = DeveloperPeerResolver(
             sessions=daemon.sessions,
@@ -602,13 +602,17 @@ def build_daemon_from_config(
         )
         tasks = SQLiteTaskMetadataStore(daemon.db)
 
-        def _role_executors(wt_mgr: OrcaWorktreeManager, orca: bool) -> dict[str, ExecutorPort]:
-            # Orca worktree projects run roles in visible terminals unless the role sets visible = false.
+        def _role_executors(wt_mgr: OrcaWorktreeManager, no_terminal: str | None) -> dict[str, ExecutorPort]:
+            # no_terminal says why this inbox has no terminal backend; None means Orca opens the sessions.
             # Each SDE run reviews through the reviewer built for the same project and config generation.
+            def terminal(role: RoleConfig) -> OrcaVisibleRunner | TerminalUnavailable | None:
+                if not role.interactive:
+                    return None
+                return terminal_runner if no_terminal is None else TerminalUnavailable(no_terminal)
+
             reviewers: dict[str, CoderReviewerExecutor] = {
                 name: CoderReviewerExecutor(profile=role.profile, workspaces=daemon.workspaces,
-                                            visible=visible_runner if orca and role.visible else None,
-                                            peers=developer_peers, tasks=tasks)
+                                            terminal=terminal(role), peers=developer_peers, tasks=tasks)
                 for name, role in config.roles.items()
                 if role.role == CODER_REVIEWER_ROLE
             }
@@ -622,7 +626,7 @@ def build_daemon_from_config(
                     reviewer=reviewers.get(role.sde.reviewer) if role.sde.review else None,
                     worktree_manager=wt_mgr,
                     inbox_checkout_map=inbox_checkout_map,
-                    visible=visible_runner if orca and role.visible else None,
+                    terminal=terminal(role),
                     tasks=tasks,
                 )
             return built
@@ -645,11 +649,14 @@ def build_daemon_from_config(
                     default_executor=exec_name,
                     orca_workspace=proj.worktree_backend == "orca",
                     terminal_bindings=terminal_bindings,
-                    visible_runner=visible_runner,
+                    visible_runner=terminal_runner,
                 )
                 for exec_name in config.executors
             }
-            executors_by_inbox[proj.inbox_id].update(_role_executors(wt_mgr, proj.worktree_backend == "orca"))
+            executors_by_inbox[proj.inbox_id].update(_role_executors(
+                wt_mgr,
+                None if proj.terminal_backend == "orca" else f"project '{proj.name}' has terminal_backend = \"none\"",
+            ))
 
         default_mgr = OrcaWorktreeManager(
             workspace_store=daemon.workspaces,
@@ -664,7 +671,7 @@ def build_daemon_from_config(
             )
             for exec_name in config.executors
         }
-        fallback_executors.update(_role_executors(default_mgr, False))
+        fallback_executors.update(_role_executors(default_mgr, "the inbox matches no [projects] entry"))
 
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
             return AgentWorker(

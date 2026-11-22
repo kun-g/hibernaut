@@ -417,7 +417,8 @@ class TestTwoProjectsThroughTheDaemon(unittest.TestCase):
             f'[projects.alpha]\ninbox_id = "proj:alpha"\nrepo = "o/alpha"\ncheckout = "{alpha}"\nworktree_backend = "git"\n'
             f'[projects.beta]\ninbox_id = "proj:beta"\nrepo = "o/beta"\ncheckout = "{beta}"\nworktree_backend = "git"\n'
             '[executors.coder-reviewer]\nrole = "coder-reviewer"\nlauncher = "fake"\nskills = ["skills/team-review"]\n'
-            '[executors.sde]\nrole = "sde"\nlauncher = "fake"\nskills = ["skills/team-tdd"]\n'
+            'interactive = false\n'
+            '[executors.sde]\nrole = "sde"\nlauncher = "fake"\nskills = ["skills/team-tdd"]\ninteractive = false\n'
         )
         self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(log), "FAKE_PLAN": str(plan)}))
         stderr = self.enterContext(patch("sys.stderr", new_callable=_Capture))

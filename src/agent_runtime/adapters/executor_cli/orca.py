@@ -193,6 +193,12 @@ def with_handoff(role_args: Sequence[str], root: Path) -> list[str]:
     return [*args, "--mcp-config", json.dumps({"mcpServers": {HANDOFF_SERVER: server}})]
 
 
+@dataclass(frozen=True, slots=True)
+class TerminalUnavailable:
+    # An interactive role with no terminal backend for this inbox: its runs stop with this reason, never headless.
+    reason: str
+
+
 def terminal_title(executor_id: str, role: str, subject: str) -> str:
     who = executor_id if executor_id == role else f"{executor_id} ({role})"
     return f"{who} · {subject}"
