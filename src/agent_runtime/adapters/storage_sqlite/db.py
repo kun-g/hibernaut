@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS outbox (
     status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed')),
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
-    metadata_json TEXT NOT NULL
+    metadata_json TEXT NOT NULL,
+    -- NULL means due now; idx_outbox_sched is created in _ensure_migrations, after legacy tables gain the column.
+    next_retry_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_outbox_pending
@@ -236,6 +238,22 @@ class SQLiteDatabase:
                     ON event_inbox (inbox_id, source, external_id, status)
                 """
             )
+
+        outbox_cols = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(outbox)").fetchall()
+        }
+        if "last_error" not in outbox_cols:
+            conn.execute("ALTER TABLE outbox ADD COLUMN last_error TEXT")
+        if "next_retry_at" not in outbox_cols:
+            # Existing rows get NULL, so whatever was pending before the upgrade is due at once.
+            conn.execute("ALTER TABLE outbox ADD COLUMN next_retry_at TEXT")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_outbox_sched
+                ON outbox (status, next_retry_at, seq)
+            """
+        )
 
         workspace_cols = {
             str(row["name"])
