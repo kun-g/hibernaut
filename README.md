@@ -1,496 +1,120 @@
 # Hibernaut
 
-Clean Architecture (L0–L3) Python runtime for **Always-on Agents** built around the **Sleep → Wake → Run → Write-back** lifecycle, **multi-`inbox_id` Actor partition concurrency**, and a **zero-dependency local self-bootstrap loop**.
+Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、不花 token；GitHub Issue、飞书消息、MCP 调用、Google Drive 任务文件或定时器到达时唤醒，在独立的 git worktree 里调用 Claude Code 等 CLI 干活，把结果写回后继续休眠。每轮执行只有三种结局：`Silent`（静默结束）、`Emit`（发一条消息）、`Suspend`（保存断点、等人审批）。
 
-> Asleep by default (no tokens spent), wakes only when events, polled GitHub Issues, MCP tool calls, or timers arrive, runs in isolated dynamic worktrees, and exits cleanly with explicit `Silent | Emit | Suspend` outcomes.
+纯 Python 标准库实现（3.11+），运行不需要第三方依赖。
 
-- Full up-to-date architecture: [`docs/architecture.md`](docs/architecture.md)
-- Glossary (single source of truth for terms): [`docs/glossary.md`](docs/glossary.md)
-- Contributor & coding-agent rules: [`AGENTS.md`](AGENTS.md)
-- Declarative config template: [`hibernaut.example.toml`](hibernaut.example.toml)
+## 功能一览
 
-## Architecture Layers (L0–L3)
+| 功能 | 做什么 |
+| :--- | :--- |
+| 多入口接单 | `POST /events`、GitHub Webhook 与 Issue 轮询、飞书消息与审批卡片、MCP、Google Drive 任务队列、定时器；重复事件只执行一次 |
+| 按 Inbox 并发 | 每个 `inbox_id` 一条串行队列，不同 Inbox 并行；同一个 Issue、Drive 文件或飞书话题的事件接着同一会话和 worktree 做 |
+| 多执行器 | claude / cursor-agent / grok / dsh 等 CLI 和角色执行器；按事件、会话、项目、全局四级选择，会话粘在首次选定的执行器上 |
+| SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `executor_id = "sde"`（Drive 任务 frontmatter 写 `executor_id: sde`），项目也可设为默认执行器 |
+| 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested` |
+| PR 交付 | SDE 完成后由 Hibernaut 合入主干、按改动类型定版本号、跑检查、推分支、开 PR，可选在评审通过且 CI 绿后自动合并；与任务来源无关 |
+| 可见终端 | 运行在 Orca 终端里打开，人可以旁观、回答提问，后续事件回到同一对话 |
+| 工作区管理 | 按任务自动建 `hb-*` worktree、复用，证据齐全（PR 已合并、无未提交改动等）后才回收 |
+| 项目规范注入 | 读取被改仓库的 `AGENTS.md` 与 `guidance.toml`，按任务类型挑选规范文档，从固定 commit 读取 |
+| 人工审批 | 权限门禁返回 `defer`、agent 需要人回答或交付受阻时挂起，审批后从断点继续 |
+| 安全 | agent 进程不持有真实密钥：API key 由外置代理注入，Drive 密钥由独立系统用户保管，GitHub 走宿主机凭据 |
+| 运维 | 配置热加载、跟随 `origin/main` 自动更新、轮询失败退避 |
+| Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard |
 
-```text
-src/agent_runtime/
-├── core/                  # L0 + L1: Zero external dependencies (Python stdlib only)
-│   ├── models.py          # 4-state Event (pure event facts + status) / SessionRef (status, work_key, correlation_key, executor binding, parent_session_id), resolve_executor_id, TimerSpec, OutboxMessage, RunOutcome
-│   └── ports.py           # 9 L1 Ports (with ExecutorPort.executor_id) + RunCapabilities (fold / interrupt control hooks)
-├── engine/                # L2: Depends ONLY on core/ (never imports adapters/ or app/)
-│   ├── handler.py         # EventHandler: lightweight ingest, idempotent dedup (dropped), fast ACK, async Worker wake
-│   ├── worker.py          # AgentWorker: per-inbox_id lease lock, 4-level session resolution, multi-executor sticky routing, defer/fold/interrupt, exhaustive RunOutcome
-│   ├── scheduler.py       # TimerScheduler: scans due Follow-up & Schedule timers -> appends Inbox events
-│   └── dispatcher.py      # OutboxDispatcher: paced Outbox delivery with anti-spam throttling and retries
-├── adapters/              # L3: Volatile infrastructure implementations
-│   ├── storage_sqlite/    # SQLite WAL, one lock-guarded connection + BEGIN IMMEDIATE writes (Inbox, Timers, Outbox, Leases, Sessions + correlation_key/executor binding, Workspaces, task metadata)
-│   ├── memory_fs/         # FileSystemMemoryAdapter + PartitionedMemoryAdapter & WorkspacePartitionRegistry
-│   ├── permissions/       # Auto Mode classifier (allow / block / defer) + external CredentialProxyClient
-│   ├── credential_proxy/  # External Drive queue proxy (own OS user holds the service account key; fixed queue operations on loopback)
-│   ├── delivery/          # PRDelivery: SDE task -> version decision, repo gates, pushed branch, PR, separately authorized merge
-│   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
-│   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + resume_args + magpie env), shared Claude Code launch adapter (claude_code.py), CoderReviewerExecutor & CLIReviewer (read-only review) & OrcaWorktreeManager (3 safety gates)
-│   └── channels/          # Multi-route HTTP (/events, /webhooks/github, /webhooks/feishu, /mcp), MCPServerAdapter, GitHubIssuePoller, FeishuChannelAdapter, Console, Drive queue poller/writer (via ProxiedDriveClient)
-└── app/
-    ├── config.py          # Stdlib tomllib loader for hibernaut.toml
-    ├── bootstrap.py       # Single-inbox Composition Root
-    ├── main.py            # Multi-inbox_id AlwaysOnDaemon (--config hibernaut.toml | --demo | --mcp-stdio)
-    └── demo.py            # Zero-API-key end-to-end demo (Silent -> Suspend -> Human Approval -> Resume -> Emit)
-```
+## 工作方式
 
-## Local Self-Bootstrap Quick Start
+| 概念 | 含义 |
+| :--- | :--- |
+| Event Inbox | 全局唯一的事件表（SQLite），所有入口的事件都写进这里 |
+| Inbox / `inbox_id` | 逻辑队列。同一 `inbox_id` 同时只有一个 Run，不同 `inbox_id` 并行。常见粒度：`user:main`、`proj:<name>`、`<project>:<issue>` |
+| `correlation_key` | 外部业务实体的稳定键，如 `github:kun-g/hibernaut#42`、`gdrive:<file_id>`；同键事件进入同一会话 |
+| Session | 跨多次 Run 的对话与断点，记录绑定的执行器和 worktree |
+| Run | 一次唤醒执行：处理一批事件，返回 `Silent` / `Emit` / `Suspend` |
+| Executor | 干活的引擎：CLI（`claude`、`grok` 等）或角色执行器（`sde`、`code-reviewer`） |
 
-Zero third-party dependencies required to run the local self-bootstrap daemon and full test suite (Python 3.11+ / 3.12+):
+一轮 Run：事件写入 Event Inbox 并立即 ACK → 找到或新建会话、选定执行器 → 执行，每次工具调用先过权限门禁 → 写回状态与结果，释放租约后休眠。术语定义见 [`docs/glossary.md`](docs/glossary.md)。
+
+## 快速开始
 
 ```bash
 git clone https://github.com/kun-g/hibernaut.git
 cd hibernaut
 
-# 1. Copy and edit declarative config (primary checkout, CLI template, env var names)
-cp hibernaut.example.toml hibernaut.toml
+# 不需要 API key 的端到端演示：Silent -> Suspend -> 人工批准 -> 恢复 -> Emit
+PYTHONPATH=src python3 -m agent_runtime.app.demo
 
-# 2. Launch full local Always-on daemon (GitHub Issue Poller + LocalCLIExecutor + Dynamic Worktree + Feishu/Console)
+# 正式运行：复制配置，填写主检出路径、执行器和环境变量名
+cp hibernaut.example.toml hibernaut.toml
 PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
 ```
 
-When started with `--config`, Hibernaut registers all `[executors.<id>]` templates into `AgentWorker` for 4-level sticky executor routing (`event.payload["executor_id"]` → `session.executor_id` → `projects.<name>.executor` → `runtime.default_executor`) and never silently falls back to `RuleBasedDemoLLM`. If `[executors]` or `runtime.default_executor` is not configured, it prints a warning to `stderr` and starts in **`ingest-only`** mode (keeping inbound webhooks, polling, and MCP active while events remain safely `pending` in SQLite). Pass `--demo` explicitly if you want `RuleBasedDemoLLM` with `--config`.
+没有配置执行器时，daemon 以 ingest-only 模式启动：照常接单，事件保持待处理，等配置补好再执行。
 
-The GitHub Issue poller tolerates transient failures (`gh` errors or timeouts, network errors, GitHub API 4xx/5xx): each failing repo logs one WARNING with the repo, poll mode and the `gh` stderr or HTTP status and body excerpt, other repos keep polling, and the poller retries with exponential backoff (5s doubling, capped at 300s) before returning to `runtime.poll_interval_seconds`. `/events`, webhooks and MCP keep accepting events during an outage, and shutdown is not delayed by the backoff.
-
-The HTTP daemon watches the file passed to `--config` once per second, including under `scripts/run_updating.py`. Save project mappings, CLI templates, worker limits or channel settings and look for `[config] Reloaded` in the console. A reload does not wait for runs in progress: the HTTP listener keeps serving and new requests use the new settings, while Outbox delivery, timers and polling restart on the new settings after their current round (seconds). Runs already in progress finish on the old executors and write their results as usual; the old worker pool claims no new events, and new events for an inbox with a run in progress wait for that run and then run once on the new settings. Invalid TOML or a busy replacement port leaves the current configuration active. Changing `db_path` or `memory_root`, updating the process environment, or reconfiguring a stdio MCP session requires a restart.
-
-The HTTP endpoints handle requests on parallel threads (backlog 128); stopping the daemon, or a reload that changes the port, waits for requests already accepted. SQLite access from those threads and the worker loop goes through one locked connection, and writes use `BEGIN IMMEDIATE`, so deduplication and leases stay atomic. A worker runs all pending events that share a session (by `session_id`, then `correlation_key`) as one batch, in order of each group's first event. Events with neither key are unrelated and run one at a time under `defer` and `fold`. A session's batch closes at an approval reply (earlier events for that session run with it) or at an event whose `explicit_workdir` or `executor` differs; later events for that session wait for the next pass. When an approval for a session is already queued, it always joins that session's first batch and runs on the executor that suspended the session; incompatible events ahead of it, including ones routed to another executor, run afterwards. `fold` never pulls events across that boundary, and `interrupt` never restarts a Run that carries an approval.
-
-Hibernaut checks local branch names when allocating a worktree, including branches without a checkout. If Orca adds a numeric suffix during creation, Hibernaut records the branch and path from the creation receipt after verifying both against the primary repository's Git worktree list. On the next wake, it repairs stale SQLite paths for registered worktrees. On lease acquire, a worker recovers any orphaned `processing` events back to `pending`, claims pending events (the storage-internal `event_inbox.attempts` counter grows by one per claim and survives restarts), ensures an `active` `SessionRef` and binds `event_inbox.session_id` before execution, commits `done` immediately after `Silent`/`Emit`/`Suspend` side effects, requeues on `interrupt`, and marks `failed` with `event_inbox.last_error` once retries are exhausted. `attempts` and `last_error` are not part of the L0 `Event`; read them with `SQLiteInboxAdapter.diagnostics(event_ids)` (also returned by `hibernaut_list_events`). Session rotation archives the previous session (`archived`) while keeping the worktree reference count at 1; closing a session (`closed` via event or `hibernaut_close_session`) triggers worktree reclaim only once no `active` or `suspended` session of the same inbox references its `work_key` (`count_active_by_work_key(work_key, inbox_id) == 0`). The reclaim itself checks again: a worktree owned by one inbox of a shared project (below) counts only that inbox's sessions, any other managed worktree counts sessions of every inbox. After these checks Orca removes the managed worktree by path and retains the branch.
-
-To hand part of a task to another agent (for example a read-only Grok review of the worktree a Claude session is editing), ingest an event into the same `inbox_id` whose payload carries `parent_session_id` and optionally `work_key`, `executor_id` and `readonly`. Give it its own `correlation_key` or none; reusing the parent's key would route it back into the parent session. The parent's Run does not wait: the worker later starts a child session that records `parent_session_id` and, unless the payload names another `work_key`, inherits the parent's `work_key`, so it reuses the same worktree and counts toward its reference count while `active` or `suspended`. Closing the parent first leaves the worktree in place; it is reclaimed once the child is closed too. `readonly` is passed through to the executor unchanged. `hibernaut_list_sessions` returns `parent_session_id` and accepts it as a filter to list a session's children.
-
-For a visible agent session, set `orca_agent = "claude"` under `[executors.claude]` and use `worktree_backend = "orca"` for the project. Restart the daemon after installing this version. Each managed run opens an Orca terminal in the background where you can watch progress and respond to permission prompts. The agent returns its `Silent`, `Emit`, or `Suspend` outcome in a per-run temporary file. Successful terminal tabs stay open, and later events for the same session (same `session_id` or `correlation_key`) go back to that conversation: the live terminal when its process is unchanged, otherwise `<command> --resume <native session id>` in a new terminal. The native session ID is confirmed from the Claude Code transcript that holds the run's unique result path and is stored in `sessions.executor_session_id`. When neither is available the run suspends with the reason and sends nothing; approve to start a new conversation. `timeout_seconds` includes time spent waiting for input. Configure agent accounts and environment in Orca. The template's `command`, `args`, and `env` apply to direct CLI runs, including Git worktrees and explicit directory overrides.
-
-### One project, several inboxes
-
-`projects.<name>.inbox_id` takes a string, as before, or an array of regular expressions:
-
-```toml
-[projects.hibernaut]
-inbox_id = ["proj:hibernaut", "proj:hibernaut:.+"]
-repo = "kun-g/hibernaut"
-checkout = "/absolute/path/to/your/hibernaut"
-```
-
-- Matching: every array entry is a regular expression that must match the whole inbox ID (Python `re.fullmatch`); no prefix is needed. `proj:hibernaut:.+` matches `proj:hibernaut:drive` and `proj:hibernaut:task-12` but not `proj:hibernaut:` or `proj:other:drive`; `proj:hibernaut:task-\d+` matches `proj:hibernaut:task-12` but not `proj:hibernaut:task-12x`. A string `inbox_id` is still one exact ID compared as written, never a regex. Every inbox an event names is routed through these rules, so a matched inbox gets the project's checkout, worktree and terminal backends, default `executor`, Feishu chat and reclaim settings.
-- Exact IDs: an entry without regex syntax (`. ^ $ * + ? { } [ ] | ( )` or a backslash class such as `\d`) matches one inbox ID and is an exact ID. Escaped punctuation keeps an entry exact: `proj:my\.app` is the exact ID `proj:my.app`. Only exact IDs are used as delivery addresses; an expression is never one.
-- Primary inbox: the first exact ID, wherever it stands in the array. GitHub webhooks and polling for `repo`, and Feishu messages from `feishu_chat_id`, deliver there. Each project polls its repo once, however many inboxes it serves. Delivery targets other channels configure themselves, such as `gdrive.default_inbox_id`, do not go through these rules and keep working as configured.
-- Existing configs: the `re:` prefix from earlier versions is still accepted. `re:proj:hibernaut:.+` matches exactly what `proj:hibernaut:.+` matches, and a `re:` entry never counts as an exact ID, so the primary inbox stays what it was. A string `inbox_id` behaves as before. An array entry that was an exact ID but contains regex syntax (for example `proj:my.app`) now reads as a pattern; escape it (`proj:my\.app`) to keep it exact. If that leaves the array without an exact ID, loading fails with a message that says so.
-- Still separate per inbox: queue, lease, sessions, memory partition and worktrees. Two inboxes of one project with the same `correlation_key` run concurrently in different worktrees.
-- Writable tasks: when a project serves more than one inbox (several entries, or any pattern), every task runs in a managed `hb-*` worktree that the workspaces table records for that inbox and `work_key`. The primary inbox keeps the bare `work_key` as its key, the others use `<inbox_id>/<work_key>`. Before launch Hibernaut refuses the primary checkout, an `explicit_workdir` other than the task's own worktree, another inbox's worktree, and a resumed checkpoint whose workdir is not that worktree: `LocalCLIExecutor` replies `refused: ...`, the SDE replies `development failed: ...`, and nothing is started. A worktree recorded before ownership existed is adopted only by the inbox whose sessions alone used it. Projects with a string `inbox_id` behave as before, including `explicit_workdir`.
-- Errors at load: an empty array, non-string or empty entries, an empty or invalid pattern (for example `proj:(`), an entry listed twice (`re:x` and `x` count as the same entry), an array without an exact ID, a string starting with `re:`, an exact ID assigned to two projects, and an exact ID of one project that another project's pattern matches. An invalid file on reload leaves the current settings active.
-- Errors at dispatch: an inbox that matches two projects (for example two overlapping patterns) raises `AmbiguousProjectMatch` before a lease, executor or workspace is created. The worker pool logs it and the events stay `pending` until the configuration is fixed. Several rules of one project matching the same inbox count as one match.
-- Inbox without a project: an event in an inbox that matches no `[projects]` entry waits when it needs a project's checkout, that is, when it names no `explicit_workdir` or `review_of`, is not an approval reply or close request, and does not continue a suspended session. It is stored and stays `pending` with the same `event_id`: it is not claimed (its `attempts` stay 0), and no session, workspace, Outbox message or Drive result is created. Each event logs one `WARNING` on `agent_runtime.app.projects` when it enters the wait, naming the event ID, source, `external_id`, inbox and reason. The worker returns at once, so a waiting inbox neither polls nor holds a pool slot; other events in the same inbox that can run without a project, and other inboxes, run as usual. A new event in the inbox re-checks it, and every restart or config reload wakes each inbox with pending events once, so adding a matching rule runs the waiting event exactly once with the usual per-inbox order and deduplication. Without a matching rule it keeps waiting and logs again once per restart or reload.
-
-### Versioning
-
-The daemon and demo print `Hibernaut <version>` at startup. To check the version directly, run `PYTHONPATH=src python3 -m agent_runtime.app.main --version`.
-
-Stable releases use SemVer `MAJOR.MINOR.PATCH`. Bump the major number for incompatible API changes, minor for compatible features, and patch for compatible fixes. `__version__` in `src/agent_runtime/__init__.py` is the single source; the package metadata and startup banner both read it. The rules (change kinds, who sets the version, gates, merging) are in [`docs/process/versioning.md`](docs/process/versioning.md), which `guidance.toml` gives to tasks with the `versioning` or `release` activity and to reviews whose diff touches the version. For SDE tasks the delivery step sets the version (see PR Delivery).
-
-### Run with automatic updates (macOS / Linux)
-
-From a dedicated Git checkout on `main`, launch the supervisor with Python 3.11+ and Git installed:
-
-```bash
-python3 scripts/run_updating.py --port 8080
-```
-
-The supervisor checks the configured `origin/main` every 300 seconds. Use `--interval 60` for one-minute checks. Daemon options such as `--db`, `--memory-root`, `--workers`, and `--policy` are forwarded across restarts. Stop with `Ctrl+C`.
-
-Use an origin you trust to supply executable code. A dirty checkout (including untracked files), another branch, a divergent history, or a failed fetch leaves the running daemon in place. On a fast-forward, the old daemon closes ingress and drains accepted work before the supervisor applies the commit and relaunches. Clients should retry during this short interruption using the same external event ID. Keep runtime state in ignored paths or outside the checkout. The supervisor reuses those paths. If a new daemon fails to start, the supervisor exits with its status for operator recovery.
-
-## Independent Code Review (`code-reviewer`)
-
-Register a reviewer in `hibernaut.toml` (defaults shown; only `role` is required). Role, harness, launcher, billing and model are separate settings:
-
-```toml
-[launchers.claude-sg]       # optional; built-in "claude" runs `claude`
-command = "claude-sg"       # trusted launcher on the deployment host
-
-[credential_proxy]          # required only for billing = "api"
-url = "http://127.0.0.1:9000"
-
-[executors.code-reviewer]
-role = "code-reviewer"
-harness = "claude-code"    # only claude-code
-launcher = "claude"        # a [launchers.<name>] entry
-billing = "subscription"   # subscription | api
-model = "claude-opus-5-5"  # Claude full name or alias (opus, sonnet, haiku, fable)
-effort = "high"            # low | medium | high | xhigh | max
-```
-
-The old names `role = "coder-reviewer"` and `builtin:coder-reviewer` still work and mean the same role.
-
-Dispatch a review with `executor_id = "code-reviewer"`:
-
-```bash
-curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
-  "inbox_id": "proj:hibernaut", "external_id": "review-42-r1", "correlation_key": "review:task-42",
-  "payload": {
-    "executor_id": "code-reviewer",
-    "text": "Task requirements the change must meet",
-    "test_evidence": "pytest -v: 119 passed; pyright: 0 errors",
-    "review_of": "task-42",
-    "base_ref": "origin/main"
-  }}'
-```
-
-- Workspace: `explicit_workdir`, or the ready workspace of `review_of` (the developer task's `correlation_key`), or the workdir recorded for that task. The reviewer never creates a worktree.
-- Project guidance: read from the commit recorded for the `review_of` task, otherwise from the merge base of `base_ref` and `HEAD`; selected by the task's `activities`, `tags`/`labels` and the diff's paths (see Project Guidance). Use its own `correlation_key` so the developer session stays bound to its executor.
-- Diff: computed by the executor from the merge base with `base_ref` (default `origin/HEAD`, then `main`), including uncommitted and untracked files.
-- Result: one Outbox message with `verdict=pass` or `verdict=changes_requested`. Each blocking item lists location, trigger, impact and an optional fix. After a fix, send a new event (new `external_id`) for a fresh, independent review.
-- Read-only: edit tools are denied and the working tree is fingerprinted before and after; any change discards the review.
-- Launcher: chosen only in `hibernaut.toml`; event payloads cannot name a launcher or command. The launcher may set its own config dir, account, gateway or proxy (like `claude-sg`) and receives `-p --output-format stream-json --verbose --model --effort --permission-mode dontAsk` plus the reviewer's tool and schema arguments unchanged. The permission mode is always explicit, so a launcher's own default (such as `bypassPermissions`) never applies.
-- Billing: both modes remove `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL` and the Bedrock/Vertex/Foundry switches from the daemon environment before starting the launcher. `subscription` uses the launcher's own login and stops at session start if Claude Code reports any paid credential source. `api` points Claude Code at `<credential_proxy.url>/proxy/anthropic` with a placeholder key; the external proxy injects the real key, and the run stops if Claude Code authenticates any other way. Credentials never go in `hibernaut.toml` (the parser rejects them).
-- Hot reload: save the settings (including launcher) and the next review uses them. Invalid values or combinations print `[config] Invalid ... (ValueError: <reason>)` and keep the running settings.
-
-## Role Skills
-
-How each role works comes from a skill; what it may do and what it must return stays in code. Each role-based executor takes an ordered `skills` list in its own `[executors.<id>]` table:
-
-```toml
-[executors.sde]
-role = "sde"
-skills = ["builtin:sde", "./skills/team-tdd", "~/skills/security/SKILL.md"]
-
-[executors.code-reviewer]
-role = "code-reviewer"
-skills = ["./skills/team-review"]   # replaces the built-in review method
-```
-
-- Entries: a local `SKILL.md`, a directory containing one, or `builtin:<role>` (the skill shipped in the package under `agent_runtime/adapters/executor_cli/skills/<role>/`). Relative paths resolve against the directory of `hibernaut.toml`; `~` expands.
-- Default: without `skills`, the role uses its built-in skill (`sde`: test-first development; `code-reviewer`: the review method). A listed `skills` replaces the default; list `builtin:<role>` to keep it and add your own. A role can name only its own built-in skill.
-- Delivery: every launch reads the files again and passes them, in order, with `--append-system-prompt`, each headed by its absolute path and resource directory (`Relative resources are relative to <dir>`). Editing a `SKILL.md` affects the next run without a reload.
-- Fixed by code: the system prompt starts with the role's contract (what to return, no force-push for `sde`, read-only for the reviewer). Tools, permission mode, JSON schema and launcher come from the executor and `hibernaut.toml`. A skill, an event payload or a project document cannot change them or choose a skill.
-- Errors: a missing file, an empty list or another role's `builtin:` entry fails config parsing with the executor name and path (`executors.sde: skill './skills/team-tdd' not found (no file at ...)`); hot reload keeps the running settings. A skill deleted after loading fails that run before launch.
-- Separate roles: the SDE's built-in review uses the reviewer executor's own `skills`, never the SDE's.
-
-## Project Guidance (`AGENTS.md` + `guidance.toml`)
-
-A project keeps its own process in its repository, versioned with its code. Two files at the repository root:
-
-- `AGENTS.md`: short general rules for every task and a pointer to the catalog. Always included.
-- `guidance.toml`: the catalog of detailed documents. Each entry names the document, a one-line summary, the activities and tags it applies to, and the file paths it governs.
-
-```markdown
-# AGENTS.md
-- Run `make check` before every commit; all of it must pass.
-- Detailed rules for specific work are listed in guidance.toml.
-```
-
-```toml
-# guidance.toml
-[[docs]]
-path = "docs/process/versioning.md"   # repository-relative, must exist in the same commit
-summary = "Changing the version"
-activities = ["versioning", "release"]  # matched against the task's explicit activities
-tags = ["version"]                      # matched against the task's tags or issue labels
-paths = ["VERSION", "src/*/__init__.py"] # a review also selects it when the diff touches these
-
-[[docs]]
-path = "docs/process/testing.md"
-summary = "Writing tests"
-activities = ["testing"]
-tags = ["tests"]
-paths = ["tests/**"]                    # "*" stays in one directory, "**" spans directories
-```
-
-- Selection for development: explicit `activities` in the task payload (list or comma-separated string) win; without them the task's `tags` and `labels` (GitHub label objects included) pick documents by `tags`. Matching ignores case.
-- Selection for review: the same, plus every document whose `paths` match a file the actual diff changes (committed, uncommitted or untracked). Paths are read unquoted (`git -z`), so non-ASCII names such as `docs/规范/版本.md` match as written. A version bump inside a test-only task therefore brings the versioning document into the review.
-- Nothing selected: the task message carries `AGENTS.md` and the catalog (path, summary, activities, tags, paths) and says that no document matched. Bodies of unselected documents are never included; the agent can read one with `git show <commit>:<path>` if it turns out to need it.
-- Pinned commit: every guidance file is read from a commit with `git show <commit>:<path>`, never from the working tree. Each quoted body is headed `Source: <commit>:<path>`, so `git show` reproduces exactly what the agent received. Uncommitted edits to guidance files are never used.
-  - SDE task: the worktree's `HEAD` when the task starts. It is stored with the task's activities and tags in the `task_metadata` table under the task's `correlation_key`, and in the session checkpoint. Development, review rounds, fix rounds, resumed runs and later tasks on the same `correlation_key` and worktree all read that commit, even after the change commits edits to the guidance.
-  - Independent review with `review_of`: the commit recorded for that developer task, plus its activities and tags merged with the review event's own. The workdir falls back to the task's recorded workdir when there is no ready workspace.
-  - Independent review without a recorded task (only `explicit_workdir`): the merge base of `base_ref` and `HEAD`, the same base the diff is computed from. The change under review starts after it and cannot rewrite its own review rules. The message says `Pinned to commit <sha> (merge base of <ref> and HEAD; ...)`; `git merge-base <ref> HEAD` verifies it.
-- Review citations: a blocking item that rests on project guidance carries `guidance_path` and `guidance_clause` (both or neither). The review shows them as `Guidance:` and `Clause:` lines. In the SDE's fix round, cited documents the developer session has not received are sent with the fix request, read from the same pinned commit; each is sent once.
-- Errors: an invalid `guidance.toml` (bad TOML, unknown key, duplicate or missing document, a path outside the repository) or a guidance file that is a symlink resolving outside the repository fails the run before launch with the file and commit. A failing built-in review suspends as `review pending`.
-- Limits: the text is project requirements. It cannot grant tools, change the permission mode, pick a launcher or a role skill, or change the report format.
-- Neither file: the task message is the same as before, with no project section. `AGENTS.md` alone: it is included without a catalog.
-- Keep project-specific rules such as versioning and release steps in the project's documents, not in role skills.
-
-## SDE Executor (`sde`)
-
-An SDE develops a task test-first in its own worktree and delivers the change with red/green test evidence. Register it next to a reviewer (defaults shown; only `role` is required):
-
-```toml
-[executors.sde]
-role = "sde"
-harness = "claude-code"
-launcher = "claude"
-billing = "subscription"
-model = "claude-opus-5-5"
-effort = "high"
-review = true                # runtime switch: false delivers after tests and repo checks
-reviewer = "code-reviewer"   # a role = "code-reviewer" executor or any CLI executor (claude, cursor-agent, grok, dsh, ...)
-max_review_rounds = 3
-```
-
-Dispatch with `executor_id = "sde"` (templates in [`docs/dispatch/`](docs/dispatch): `sde-task.json` for `/events`, `sde-task.drive.md` for the Drive queue, `review-task.json` for an independent review). A development task always names its executor: without `executor_id` the event follows the session's or project's default executor, which may not be the SDE.
+派一个开发任务（模板见 [`docs/dispatch/`](docs/dispatch)）：
 
 ```bash
 curl -s localhost:8080/events -H 'Content-Type: application/json' -d @docs/dispatch/sde-task.json
-# or inline:
-curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
-  "inbox_id": "proj:hibernaut", "external_id": "task-42", "correlation_key": "task-42",
-  "payload": {"executor_id": "sde", "title": "Short PR title", "text": "Task requirements", "base_ref": "origin/main"}}'
 ```
 
-- Workspace: `explicit_workdir`, else the task worktree for `correlation_key` (created on first use, reused afterwards), like other executors.
-- Requirements: `requirements` or `text`; a GitHub issue or Drive task without them uses `title` and `body` (`# <title>` then the body). `title` also titles the pull request.
-- Guidance selection: optional `activities` (for example `["versioning"]`) and `tags` or `labels` in the payload pick the project documents the developer receives; the commit and selection are recorded for the task when it starts.
-- Development: the launcher starts Claude Code with `--permission-mode dontAsk`, read/edit/write tools and Bash allowed, `git push` and `gh pr create/merge` denied. The system prompt carries the role contract and the role skills (by default: a failing test first, the smallest fix, the repository's full checks); the task message carries the requirements and the project guidance selected for the task from its pinned commit (see Project Guidance). The developer commits on the task branch. The run returns a structured report (`summary`, `test_evidence`, `change_kind`, `change_rationale`); `change_kind` classifies the whole branch as `breaking`, `feature`, `fix` or `test_docs` and `change_rationale` says why. A `done` report without a valid kind and a rationale fails the run; a question for a person becomes a `Suspend`: answer by replying on the task (same `correlation_key`) or with an approval `comment`, then approve. Rejecting stops the task with `[sde] stopped: question declined`.
-  With no project delivery configuration, the 0.7.1 SDE workflow handles the version bump, branch push and PR itself (and deletes the source branch with `--delete-branch` when merging a pull request, falling back to deleting the remote branch if a worktree blocks local branch deletion). When a delivery configuration is present, SDE commits locally and HB applies that configuration to publication.
-- Review on: the SDE sends the requirements, the diff it computes from the worktree (not the developer's own description) and the test evidence to the configured `reviewer`. A `code-reviewer` executor runs as its own read-only session with its own launcher, billing and model. A CLI executor (for example `reviewer = "grok"`) runs non-interactively in the worktree and must print one JSON verdict; nothing limits its tools, so read-only is only checked afterwards and a review that changed the worktree is discarded. Without `reviewer`, an existing `coder-reviewer` executor is used when no `code-reviewer` exists. `changes_requested` sends every blocking item back to the same developer session for a fix; the re-review also gets the previous findings and the diff since that review. `pass` delivers. If the review cannot finish (reviewer error, malformed verdict, model or billing mismatch) or rounds run out, the run suspends as `review pending`: approve to retry (another fix round when changes were requested), reject to deliver marked `review=pending`.
-- Review off: the SDE delivers after its own tests and checks (`review=off`).
-- While suspended: messages on the same task are kept with the suspended state (the open approval card is not posted again). Messages that arrive in the same batch as the decision count too. On approval they are added to the requirements, developed first, and shown to the reviewer; a rejected review retry lists them as unprocessed in the delivery.
-- Permission gate `sde.launch` runs before every developer launch, fix rounds included. `defer` suspends with the full state; approval runs that launch, rejection stops with `[sde] stopped: launch declined`; `block` stops with `[sde] stopped: launch blocked`.
-- Delivery: one Outbox message `[sde] delivered (review=pass after N round(s) | review=off | review=pending; harness=... launcher=... billing=... model=... effort=...)` with workdir, summary, `Change: <kind> (<rationale>)`, test evidence, review history and the last review. When the project configures `[projects.<name>.delivery]`, Hibernaut's delivery step runs first and the message adds its state, PR link, version decision, checks, CI and merge commit (see PR Delivery).
-- Hot reload: all four launch settings and `review` take effect on the next run; invalid values keep the running settings. Billing and launcher rules are the same as for `code-reviewer`. `sde.launch` is allowed by default in the auto-mode permission adapter.
+在 Claude Code 等客户端里接入 MCP：`python3 -m agent_runtime.app.main --mcp-stdio --config <hibernaut.toml>`；远程接入设 `mcp_enabled = true`，用 `Authorization: Bearer <HIBERNAUT_MCP_TOKEN>` 访问 `POST /mcp`。
 
-## PR Delivery (`[projects.<name>.delivery]`)
+## 配置
 
-The SDE develops, tests and commits on the task branch; it never pushes. Publishing is Hibernaut's own delivery step, configured per project in `hibernaut.toml` (the trusted deployment file; nothing in the repository under change can grant it). Without a `delivery` table a task ends with local commits, as before. This repository's adoption (PR created is the default end point) is in [`hibernaut.example.toml`](hibernaut.example.toml):
+所有配置都在 `hibernaut.toml`，带注释的模板是 [`hibernaut.example.toml`](hibernaut.example.toml)。保存后自动热加载：入口、消息发送和轮询不停，进行中的任务用旧配置跑完，新事件用新配置；非法配置保留当前设置；改存储路径或 `[switchboard]` 需要重启。
 
-```toml
-[projects.hibernaut.delivery]
-open_pr = true                  # grant 1: push the task branch and create or reuse its PR
-auto_merge = false              # grant 2: merge (needs open_pr); off means a person merges
-version_file = "src/agent_runtime/__init__.py"
-version_pattern = '__version__\s*=\s*"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)"'
-title_template = "Hibernaut {version}: {title}"
-checks = [["lint-imports"], ["pytest", "-v"], ["pyright"]]
-require_review = true           # merge only after the independent review passed
-require_ci = true               # merge only after every PR check passed
-merge_method = "squash"
-close_terminal = true           # close the SDE terminal once delivery is evidenced (see Verified delivery)
-# base_branch = "main", remote = "origin", check_timeout_seconds, ci_timeout_seconds = 1800, ci_poll_seconds = 30,
-# git_command = "git", gh_command = "gh"
-```
+| 配置段 | 管什么 |
+| :--- | :--- |
+| `[runtime]` | 数据库与记忆目录、并发数、新事件策略（`defer` / `fold` / `interrupt`）、全局默认执行器 |
+| `[channels]` | HTTP 端口、GitHub / 飞书 / MCP 的密钥环境变量名 |
+| `[executors.<id>]` | CLI 模板；写 `role = "sde"` 或 `role = "code-reviewer"` 则是角色执行器。SDE 的 `review`、`reviewer` 决定评审开关和评审者 |
+| `[launchers.<name>]`、`[credential_proxy]` | Claude Code 启动命令；`billing = "api"` 时经外置凭据代理 |
+| `[projects.<name>]` | 仓库、检出路径、服务的 `inbox_id`（字符串或正则数组）、默认 `executor`、worktree 与终端后端 |
+| `[projects.<name>.delivery]` | PR 交付：开 PR、自动合并、版本文件、检查命令、是否要求评审和 CI |
+| `[gdrive]` | Drive 任务队列，部署见 [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md) |
+| `[switchboard]` | 同进程运行 Switchboard 或经 Relay 连接远程 Switchboard |
 
-After the SDE reports `done` (and the review passed, or with `review = false`), the delivery step runs in the task worktree:
+## 运行
 
-1. Gate `delivery.open_pr` (PermissionPort). `defer` suspends the task until a person approves; `block` delivers it locally with the reason. With `open_pr = false` nothing leaves the machine.
-2. Fetch the latest `<remote>/<base_branch>` and merge it into the task branch. A conflict only in `version_file` is resolved to the base's version; any other conflict aborts the merge and suspends with the files.
-3. Version: read the version on the base, bump it from `change_kind` (`breaking` → major, `feature` → minor, `fix` → patch, `test_docs` → unchanged) and commit it (`Set version X.Y.Z (...)`). A version the branch set itself is replaced.
-4. Run `checks` in order. Any failure pushes nothing and suspends with the output. Checks that passed on the same commit are not run again on a retry.
-5. Push the branch without force (an existing remote branch with other commits is reported, never overwritten), then create the PR, or reuse the open one for the branch and update its title and body. The body holds the summary, change kind and rationale, version decision, check results, review status and test evidence.
-6. With `auto_merge = true` only: require a passing independent review (`require_review`), gate `delivery.merge`, wait for the PR's CI (`gh pr checks`; a failure leaves the PR open, a timeout suspends), then fetch the base again. If the base's version changed meanwhile (another PR merged first), go back to step 2: merge it in, recompute the version, run the checks, push, wait for CI. Otherwise merge with `gh pr merge --<method> --match-head-commit <tested sha>` and record the merge commit.
-
-- States: `local` (developed and committed locally), `pr_open` (PR created) and `merged`. They are stored per task (`correlation_key`) in the SQLite `deliveries` table with the branch, base commit and version, pushed head, PR, checks, CI, merge commit and history.
-- Concurrent PRs: each PR computes its version from the base it merged. Two PRs from the same base may both propose the next version; whichever merges second is recomputed from the new base before it merges, so `main` never receives the same version twice. Merging and reading the base are serialized per repository within the daemon.
-- Failure and retry: any recoverable failure (fetch, conflict, checks, push, `gh`, CI timeout, a `defer`) suspends the task as `[sde] delivery pending: <reason>` with the delivery state so far. Approving retries only the delivery step from the recorded state: a pushed branch is not pushed again, an open PR is reused, a PR that a person already merged is adopted (its merge commit recorded, no second bump). Rejecting delivers the task as it stands with `delivery declined: <reason>`. Messages sent on the task while it waits are developed, reviewed and delivered again on approval.
-- Receipt: the delivery message lists `Delivery: <state>`, `PR:`, `Version: <base> -> <new> (<bump> for <kind>)`, `Checks:`, `CI:`, `Merge commit:` and the notes that explain what did not happen (for example `not merged: this project does not authorize merging`). A Drive task gets the same text in its file.
-- Authentication: `git` and `gh` run with `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` removed from their environment and prompts disabled. They authenticate through the host's own credential store (`gh auth login`, a git credential helper, an SSH agent) or a trusted wrapper named in `gh_command` / `git_command`; the daemon never holds a GitHub token. `-R <projects.<name>.repo>` pins every `gh` call to the configured repository.
-- Permissions: `delivery.open_pr` and `delivery.merge` are allowed by the auto-mode permission adapter, because the project's `open_pr` / `auto_merge` are the explicit grants; a deployment that wants a person to confirm each one moves it to the defer list.
-
-### Verified delivery, terminal exit and worktree reclamation
-
-Processing an event can finish before the change is delivered: a delivery that waits suspends the task, and the event is done. What counts as delivered is checked separately at each stage.
-
-- Code delivery: after every `done` report Hibernaut inspects the task worktree itself (`git status --porcelain --untracked-files=all` and `git rev-list --count <base>..HEAD`, where the base is the commit pinned when the task started). A tool result, an idle prompt or a clean tree alone is not delivery. Staged, unstaged or untracked files (tests and docs included), or a branch with no commit since the base, send the developer back once automatically; if the work is still unfinished the task suspends as `[sde] incomplete: <what is left>` and keeps the worktree, session and terminal. Approve sends the developer back again; reject stops with `[sde] stopped: incomplete work left in place` and still keeps them. This applies with or without a delivery step.
-- No-code outcome: a task that needs no repository change reports `code_change: false`. With a clean tree and no commit since the base, it ends as `[sde] finished without a code change` with no review and no delivery. Commits on the branch make it a change whatever the report says; a dirty tree makes it incomplete. Reviews (`code-reviewer`) are read-only and never take this path.
-- PR evidence: after creating or reusing the PR, Hibernaut reads the remote branch (`git ls-remote`) and the PR head (`gh pr view --json headRefOid`). Both must be the pushed commit, which is the commit the checks passed on; otherwise the delivery suspends with `PR #<n> is not at the pushed commit`. A local commit without a PR keeps the worktree, and approval continues the PR flow from the recorded state.
-- Terminal exit (`close_terminal = true`): the SDE terminal closes only when the delivery target is evidenced (open PR at the checked commit; with `auto_merge = true` the PR must also be merged) and no human question or live reviewer exchange is open (`review:<task>` sessions or queued `review_of` events). Before closing, the SHA, PR URL, Hibernaut session and Claude Code session IDs are saved in the `deliveries` record; the terminal binding keeps the native ID so the next event resumes with `--resume`. The receipt says `Terminal: closed <handle>; resume with Claude Code session <id>` or `Terminal: kept <handle> (<reason>)`. A terminal that fails to close stays bound. Closing a terminal never removes the worktree.
-- Reclamation: runs only when the last session on the work key closes, and rechecks everything immediately before and again right after claiming the worktree. It needs: no active or suspended session or child; no reviewer session, queued or running event on the task, and no unfinished delivery (`SQLiteWorkUsage`); GitHub reporting no open PR for the branch; no staged, unstaged or untracked file; and every commit of the worktree on a remote, or a merged PR whose head is exactly the local `HEAD` and whose merge commit a remote branch contains (a squash merge). A check that cannot run (for example `gh` failing) counts as missing evidence and leaves the worktree in place.
-
-## Interactive Role Sessions
-
-`interactive` on a role executor (default `true`) means each `sde` or `code-reviewer` run needs a session a person can join. The project's `terminal_backend` opens it; `interactive = false` runs the role non-interactively (headless), whatever the project.
-
-- Terminal backend: `terminal_backend = "orca"` opens an interactive Claude Code terminal in the target worktree through Orca. It is set per project, independently of `worktree_backend`: it defaults to `"orca"` for `worktree_backend = "orca"` projects (their behaviour is unchanged) and to `"none"` for `worktree_backend = "git"` projects. A Git worktree project can set `terminal_backend = "orca"` to get Orca terminals in its Git worktrees. Orca is the only terminal backend.
-- No backend: an interactive role never falls back to a background run. With `terminal_backend = "none"`, or for an inbox that matches no `[projects]` entry when the task names its own `explicit_workdir` (without one the event waits for a project, see Projects), the SDE suspends with `[sde] interactive session unavailable: <reason>` and starts nothing. Set `terminal_backend = "orca"` on the project or `interactive = false` on the role (the config reloads), then approve to retry; rejecting stops the task with `[sde] stopped: interactive session declined`. An independent review reports `[code-reviewer] review failed: interactive review not started: <reason>`. A built-in review leaves the SDE task `review pending` with that reason.
-- Attach failure: when Orca cannot open or reach the terminal (no `orca` command, worktree unknown to Orca, a failed session check), the run reports the Orca error (`[sde] development failed: Orca terminal ...`, `[code-reviewer] review failed: ...`) instead of running headless.
-- Migration: `visible` is the old name of `interactive` and is still read. Setting both on one executor is a configuration error. On an existing Git worktree project or unmatched inbox that ran roles headless, add `interactive = false` to keep doing so.
-
-- Terminals: titled `sde · <task>`, `code-reviewer · review of <task> round <n>` (built-in review) and `code-reviewer · review of <task>` (independent `review_of` event). Watch progress and answer the agent there. The delivery and review messages list the Orca terminal handle and the Claude Code session ID.
-- Settings: the same role prompt, tools, launcher, billing, model and effort as a headless run, with `--permission-mode dontAsk`. A launcher in the terminal first runs the same session check as a headless run (subscription vs. proxy billing, model), then starts the conversation; a failed check closes the terminal and reports the reason.
-- Result: the launcher gives Claude Code a `hibernaut_handoff` MCP server. The agent calls `get_task` to read its task and `submit_result` to return the structured result. The server checks the result against the role schema and rejects a malformed one so the agent can fix it. The agent never reads or writes the handoff directory, so no `--add-dir` trust dialog appears. Claude Code still asks once if the worktree itself is not yet trusted.
-- Continuation: SDE follow-up events, answers after `needs_input` and review fix rounds go back to the task's live terminal, or `--resume` its conversation in a new terminal once the tab is closed. Every review is a new conversation; a re-review receives the previous findings in its prompt.
-- Read-only review: the interactive reviewer has no file-writing tool; Edit, Write, MultiEdit and NotebookEdit are denied. The worktree fingerprint check still discards a review if anything changed.
-- Developer channel: an independent `review_of` review and its developer talk through Claude Code's native `SendMessage`; each keeps its own `/events` task, native session and result. Hibernaut names the developer only after verifying the binding: an open session for the `review_of` key in the same inbox, run by an `sde` executor, with a terminal binding in the reviewed worktree, whose native session is live under exactly one name in the Claude Code session registry (`<config dir>/sessions`) with that worktree as its cwd. Only then does the reviewer get the developer's exact session name and messaging socket (Claude Code sends it as the `from` of every reply, with the name in `from-name`) and `SendMessage`/`ListAgents` (still no file-writing tool); otherwise its prompt says why there is no channel and it messages no one. The reviewer tags messages `[review of <task>]`, sends questions and its conclusion, and records the exchange in `developer_messages`; the review message shows `Developer channel:` and the exchange. The SDE is told its reviewer's address (`<reviewer> · review of <task>`, or `<name>-<words>` when Claude Code de-duplicates the name for a second review), answers only such a sender whose message starts with the exact `[review of <task>]` tag, with evidence, and does not change the worktree while a review is open. The SDE cannot start a reviewer as its own subagent: `Agent` and `Task` are denied.
-- Timeout and cancel: `timeout_seconds` includes time spent waiting for a person. A timeout or interrupt closes the terminal and writes nothing to the Outbox. The SDE conversation stays bound and resumes on the next event.
-
-## MCP Server Integration (`stdio` & Remote `/mcp`)
-
-Hibernaut exposes 7 MCP tools (`hibernaut_ingest_event`, `hibernaut_list_sessions`, `hibernaut_list_events`, `hibernaut_list_workspaces`, `hibernaut_resolve_approval`, `hibernaut_reclaim_workspace`, `hibernaut_close_session`).
-
-### 1. Local IDE / CLI (`stdio`)
-
-Add to your Claude Code / Cursor / Claude Desktop MCP configuration:
-
-```json
-{
-  "mcpServers": {
-    "hibernaut": {
-      "command": "python3",
-      "args": ["-m", "agent_runtime.app.main", "--mcp-stdio", "--config", "/abs/path/to/hibernaut.toml"],
-      "env": {
-        "PYTHONPATH": "/abs/path/to/hibernaut/src"
-      }
-    }
-  }
-}
-```
-
-### 2. Remote Access via Cloudflare Tunnel (`POST /mcp`, Streamable HTTP)
-
-Set `mcp_enabled = true` in `hibernaut.toml`, export a strong token, and expose the local port through Cloudflare Tunnel:
+长期运行用自动更新监督进程（需在一个专用的、位于 `main` 的检出里）：
 
 ```bash
-export HIBERNAUT_MCP_TOKEN="replace-with-strong-random-token"
-PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
-
-# In another terminal, publish https://mcp.yourdomain.com -> http://127.0.0.1:8080
-cloudflared tunnel --url http://127.0.0.1:8080
+python3 scripts/run_updating.py --config hibernaut.toml
 ```
 
-Remote clients call `POST https://<your-tunnel-host>/mcp` with header `Authorization: Bearer <HIBERNAUT_MCP_TOKEN>`. If `HIBERNAUT_MCP_TOKEN` is unset or `mcp_enabled = false`, `/mcp` stays disabled (404).
+除 `--interval` 外的参数原样传给 daemon。它每 300 秒检查一次 `origin/main`，能快进时让旧 daemon 关闭入口、处理完已接收的工作，再更新代码并重启；检出不干净、不在 `main` 或历史分叉时保持现状。origin 必须是你信任其提供可执行代码的来源。
 
-## Google Drive Task Queue (`DriveTaskPoller` + `DriveResultWriter`)
+查看版本：`PYTHONPATH=src python3 -m agent_runtime.app.main --version`。版本规则见 [`docs/process/versioning.md`](docs/process/versioning.md)。
 
-Run a tunnel-free cloud-to-local task loop via Google Drive (`待执行/` → `执行中/` → `已完成/` / `失败/`), supporting `.md` files with optional YAML frontmatter (`scope`, `executor_id`, `priority`, `title`, and for role executors `activities`, `tags` and `base_ref`, comma-separated) and Google Docs (auto-exported as `text/plain`). Re-editing a file and moving it back to `待执行/` automatically continues the same `Session` and `hb-*` worktree via `correlation_key = "gdrive:<file_id>"`.
+## 文档
 
-A development task names the SDE explicitly (template: [`docs/dispatch/sde-task.drive.md`](docs/dispatch/sde-task.drive.md)); a file without `executor_id` keeps the default routing (session, project, then `runtime.default_executor`), and a review uses `executor_id: code-reviewer`:
+| 文档 | 内容 |
+| :--- | :--- |
+| [`docs/architecture.md`](docs/architecture.md) | 完整设计：生命周期（§1）、分层（§2）、会话与路由及各入口（§3）、执行器、评审、SDE、PR 交付、worktree、多 inbox 项目、热加载（§4）、并发与新事件策略（§5）、Switchboard（§7） |
+| [`docs/glossary.md`](docs/glossary.md) | 术语表（术语以它为准） |
+| [`AGENTS.md`](AGENTS.md) | 开发规范与提交门禁 |
+| [`docs/dispatch/`](docs/dispatch) | 派单模板：SDE 任务（`/events`、Drive）、独立评审 |
+| [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md) | Drive 队列凭据代理的安装与维护 |
+| [`docs/adr/`](docs/adr) | 架构决策记录 |
 
-```markdown
----
-scope: proj:hibernaut
-executor_id: sde
-title: Short title used for the pull request
-activities: development
----
-## Requirements
-...
+## 开发
+
+代码按整洁架构分四层，依赖只能由外向内：
+
+```text
+src/agent_runtime/
+├── core/       # L0 领域模型 + L1 端口，只依赖标准库
+├── engine/     # L2 编排：入站、Worker、定时器、Outbox 投递；只依赖 core/
+├── adapters/   # L3 实现：SQLite、记忆、权限、执行器、交付、各通道
+└── app/        # 配置加载与组装根（daemon、demo）
+src/switchboard/  # 独立包，不依赖 agent_runtime
 ```
 
-The SDE reads `title` and the body as the task requirements; the delivery receipt (PR link, version, checks) is appended to the file.
-
-### Setup: service account behind the external credential proxy
-
-Hibernaut never holds the service account key. An external credential proxy, running as its own system user, keeps the key, calls Google Drive, and answers only the queue's operations (list a queue folder, read a task file, move it between the four queue folders, append the result) on `127.0.0.1`. Hibernaut reaches it through `CredentialProxyClient` with a local client token and receives file metadata, task text and `ok`, never a Google token.
-
-1. **Service account**: In Google Cloud Console, enable the **Google Drive API**, create a Service Account (no IAM roles needed) and a JSON key.
-2. **Share only the queue folder**: Create `任务队列/{待执行, 执行中, 已完成, 失败}` in Drive and share the `任务队列` folder as **Editor** with the Service Account email only.
-3. **Install the proxy** (macOS LaunchDaemon or Linux systemd unit; details, allowed operations and maintenance in [`deploy/gdrive-proxy/README.md`](deploy/gdrive-proxy/README.md)):
-   ```bash
-   sudo deploy/gdrive-proxy/install.sh --key ~/.config/hibernaut/gdrive-sa.json \
-     --root-folder-id <queue folder ID from its Drive URL> --hb-user "$USER"
-   ```
-   It copies the key to `/etc/hibernaut-drive-proxy/sa.json` (readable only by the proxy user), writes the client token to `~/.config/hibernaut/gdrive-proxy.token`, checks the queue read-only and starts the service. Delete the original key file afterwards.
-4. **Enable `[gdrive]` in `hibernaut.toml`** and restart Hibernaut:
-   ```toml
-   [gdrive]
-   enabled = true
-   proxy_url = "http://127.0.0.1:9100"      # default: [credential_proxy] url
-   proxy_token_file = "~/.config/hibernaut/gdrive-proxy.token"
-   root_folder_id = "<queue folder ID>"
-   default_inbox_id = "proj:hibernaut"
-   ```
-
-- `proxy_token_file` (relative paths resolve against the directory of `hibernaut.toml`) must be mode 0600; if it is missing, empty or readable by others, Hibernaut prints the reason and starts without the Drive poller.
-- `service_account_key_env` is no longer accepted: the config fails with a message pointing to the proxy. `HIBERNAUT_GDRIVE_SA_KEY` is ignored.
-- A proxy refusal or Drive error reaches the poller as `DriveProxyError` with the HTTP status and reason; the poll logs it and retries on the next interval.
-
-## Switchboard
-
-`src/switchboard/` is a separate package in this repository: a passive exchange that normalizes inbound GitHub webhooks, Feishu events and card callbacks, and MCP tool calls into one `CanonicalEvent` envelope, stores them in its own SQLite database, delivers them to consumers (`taskboard`, `hibernaut`, `switchboard.outbound`) and sends replies through one outbound gateway. It imports nothing from `agent_runtime`, `taskboard`, `runner` or `memory_hub` (enforced by `.importlinter`), and it has no pollers or timers: external cron jobs call the MCP tool `submit_work` with `source="timer"`.
-
-```bash
-cp switchboard.example.toml switchboard.toml
-export SWITCHBOARD_GITHUB_WEBHOOK_SECRET=...   # GitHub webhook HMAC secret
-export SWITCHBOARD_FEISHU_WEBHOOK_SECRET=...   # Feishu verification token
-export SWITCHBOARD_MCP_WEBHOOK_SECRET=...      # Bearer token for /mcp
-export SWITCHBOARD_GITHUB_TOKEN=... SWITCHBOARD_FEISHU_TOKEN=...   # outbound API tokens
-PYTHONPATH=src python3 -m switchboard.app --config switchboard.toml
-```
-
-Secrets are read through `CredentialBrokerPort`; the default `EnvCredentialBroker` reads the variables above and nothing goes in the TOML file. Endpoints on one port: `POST /webhooks/github`, `POST /webhooks/feishu`, `POST /mcp` (tools `submit_work`, `post_message`, `decide_approval`, `report_execution`, `replay_delivery`) and `GET /healthz`.
-
-- A GitHub redelivery with a new `X-GitHub-Delivery` is still a duplicate: events are deduplicated by business fingerprint (`issue:{repo}#{num}:{action}:{updated_at}`, `pr:...`, `comment:{id}`).
-- A consumer that still fails after the last retry (one retry per `retry_backoff_seconds` entry, default 5/15/45/135/405 s) goes to `dead_letter` and an alert is sent to `[delivery] dead_letter_alert_channel/target`; later events for the same consumer and scope wait, other scopes and consumers continue. Replay with the MCP tool `replay_delivery`.
-- An `execution.reported` event with outcome `suspend` becomes a Feishu approval card at `[outbound] approval_target`. The button click returns a read-only card at once and is recorded as `approval.decided` with the original `correlation_key` (for example `github:kun-g/hibernaut#42`); a second click on the same request is dropped.
-- With the default `[relay] transport = "in_process"`, consumers register with `board.bus.subscribe(consumer_id, handler)`; an unregistered consumer counts as offline and its deliveries stay pending.
-
-### Relay: pushing to consumers behind NAT or asleep
-
-A consumer on a private network or a laptop connects out to the Switchboard over WebSocket and receives its events there:
-
-```toml
-[relay]
-enabled = true
-transport = "hybrid"   # local consumers in-process, the rest (hibernaut, taskboard) over the relay
-# heartbeat_sec = 20, ack_timeout_sec = 15, auth_timeout_sec = 5, max_in_flight = 8, path = "/ws/relay"
-# listen_port = 8791   # optional: serve the relay on its own port instead of the [http] port
-```
-
-```bash
-# Switchboard side: the token relay agents must present
-export SWITCHBOARD_RELAY_WEBHOOK_SECRET=...
-PYTHONPATH=src python3 -m switchboard.app --config switchboard.toml
-
-# Consumer side: prints each event as a JSON line and acks it, or pass --handler pkg.module:function
-export SWITCHBOARD_RELAY_TOKEN=...
-PYTHONPATH=src python3 -m switchboard.relay_agent --url wss://switchboard.example.com/ws/relay --consumer-id hibernaut
-```
-
-Terminate TLS at a reverse proxy in front of the Switchboard (it must pass `Upgrade` / `Connection` headers); the agent speaks `wss://` with the standard `ssl` module (`--ca-file` for a private CA). To embed the agent in a consumer process, use `switchboard.relay_agent.RelayAgent(url, consumer_id, handler, credentials).start()`; the handler is called once the event arrives and the ack is sent only after it returns, so return only once the event is stored.
-
-- While a consumer is offline (for example a closed laptop) its deliveries stay `pending` and do not use up retries. When it reconnects, the backlog is pushed at once, in order within each scope.
-- Only failures while connected count as attempts: a `nack`, an exception in the handler, or no ack within `ack_timeout_sec`. These back off and dead-letter as above.
-- A second agent with the same `consumer_id` takes over; the old connection is closed with code 4009 and its late acks are ignored. A bad token or no `hello` within `auth_timeout_sec` closes with 4001.
-- The agent reconnects after 1, 2, 4, 8, 16 and then every 30 seconds (±20%); the hub drops a connection after two missed heartbeats and pushes the unacknowledged events again after the reconnect, so a handler can see an event more than once.
-
-See `docs/architecture.md` section 7 for the full design.
-
-### Running Switchboard inside Hibernaut (Stage A)
-
-Off by default. To run Switchboard in the Hibernaut process, add to `hibernaut.toml`:
-
-```toml
-[switchboard]
-enabled = true
-mode = "in_process"                  # or "relay" (Stage B, below)
-config_path = "switchboard.toml"     # relative to hibernaut.toml
-consumer_id = "hibernaut"
-```
-
-Hibernaut then starts the Switchboard endpoints from `switchboard.toml` beside its own, subscribes as `consumer_id`, and turns `conversation.message`, `work.ready`, `approval.decided` and `work.closed` deliveries into `event_inbox` events (`source = "sb:<source>"`, deduplicated by the Switchboard `event_id`). Emit and Suspend replies that know their `correlation_key` and session go out as `execution.reported` through the Switchboard gateway (GitHub comments, Feishu approval cards); messages without an origin, such as worktree reclaim alerts, still use the Feishu/console channel. `work.closed` closes the matching session and reclaims its worktree when no active session still uses it. The `SWITCHBOARD_*` variables are moved out of the process environment at startup, so executor subprocesses do not inherit them. Changing `[switchboard]` needs a restart. The existing GitHub, Feishu, MCP and Drive channels keep working alongside it.
-
-### Connecting Hibernaut to a remote Switchboard (Stage B)
-
-With `mode = "relay"` Hibernaut does not run a Switchboard itself. It connects out to a public hub, so it works behind NAT or on a laptop that sleeps:
-
-```toml
-[switchboard]
-enabled = true
-mode = "relay"
-relay_url = "wss://switchboard.example.com/ws/relay"
-mcp_url = "https://switchboard.example.com/mcp"
-consumer_id = "hibernaut"
-# ca_file = "private-ca.pem"   # relative to hibernaut.toml
-```
-
-```bash
-export SWITCHBOARD_RELAY_TOKEN=...   # the hub's SWITCHBOARD_RELAY_WEBHOOK_SECRET
-export SWITCHBOARD_MCP_TOKEN=...     # the hub's SWITCHBOARD_MCP_WEBHOOK_SECRET
-```
-
-- Events for `consumer_id` arrive over the relay WebSocket and are stored in `event_inbox` exactly as in Stage A; the ack is sent only after they are stored, and events queued while the node was offline are pushed when it reconnects.
-- Replies go back as `execution.reported` through the hub's MCP tool `report_execution`, which deduplicates by `external_id` and fans out to `taskboard` and the outbound gateway. A failed call stays in the Outbox and is retried.
-- Both tokens are required at startup and are moved out of the process environment. A plain `ws://` or `http://` URL to a non-loopback host prints a warning, because the tokens would travel unencrypted.
-
-## Anti-Corruption Gates (CI)
+提交前三道门禁必须全绿：
 
 ```bash
 pip install -e ".[dev]"
-
-lint-imports   # Gate 1: Static import boundary checks
-pytest -v      # Gate 2: Contract, concurrency, NewEventPolicy, correlation_key, Webhook, Bootstrap, MCP & Executor binding tests
-pyright        # Gate 3: Strict static type checking on core/, engine/ and switchboard/
+lint-imports   # 分层与反向依赖检查
+pytest -v      # 契约、并发、端到端测试
+pyright        # core/、engine/、switchboard/ 的 strict 类型检查
 ```
