@@ -140,8 +140,8 @@ class TestReviewerProfile(unittest.TestCase):
         for message, override in cases.items():
             with self.subTest(message), self.assertRaisesRegex(ValueError, message):
                 parse_config({"executors": {"coder-reviewer": {"role": "coder-reviewer", **override}}})
-        with self.assertRaisesRegex(ValueError, "unsupported role 'sde'"):
-            parse_config({"executors": {"sde": {"role": "sde"}}})
+        with self.assertRaisesRegex(ValueError, "unsupported role 'qa'"):
+            parse_config({"executors": {"qa": {"role": "qa"}}})
         launcher_cases = {
             "launchers.sg: env.CLAUDE_CODE_OAUTH_TOKEN looks like a credential": {"command": "x", "env": {"CLAUDE_CODE_OAUTH_TOKEN": "t"}},
             "launchers.sg: unsupported harness 'codex'": {"command": "x", "harness": "codex"},

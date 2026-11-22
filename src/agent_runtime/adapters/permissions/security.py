@@ -18,6 +18,7 @@ class AutoModePermissionAdapter:
             "fetch_status",
             "orca.agent.launch",
             "coder_reviewer.launch",
+            "sde.launch",
         }
     )
     DEFAULT_DEFER_TOOLS: frozenset[str] = frozenset(

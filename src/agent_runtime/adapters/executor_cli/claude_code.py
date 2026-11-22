@@ -143,9 +143,10 @@ def parse_profile(
     role: str,
     launchers: Mapping[str, ClaudeCodeLauncher],
     credential_proxy_url: str,
+    extra_keys: frozenset[str] = frozenset(),
 ) -> ClaudeCodeProfile:
     where = f"executors.{name}"
-    unknown = sorted(set(item) - PROFILE_KEYS - {"role"})
+    unknown = sorted(set(item) - PROFILE_KEYS - extra_keys - {"role"})
     if unknown:
         raise ValueError(f"{where}: {', '.join(unknown)} not supported for role '{role}'")
     launcher_name = str(item.get("launcher", DEFAULT_LAUNCHER))

@@ -11,6 +11,11 @@ from agent_runtime.adapters.executor_cli.reviewer import (
     CODER_REVIEWER_ROLE,
     CoderReviewerExecutor,
 )
+from agent_runtime.adapters.executor_cli.sde import (
+    SDE_ROLE,
+    SDEExecutor,
+    SDEOptions,
+)
 from agent_runtime.adapters.executor_cli.worktree import (
     CommandResult,
     OrcaWorktreeManager,
@@ -29,5 +34,8 @@ __all__ = [
     "LocalCLIExecutor",
     "OrcaWorktreeManager",
     "ReclaimResult",
+    "SDE_ROLE",
+    "SDEExecutor",
+    "SDEOptions",
     "derive_worktree_names",
 ]
