@@ -25,6 +25,7 @@ src/agent_runtime/
 │   ├── memory_fs/         # FileSystemMemoryAdapter + PartitionedMemoryAdapter & WorkspacePartitionRegistry
 │   ├── permissions/       # Auto Mode classifier (allow / block / defer) + external CredentialProxyClient
 │   ├── credential_proxy/  # External Drive queue proxy (own OS user holds the service account key; fixed queue operations on loopback)
+│   ├── delivery/          # PRDelivery: SDE task -> version decision, repo gates, pushed branch, PR, separately authorized merge
 │   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
 │   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + resume_args + magpie env), shared Claude Code launch adapter (claude_code.py), CoderReviewerExecutor (read-only review) & OrcaWorktreeManager (3 safety gates)
 │   └── channels/          # Multi-route HTTP (/events, /webhooks/github, /webhooks/feishu, /mcp), MCPServerAdapter, GitHubIssuePoller, FeishuChannelAdapter, Console, Drive queue poller/writer (via ProxiedDriveClient)
@@ -86,7 +87,7 @@ checkout = "/absolute/path/to/your/hibernaut"
 
 The daemon and demo print `Hibernaut <version>` at startup. To check the version directly, run `PYTHONPATH=src python3 -m agent_runtime.app.main --version`.
 
-Stable releases use SemVer `MAJOR.MINOR.PATCH`. Bump the major number for incompatible API changes, minor for compatible features, and patch for compatible fixes. Set `__version__` in `src/agent_runtime/__init__.py` when preparing a release. The package metadata and startup banner both read that value.
+Stable releases use SemVer `MAJOR.MINOR.PATCH`. Bump the major number for incompatible API changes, minor for compatible features, and patch for compatible fixes. `__version__` in `src/agent_runtime/__init__.py` is the single source; the package metadata and startup banner both read it. The rules (change kinds, who sets the version, gates, merging) are in [`docs/process/versioning.md`](docs/process/versioning.md), which `guidance.toml` gives to tasks with the `versioning` or `release` activity and to reviews whose diff touches the version. For SDE tasks the delivery step sets the version (see PR Delivery).
 
 ### Run with automatic updates (macOS / Linux)
 
@@ -224,23 +225,73 @@ reviewer = "coder-reviewer"  # a role = "coder-reviewer" executor; required whil
 max_review_rounds = 3
 ```
 
-Dispatch with `executor_id = "sde"`:
+Dispatch with `executor_id = "sde"` (templates in [`docs/dispatch/`](docs/dispatch): `sde-task.json` for `/events`, `sde-task.drive.md` for the Drive queue, `review-task.json` for an independent review). A development task always names its executor: without `executor_id` the event follows the session's or project's default executor, which may not be the SDE.
 
 ```bash
+curl -s localhost:8080/events -H 'Content-Type: application/json' -d @docs/dispatch/sde-task.json
+# or inline:
 curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
   "inbox_id": "proj:hibernaut", "external_id": "task-42", "correlation_key": "task-42",
-  "payload": {"executor_id": "sde", "text": "Task requirements", "base_ref": "main"}}'
+  "payload": {"executor_id": "sde", "title": "Short PR title", "text": "Task requirements", "base_ref": "origin/main"}}'
 ```
 
 - Workspace: `explicit_workdir`, else the task worktree for `correlation_key` (created on first use, reused afterwards), like other executors.
+- Requirements: `requirements` or `text`; a GitHub issue or Drive task without them uses `title` and `body` (`# <title>` then the body). `title` also titles the pull request.
 - Guidance selection: optional `activities` (for example `["versioning"]`) and `tags` or `labels` in the payload pick the project documents the developer receives; the commit and selection are recorded for the task when it starts.
-- Development: the launcher starts Claude Code with `--permission-mode dontAsk`, read/edit/write tools and Bash allowed, normal `git push` and `gh pr` commands allowed, and force-push (`--force`, `--force-with-lease`, `-f`, `+refspec`) and subagents denied. The system prompt carries the role contract and the role skills (by default: a failing test first, the smallest fix, the repository's full checks, version bump when tracked, commit, push, and open or update a pull request); the task message carries the requirements and the project guidance selected for the task from its pinned commit (see Project Guidance). The run returns a structured report (`summary`, `test_evidence`); a question for a person becomes a `Suspend`: answer by replying on the task (same `correlation_key`) or with an approval `comment`, then approve. Rejecting stops the task with `[sde] stopped: question declined`.
+- Development: the launcher starts Claude Code with `--permission-mode dontAsk`, read/edit/write tools and Bash allowed, `git push` and `gh pr create/merge` denied. The system prompt carries the role contract and the role skills (by default: a failing test first, the smallest fix, the repository's full checks); the task message carries the requirements and the project guidance selected for the task from its pinned commit (see Project Guidance). The developer commits on the task branch. The run returns a structured report (`summary`, `test_evidence`, `change_kind`, `change_rationale`); `change_kind` classifies the whole branch as `breaking`, `feature`, `fix` or `test_docs` and `change_rationale` says why. A `done` report without a valid kind and a rationale fails the run; a question for a person becomes a `Suspend`: answer by replying on the task (same `correlation_key`) or with an approval `comment`, then approve. Rejecting stops the task with `[sde] stopped: question declined`.
+  With no project delivery configuration, the 0.7.1 SDE workflow handles the version bump, branch push and PR itself. When a delivery configuration is present, SDE commits locally and HB applies that configuration to publication.
 - Review on: the SDE sends the requirements, the diff it computes from the worktree (not the developer's own description) and the test evidence to the configured `coder-reviewer`, which runs as its own read-only session with its own launcher, billing and model. `changes_requested` sends every blocking item back to the same developer session for a fix; the re-review also gets the previous findings and the diff since that review. `pass` delivers. If the review cannot finish (reviewer error, malformed verdict, model or billing mismatch) or rounds run out, the run suspends as `review pending`: approve to retry (another fix round when changes were requested), reject to deliver marked `review=pending`.
 - Review off: the SDE delivers after its own tests and checks (`review=off`).
 - While suspended: messages on the same task are kept with the suspended state (the open approval card is not posted again). Messages that arrive in the same batch as the decision count too. On approval they are added to the requirements, developed first, and shown to the reviewer; a rejected review retry lists them as unprocessed in the delivery.
 - Permission gate `sde.launch` runs before every developer launch, fix rounds included. `defer` suspends with the full state; approval runs that launch, rejection stops with `[sde] stopped: launch declined`; `block` stops with `[sde] stopped: launch blocked`.
-- Delivery: one Outbox message `[sde] delivered (review=pass after N round(s) | review=off | review=pending; harness=... launcher=... billing=... model=... effort=...)` with workdir, summary, test evidence, review history and the last review.
+- Delivery: one Outbox message `[sde] delivered (review=pass after N round(s) | review=off | review=pending; harness=... launcher=... billing=... model=... effort=...)` with workdir, summary, `Change: <kind> (<rationale>)`, test evidence, review history and the last review. When the project configures `[projects.<name>.delivery]`, Hibernaut's delivery step runs first and the message adds its state, PR link, version decision, checks, CI and merge commit (see PR Delivery).
 - Hot reload: all four launch settings and `review` take effect on the next run; invalid values keep the running settings. Billing and launcher rules are the same as for `coder-reviewer`. `sde.launch` is allowed by default in the auto-mode permission adapter.
+
+## PR Delivery (`[projects.<name>.delivery]`)
+
+The SDE develops, tests and commits on the task branch; it never pushes. Publishing is Hibernaut's own delivery step, configured per project in `hibernaut.toml` (the trusted deployment file; nothing in the repository under change can grant it). Without a `delivery` table a task ends with local commits, as before. This repository's adoption (PR created is the default end point) is in [`hibernaut.example.toml`](hibernaut.example.toml):
+
+```toml
+[projects.hibernaut.delivery]
+open_pr = true                  # grant 1: push the task branch and create or reuse its PR
+auto_merge = false              # grant 2: merge (needs open_pr); off means a person merges
+version_file = "src/agent_runtime/__init__.py"
+version_pattern = '__version__\s*=\s*"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)"'
+title_template = "Hibernaut {version}: {title}"
+checks = [["lint-imports"], ["pytest", "-v"], ["pyright"]]
+require_review = true           # merge only after the independent review passed
+require_ci = true               # merge only after every PR check passed
+merge_method = "squash"
+close_terminal = true           # close the SDE terminal once delivery is evidenced (see Verified delivery)
+# base_branch = "main", remote = "origin", check_timeout_seconds, ci_timeout_seconds = 1800, ci_poll_seconds = 30,
+# git_command = "git", gh_command = "gh"
+```
+
+After the SDE reports `done` (and the review passed, or with `review = false`), the delivery step runs in the task worktree:
+
+1. Gate `delivery.open_pr` (PermissionPort). `defer` suspends the task until a person approves; `block` delivers it locally with the reason. With `open_pr = false` nothing leaves the machine.
+2. Fetch the latest `<remote>/<base_branch>` and merge it into the task branch. A conflict only in `version_file` is resolved to the base's version; any other conflict aborts the merge and suspends with the files.
+3. Version: read the version on the base, bump it from `change_kind` (`breaking` → major, `feature` → minor, `fix` → patch, `test_docs` → unchanged) and commit it (`Set version X.Y.Z (...)`). A version the branch set itself is replaced.
+4. Run `checks` in order. Any failure pushes nothing and suspends with the output. Checks that passed on the same commit are not run again on a retry.
+5. Push the branch without force (an existing remote branch with other commits is reported, never overwritten), then create the PR, or reuse the open one for the branch and update its title and body. The body holds the summary, change kind and rationale, version decision, check results, review status and test evidence.
+6. With `auto_merge = true` only: require a passing independent review (`require_review`), gate `delivery.merge`, wait for the PR's CI (`gh pr checks`; a failure leaves the PR open, a timeout suspends), then fetch the base again. If the base's version changed meanwhile (another PR merged first), go back to step 2: merge it in, recompute the version, run the checks, push, wait for CI. Otherwise merge with `gh pr merge --<method> --match-head-commit <tested sha>` and record the merge commit.
+
+- States: `local` (developed and committed locally), `pr_open` (PR created) and `merged`. They are stored per task (`correlation_key`) in the SQLite `deliveries` table with the branch, base commit and version, pushed head, PR, checks, CI, merge commit and history.
+- Concurrent PRs: each PR computes its version from the base it merged. Two PRs from the same base may both propose the next version; whichever merges second is recomputed from the new base before it merges, so `main` never receives the same version twice. Merging and reading the base are serialized per repository within the daemon.
+- Failure and retry: any recoverable failure (fetch, conflict, checks, push, `gh`, CI timeout, a `defer`) suspends the task as `[sde] delivery pending: <reason>` with the delivery state so far. Approving retries only the delivery step from the recorded state: a pushed branch is not pushed again, an open PR is reused, a PR that a person already merged is adopted (its merge commit recorded, no second bump). Rejecting delivers the task as it stands with `delivery declined: <reason>`. Messages sent on the task while it waits are developed, reviewed and delivered again on approval.
+- Receipt: the delivery message lists `Delivery: <state>`, `PR:`, `Version: <base> -> <new> (<bump> for <kind>)`, `Checks:`, `CI:`, `Merge commit:` and the notes that explain what did not happen (for example `not merged: this project does not authorize merging`). A Drive task gets the same text in its file.
+- Authentication: `git` and `gh` run with `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` removed from their environment and prompts disabled. They authenticate through the host's own credential store (`gh auth login`, a git credential helper, an SSH agent) or a trusted wrapper named in `gh_command` / `git_command`; the daemon never holds a GitHub token. `-R <projects.<name>.repo>` pins every `gh` call to the configured repository.
+- Permissions: `delivery.open_pr` and `delivery.merge` are allowed by the auto-mode permission adapter, because the project's `open_pr` / `auto_merge` are the explicit grants; a deployment that wants a person to confirm each one moves it to the defer list.
+
+### Verified delivery, terminal exit and worktree reclamation
+
+Processing an event can finish before the change is delivered: a delivery that waits suspends the task, and the event is done. What counts as delivered is checked separately at each stage.
+
+- Code delivery: after every `done` report Hibernaut inspects the task worktree itself (`git status --porcelain --untracked-files=all` and `git rev-list --count <base>..HEAD`, where the base is the commit pinned when the task started). A tool result, an idle prompt or a clean tree alone is not delivery. Staged, unstaged or untracked files (tests and docs included), or a branch with no commit since the base, send the developer back once automatically; if the work is still unfinished the task suspends as `[sde] incomplete: <what is left>` and keeps the worktree, session and terminal. Approve sends the developer back again; reject stops with `[sde] stopped: incomplete work left in place` and still keeps them. This applies with or without a delivery step.
+- No-code outcome: a task that needs no repository change reports `code_change: false`. With a clean tree and no commit since the base, it ends as `[sde] finished without a code change` with no review and no delivery. Commits on the branch make it a change whatever the report says; a dirty tree makes it incomplete. Reviews (`coder-reviewer`) are read-only and never take this path.
+- PR evidence: after creating or reusing the PR, Hibernaut reads the remote branch (`git ls-remote`) and the PR head (`gh pr view --json headRefOid`). Both must be the pushed commit, which is the commit the checks passed on; otherwise the delivery suspends with `PR #<n> is not at the pushed commit`. A local commit without a PR keeps the worktree, and approval continues the PR flow from the recorded state.
+- Terminal exit (`close_terminal = true`): the SDE terminal closes only when the delivery target is evidenced (open PR at the checked commit; with `auto_merge = true` the PR must also be merged) and no human question or live reviewer exchange is open (`review:<task>` sessions or queued `review_of` events). Before closing, the SHA, PR URL, Hibernaut session and Claude Code session IDs are saved in the `deliveries` record; the terminal binding keeps the native ID so the next event resumes with `--resume`. The receipt says `Terminal: closed <handle>; resume with Claude Code session <id>` or `Terminal: kept <handle> (<reason>)`. A terminal that fails to close stays bound. Closing a terminal never removes the worktree.
+- Reclamation: runs only when the last session on the work key closes, and rechecks everything immediately before and again right after claiming the worktree. It needs: no active or suspended session or child; no reviewer session, queued or running event on the task, and no unfinished delivery (`SQLiteWorkUsage`); GitHub reporting no open PR for the branch; no staged, unstaged or untracked file; and every commit of the worktree on a remote, or a merged PR whose head is exactly the local `HEAD` and whose merge commit a remote branch contains (a squash merge). A check that cannot run (for example `gh` failing) counts as missing evidence and leaves the worktree in place.
 
 ## Interactive Role Sessions
 
@@ -297,7 +348,22 @@ Remote clients call `POST https://<your-tunnel-host>/mcp` with header `Authoriza
 
 ## Google Drive Task Queue (`DriveTaskPoller` + `DriveResultWriter`)
 
-Run a tunnel-free cloud-to-local task loop via Google Drive (`待执行/` → `执行中/` → `已完成/` / `失败/`), supporting `.md` files with optional YAML frontmatter (`scope`, `executor_id`, `priority`, `title`) and Google Docs (auto-exported as `text/plain`). Re-editing a file and moving it back to `待执行/` automatically continues the same `Session` and `hb-*` worktree via `correlation_key = "gdrive:<file_id>"`.
+Run a tunnel-free cloud-to-local task loop via Google Drive (`待执行/` → `执行中/` → `已完成/` / `失败/`), supporting `.md` files with optional YAML frontmatter (`scope`, `executor_id`, `priority`, `title`, and for role executors `activities`, `tags` and `base_ref`, comma-separated) and Google Docs (auto-exported as `text/plain`). Re-editing a file and moving it back to `待执行/` automatically continues the same `Session` and `hb-*` worktree via `correlation_key = "gdrive:<file_id>"`.
+
+A development task names the SDE explicitly (template: [`docs/dispatch/sde-task.drive.md`](docs/dispatch/sde-task.drive.md)); a file without `executor_id` keeps the default routing (session, project, then `runtime.default_executor`), and a review uses `executor_id: coder-reviewer`:
+
+```markdown
+---
+scope: proj:hibernaut
+executor_id: sde
+title: Short title used for the pull request
+activities: development
+---
+## Requirements
+...
+```
+
+The SDE reads `title` and the body as the task requirements; the delivery receipt (PR link, version, checks) is appended to the file.
 
 ### Setup: service account behind the external credential proxy
 

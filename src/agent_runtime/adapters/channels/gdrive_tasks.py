@@ -266,6 +266,10 @@ class DriveTaskPoller:
             }
             if frontmatter.get("executor_id"):
                 payload["executor_id"] = frontmatter["executor_id"]
+            # Guidance selection for role executors, as comma-separated lists.
+            for key in ("activities", "tags", "base_ref"):
+                if frontmatter.get(key):
+                    payload[key] = frontmatter[key]
 
             ingest_res = self._handler.ingest(
                 inbox_id=inbox_id,

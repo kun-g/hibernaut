@@ -199,10 +199,13 @@ class TestSQLiteThreadSafety(unittest.TestCase):
         store.mark_ready("x", workdir=str(folder), branch="b")
         both_past_gates = threading.Barrier(2, timeout=5)
         removals: list[tuple[str, ...]] = []
+        waited: set[int] = set()
 
         def runner(argv: Sequence[str], cwd: Path | None) -> CommandResult:
             _ = cwd
-            if list(argv[:2]) == ["gh", "pr"]:
+            # Both callers pass the first gates together; the winner's recheck after its claim runs alone.
+            if list(argv[:2]) == ["gh", "pr"] and threading.get_ident() not in waited:
+                waited.add(threading.get_ident())
                 both_past_gates.wait()
             if "remove" in argv:
                 removals.append(tuple(argv))

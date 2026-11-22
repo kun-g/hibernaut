@@ -62,6 +62,21 @@ def next_step(name):
     return steps[min(n, len(steps) - 1)]
 
 
+def apply_work(step):
+    # A developer step writes its files and commits them like a developer finishing a task; "commit": null leaves
+    # the work uncommitted and "write_uncommitted" adds files after the commit.
+    for rel, content in step.get("write", {}).items():
+        target = Path.cwd() / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    message = step.get("commit", "fake sde work")
+    if message and step.get("output", {}).get("status", "done") == "done":
+        subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", message], check=True, capture_output=True)
+    for rel, content in step.get("write_uncommitted", {}).items():
+        (Path.cwd() / rel).write_text(content, encoding="utf-8")
+
+
 HANDOFF_TOOLS = ("mcp__hibernaut_handoff__get_task", "mcp__hibernaut_handoff__submit_result")
 
 
@@ -151,11 +166,8 @@ def run_interactive():
             output = step if step is not None else {"verdict": "pass", "summary": "ok", "blocking": []}
         else:
             step = step or {}
-            for rel, content in step.get("write", {}).items():
-                target = Path.cwd() / rel
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content, encoding="utf-8")
-            output = step.get("output", {"status": "done", "summary": "implemented", "test_evidence": "red: 1 failed; green: 1 passed"})
+            apply_work(step)
+            output = step.get("output", {"status": "done", "summary": "implemented", "test_evidence": "red: 1 failed; green: 1 passed", "change_kind": "fix", "change_rationale": "corrects the behaviour under test"})
         if HANDOFF_TOOLS[1] in permitted:
             failed, text = handoff.call("submit_result", {"turn": turn, **output})
             if failed:
@@ -187,18 +199,8 @@ if role == "reviewer":
     )
 else:
     step = step or {}
-    for rel, content in step.get("write", {}).items():
-        target = Path.cwd() / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-    if step.get("commit"):
-        # Commit everything written so far; later "write" steps stay uncommitted unless they commit too.
-        import subprocess
-        subprocess.run(["git", "add", "-A"], check=True)
-        subprocess.run(["git", "commit", "-qm", step["commit"]], check=True)
-    for rel, content in step.get("write_uncommitted", {}).items():
-        (Path.cwd() / rel).write_text(content, encoding="utf-8")
-    output = step.get("output", {"status": "done", "summary": "implemented", "test_evidence": "red: 1 failed; green: 1 passed"})
+    apply_work(step)
+    output = step.get("output", {"status": "done", "summary": "implemented", "test_evidence": "red: 1 failed; green: 1 passed", "change_kind": "fix", "change_rationale": "corrects the behaviour under test"})
 if isinstance(step, dict) and step.get("error"):
     emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "result": step["error"], "session_id": session_id})
     sys.exit(1)

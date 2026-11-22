@@ -17,7 +17,7 @@ The project guidance quotes the documents selected for this task and lists the r
 
 # Versioning and pull request
 
-Before finishing:
+If the role contract assigns publication to Hibernaut, commit the reviewed work locally, classify the change, and report the evidence. Hibernaut handles the version and PR. For standalone publication, follow these steps:
 
 - Locate the repository's version definition (follow the project guidance or README when specified; otherwise inspect standard project files such as `src/*/__init__.py`, `pyproject.toml`, `package.json`, `Cargo.toml`, or `VERSION`). If the repository tracks a version, bump it according to the project's versioning rules (default SemVer: patch for fixes, minor for compatible features, major for breaking changes). On a rework round where this branch already bumped the version, keep that bump unless the change scope grew.
 - Re-run the repository's full checks after bumping the version so the final commit is verified.

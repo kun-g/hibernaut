@@ -29,6 +29,7 @@ from agent_runtime.adapters.channels import (
     build_feishu_or_console_channel,
 )
 from agent_runtime.adapters.channels.channels import webhook_request_handler
+from agent_runtime.adapters.delivery import DeliveryConfig, PRDelivery
 from agent_runtime.adapters.executor_cli import (
     CODER_REVIEWER_ROLE,
     CoderReviewerExecutor,
@@ -48,6 +49,8 @@ from agent_runtime.adapters.permissions import AutoModePermissionAdapter, Creden
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
+    SQLiteDeliveryStore,
+    SQLiteWorkUsage,
     SQLiteInboxAdapter,
     SQLiteLeaseLockAdapter,
     SQLiteOutboxAdapter,
@@ -354,6 +357,7 @@ def build_daemon(
     resolved_wt_mgr = worktree_manager or OrcaWorktreeManager(
         workspace_store=workspaces,
         session_store=sessions,
+        usage=SQLiteWorkUsage(db).blockers,
     )
 
     def _make_worker(inbox_id: str, worker_id: str) -> AgentWorker:
@@ -607,7 +611,12 @@ def build_daemon_from_config(
         )
         tasks = SQLiteTaskMetadataStore(daemon.db)
 
-        def _role_executors(wt_mgr: OrcaWorktreeManager, no_terminal: str | None) -> dict[str, ExecutorPort]:
+        deliveries = SQLiteDeliveryStore(daemon.db)
+        usage = SQLiteWorkUsage(daemon.db)
+
+        def _role_executors(
+            wt_mgr: OrcaWorktreeManager, no_terminal: str | None, delivery: DeliveryConfig | None = None,
+        ) -> dict[str, ExecutorPort]:
             # no_terminal says why this inbox has no terminal backend; None means Orca opens the sessions.
             # Each SDE run reviews through the reviewer built for the same project and config generation.
             def terminal(role: RoleConfig) -> OrcaVisibleRunner | TerminalUnavailable | None:
@@ -634,6 +643,8 @@ def build_daemon_from_config(
                     inbox_checkout_map=inbox_checkout_map,
                     terminal=terminal(role),
                     tasks=tasks,
+                    delivery=PRDelivery(delivery, deliveries) if delivery is not None else None,
+                    live_peers=usage.peers,
                 )
             return built
 
@@ -645,6 +656,7 @@ def build_daemon_from_config(
                 session_store=daemon.sessions,
                 backend=proj.worktree_backend,
                 create_terminal=proj.orca_create_terminal,
+                usage=usage.blockers,
                 primary_inbox_id=proj.inbox_id,
                 isolate_inboxes=proj.serves_multiple_inboxes,
             )
@@ -664,11 +676,13 @@ def build_daemon_from_config(
             executors_by_project[proj.name].update(_role_executors(
                 wt_mgr,
                 None if proj.terminal_backend == "orca" else f"project '{proj.name}' has terminal_backend = \"none\"",
+                proj.delivery,
             ))
 
         default_mgr = OrcaWorktreeManager(
             workspace_store=daemon.workspaces,
             session_store=daemon.sessions,
+            usage=usage.blockers,
         )
         fallback_executors: dict[str, ExecutorPort] = {
             exec_name: LocalCLIExecutor(

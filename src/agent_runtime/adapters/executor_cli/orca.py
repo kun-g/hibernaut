@@ -297,6 +297,20 @@ class OrcaVisibleRunner:
                     self._save(dataclasses.replace(binding, handle=None, incarnation_id=None, native_session_id=native))
                 await _close_quietly(handle, workdir)
 
+    async def release(self, session_id: str, workdir: Path) -> str:
+        # Ends the visible terminal of a conversation whose work is delivered. The binding keeps the native ID, so a
+        # later event resumes the conversation with --resume; the worktree is untouched.
+        binding = self._bindings.get(session_id) if self._bindings is not None else None
+        if binding is None or not binding.handle:
+            return "no live terminal is bound to this session"
+        try:
+            await _orca("terminal", "close", "--terminal", binding.handle, cwd=Path(os.path.realpath(workdir)))
+        except _ORCA_ERRORS as exc:
+            # The binding keeps the handle: a live terminal must not look closed, or a resume would run beside it.
+            return f"could not close {binding.handle}: {type(exc).__name__} {exc}"
+        self._save(dataclasses.replace(binding, handle=None, incarnation_id=None))
+        return f"closed {binding.handle}"
+
     async def _start(
         self, profile: ClaudeCodeProfile, title: str, workdir: Path, turn: Path, args: Sequence[str], instruction: str
     ) -> tuple[str, str | None]:

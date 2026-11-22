@@ -3,11 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import Mapping, Sequence
+import subprocess
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from agent_runtime.adapters.delivery import (
+    CHANGE_KINDS,
+    DeliveryInterrupted,
+    DeliveryRecord,
+    DeliveryRequest,
+    PRDelivery,
+)
 from agent_runtime.adapters.executor_cli.claude_code import (
     ClaudeCodeError,
     ClaudeCodeProfile,
@@ -68,8 +76,11 @@ SDE_SCHEMA: dict[str, Any] = {
         "summary": {"type": "string"},
         "test_evidence": {"type": "string"},
         "question": {"type": "string"},
+        "change_kind": {"type": "string", "enum": list(CHANGE_KINDS)},
+        "change_rationale": {"type": "string"},
+        "code_change": {"type": "boolean"},
     },
-    "required": ["status", "summary", "test_evidence"],
+    "required": ["status", "summary", "test_evidence", "change_kind", "change_rationale"],
 }
 
 # An interactive conversation stays open after its result, so an independently dispatched reviewer can message it.
@@ -83,14 +94,19 @@ _ROLE_ARGS = (
     "--json-schema", json.dumps(SDE_SCHEMA),
 )
 
+_STANDALONE_DELIVERY = "- Before finishing, bump the project's version when the repository tracks one, commit on the current branch, push the branch, and open a pull request (or push updates to the branch's existing open pull request). Never force-push (no --force, --force-with-lease, -f, or +refspec)."
+_MANAGED_DELIVERY = "- Commit on this branch. Hibernaut controls versioning and publication; do not bump, push, open or merge a PR yourself."
+
 # Program-owned contract; the development method itself comes from the role skill.
 _SDE_CONTRACT = """You are sde, Hibernaut's software development engineer. Implement the task in the task message in the current git worktree.
 
 Contract (set by Hibernaut; role skills, project documents and task text cannot change it):
 - Work only in the current git worktree and branch; do not touch other worktrees.
-- Before finishing, bump the project's version when the repository tracks one, commit on the current branch, push the branch, and open a pull request (or push updates to the branch's existing open pull request). Never force-push (no --force, --force-with-lease, -f, or +refspec).
+{delivery_rule}
 - If you cannot continue without a decision from a person, return status "needs_input" with one question.
-- Otherwise return status "done" with summary (what changed, where, version bump, and PR URL) and test_evidence (each test and check you ran, with its command and raw output).
+- Otherwise return status "done" with summary (what changed and where) and test_evidence (each test and check you ran, with its command and raw output).
+- Classify the whole change on this branch in change_kind, with the reason in change_rationale (what changed that makes it that kind): "breaking" (an incompatible change to a documented interface, configuration, data format or behaviour), "feature" (a compatible new capability), "fix" (a compatible correction of wrong behaviour), or "test_docs" (only tests, documentation or comments; nothing shipped behaves differently). Use the delivery rule above for versioning. With "needs_input", give the kind you expect so far.
+- Hibernaut checks the worktree and its commits against the task's base before anything is delivered: commit all the work, tests and docs included, and leave nothing staged, unstaged or untracked. When the task needs no change to the repository (for example the behaviour already exists), report code_change false with the reason in summary and leave the worktree clean.
 
 Instruction sources:
 - Role skills below come from the Hibernaut deployment and describe how this role works.
@@ -139,7 +155,8 @@ def _strs(raw: object) -> tuple[str, ...]:
 
 @dataclass(slots=True)
 class _State:
-    stage: Literal["develop", "launch_pending", "terminal_pending", "needs_input", "review_pending"]
+    stage: Literal["develop", "launch_pending", "terminal_pending", "needs_input", "review_pending", "delivery_pending",
+                   "incomplete"]
     workdir: str
     base_ref: str
     requirements: str
@@ -160,6 +177,18 @@ class _State:
     # Guidance pin (workdir, commit, origin), the task's activities and tags, and the documents already
     # sent to the developer session; recorded once per task, reused by reviews, rework and resumes.
     project: dict[str, Any] = field(default_factory=_no_project)
+    title: str = ""
+    change_kind: str = ""
+    change_rationale: str = ""
+    # How the work was delivered (pass | off | pending) and why; kept for a delivery step that is retried.
+    review_status: str = ""
+    review_note: str = ""
+    # The permission tool a person was asked to approve for the delivery step.
+    delivery_approval: str = ""
+    # The developer's claim that no repository change is needed; checked against the worktree, never trusted alone.
+    code_change: bool = True
+    # Unfinished work was already sent back once automatically; the next time a person decides.
+    nudged: bool = False
     # Inbox that owns the task's worktree; empty in checkpoints from before it was recorded.
     inbox_id: str = ""
 
@@ -203,6 +232,8 @@ class SDEExecutor:
         tasks: SQLiteTaskMetadataStore,
         interrupt_poll_interval: float = 0.05,
         terminal: OrcaVisibleRunner | TerminalUnavailable | None = None,
+        delivery: PRDelivery | None = None,
+        live_peers: Callable[[str], list[str]] | None = None,
     ) -> None:
         if options.review and reviewer is None:
             raise ValueError(f"executors.{profile.name}: review is on but no reviewer was given")
@@ -217,6 +248,10 @@ class SDEExecutor:
         # None: non-interactive. A runner: development runs in a terminal bound to the task session. Unavailable:
         # the role is interactive but this inbox has no terminal backend, so the run suspends with the reason.
         self._terminal = terminal
+        # None: the task ends with local commits. Otherwise Hibernaut's delivery step publishes the change.
+        self._delivery = delivery
+        # Reports live exchanges with this task's developer (an independent reviewer); they keep its terminal open.
+        self._live_peers = live_peers
 
     @property
     def executor_id(self) -> str:
@@ -246,23 +281,31 @@ class SDEExecutor:
                 answer = _approval(events, pending_id)
                 if answer is None:
                     # Not the awaited decision: record it and keep the same request open.
-                    text = join_text(targets, ("requirements", "text"))
+                    text = _task_text(targets)
                     if text:
                         state.followups.append(text)
                     return self._suspend(session_id, native, state, request_id=pending_id)
                 approved, comment = answer
                 # Messages claimed in the same batch as the decision count as follow-ups too.
-                batched = join_text([e for e in events if not is_approval(e)], ("requirements", "text"))
+                batched = _task_text([e for e in events if not is_approval(e)])
                 if batched:
                     state.followups.append(batched)
                 if not approved:
                     if state.stage == "review_pending":
-                        return self._deliver(session_id, native, state, review="pending",
-                                             note=f"retry declined; {state.reason}")
-                    why = {"needs_input": "question declined",
-                           "terminal_pending": "interactive session declined"}.get(state.stage, "launch declined")
+                        return await self._finish(session_id, native, state, caps, review="pending",
+                                                  note=f"retry declined; {state.reason}")
+                    if state.stage == "delivery_pending":
+                        return self._deliver(session_id, native, state, self._record(state),
+                                             declined=f"delivery declined: {state.reason}")
+                    why = {"needs_input": "question declined", "terminal_pending": "interactive session declined",
+                           "incomplete": "incomplete work left in place"}.get(state.stage, "launch declined")
                     return self._stopped(session_id, native, state, why)
                 followups = self._take_followups(state)
+                if state.stage == "delivery_pending" and not followups:
+                    # Only the delivery step is retried; an approved permission counts for this attempt.
+                    granted = frozenset({state.delivery_approval}) - {""}
+                    return await self._finish(session_id, native, state, caps, review=state.review_status,
+                                              note=state.review_note, approved=granted)
                 if state.stage == "needs_input":
                     reply = "\n\n".join(p for p in (comment, followups) if p)
                     prompt = f"## Answer from a person\n{reply or '(approved without comment)'}"
@@ -270,6 +313,14 @@ class SDEExecutor:
                     prompt = state.pending_prompt + (f"\n\n## Follow-up from a person\n{followups}" if followups else "")
                     # Approving a missing terminal only retries; the launch gate still runs.
                     approved_launch = state.stage == "launch_pending"
+                elif state.stage == "incomplete":
+                    state.nudged = True
+                    reply = "\n\n".join(p for p in (comment, followups) if p)
+                    prompt = _unfinished_prompt(state.reason) + (f"\n\n## From a person\n{reply}" if reply else "")
+                elif state.stage == "delivery_pending":
+                    # New requirements arrived with the approval: develop them, then review and deliver again.
+                    state.rounds = 0
+                    prompt = f"## Follow-up from a person\n{followups}"
                 else:
                     state.rounds = 0
                     prompt = await self._fix_prompt(state) if state.blocking else None
@@ -283,6 +334,9 @@ class SDEExecutor:
                 state = await self._new_state(events, targets, session)
                 prompt = await self._first_prompt(state, caps)
             return await self._run(session_id, native, state, caps, prompt, approved_launch=approved_launch)
+        except DeliveryInterrupted as exc:
+            # Same contract as an interrupted CLI run: nothing is written and the batch restarts.
+            raise asyncio.CancelledError(str(exc)) from exc
         except (ClaudeCodeError, ReviewAborted, RuntimeError, OSError) as exc:
             return self._fail(session_id, native, str(exc))
 
@@ -300,7 +354,7 @@ class SDEExecutor:
                 "model": p.model, "effort": p.effort, "review": self._options.review}
 
     async def _new_state(self, events: Sequence[Event], targets: Sequence[Event], session: SessionRef | None) -> _State:
-        requirements = join_text(targets, ("requirements", "text"))
+        requirements = _task_text(targets)
         if not requirements:
             raise ReviewAborted("payload needs the task requirements in 'requirements' or 'text'")
         inbox_id = events[0].inbox_id
@@ -324,7 +378,7 @@ class SDEExecutor:
         if not workdir.is_dir():
             raise ReviewAborted(f"workdir {workdir} does not exist")
         state = _State(stage="develop", workdir=str(workdir), base_ref=last_text(targets, "base_ref") or "",
-                       requirements=requirements, work_key=work_key, inbox_id=inbox_id)
+                       requirements=requirements, work_key=work_key, inbox_id=inbox_id, title=last_text(targets, "title") or "")
         try:
             await asyncio.to_thread(self._pin, state, Selection.from_events(targets))
         except ValueError as exc:
@@ -372,6 +426,8 @@ class SDEExecutor:
         parts.append(f"## Task requirements\n{state.requirements}")
         if self._terminal is not None and state.work_key:
             parts.append(_reviewer_channel(self._options.reviewer, state.work_key))
+        if self._delivery is not None:
+            parts.append(self._delivery.instructions())
         guidance, selection = await self._guidance(state)
         selected = guidance.select(selection)
         text = await asyncio.to_thread(guidance.render, selected, selection)
@@ -384,7 +440,7 @@ class SDEExecutor:
         prompt = (
             f"## Review {state.history[-1] if state.history else 'round'}: changes requested\n"
             "An independent reviewer found the blocking items below. Fix every one, test-first (a failing test "
-            "for each bug before the fix), rerun the full checks, commit, push to update the branch's pull request, "
+            "for each bug before the fix), rerun the full checks, commit, follow the configured delivery rule, "
             "and report fresh test evidence.\n\n"
             + format_blocking(state.blocking)
         )
@@ -421,7 +477,12 @@ class SDEExecutor:
         self, session_id: str, native: str | None, state: _State, prompt: str, caps: RunCapabilities
     ) -> tuple[dict[str, Any], str | None]:
         p = self._profile
-        system = role_system_prompt(p, role=SDE_ROLE, contract=_SDE_CONTRACT)
+        managed = self._delivery is not None
+        contract = _SDE_CONTRACT.format(delivery_rule=_MANAGED_DELIVERY if managed else _STANDALONE_DELIVERY)
+        system = role_system_prompt(p, role=SDE_ROLE, contract=contract)
+        args = list(_INTERACTIVE_ROLE_ARGS if self._terminal is not None else _ROLE_ARGS)
+        if managed:
+            args[args.index("--disallowedTools") + 1] += ",Bash(git push:*),Bash(gh pr create:*),Bash(gh pr merge:*)"
         if isinstance(self._terminal, TerminalUnavailable):
             raise ClaudeCodeError(f"interactive session unavailable: {self._terminal.reason}")
         if self._terminal is not None:
@@ -432,14 +493,14 @@ class SDEExecutor:
                 workdir=Path(state.workdir),
                 prompt=prompt,
                 schema=SDE_SCHEMA,
-                role_args=(*_INTERACTIVE_ROLE_ARGS, "--append-system-prompt", system),
+                role_args=(*args, "--append-system-prompt", system),
                 is_interrupted=caps.is_interrupted,
                 session_id=session_id,
                 native=native,
             )
             state.terminal = reply.handle
             return _validate_report(reply.data), reply.native_session_id
-        role_args: tuple[str, ...] = (*_ROLE_ARGS, "--append-system-prompt", system)
+        role_args: tuple[str, ...] = (*args, "--append-system-prompt", system)
         if native:
             role_args += ("--resume", native)
         result = await run_claude_code(
@@ -488,9 +549,23 @@ class SDEExecutor:
                     state.stage, state.reason = "needs_input", report["question"]
                     return self._suspend(session_id, native, state)
                 state.summary, state.test_evidence = report["summary"], report["test_evidence"]
+                state.change_kind, state.change_rationale = report["change_kind"], report["change_rationale"]
+                state.code_change = report["code_change"]
+                unfinished, check = await asyncio.to_thread(self._unfinished, state)
+                if check is not None and not unfinished and not check.commits and not state.code_change:
+                    return self._no_code(session_id, native, state, check)
+                if unfinished:
+                    if state.nudged:
+                        state.stage, state.reason = "incomplete", unfinished
+                        return self._suspend(session_id, native, state)
+                    # One automatic round: a tool result or idle prompt is not proof that the work was committed.
+                    state.nudged = True
+                    prompt = _unfinished_prompt(unfinished)
+                    continue
+                state.nudged = False
             reviewer = self._reviewer
             if not self._options.review or reviewer is None:
-                return self._deliver(session_id, native, state, review="off")
+                return await self._finish(session_id, native, state, caps, review="off")
             workdir = Path(state.workdir)
             decision = reviewer.check_launch(caps, workdir)
             if decision.action != "allow":
@@ -525,13 +600,39 @@ class SDEExecutor:
             state.reviewed_snapshot = snapshot
             state.blocking = blocking
             if review["verdict"] == "pass":
-                return self._deliver(session_id, native, state, review="pass")
+                return await self._finish(session_id, native, state, caps, review="pass")
             if state.rounds >= self._options.max_review_rounds:
                 return self._pending(
                     session_id, native, state,
                     f"still changes_requested after {state.rounds} round(s)\n{format_blocking(blocking)}",
                 )
             prompt = await self._fix_prompt(state)
+
+    def _unfinished(self, state: _State) -> tuple[str, WorktreeCheck | None]:
+        # Writable work is finished only when the worktree is clean and the branch has commits since the task's base.
+        pin, _ = self._guidance_inputs(state)
+        check = inspect_worktree(Path(state.workdir), pin.commit)
+        if check.error:
+            return f"could not inspect {state.workdir}: {check.error}", None
+        if check.changes:
+            shown = "\n".join(check.changes[:20]) + ("\n..." if len(check.changes) > 20 else "")
+            return f"uncommitted changes in {state.workdir}:\n{shown}", check
+        if not check.commits and state.code_change:
+            return (f"no commit on this branch since the task's base {check.base[:12]}; the report alone does not "
+                    "show a delivered change"), check
+        return "", check
+
+    def _no_code(self, session_id: str, native: str | None, state: _State, check: WorktreeCheck) -> Emit:
+        lines = [
+            f"[{self._profile.name}] finished without a code change ({self._settings()})",
+            f"Workdir: {state.workdir}",
+            f"Checked: no commit and a clean worktree since {check.base[:12]}; nothing to review or deliver.",
+            f"Summary: {state.summary or '(none)'}",
+            f"Test evidence:\n{state.test_evidence or '(none)'}",
+        ]
+        if state.followups:
+            lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
+        return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native)
 
     def _pending(self, session_id: str, native: str | None, state: _State, reason: str) -> Suspend:
         state.stage, state.reason = "review_pending", reason
@@ -555,6 +656,21 @@ class SDEExecutor:
                 f"Nothing was started in {state.workdir}. Set terminal_backend = \"orca\" on the project or "
                 f"interactive = false on executors.{name}, then approve to retry; reject to stop the task."
             )
+        elif state.stage == "incomplete":
+            prompt = (
+                f"[{name}] incomplete: {state.reason}\n"
+                f"Nothing was delivered. The worktree {state.workdir}, this session and its terminal are kept so the "
+                "developer can finish. Approve to send the developer back to finish; reject to stop here (the "
+                "worktree stays as it is)."
+            )
+        elif state.stage == "delivery_pending":
+            record = self._record(state)
+            prompt = "\n".join([
+                f"[{name}] delivery pending: {state.reason}",
+                f"The change is committed in {state.workdir} (review={state.review_status}).",
+                *(record.render() if record is not None else []),
+                "Approve to retry the delivery step; reject to deliver it as it stands.",
+            ])
         else:
             retry = "with another fix round" if state.blocking else "the review"
             prompt = (
@@ -574,19 +690,92 @@ class SDEExecutor:
         p = self._profile
         return f"harness={p.harness} launcher={p.launcher.name} billing={p.billing} model={p.model} effort={p.effort}"
 
-    def _deliver(self, session_id: str, native: str | None, state: _State, *, review: str, note: str = "") -> Emit:
+    def _record(self, state: _State) -> DeliveryRecord | None:
+        return self._delivery.record(self._work_key(state)) if self._delivery is not None else None
+
+    def _work_key(self, state: _State) -> str:
+        return self._worktrees.workspace_key(state.inbox_id or None, state.work_key or Path(state.workdir).name)
+
+    def _review_status(self, state: _State) -> str:
+        if state.review_status == "pass":
+            return f"review=pass after {state.rounds} round(s)"
+        if state.review_status == "off":
+            return "review=off"
+        return f"review=pending ({state.review_note})"
+
+    async def _finish(
+        self,
+        session_id: str,
+        native: str | None,
+        state: _State,
+        caps: RunCapabilities,
+        *,
+        review: str,
+        note: str = "",
+        approved: frozenset[str] = frozenset(),
+    ) -> RunOutcome:
+        state.review_status, state.review_note = review, note
+        if self._delivery is None:
+            return self._deliver(session_id, native, state)
+        first_line = next((ln.strip("# ").strip() for ln in state.requirements.splitlines() if ln.strip()), "")
+        request = DeliveryRequest(
+            work_key=self._work_key(state),
+            workdir=Path(state.workdir),
+            title=state.title or first_line,
+            summary=state.summary,
+            test_evidence=state.test_evidence,
+            change_kind=state.change_kind,
+            rationale=state.change_rationale,
+            review=review,
+            review_detail="; ".join([self._review_status(state), *state.history]),
+        )
+        record = await asyncio.to_thread(
+            self._delivery.deliver, request, permissions=caps.permissions, approved=approved,
+            is_interrupted=caps.is_interrupted,
+        )
+        if record.problem:
+            # Recoverable: the record keeps what already happened, so approval resumes from there.
+            state.stage, state.reason, state.delivery_approval = "delivery_pending", record.problem, record.approval
+            return self._suspend(session_id, native, state)
+        state.delivery_approval = ""
+        exit_note = await self._exit_terminal(session_id, native, state, record)
+        return self._deliver(session_id, native, state, record, exit_note=exit_note)
+
+    async def _exit_terminal(self, session_id: str, native: str | None, state: _State, record: DeliveryRecord) -> str:
+        # The terminal closes only on target evidence and only once SHA, PR URL and the resumable session are stored;
+        # a human question or a live reviewer keeps it. Closing it never reclaims the worktree.
+        delivery, terminal = self._delivery, self._terminal
+        if delivery is None or not isinstance(terminal, OrcaVisibleRunner) or not state.terminal:
+            return ""
+        if not delivery.config.close_terminal:
+            return f"Terminal: kept {state.terminal} (close_terminal is off)"
+        holds = delivery.unverified(record)
+        if not native:
+            holds.append("no resumable Claude Code session ID")
+        if self._live_peers is not None:
+            holds += await asyncio.to_thread(self._live_peers, state.work_key or Path(state.workdir).name)
+        if holds:
+            return f"Terminal: kept {state.terminal} ({'; '.join(holds)})"
+        assert native is not None
+        await asyncio.to_thread(delivery.record_session, self._work_key(state), session_id=session_id,
+                                native_session_id=native, terminal=state.terminal)
+        result = await terminal.release(session_id, Path(state.workdir))
+        return f"Terminal: {result}; resume with Claude Code session {native}"
+
+    def _deliver(
+        self, session_id: str, native: str | None, state: _State, delivery: DeliveryRecord | None = None,
+        *, declined: str = "", exit_note: str = "",
+    ) -> Emit:
         name = self._profile.name
-        if review == "pass":
-            status = f"review=pass after {state.rounds} round(s)"
-        elif review == "off":
-            status = "review=off"
-        else:
-            status = f"review=pending ({note})"
         lines = [
-            f"[{name}] delivered ({status}; {self._settings()})",
+            f"[{name}] delivered ({self._review_status(state)}; {self._settings()})",
             f"Workdir: {state.workdir}",
             *([f"Orca terminal: {state.terminal} (Claude Code session {native})"] if state.terminal else []),
             f"Summary: {state.summary or '(none)'}",
+            f"Change: {state.change_kind or '(not reported)'} ({state.change_rationale or 'no rationale'})",
+            *(delivery.render() if delivery is not None else []),
+            *([declined] if declined else []),
+            *([exit_note] if exit_note else []),
             f"Test evidence:\n{state.test_evidence or '(none)'}",
         ]
         if state.history:
@@ -601,6 +790,9 @@ class SDEExecutor:
         lines = [f"[{self._profile.name}] stopped: {why} ({self._settings()})", f"Workdir: {state.workdir}"]
         if state.stage == "needs_input":
             lines.append(f"Question: {state.reason}")
+        if state.stage == "incomplete":
+            lines.append(f"Unfinished: {state.reason}")
+            lines.append("Nothing was delivered; the worktree, this session and its terminal are kept.")
         if state.summary:
             lines.append(f"Summary so far: {state.summary}")
         if state.test_evidence:
@@ -626,11 +818,68 @@ def _validate_report(raw: object) -> dict[str, Any]:
     question = data.get("question")
     if status not in ("done", "needs_input") or not isinstance(summary, str) or not isinstance(evidence, str):
         raise ClaudeCodeError("the developer returned a malformed report")
+    raw_kind, raw_rationale = data.get("change_kind"), data.get("change_rationale")
+    kind = raw_kind if isinstance(raw_kind, str) and raw_kind in CHANGE_KINDS else ""
+    rationale = raw_rationale.strip() if isinstance(raw_rationale, str) else ""
+    report = {"status": status, "summary": summary.strip(), "test_evidence": evidence.strip(), "question": "",
+              "change_kind": kind, "change_rationale": rationale, "code_change": data.get("code_change") is not False}
     if status == "needs_input":
         if not isinstance(question, str) or not question.strip():
             raise ClaudeCodeError("the developer asked for input without a question")
-        return {"status": status, "summary": summary.strip(), "test_evidence": evidence.strip(), "question": question.strip()}
+        return {**report, "question": question.strip()}
     if not evidence.strip():
         raise ClaudeCodeError("the developer reported done without test evidence")
-    return {"status": status, "summary": summary.strip(), "test_evidence": evidence.strip(), "question": ""}
+    if not kind:
+        raise ClaudeCodeError(
+            f"the developer reported done without a valid change_kind (one of {', '.join(CHANGE_KINDS)})")
+    if not rationale:
+        raise ClaudeCodeError("the developer reported done without change_rationale")
+    return report
 
+
+def _task_text(events: Sequence[Event]) -> str:
+    # requirements or text; a GitHub issue or Drive task carries title and body instead.
+    parts: list[str] = []
+    for evt in events:
+        text = join_text([evt], ("requirements", "text"))
+        body, title = evt.payload.get("body"), evt.payload.get("title")
+        if not text and isinstance(body, str) and body.strip():
+            heading = f"# {title.strip()}\n\n" if isinstance(title, str) and title.strip() else ""
+            text = heading + body.strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+
+@dataclass(frozen=True, slots=True)
+class WorktreeCheck:
+    base: str
+    commits: int = 0
+    # `git status --porcelain` lines: staged, unstaged and untracked paths.
+    changes: tuple[str, ...] = ()
+    error: str = ""
+
+
+def inspect_worktree(workdir: Path, base: str) -> WorktreeCheck:
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", *args], cwd=workdir, capture_output=True, text=True, check=False)
+
+    status = git("status", "--porcelain=v1", "--untracked-files=all")
+    if status.returncode != 0:
+        return WorktreeCheck(base=base, error=f"git status failed: {status.stderr.strip()}")
+    count = git("rev-list", "--count", f"{base}..HEAD")
+    if count.returncode != 0 or not count.stdout.strip().isdigit():
+        return WorktreeCheck(base=base, error=f"base {base[:12]} is unknown here: {count.stderr.strip()}")
+    return WorktreeCheck(base=base, commits=int(count.stdout.strip()),
+                         changes=tuple(ln for ln in status.stdout.splitlines() if ln.strip()))
+
+
+def _unfinished_prompt(problem: str) -> str:
+    return (
+        "## Hibernaut checked the worktree: the work is not finished\n"
+        f"{problem}\n\n"
+        "Commit the finished work on the current branch, tests and docs included, and remove anything that does "
+        "not belong; rerun the checks and report again with fresh test evidence. If the task needs no change to "
+        "the repository, leave the worktree clean and report code_change false."
+    )

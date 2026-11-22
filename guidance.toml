@@ -1,0 +1,9 @@
+# Catalog of Hibernaut's detailed process documents. AGENTS.md (always included) holds the general rules;
+# a task receives a document below only when its activities, tags/labels or (for a review) its diff match.
+
+[[docs]]
+path = "docs/process/versioning.md"
+summary = "Version numbers, change kinds and how a delivery sets the version"
+activities = ["versioning", "release"]
+tags = ["version", "release"]
+paths = ["src/agent_runtime/__init__.py", "pyproject.toml"]

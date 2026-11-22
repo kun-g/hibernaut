@@ -57,6 +57,8 @@ pyright
 
 ## 6. 文档增量协作闭环规范
 
+- **详细流程文档**：登记在 [`guidance.toml`](guidance.toml)，按任务的 `activities` / 标签选取（如版本规则 [`docs/process/versioning.md`](docs/process/versioning.md)：`versioning`、`release`）。SDE 不改 `__version__`，交付回执报 `change_kind` 与理由，版本由 Hibernaut 交付步骤决定。
+
 - **Drive 基准只读**：Google Drive 原基准设计文档《Always-on Agent 整洁架构设计方案（Task 交接文档）》保持只读不动，不直接覆写。
 - **增量追踪**：新增架构讨论与待落地改动先记录在 Google Drive《Always-on Agent 架构增量变更（待落地）》。
 - **Git 文档同步与闭环清理**：**代码落地时必须同步更新仓库内的 `docs/architecture.md` 与 `README.md`**；待三道门禁全绿、推送至 `main` 并经确认后，再从 Drive《Always-on Agent 架构增量变更（待落地）》中清空已落地条目。
