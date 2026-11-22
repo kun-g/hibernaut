@@ -23,6 +23,7 @@ from agent_runtime.adapters.channels import (
     DriveResultWriter,
     DriveTaskPoller,
     FeishuWebhookAdapter,
+    FileOutboxChannel,
     GitHubIssuePoller,
     GitHubWebhookAdapter,
     MCPServerAdapter,
@@ -30,6 +31,7 @@ from agent_runtime.adapters.channels import (
     ProxiedDriveClient,
     WebhookHTTPServer,
     build_feishu_or_console_channel,
+    local_events_url,
 )
 from agent_runtime.adapters.channels.channels import webhook_request_handler
 from agent_runtime.adapters.channels.switchboard_bridge import SwitchboardChannelAdapter, SwitchboardInboundBridge
@@ -414,6 +416,8 @@ def build_daemon(
     gdrive_failed_folder_id: str | None = None,
     gdrive_poll_interval_seconds: float = 30.0,
     gdrive_default_inbox_id: str = "default",
+    outbox_dir: str | Path | None = None,
+    approval_events_url: str = "http://127.0.0.1:8080/events",
 ) -> AlwaysOnDaemon:
     db = database if database is not None else SQLiteDatabase(db_path)
     inbox = SQLiteInboxAdapter(db)
@@ -424,7 +428,9 @@ def build_daemon(
     workspaces = SQLiteWorkspaceStore(db)
     partitions = WorkspacePartitionRegistry(memory_root)
     permissions = AutoModePermissionAdapter()
-    resolved_channel: ChannelPort = channel if channel is not None else ConsoleChannelAdapter()
+    resolved_channel: ChannelPort = (
+        channel if channel is not None else ConsoleChannelAdapter(echo=outbox_dir is None)
+    )
 
     def _send_email_tool(args: dict[str, Any], _caps: RunCapabilities) -> str:
         return f"Email sent to {args.get('to')} (subject={args.get('subject')})"
@@ -497,6 +503,9 @@ def build_daemon(
             failed_folder_id=gdrive_failed_folder_id or None,
         )
         resolved_channel = gdrive_writer
+    if outbox_dir is not None:
+        # Outermost: the file is written first, then every existing channel gets the message unchanged.
+        resolved_channel = FileOutboxChannel(outbox_dir, resolved_channel, events_url=approval_events_url)
 
     def _on_reports(reports: list[RunReport]) -> None:
         if gdrive_writer is None:
@@ -623,6 +632,7 @@ def build_daemon_from_config(
         app_secret_env=config.channels.feishu_app_secret_env,
         default_chat_id=config.channels.feishu_default_chat_id or None,
         inbox_chat_map=inbox_chat_map,
+        console_echo=not config.channels.outbox_dir,
     )
     if switchboard is not None:
         # Replies with an origin go out through the Switchboard gateway; session-less notices keep the old channel.
@@ -685,6 +695,8 @@ def build_daemon_from_config(
         gdrive_failed_folder_id=config.gdrive.failed_folder_id or None,
         gdrive_poll_interval_seconds=config.gdrive.poll_interval_seconds,
         gdrive_default_inbox_id=config.gdrive.default_inbox_id,
+        outbox_dir=config.channels.outbox_dir or None,
+        approval_events_url=local_events_url(config.channels.host, config.channels.port),
     )
 
     if has_configured_executor and not demo:

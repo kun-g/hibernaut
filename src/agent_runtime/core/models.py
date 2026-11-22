@@ -12,6 +12,12 @@ TimerStatus: TypeAlias = Literal["pending", "done", "cancelled"]
 OutboxStatus: TypeAlias = Literal["pending", "sent", "failed"]
 PermissionAction: TypeAlias = Literal["allow", "block", "defer"]
 NewEventPolicy: TypeAlias = Literal["defer", "fold", "interrupt"]
+# How an Emit ended, as the executor states it; channels never infer it from the message text.
+EmitStatus: TypeAlias = Literal["done", "failed", "stopped", "refused"]
+EMIT_STATUSES: tuple[EmitStatus, ...] = ("done", "failed", "stopped", "refused")
+# Outbox metadata key the worker fills with {title, source, executor_id, status}; status is an EmitStatus or
+# "awaiting_approval". Nested so channels that pass top-level keys on are unaffected.
+TASK_CONTEXT_KEY = "task_context"
 
 
 def utc_now_iso() -> str:
@@ -117,6 +123,7 @@ class Emit:
     messages: tuple[str, ...]
     session_id: str | None = None
     executor_session_id: str | None = None
+    status: EmitStatus = "done"
 
 
 @dataclass(frozen=True, slots=True)

@@ -9,6 +9,14 @@ from agent_runtime.adapters.channels.feishu_channel import (
     build_feishu_or_console_channel,
 )
 from agent_runtime.adapters.channels.feishu_webhook import FeishuWebhookAdapter
+from agent_runtime.adapters.channels.file_outbox import (
+    FileOutboxChannel,
+    OutboxContext,
+    local_events_url,
+    outbox_context,
+    render_header,
+    render_summary,
+)
 from agent_runtime.adapters.channels.gdrive_tasks import (
     DriveClientProtocol,
     DriveFileMeta,
@@ -34,9 +42,11 @@ __all__ = [
     "DriveTaskPoller",
     "FeishuChannelAdapter",
     "FeishuWebhookAdapter",
+    "FileOutboxChannel",
     "GitHubIssuePoller",
     "GitHubWebhookAdapter",
     "MCPServerAdapter",
+    "OutboxContext",
     "PollTarget",
     "ProxiedDriveClient",
     "WebhookChannelAdapter",
@@ -44,5 +54,9 @@ __all__ = [
     "WebhookResponse",
     "build_feishu_or_console_channel",
     "create_webhook_server",
+    "local_events_url",
+    "outbox_context",
     "parse_task_markdown",
+    "render_header",
+    "render_summary",
 ]

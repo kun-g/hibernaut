@@ -113,6 +113,7 @@ class LocalCLIExecutor:
             return Emit(
                 messages=(f"[LocalCLIExecutor] No primary checkout configured for '{inbox_id}'",),
                 session_id=session_id,
+                status="failed",
             )
 
         try:
@@ -124,7 +125,7 @@ class LocalCLIExecutor:
                 inbox_id=inbox_id,
             )
         except WorkspaceIsolationError as exc:
-            return Emit(messages=(f"[LocalCLIExecutor] refused: {exc}",), session_id=session_id)
+            return Emit(messages=(f"[LocalCLIExecutor] refused: {exc}",), session_id=session_id, status="refused")
 
         executor_name = self._extract_executor(targets) or self._default_executor
         template = self._templates.get(executor_name)
@@ -132,6 +133,7 @@ class LocalCLIExecutor:
             return Emit(
                 messages=(f"[LocalCLIExecutor] Unknown CLI template '{executor_name}'",),
                 session_id=session_id,
+                status="failed",
             )
 
         prompt = self._build_prompt(events, session, caps)
@@ -177,6 +179,7 @@ class LocalCLIExecutor:
             return Emit(
                 messages=(f"[CLI:{template.name} exit={returncode}] {detail}",),
                 session_id=session_id,
+                status="failed",
             )
 
         return self._parse_outcome(stdout, session_id=session_id)

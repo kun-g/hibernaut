@@ -68,7 +68,9 @@ class WebhookHTTPServer(ThreadingHTTPServer):
 
 
 class ConsoleChannelAdapter:
-    def __init__(self) -> None:
+    # echo=False when a file Outbox prints the one-line summary instead of the full text.
+    def __init__(self, *, echo: bool = True) -> None:
+        self.echo = echo
         self.delivered: list[tuple[str, str, dict[str, Any]]] = []
 
     async def send(
@@ -78,6 +80,8 @@ class ConsoleChannelAdapter:
         metadata: dict[str, Any],
     ) -> None:
         self.delivered.append((inbox_id, content, dict(metadata)))
+        if not self.echo:
+            return
         kind = metadata.get("kind", "emit")
         print(f"[OUTBOX:{kind}] inbox={inbox_id} | {content}")
 

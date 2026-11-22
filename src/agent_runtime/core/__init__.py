@@ -1,5 +1,7 @@
 from agent_runtime.core.models import (
+    EMIT_STATUSES,
     Emit,
+    EmitStatus,
     Event,
     EventStatus,
     NewEventPolicy,
@@ -30,7 +32,9 @@ from agent_runtime.core.ports import (
 
 __all__ = [
     "ChannelPort",
+    "EMIT_STATUSES",
     "Emit",
+    "EmitStatus",
     "Event",
     "EventStatus",
     "ExecutorPort",

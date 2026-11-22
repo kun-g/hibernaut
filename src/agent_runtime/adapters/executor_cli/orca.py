@@ -429,7 +429,7 @@ class OrcaVisibleRunner:
     ) -> RunOutcome:
         decision = caps.permissions.check("orca.agent.launch", {"agent": agent, "workdir": str(workdir), "prompt": prompt})
         if decision.action == "block":
-            return Emit(messages=(decision.reason,), session_id=session_id)
+            return Emit(messages=(decision.reason,), session_id=session_id, status="refused")
         if decision.action == "defer":
             return Suspend(request_id=new_id("req"), prompt=decision.reason, session_checkpoint="{}", session_id=session_id)
 
@@ -437,7 +437,8 @@ class OrcaVisibleRunner:
         if session is not None and session.pending_request_id and session.checkpoint == UNCONFIRMED_CHECKPOINT:
             answer = _approval(events, session.pending_request_id)
             if answer is False:
-                return Emit(messages=("Continuation declined; no new conversation was started.",), session_id=session_id)
+                return Emit(messages=("Continuation declined; no new conversation was started.",), session_id=session_id,
+                            status="stopped")
             approved_fresh = answer is True
         try:
             plan = _Plan("launch") if approved_fresh else await self._plan(executor_id, agent, workdir, session)
