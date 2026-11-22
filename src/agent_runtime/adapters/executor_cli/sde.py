@@ -39,8 +39,10 @@ from agent_runtime.adapters.executor_cli.project_guidance import (
     resolve_commit,
 )
 from agent_runtime.adapters.executor_cli.reviewer import (
+    CODE_REVIEWER_ROLE,
     CoderReviewerExecutor,
     ReviewAborted,
+    Reviewer,
     ReviewRequest,
     format_blocking,
     review_title,
@@ -116,7 +118,7 @@ Instruction sources:
 def _reviewer_channel(reviewer: str, work_key: str) -> str:
     sender = review_title(reviewer, work_key)
     return f"""## Reviewer channel
-An independent coder-reviewer, dispatched as its own task, may review this work and message you through Claude \
+An independent {CODE_REVIEWER_ROLE}, dispatched as its own task, may review this work and message you through Claude \
 Code's SendMessage, during this turn or after it. Its messages arrive as \
 <cross-session-message from="uds:..." from-name="{sender}">. Each review is a separate session, so there may be \
 several, one after another.
@@ -133,7 +135,7 @@ Acknowledge a defect it finds; the fix comes with the next task or answer from a
 @dataclass(frozen=True, slots=True)
 class SDEOptions:
     review: bool = True
-    reviewer: str = "coder-reviewer"
+    reviewer: str = CODE_REVIEWER_ROLE
     max_review_rounds: int = 3
 
 
@@ -226,7 +228,7 @@ class SDEExecutor:
         *,
         profile: ClaudeCodeProfile,
         options: SDEOptions,
-        reviewer: CoderReviewerExecutor | None,
+        reviewer: Reviewer | None,
         worktree_manager: OrcaWorktreeManager,
         inbox_checkout_map: Mapping[str, str | Path],
         tasks: SQLiteTaskMetadataStore,
@@ -234,6 +236,7 @@ class SDEExecutor:
         terminal: OrcaVisibleRunner | TerminalUnavailable | None = None,
         delivery: PRDelivery | None = None,
         live_peers: Callable[[str], list[str]] | None = None,
+        peer_reviewer: str | None = None,
     ) -> None:
         if options.review and reviewer is None:
             raise ValueError(f"executors.{profile.name}: review is on but no reviewer was given")
@@ -252,6 +255,10 @@ class SDEExecutor:
         self._delivery = delivery
         # Reports live exchanges with this task's developer (an independent reviewer); they keep its terminal open.
         self._live_peers = live_peers
+        # The code-reviewer executor whose independently dispatched reviews may message this developer.
+        self._peer_reviewer = peer_reviewer or (
+            reviewer.executor_id if isinstance(reviewer, CoderReviewerExecutor) else options.reviewer
+        )
 
     @property
     def executor_id(self) -> str:
@@ -425,7 +432,7 @@ class SDEExecutor:
                 parts.append(f"## {name}\n{text}")
         parts.append(f"## Task requirements\n{state.requirements}")
         if self._terminal is not None and state.work_key:
-            parts.append(_reviewer_channel(self._options.reviewer, state.work_key))
+            parts.append(_reviewer_channel(self._peer_reviewer, state.work_key))
         if self._delivery is not None:
             parts.append(self._delivery.instructions())
         guidance, selection = await self._guidance(state)

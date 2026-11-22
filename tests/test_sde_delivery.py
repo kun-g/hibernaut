@@ -236,7 +236,7 @@ class TestProjectAdoption(unittest.TestCase):
         sde_event = json.loads((REPO / "docs/dispatch/sde-task.json").read_text(encoding="utf-8"))
         self.assertEqual(sde_event["payload"]["executor_id"], "sde")
         review_event = json.loads((REPO / "docs/dispatch/review-task.json").read_text(encoding="utf-8"))
-        self.assertEqual(review_event["payload"]["executor_id"], "coder-reviewer")
+        self.assertEqual(review_event["payload"]["executor_id"], "code-reviewer")
         readme = (REPO / "README.md").read_text(encoding="utf-8")
         self.assertIn("executor_id: sde", readme)
 

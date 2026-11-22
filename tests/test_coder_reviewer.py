@@ -117,7 +117,8 @@ class TestReviewerProfile(unittest.TestCase):
         cfg = parse_config({"executors": {"coder-reviewer": {"role": "coder-reviewer"}}})
         role = cfg.roles["coder-reviewer"]
         profile = role.profile
-        self.assertEqual(role.role, "coder-reviewer")
+        # The old role name is the same role under its current name.
+        self.assertEqual(role.role, "code-reviewer")
         self.assertEqual(
             (profile.harness, profile.launcher.name, profile.launcher.command, profile.billing, profile.model, profile.effort),
             ("claude-code", "claude", "claude", "subscription", "claude-opus-5-5", "high"),
@@ -377,7 +378,7 @@ class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
 
     async def test_permission_gate_runs_before_launch(self):
         self.caps.permissions = InMemoryPermission(
-            {"coder_reviewer.launch": PermissionDecision(action="defer", reason="approve review")}
+            {"code_reviewer.launch": PermissionDecision(action="defer", reason="approve review")}
         )
         outcome = await self.executor().execute([event(self.payload())], None, self.caps)
         self.assertIsInstance(outcome, Suspend)

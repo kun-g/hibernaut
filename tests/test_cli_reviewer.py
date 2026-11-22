@@ -1,0 +1,326 @@
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from agent_runtime.adapters.delivery import MERGE_TOOL
+from agent_runtime.adapters.executor_cli import CLIReviewer, CLITemplate, CoderReviewerExecutor, OrcaWorktreeManager
+from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
+from agent_runtime.adapters.executor_cli.project_guidance import pin_head
+from agent_runtime.adapters.executor_cli.reviewer import ReviewAborted, ReviewRequest
+from agent_runtime.adapters.executor_cli.role_skills import builtin_skill
+from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions
+from agent_runtime.adapters.permissions import AutoModePermissionAdapter
+from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteSessionStoreAdapter
+from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
+from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
+from agent_runtime.app.config import parse_config
+from agent_runtime.app.main import build_daemon_from_config
+from agent_runtime.core.models import Emit, Event, PermissionDecision
+from tests.fakes import InMemoryPermission
+from tests.test_coder_reviewer import CHANGES_REQUESTED, fake_command, make_repo
+from tests.test_pr_delivery import DeliveryCase
+
+FAKE_CLI = Path(__file__).with_name("fake_cli_reviewer.py")
+PASS = {"verdict": "pass", "summary": "zero is rejected", "blocking": []}
+EVIDENCE = "red: test_zero FAILED\ngreen: 4 passed"
+
+
+def cli_command(root: Path) -> str:
+    script = root / "review-cli"
+    script.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_CLI}" "$@"\n')
+    script.chmod(0o700)
+    return str(script)
+
+
+class CLIPlan:
+    def __init__(self, root: Path) -> None:
+        self.plan = root / "cli-plan.json"
+        self.log = root / "cli-calls.jsonl"
+
+    def env(self) -> dict[str, str]:
+        return {"FAKE_CLI_PLAN": str(self.plan), "FAKE_CLI_LOG": str(self.log)}
+
+    def set(self, *steps):
+        self.plan.write_text(json.dumps([s if isinstance(s, dict) else {"stdout": s} for s in steps]))
+
+    def calls(self):
+        return [json.loads(ln) for ln in self.log.read_text().splitlines()] if self.log.exists() else []
+
+
+class TestReviewerConfig(unittest.TestCase):
+    def test_a_cli_template_can_review_including_the_built_in_ones(self):
+        cfg = parse_config({"executors": {"sde": {"role": "sde", "reviewer": "grok"}}})
+        self.assertEqual(cfg.roles["sde"].sde.reviewer, "grok")  # type: ignore[union-attr]
+        cfg = parse_config({"executors": {"mycli": {"command": "my-review", "args": ["--json", "{prompt}"]},
+                                          "sde": {"role": "sde", "reviewer": "mycli"}}})
+        self.assertEqual(cfg.roles["sde"].sde.reviewer, "mycli")  # type: ignore[union-attr]
+        cfg = parse_config({"executors": {"r": {"role": "code-reviewer"}, "sde": {"role": "sde", "reviewer": "r"}}})
+        self.assertEqual(cfg.roles["sde"].sde.reviewer, "r")  # type: ignore[union-attr]
+
+    def test_a_reviewer_that_cannot_review_fails_with_the_choices(self):
+        base = {"r": {"role": "code-reviewer"}, "other-sde": {"role": "sde", "review": False}}
+        choices = r"\(claude, cursor-agent, dsh, grok, r\)"
+        cases = {
+            rf"executors\.sde: reviewer 'sde' is this executor itself; choose a code-reviewer executor or a CLI "
+            rf"executor {choices} or set review = false": "sde",
+            rf"executors\.sde: reviewer 'other-sde' has role 'sde', which cannot review; .*{choices}": "other-sde",
+            rf"executors\.sde: reviewer 'ghost' is not a declared executor; .*{choices}": "ghost",
+        }
+        for message, reviewer in cases.items():
+            with self.subTest(reviewer), self.assertRaisesRegex(ValueError, message):
+                parse_config({"executors": {**base, "sde": {"role": "sde", "reviewer": reviewer}}})
+        # With review off the reviewer is not used, so it is not checked.
+        cfg = parse_config({"executors": {"sde": {"role": "sde", "review": False, "reviewer": "ghost"}}})
+        self.assertFalse(cfg.roles["sde"].sde.review)  # type: ignore[union-attr]
+
+    def test_the_old_role_and_builtin_skill_names_still_work(self):
+        cfg = parse_config({"executors": {"cr": {"role": "coder-reviewer", "skills": ["builtin:coder-reviewer"]},
+                                          "new": {"role": "code-reviewer", "skills": ["builtin:coder-reviewer"]},
+                                          "sde": {"role": "sde", "reviewer": "cr"}}})
+        skill = builtin_skill("code-reviewer")
+        self.assertEqual(skill.parent.name, "code-reviewer")
+        self.assertTrue(skill.is_file())
+        self.assertEqual(builtin_skill("coder-reviewer"), skill)
+        for name in ("cr", "new"):
+            self.assertEqual((cfg.roles[name].role, cfg.roles[name].profile.skills), ("code-reviewer", (skill,)))
+        self.assertEqual(cfg.roles["sde"].sde.reviewer, "cr")  # type: ignore[union-attr]
+        with self.assertRaisesRegex(ValueError, "'builtin:coder-reviewer' is not available for role 'sde'"):
+            parse_config({"executors": {"sde": {"role": "sde", "review": False, "skills": ["builtin:coder-reviewer"]}}})
+
+    def test_the_default_reviewer_falls_back_to_an_old_coder_reviewer_executor(self):
+        legacy = {"coder-reviewer": {"role": "coder-reviewer"}}
+        cfg = parse_config({"executors": {"sde": {"role": "sde"}, **legacy}})
+        self.assertEqual(cfg.roles["sde"].sde.reviewer, "coder-reviewer")  # type: ignore[union-attr]
+        both = {**legacy, "code-reviewer": {"role": "code-reviewer"}}
+        cfg = parse_config({"executors": {"sde": {"role": "sde"}, **both}})
+        self.assertEqual(cfg.roles["sde"].sde.reviewer, "code-reviewer")  # type: ignore[union-attr]
+        # An explicit name never falls back, and a CLI executor named coder-reviewer is not the old reviewer role.
+        with self.assertRaisesRegex(ValueError, "reviewer 'code-reviewer' is not a declared executor"):
+            parse_config({"executors": {"sde": {"role": "sde", "reviewer": "code-reviewer"}, **legacy}})
+        with self.assertRaisesRegex(ValueError, "reviewer 'code-reviewer' is not a declared executor"):
+            parse_config({"executors": {"sde": {"role": "sde"}, "coder-reviewer": {"command": "x"}}})
+
+    def test_the_assembled_sde_reviews_through_the_configured_kind_of_reviewer(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+        def sde_reviewer(executors):
+            cfg = parse_config({"runtime": {"db_path": str(root / "hb.db"), "memory_root": str(root / "mem"),
+                                            "default_executor": "sde"}, "executors": executors})
+            daemon = build_daemon_from_config(cfg)
+            self.addCleanup(daemon.db.close)
+            worker = daemon.pool._worker_factory("anything", "w")  # pyright: ignore
+            return worker._executors["sde"]._reviewer  # pyright: ignore
+
+        cli = sde_reviewer({"sde": {"role": "sde", "reviewer": "grok"}})
+        self.assertIsInstance(cli, CLIReviewer)
+        self.assertEqual(cli.executor_id, "grok")
+        role = sde_reviewer({"sde": {"role": "sde"}, "coder-reviewer": {"role": "coder-reviewer"}})
+        self.assertIsInstance(role, CoderReviewerExecutor)
+        self.assertEqual(role.executor_id, "coder-reviewer")
+
+
+class TestReviewPermissionName(unittest.TestCase):
+    def test_the_new_tool_name_is_allowed_and_old_rules_apply_to_it(self):
+        self.assertEqual(AutoModePermissionAdapter().check("code_reviewer.launch", {}).action, "allow")
+        self.assertEqual(AutoModePermissionAdapter().check("coder_reviewer.launch", {}).action, "allow")
+        old_defer = AutoModePermissionAdapter(defer_tools=frozenset({"coder_reviewer.launch"}))
+        self.assertEqual(old_defer.check("code_reviewer.launch", {}).action, "defer")
+        old_block = AutoModePermissionAdapter(block_tools=frozenset({"coder_reviewer.launch"}))
+        self.assertEqual(old_block.check("code_reviewer.launch", {}).action, "block")
+        old_allow = AutoModePermissionAdapter(allow_tools=frozenset({"coder_reviewer.launch"}), defer_tools=frozenset())
+        self.assertEqual(old_allow.check("code_reviewer.launch", {}).action, "allow")
+
+
+class TestCLIReviewer(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.repo = make_repo(self.root)
+        self.cli = CLIPlan(self.root)
+        self.enterContext(patch.dict(os.environ, self.cli.env()))
+        self.caps = Mock(permissions=InMemoryPermission())
+        self.caps.is_interrupted.return_value = False
+
+    def reviewer(self, **overrides):
+        fields = {"name": "grok", "command": cli_command(self.root), "args": ("-p",), **overrides}
+        return CLIReviewer(template=CLITemplate(**fields))
+
+    def request(self, **extra):
+        return ReviewRequest(workdir=self.repo, requirements="divide must reject a zero divisor",
+                             test_evidence=EVIDENCE, base_ref="main", pin=pin_head(self.repo, "test"), **extra)
+
+    async def test_bare_json_verdict_and_the_prompt_carry_the_review_inputs_and_contract(self):
+        self.cli.set(json.dumps(PASS))
+        template_env = {"FAKE_CLI_MARK": "from-template"}
+        review = await self.reviewer(env=template_env).review(self.request(previous_round="## Previous review round\nX"), self.caps)
+        self.assertEqual((review["verdict"], review["summary"], review["blocking"]), ("pass", "zero is rejected", []))
+        (call,) = self.cli.calls()
+        self.assertEqual(call["argv"][0], "-p")
+        prompt = call["argv"][1]
+        self.assertEqual(Path(call["cwd"]).resolve(), self.repo.resolve())
+        self.assertEqual(call["env"], "from-template")
+        self.assertFalse(call["stdin_tty"])
+        for part in ("## Task requirements\ndivide must reject a zero divisor", f"## Test evidence\n{EVIDENCE}",
+                     "+    return a / b", "## Previous review round\nX", "## Review contract",
+                     "Do not create, edit, stage, commit", "location (path:line), trigger", "guidance_clause",
+                     "Output exactly one JSON object and nothing else", '"required": ["verdict", "summary", "blocking"]'):
+            self.assertIn(part, prompt)
+        self.assertTrue(prompt.rstrip().endswith("}"), "the output schema closes the prompt")
+
+    async def test_the_prompt_placeholder_follows_the_template(self):
+        self.cli.set(json.dumps(PASS))
+        reviewer = self.reviewer(args=("--print", "--prompt={prompt}", "--format", "json"),
+                                 resume_args=("--resume", "{executor_session_id}"))
+        await reviewer.review(self.request(), self.caps)
+        argv = self.cli.calls()[0]["argv"]
+        self.assertEqual(argv[:1] + argv[2:], ["--print", "--format", "json"])
+        self.assertTrue(argv[1].startswith("--prompt=## Task requirements"))
+
+    async def test_a_fenced_block_or_a_result_envelope_is_unwrapped(self):
+        fenced = f"Reviewed the diff.\n\n```json\n{json.dumps(CHANGES_REQUESTED, indent=2)}\n```\n"
+        cases = {
+            "fenced": fenced,
+            "envelope with a fenced block": json.dumps({"type": "result", "result": fenced, "session_id": "s"}),
+            "envelope with bare JSON": json.dumps({"result": json.dumps(CHANGES_REQUESTED)}),
+        }
+        for name, stdout in cases.items():
+            with self.subTest(name):
+                self.cli.set(stdout)
+                review = await self.reviewer().review(self.request(), self.caps)
+                self.assertEqual(review["verdict"], "changes_requested")
+                self.assertEqual(review["blocking"][0]["location"], "calc.py:2")
+
+    async def test_a_malformed_answer_is_retried_once_with_the_error(self):
+        contradictory = {"verdict": "pass", "summary": "s", "blocking": CHANGES_REQUESTED["blocking"]}
+        for name, bad in (("not json", "Looks good to me!"), ("invalid verdict", json.dumps(contradictory))):
+            with self.subTest(name):
+                self.cli.log.unlink(missing_ok=True)
+                Path(f"{self.cli.plan}.n").unlink(missing_ok=True)
+                self.cli.set(bad, json.dumps(PASS))
+                review = await self.reviewer().review(self.request(), self.caps)
+                self.assertEqual(review["verdict"], "pass")
+                first, retry = self.cli.calls()
+                self.assertNotIn("Your previous output was rejected", first["argv"][1])
+                self.assertIn("## Your previous output was rejected", retry["argv"][1])
+                self.assertTrue(retry["argv"][1].startswith(first["argv"][1]))
+
+    async def test_a_second_malformed_answer_aborts_the_review(self):
+        self.cli.set("no verdict here", "```json\n{\"verdict\": \"maybe\"}\n```")
+        with self.assertRaisesRegex(ReviewAborted, "grok returned no valid verdict after one retry: the reviewer "
+                                                   "returned a malformed verdict"):
+            await self.reviewer().review(self.request(), self.caps)
+        self.assertEqual(len(self.cli.calls()), 2)
+
+    async def test_a_failed_or_timed_out_run_aborts_without_a_retry(self):
+        self.cli.set({"stdout": json.dumps(PASS), "stderr": "auth expired: run grok login\n", "exit": 3})
+        with self.assertRaisesRegex(ReviewAborted, "grok: '.*review-cli' exited with code 3: auth expired: run grok login"):
+            await self.reviewer().review(self.request(), self.caps)
+        self.assertEqual(len(self.cli.calls()), 1)
+        self.cli.set({"sleep": 5, "stdout": json.dumps(PASS)})
+        with self.assertRaisesRegex(ReviewAborted, "timed out after 0.5s"):
+            await self.reviewer(timeout_seconds=0.5).review(self.request(), self.caps)
+        with self.assertRaisesRegex(ReviewAborted, "cannot start '/nonexistent/grok'"):
+            await self.reviewer(command="/nonexistent/grok").review(self.request(), self.caps)
+
+    async def test_a_review_that_changes_the_worktree_is_discarded(self):
+        self.cli.set({"stdout": json.dumps(PASS), "write": {"calc.py": "def divide(a, b):\n    return 0\n"}})
+        with self.assertRaisesRegex(ReviewAborted, "changed during the review by grok; findings discarded"):
+            await self.reviewer().review(self.request(), self.caps)
+        self.assertEqual(len(self.cli.calls()), 1)
+
+    def test_launch_gate_and_output_format(self):
+        seen = []
+        self.caps.permissions = Mock(check=lambda tool, args: seen.append((tool, args)) or PermissionDecision("allow", "ok"))
+        reviewer = self.reviewer(command="grok")
+        reviewer.check_launch(self.caps, self.repo)
+        self.assertEqual(seen, [("code_reviewer.launch", {"executor": "grok", "workdir": str(self.repo), "command": "grok"})])
+        review = {**CHANGES_REQUESTED, "developer_messages": []}
+        lines = reviewer.format_review(review).splitlines()
+        self.assertEqual(lines[0], "[grok] verdict=changes_requested (cli=grok)")
+        self.assertEqual(lines[1:4], ["Summary: division is unguarded", "Blocking:", "1. calc.py:2"])
+        self.assertIn("Notes:", lines)
+
+
+class TestSDEWithCLIReviewer(DeliveryCase, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.wt = self.clone("task-1", "hb/task-1")
+        self.log = self.root / "calls.jsonl"
+        self.plan = self.root / "plan.json"
+        self.cli = CLIPlan(self.root)
+        self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan),
+                                                  **self.cli.env()}))
+        self.workspaces = SQLiteWorkspaceStore(self.db)
+        self.caps = Mock(permissions=InMemoryPermission())
+        self.caps.is_interrupted.return_value = False
+        self.caps.memory.load_baseline.return_value = {}
+
+    def set_dev(self, *outputs):
+        steps = [{"write": files, "commit": "work", "output": {
+            "status": "done", "summary": summary, "test_evidence": EVIDENCE, "change_kind": "fix",
+            "change_rationale": "divide handled zero wrongly"}} for files, summary in outputs]
+        self.plan.write_text(json.dumps({"sde": steps, "reviewer": []}))
+
+    def executor(self, delivery):
+        launcher = ClaudeCodeLauncher(name="fake", command=fake_command(self.root))
+        return SDEExecutor(
+            profile=ClaudeCodeProfile(name="sde", launcher=launcher),
+            options=SDEOptions(review=True, reviewer="grok"),
+            reviewer=CLIReviewer(template=CLITemplate(name="grok", command=cli_command(self.root), args=("-p",))),
+            worktree_manager=OrcaWorktreeManager(workspace_store=self.workspaces,
+                                                 session_store=SQLiteSessionStoreAdapter(self.db), backend="git"),
+            inbox_checkout_map={},
+            tasks=SQLiteTaskMetadataStore(self.db),
+            delivery=delivery,
+        )
+
+    def payload(self):
+        return {"executor_id": "sde", "text": "divide must reject a zero divisor", "title": "Reject zero divisors",
+                "explicit_workdir": str(self.wt), "base_ref": "origin/main"}
+
+    def event(self):
+        return Event(inbox_id="proj:x", source="test", external_id=f"e-{os.urandom(4).hex()}", payload=self.payload(),
+                     correlation_key="task:1")
+
+    def dev_calls(self):
+        return [json.loads(ln) for ln in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    async def test_a_cli_pass_counts_as_review_pass_for_a_merge_that_requires_review(self):
+        self.set_dev(({"calc.py": "x = 1\n"}, "divide fixed"))
+        self.cli.set(json.dumps({"result": json.dumps(PASS)}))
+        delivery = self.delivery(auto_merge=True)
+        self.assertTrue(delivery.config.require_review)
+        outcome = await self.executor(delivery).execute([self.event()], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        text = outcome.messages[0]
+        main_sha = self.git_bare("rev-parse", "main")
+        for part in ("[sde] delivered (review=pass after 1 round", "[grok] verdict=pass (cli=",
+                     f"Merge commit: {main_sha}"):
+            self.assertIn(part, text)
+        self.assertNotIn("not merged", text)
+        self.assertEqual(len(self.cli.calls()), 1)
+        self.assertEqual(Path(self.cli.calls()[0]["cwd"]).resolve(), self.wt.resolve())
+
+    async def test_cli_changes_requested_sends_the_blocking_items_back_for_a_fix(self):
+        self.set_dev(({"calc.py": "x = 1\n"}, "first try"), ({"calc.py": "x = 2\n"}, "zero divisor rejected"))
+        self.cli.set(f"```json\n{json.dumps(CHANGES_REQUESTED)}\n```", json.dumps(PASS))
+        self.caps.permissions = InMemoryPermission({MERGE_TOOL: PermissionDecision("block", "not in this test")})
+        outcome = await self.executor(self.delivery()).execute([self.event()], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertIn("review=pass after 2 round", outcome.messages[0])
+        self.assertIn("zero divisor rejected", outcome.messages[0])
+        first_dev, fix_dev = self.dev_calls()
+        for part in ("calc.py:2", "divide(1, 0)", "ZeroDivisionError crashes the caller", "reject zero divisors"):
+            self.assertIn(part, fix_dev["prompt"])
+        first_review, rereview = self.cli.calls()
+        rereview_prompt = rereview["argv"][1]
+        self.assertIn("## Previous review round\n[grok] verdict=changes_requested (cli=", rereview_prompt)
+        self.assertIn("## Changes since the previous review", rereview_prompt)
+        self.assertIn("+x = 2", rereview_prompt)
+
+    def git_bare(self, *args):
+        import subprocess
+        return subprocess.run(["git", *args], cwd=self.bare, check=True, capture_output=True, text=True).stdout.strip()

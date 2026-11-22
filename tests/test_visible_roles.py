@@ -151,7 +151,7 @@ class VisibleCase(unittest.IsolatedAsyncioTestCase):
         overrides.setdefault("launcher", self.launcher())
         return SDEExecutor(
             profile=ClaudeCodeProfile(name="sde", timeout_seconds=timeout, **overrides),
-            options=SDEOptions(review=review),
+            options=SDEOptions(review=review, reviewer="coder-reviewer"),
             reviewer=self.reviewer(reviewer_terminal) if review else None,
             worktree_manager=OrcaWorktreeManager(workspace_store=self.workspaces,
                                                  session_store=SQLiteSessionStoreAdapter(self.db), backend="git"),
@@ -184,7 +184,7 @@ class TestVisibleSDE(VisibleCase):
         dev_term, review_term = self.orca.created()
         # Each role has its own terminal in the target worktree, labelled with the role and the task.
         self.assertEqual(dev_term["title"], "sde · task:1")
-        self.assertEqual(review_term["title"], "coder-reviewer · review of task:1 round 1")
+        self.assertEqual(review_term["title"], "coder-reviewer (code-reviewer) · review of task:1 round 1")
         self.assertEqual({dev_term["worktree"], review_term["worktree"]}, {str(self.repo)})
         dev_handle = next(h for h, t in self.orca.terminals.items() if t is dev_term)
         review_handle = next(h for h, t in self.orca.terminals.items() if t is review_term)
@@ -240,8 +240,8 @@ class TestVisibleSDE(VisibleCase):
         self.assertEqual((first["turn"], fix["turn"]), (1, 2))
         # The fix went to the same terminal; nothing new was started for the developer.
         self.assertEqual([t["title"] for t in self.orca.created()],
-                         ["sde · task:1", "coder-reviewer · review of task:1 round 1",
-                          "coder-reviewer · review of task:1 round 2"])
+                         ["sde · task:1", "coder-reviewer (code-reviewer) · review of task:1 round 1",
+                          "coder-reviewer (code-reviewer) · review of task:1 round 2"])
         self.assertIn("terminal send", self.orca.verbs())
         for part in ("calc.py:2", "divide(1, 0)", "reject zero divisors"):
             self.assertIn(part, fix["prompt"])
@@ -365,7 +365,7 @@ class TestVisibleReviewer(VisibleCase):
         outcome = await self.reviewer().execute([review], None, self.caps)
         assert isinstance(outcome, Emit), outcome
         (term,) = self.orca.created()
-        self.assertEqual((term["title"], term["worktree"]), ("coder-reviewer · review of task:1", str(self.repo)))
+        self.assertEqual((term["title"], term["worktree"]), ("coder-reviewer (code-reviewer) · review of task:1", str(self.repo)))
         (call,) = self.calls("reviewer", "interactive")
         self.assertEqual(call["cwd"], str(self.repo))
         self.assertEqual(outcome.executor_session_id, arg(call, "--session-id"))
@@ -559,8 +559,8 @@ class TestVisibleRolesThroughEvents(unittest.TestCase):
                 self.assertEqual(len({sde_native, builtin["session_id"], rev_native}), 3)
                 self.assertTrue(all(c["cwd"] == str(workdir) for c in (dev_call, builtin, independent)))
                 titles = [t["title"] for t in orca.created()]
-                self.assertEqual(titles, ["sde · task-42", "coder-reviewer · review of task-42 round 1",
-                                          "coder-reviewer · review of task-42"])
+                self.assertEqual(titles, ["sde · task-42", "coder-reviewer (code-reviewer) · review of task-42 round 1",
+                                          "coder-reviewer (code-reviewer) · review of task-42"])
                 handles = list(orca.terminals)
                 self.assertIn(f"Orca terminal: {handles[0]} (Claude Code session {sde_native})", delivered)
                 self.assertIn(f"Orca terminal: {handles[1]}", delivered)

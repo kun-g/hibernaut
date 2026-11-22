@@ -3,7 +3,7 @@
   "external_id": "review-42-r1",
   "correlation_key": "review:task-42",
   "payload": {
-    "executor_id": "coder-reviewer",
+    "executor_id": "code-reviewer",
     "text": "Task requirements the change must meet",
     "test_evidence": "pytest -v: 119 passed; pyright: 0 errors",
     "review_of": "task-42",
