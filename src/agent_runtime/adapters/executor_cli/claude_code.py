@@ -234,51 +234,6 @@ class ClaudeCodeError(Exception):
     pass
 
 
-async def probe_init(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str], timeout_seconds: float) -> dict[str, Any]:
-    # Starts the harness headless and stops it at its init message, before any model request matters.
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv, cwd=str(cwd), env=dict(env),
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            limit=_STREAM_LIMIT,
-        )
-    except OSError as exc:
-        raise ClaudeCodeError(f"cannot start launcher ({argv[0]}): {exc.strerror or exc}") from exc
-    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
-    stdout = proc.stdout
-    try:
-        proc.stdin.write(PROBE_PROMPT.encode())
-        await proc.stdin.drain()
-        proc.stdin.close()
-    except (BrokenPipeError, ConnectionResetError):
-        pass
-
-    async def first_init() -> dict[str, Any] | None:
-        while line := await stdout.readline():
-            try:
-                parsed: object = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict):
-                message = cast(dict[str, Any], parsed)
-                if message.get("type") == "system" and message.get("subtype") == "init":
-                    return message
-        return None
-
-    try:
-        init = await asyncio.wait_for(first_init(), timeout=timeout_seconds)
-    except TimeoutError as exc:
-        raise ClaudeCodeError(f"no session report within {timeout_seconds}s") from exc
-    finally:
-        if proc.returncode is None:
-            proc.kill()
-        stderr = (await proc.stderr.read()).decode("utf-8", errors="replace").strip()
-        await proc.wait()
-    if init is None:
-        raise ClaudeCodeError(f"exited ({proc.returncode}) before reporting its session: {stderr[-2000:]}")
-    return init
-
-
 async def run_claude_code(
     profile: ClaudeCodeProfile,
     *,

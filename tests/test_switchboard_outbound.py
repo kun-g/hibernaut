@@ -118,6 +118,16 @@ class GatewayTests(unittest.TestCase):
         assert opted_in is not None
         self.assertEqual((opted_in.channel, dict(opted_in.target)), ("github", {"repo": "kun-g/hibernaut", "number": 42}))
 
+    def test_approval_card_without_a_message_id_retries_with_same_uuid(self) -> None:
+        gateway = self.gateway(approval_target="oc_approvals")
+        gateway.consume_event(self._github_report(outcome_kind="suspend", approval_request_id="req"))
+        self.http.responses = [HttpResponse(200, b'{"code":0,"data":{}}')]
+        self.assertEqual(gateway.run_once(), 0)
+        self.clock.advance(5)
+        self.assertEqual(gateway.run_once(), 1)
+        self.assertEqual(self.http.calls[0]["json"]["uuid"], self.http.calls[1]["json"]["uuid"])
+        self.assertEqual(self.store.list_outbound()[0].platform_msg_id, "om_out")
+
     def test_emit_report_becomes_github_comment_with_labels(self) -> None:
         gateway = self.gateway()
         report = self._github_report(

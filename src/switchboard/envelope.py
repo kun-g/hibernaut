@@ -169,8 +169,8 @@ _TOP_LEVEL_REQUIRED: Final[Mapping[str, tuple[str, ...]]] = {
     "work.closed": ("correlation_key", "subject"),
     "work.ready": ("correlation_key", "subject"),
     "conversation.message": ("correlation_key", "body"),
-    "approval.decided": ("actor", "correlation_key"),
-    "execution.reported": ("correlation_key", "subject"),
+    "approval.decided": ("actor",),
+    "execution.reported": ("subject",),
 }
 
 _METADATA_REQUIRED: Final[Mapping[str, tuple[str, ...]]] = {
@@ -212,7 +212,22 @@ def validate_envelope(event: CanonicalEvent) -> None:
             problems.append(f"{event.event_type} requires metadata.{key}")
     if event.event_type == "execution.reported":
         outcome = event.metadata.get("outcome_kind")
-        if outcome is not None and outcome not in OUTCOME_KINDS:
+        if not isinstance(outcome, str) or outcome not in OUTCOME_KINDS:
             problems.append(f"metadata.outcome_kind must be one of {sorted(OUTCOME_KINDS)}")
+        if outcome == "suspend":
+            for key in ("approval_request_id", "session_id"):
+                identifier = event.metadata.get(key)
+                if not isinstance(identifier, str) or not identifier.strip():
+                    problems.append(f"suspend requires non-empty metadata.{key}")
+        elif not event.correlation_key:
+            problems.append("execution.reported requires correlation_key")
+    if event.event_type == "approval.decided":
+        if event.metadata.get("decision") not in ("approve", "reject"):
+            problems.append("metadata.decision must be approve or reject")
+        session_id = event.metadata.get("session_id")
+        if not event.correlation_key and not (
+            event.source == "feishu" and isinstance(session_id, str) and session_id.strip()
+        ):
+            problems.append("approval.decided requires correlation_key or a Feishu card session")
     if problems:
         raise EnvelopeError(problems)

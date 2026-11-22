@@ -65,6 +65,9 @@ class FeishuOutboundAdapter:
             body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         )
         result, code = _feishu_result(response)
+        if result.ok and msg.kind == "approval_card" and not result.platform_msg_id:
+            # Retry with the same UUID: the receipt is needed to bind the callback to this report.
+            return SendResult(ok=False, error="feishu approval card response missing message_id", retryable=True)
         if code in TOKEN_REJECTED_CODES and self._tokens is not None:
             self._tokens.invalidate()
             return SendResult(ok=False, error=result.error, retryable=True)
