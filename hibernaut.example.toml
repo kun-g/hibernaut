@@ -123,6 +123,7 @@ checkout = "/absolute/path/to/your/hibernaut"
 worktree_backend = "orca"    # orca | git
 terminal_backend = "orca"    # orca | none；交互角色会话的后端，与 worktree_backend 独立。默认：orca 项目为 orca，git 项目为 none
 orca_create_terminal = false    # agent launch opens its own terminal
+handoff = "mcp"              # mcp | peer；Claude Code 角色会话取任务、交结果的方式。peer 需要下面 [peer] 的接收端常驻（hb 启动时检查，不在则启动失败）
 # 可选：项目级默认执行器（未设置时回退到 runtime.default_executor）
 # executor = "claude"
 
@@ -153,6 +154,16 @@ issue_link = "refs"             # 任务来自 GitHub Issue 时 PR 正文开头�
 # Hibernaut 调用前剥离 GH_TOKEN / GITHUB_TOKEN 等变量，进程里不持有 token。
 git_command = "git"
 gh_command = "gh"
+
+# 可选：handoff = "peer" 的项目所用的 ccpeer 接收端（launchd 常驻，见 deploy/ccpeer/README.md；hb 只读它的收件箱，不启动它）。
+# 任务、返工、跟进以 peer 消息发给 Orca 终端里的 Claude Code 会话，会话用 SendMessage 把结果 JSON 发回这个名字。
+# [peer]
+# receiver = "hibernaut"                 # 接收端名字（python -m ccpeer serve --as <名字>）
+# state_dir = "~/.ccpeer"                # 接收端状态根目录；相对路径以本文件目录为准
+# config_dirs = ["~/.claude"]            # 会话登记目录；会话启动时清掉 CLAUDE_CONFIG_DIR，所以默认 ~/.claude
+# max_resends = 3                        # 结果格式不对时请会话重发的次数，超过则本轮失败
+# register_timeout_seconds = 120         # 终端起来后等会话登记的上限
+# exit_timeout_seconds = 30              # 交付后发 /exit 等 Claude Code 退出的上限，超时再关终端
 
 # 可选：Google Drive 任务队列入站与回写闭环（将「任务队列」根目录单独共享给 GCP Service Account 邮箱）
 # Service Account 密钥只放在外置凭据代理里（sudo deploy/gdrive-proxy/install.sh，见 deploy/gdrive-proxy/README.md），

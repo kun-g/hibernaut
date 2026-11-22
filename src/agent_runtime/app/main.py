@@ -56,6 +56,9 @@ from agent_runtime.adapters.executor_cli.reclaim_sweep import (
 from agent_runtime.adapters.executor_cli.worktree import ReclaimResult
 from agent_runtime.adapters.storage_sqlite.workspaces import WorkspaceRecord
 from agent_runtime.adapters.executor_cli.peer import DeveloperPeerResolver, registry_dirs
+from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeError
+from agent_runtime.adapters.executor_cli.peer_handoff import PeerHandoff, require_receiver
+from agent_runtime.adapters.storage_sqlite.peer_mailbox import SQLitePeerMailbox
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
     RuleBasedDemoLLM,
@@ -703,6 +706,16 @@ def build_daemon_from_config(
                 service_name=config.gdrive.proxy_service,
             )
 
+    peer_projects = [p.name for p in config.projects.values() if p.handoff == "peer" and p.terminal_backend == "orca"]
+    if has_configured_executor and not demo and peer_projects:
+        # Fails before anything runs: a peer-handoff task sent with no receiver would have nowhere to answer.
+        try:
+            require_receiver(config.peer)
+        except ClaudeCodeError as exc:
+            raise RuntimeError(
+                f"handoff = \"peer\" for {', '.join(peer_projects)}, but {exc}"
+            ) from exc
+
     daemon = build_daemon(
         db_path=config.runtime.db_path,
         database=database,
@@ -730,6 +743,15 @@ def build_daemon_from_config(
         # Role executors are rebuilt with each config reload, so the next run uses the new profile and launcher.
         terminal_bindings = SQLiteTerminalBindingStore(daemon.db)
         terminal_runner = OrcaVisibleRunner(bindings=terminal_bindings)
+
+        def _notify(inbox_id: str, text: str) -> None:
+            daemon.outbox.enqueue(inbox_id, text, metadata={"kind": "peer_notice"})
+
+        # Projects with handoff = "peer" share one runner; the receiver's inbox and cursor live outside any Run.
+        peer_runner = OrcaVisibleRunner(
+            bindings=terminal_bindings, notify=_notify,
+            peer=PeerHandoff(config.peer, SQLitePeerMailbox(daemon.db, config.peer.receiver)),
+        )
         cli_terminal = OrcaCommandTerminal()
         # An independently dispatched review finds its developer only through bindings this runtime recorded.
         developer_peers = DeveloperPeerResolver(
@@ -745,13 +767,16 @@ def build_daemon_from_config(
 
         def _role_executors(
             wt_mgr: OrcaWorktreeManager, no_terminal: str | None, delivery: DeliveryConfig | None = None,
+            handoff: str = "mcp",
         ) -> dict[str, ExecutorPort]:
             # no_terminal says why this inbox has no terminal backend; None means Orca opens the sessions.
             # Each SDE run reviews through the reviewer built for the same project and config generation.
+            runner = peer_runner if handoff == "peer" else terminal_runner
+
             def terminal(role: RoleConfig) -> OrcaVisibleRunner | TerminalUnavailable | None:
                 if not role.interactive:
                     return None
-                return terminal_runner if no_terminal is None else TerminalUnavailable(no_terminal)
+                return runner if no_terminal is None else TerminalUnavailable(no_terminal)
 
             reviewers: dict[str, CoderReviewerExecutor] = {
                 name: CoderReviewerExecutor(profile=role.profile, workspaces=daemon.workspaces,
@@ -821,6 +846,7 @@ def build_daemon_from_config(
                 wt_mgr,
                 None if proj.terminal_backend == "orca" else f"project '{proj.name}' has terminal_backend = \"none\"",
                 proj.delivery,
+                proj.handoff,
             ))
 
         default_mgr = OrcaWorktreeManager(

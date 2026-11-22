@@ -61,3 +61,7 @@ python3 -m ccpeer inbox --as hibernaut --control         # 控制回执
 ```
 
 协议是逆向所得，已验证的 Claude Code 版本见 `ccpeer.VERIFIED_CLAUDE_CODE_VERSIONS`。会话登记的 `peerProtocol` 不在 `ccpeer.SUPPORTED_PEER_PROTOCOLS` 里时，`send` 报 `UnsupportedProtocol` 并拒绝发送；Claude Code 升级后先重新验证帧格式，再放开新版本。
+
+## Hibernaut 的 peer 交接
+
+项目在 `hibernaut.toml` 里设 `handoff = "peer"` 后，Hibernaut 以 `[peer] receiver`（默认 `hibernaut`）的名义给 Orca 终端里的 Claude Code 会话发任务，会话用 `SendMessage(to="hibernaut")` 回结果。Hibernaut 只读 `~/.ccpeer/<名字>/` 下的收件箱（读到哪里记在自己的 SQLite `peer_cursors`），不启动接收端；接收端不在时 Hibernaut 启动失败。Hibernaut 起会话时清掉 `CLAUDE_CONFIG_DIR`，会话登记在 `~/.claude/sessions`，所以接收端至少要带 `--config-dir ~/.claude`。

@@ -18,9 +18,15 @@ class TerminalBinding:
     handle: str | None = None
     incarnation_id: str | None = None
     native_session_id: str | None = None
+    # Peer handoff: the Claude Code registration the terminal's session answers on, and the attempt it was last sent.
+    peer_name: str | None = None
+    peer_pid: int | None = None
+    peer_socket: str | None = None
+    peer_attempt: str | None = None
 
 
-_COLUMNS = "session_id, executor_id, agent, workdir, handle, incarnation_id, native_session_id"
+_COLUMNS = ("session_id, executor_id, agent, workdir, handle, incarnation_id, native_session_id, "
+            "peer_name, peer_pid, peer_socket, peer_attempt")
 
 
 class SQLiteTerminalBindingStore:
@@ -43,6 +49,10 @@ class SQLiteTerminalBindingStore:
             handle=opt("handle"),
             incarnation_id=opt("incarnation_id"),
             native_session_id=opt("native_session_id"),
+            peer_name=opt("peer_name"),
+            peer_pid=int(cast(int, r["peer_pid"])) if r["peer_pid"] is not None else None,
+            peer_socket=opt("peer_socket"),
+            peer_attempt=opt("peer_attempt"),
         )
 
     def get(self, session_id: str) -> TerminalBinding | None:
@@ -62,7 +72,7 @@ class SQLiteTerminalBindingStore:
             conn.execute(
                 f"""
                 INSERT INTO terminal_bindings ({_COLUMNS}, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     executor_id = excluded.executor_id,
                     agent = excluded.agent,
@@ -70,6 +80,10 @@ class SQLiteTerminalBindingStore:
                     handle = excluded.handle,
                     incarnation_id = excluded.incarnation_id,
                     native_session_id = excluded.native_session_id,
+                    peer_name = excluded.peer_name,
+                    peer_pid = excluded.peer_pid,
+                    peer_socket = excluded.peer_socket,
+                    peer_attempt = excluded.peer_attempt,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -80,6 +94,10 @@ class SQLiteTerminalBindingStore:
                     binding.handle,
                     binding.incarnation_id,
                     binding.native_session_id,
+                    binding.peer_name,
+                    binding.peer_pid,
+                    binding.peer_socket,
+                    binding.peer_attempt,
                     utc_now_iso(),
                 ),
             )
