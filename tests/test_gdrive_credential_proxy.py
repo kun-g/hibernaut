@@ -340,9 +340,14 @@ class DriveProxyInstallerTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def _dry_run(self, platform: str) -> str:
+        # Model a fresh installation even on hosts already running the proxy.
+        lookup = self.root / "id"
+        lookup.write_text("#!/bin/sh\nexit 1\n")
+        lookup.chmod(0o755)
         proc = subprocess.run(
             ["bash", str(INSTALLER), "--dry-run", "--platform", platform, "--key", str(self.key),
              "--root-folder-id", "root-q", "--hb-user", "hbuser", "--python", "/usr/bin/python3"],
+            env={**os.environ, "PATH": f"{self.root}{os.pathsep}{os.environ['PATH']}"},
             capture_output=True, text=True, timeout=60,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)

@@ -81,7 +81,7 @@ class TestEventSessionLifecycleAndReclaim(unittest.IsolatedAsyncioTestCase):
             claimed = daemon.inbox.claim_pending("proj:hibernaut")
             self.assertEqual(len(claimed), 1)
             self.assertEqual(claimed[0].status, "processing")
-            self.assertEqual(claimed[0].attempts, 1)
+            self.assertEqual(daemon.inbox.diagnostics([evt.event_id])[evt.event_id].attempts, 1)
 
             # New worker acquires lease -> recovers orphan processing -> claims & runs -> done.
             worker = daemon.pool._worker_factory("proj:hibernaut", "worker-recovery")
@@ -95,7 +95,7 @@ class TestEventSessionLifecycleAndReclaim(unittest.IsolatedAsyncioTestCase):
             done_events = daemon.inbox.list_events(inbox_id="proj:hibernaut", status="done")
             self.assertEqual(len(done_events), 1)
             self.assertEqual(done_events[0].event_id, evt.event_id)
-            self.assertEqual(done_events[0].attempts, 2)
+            self.assertEqual(daemon.inbox.diagnostics([evt.event_id])[evt.event_id].attempts, 2)
             self.assertEqual(done_events[0].session_id, executor.seen_sessions[0].session_id)
         finally:
             daemon.close()

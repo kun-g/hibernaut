@@ -279,6 +279,18 @@ class AlwaysOnDaemon:
         self.db.close()
 
 
+def _report_failed_events(inbox: SQLiteInboxAdapter, writer: DriveResultWriter, inbox_id: str) -> None:
+    failed = inbox.list_events(inbox_id=inbox_id, status="failed", limit=20)
+    diagnostics = inbox.diagnostics([evt.event_id for evt in failed])
+    for evt in failed:
+        diag = diagnostics.get(evt.event_id)
+        writer.handle_failed_event(
+            evt,
+            error=diag.last_error if diag else None,
+            attempts=diag.attempts if diag else 0,
+        )
+
+
 def build_daemon(
     *,
     db_path: str | Path = "./hibernaut.db",
@@ -403,8 +415,7 @@ def build_daemon(
     def _on_failed(inbox_id: str) -> None:
         if gdrive_writer is None:
             return
-        for failed_evt in inbox.list_events(inbox_id=inbox_id, status="failed", limit=20):
-            gdrive_writer.handle_failed_event(failed_evt)
+        _report_failed_events(inbox, gdrive_writer, inbox_id)
 
     pool = AsyncWorkerPool(
         worker_factory=_make_worker,
@@ -697,8 +708,7 @@ def build_daemon_from_config(
         def _cli_on_failed(inbox_id: str) -> None:
             if daemon.gdrive_result_writer is None:
                 return
-            for failed_evt in daemon.inbox.list_events(inbox_id=inbox_id, status="failed", limit=20):
-                daemon.gdrive_result_writer.handle_failed_event(failed_evt)
+            _report_failed_events(daemon.inbox, daemon.gdrive_result_writer, inbox_id)
 
         daemon.pool = AsyncWorkerPool(
             worker_factory=_cli_worker_factory,

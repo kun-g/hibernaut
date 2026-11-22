@@ -4,7 +4,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
@@ -23,6 +23,17 @@ from agent_runtime.core.models import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class EventDiagnostics:
+    # How often the event was claimed (survives restarts) and the last executor failure.
+    attempts: int
+    last_error: str | None
+
+
+_EVENT_COLUMNS = """event_id, inbox_id, source, external_id, occurred_at,
+                   payload_json, session_id, correlation_key, status"""
+
+
 class SQLiteInboxAdapter:
     def __init__(self, db: SQLiteDatabase) -> None:
         self._db = db
@@ -39,8 +50,6 @@ class SQLiteInboxAdapter:
             session_id=row["session_id"],
             correlation_key=row["correlation_key"],
             status=cast(EventStatus, str(row["status"])),
-            attempts=int(row["attempts"]),
-            last_error=row["last_error"],
         )
 
     def append(self, event: Event) -> tuple[Event, bool]:
@@ -61,8 +70,8 @@ class SQLiteInboxAdapter:
                 """
                 INSERT INTO event_inbox (
                     event_id, inbox_id, source, external_id, occurred_at,
-                    payload_json, session_id, correlation_key, status, attempts, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    payload_json, session_id, correlation_key, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     stored.event_id,
@@ -74,17 +83,14 @@ class SQLiteInboxAdapter:
                     stored.session_id,
                     stored.correlation_key,
                     stored.status,
-                    stored.attempts,
-                    stored.last_error,
                 ),
             )
         return stored, is_duplicate
 
     def fetch_pending(self, inbox_id: str) -> list[Event]:
         rows = self._db.fetchall(
-            """
-            SELECT event_id, inbox_id, source, external_id, occurred_at,
-                   payload_json, session_id, correlation_key, status, attempts, last_error
+            f"""
+            SELECT {_EVENT_COLUMNS}
             FROM event_inbox
             WHERE inbox_id = ? AND status = 'pending'
             ORDER BY seq ASC
@@ -95,9 +101,8 @@ class SQLiteInboxAdapter:
 
     def fetch_processing(self, inbox_id: str) -> list[Event]:
         rows = self._db.fetchall(
-            """
-            SELECT event_id, inbox_id, source, external_id, occurred_at,
-                   payload_json, session_id, correlation_key, status, attempts, last_error
+            f"""
+            SELECT {_EVENT_COLUMNS}
             FROM event_inbox
             WHERE inbox_id = ? AND status = 'processing'
             ORDER BY seq ASC
@@ -109,9 +114,8 @@ class SQLiteInboxAdapter:
     def claim_pending(self, inbox_id: str) -> list[Event]:
         with self._db.transaction() as conn:
             rows = conn.execute(
-                """
-                SELECT event_id, inbox_id, source, external_id, occurred_at,
-                       payload_json, session_id, correlation_key, status, attempts, last_error
+                f"""
+                SELECT {_EVENT_COLUMNS}
                 FROM event_inbox
                 WHERE inbox_id = ? AND status = 'pending'
                 ORDER BY seq ASC
@@ -133,10 +137,7 @@ class SQLiteInboxAdapter:
                     """,
                     tuple(part),
                 )
-            return [
-                replace(self._row_to_event(row), status="processing", attempts=int(row["attempts"]) + 1)
-                for row in rows
-            ]
+            return [replace(self._row_to_event(row), status="processing") for row in rows]
 
     def bind_session(self, event_ids: Sequence[str], session_id: str) -> None:
         if not event_ids:
@@ -189,8 +190,7 @@ class SQLiteInboxAdapter:
         params.append(max(1, min(limit, 500)))
         rows = self._db.fetchall(
             f"""
-            SELECT event_id, inbox_id, source, external_id, occurred_at,
-                   payload_json, session_id, correlation_key, status, attempts, last_error
+            SELECT {_EVENT_COLUMNS}
             FROM event_inbox
             {where}
             ORDER BY seq DESC
@@ -199,6 +199,26 @@ class SQLiteInboxAdapter:
             tuple(params),
         )
         return [self._row_to_event(row) for row in rows]
+
+    def diagnostics(self, event_ids: Sequence[str]) -> dict[str, EventDiagnostics]:
+        result: dict[str, EventDiagnostics] = {}
+        ids = list(event_ids)
+        if not ids:
+            return result
+        # 500 stays under SQLite's smallest default bound-parameter limit (999).
+        for start in range(0, len(ids), 500):
+            part = ids[start : start + 500]
+            placeholders = ",".join("?" for _ in part)
+            rows = self._db.fetchall(
+                f"SELECT event_id, attempts, last_error FROM event_inbox WHERE event_id IN ({placeholders})",
+                tuple(part),
+            )
+            for row in rows:
+                result[str(row["event_id"])] = EventDiagnostics(
+                    attempts=int(row["attempts"]),
+                    last_error=row["last_error"],
+                )
+        return result
 
     def mark_done(self, event_ids: Sequence[str]) -> None:
         if not event_ids:
@@ -463,13 +483,14 @@ class SQLiteSessionStoreAdapter:
             checkpoint=row["checkpoint"],
             pending_request_id=row["pending_request_id"],
             updated_at=str(row["updated_at"]),
+            parent_session_id=row["parent_session_id"],
         )
 
     def get(self, session_id: str) -> SessionRef | None:
         row = self._db.fetchone(
             """
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
-                   status, work_key, checkpoint, pending_request_id, updated_at
+                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id
             FROM sessions
             WHERE session_id = ?
             """,
@@ -481,7 +502,7 @@ class SQLiteSessionStoreAdapter:
         row = self._db.fetchone(
             """
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
-                   status, work_key, checkpoint, pending_request_id, updated_at
+                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id
             FROM sessions
             WHERE pending_request_id = ?
             LIMIT 1
@@ -494,7 +515,7 @@ class SQLiteSessionStoreAdapter:
         row = self._db.fetchone(
             """
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
-                   status, work_key, checkpoint, pending_request_id, updated_at
+                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id
             FROM sessions
             WHERE inbox_id = ? AND correlation_key = ? AND status IN ('active', 'suspended')
             ORDER BY updated_at DESC
@@ -561,6 +582,7 @@ class SQLiteSessionStoreAdapter:
         *,
         inbox_id: str | None = None,
         status: str | None = None,
+        parent_session_id: str | None = None,
     ) -> list[SessionRef]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -570,11 +592,14 @@ class SQLiteSessionStoreAdapter:
         if status:
             clauses.append("status = ?")
             params.append(status)
+        if parent_session_id:
+            clauses.append("parent_session_id = ?")
+            params.append(parent_session_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._db.fetchall(
             f"""
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
-                   status, work_key, checkpoint, pending_request_id, updated_at
+                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id
             FROM sessions
             {where}
             ORDER BY updated_at DESC
@@ -603,9 +628,9 @@ class SQLiteSessionStoreAdapter:
                 """
                 INSERT INTO sessions (
                     session_id, inbox_id, correlation_key, executor_id, executor_session_id,
-                    status, work_key, checkpoint, pending_request_id, updated_at
+                    status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     inbox_id = excluded.inbox_id,
                     correlation_key = excluded.correlation_key,
@@ -615,7 +640,8 @@ class SQLiteSessionStoreAdapter:
                     work_key = excluded.work_key,
                     checkpoint = excluded.checkpoint,
                     pending_request_id = excluded.pending_request_id,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    parent_session_id = excluded.parent_session_id
                 """,
                 (
                     session.session_id,
@@ -628,5 +654,6 @@ class SQLiteSessionStoreAdapter:
                     session.checkpoint,
                     session.pending_request_id,
                     session.updated_at,
+                    session.parent_session_id,
                 ),
             )

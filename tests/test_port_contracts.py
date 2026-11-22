@@ -59,7 +59,9 @@ class InboxContractMixin:
 
         claimed = inbox.claim_pending("u2")
         self.assertEqual([e.event_id for e in claimed], [e1.event_id, e2.event_id])
-        self.assertTrue(all(e.status == "processing" and e.attempts == 1 for e in claimed))
+        self.assertTrue(all(e.status == "processing" for e in claimed))
+        self.assertFalse(hasattr(claimed[0], "attempts"))
+        self.assertEqual(inbox.diagnostics([e1.event_id])[e1.event_id].attempts, 1)
         self.assertEqual(inbox.fetch_pending("u2"), [])
         self.assertEqual(len(inbox.fetch_processing("u2")), 2)
 
@@ -72,6 +74,12 @@ class InboxContractMixin:
 
         inbox.mark_failed([e2.event_id], "boom")
         self.assertEqual(inbox.fetch_processing("u2"), [])
+        self.assertEqual(inbox.diagnostics([e2.event_id])[e2.event_id].last_error, "boom")
+
+        # Claim count is storage-internal and keeps growing across re-claims (poison-event stop-loss input).
+        inbox.claim_pending("u2")
+        self.assertEqual(inbox.diagnostics([e1.event_id])[e1.event_id].attempts, 2)
+        self.assertEqual(inbox.diagnostics(["missing"]), {})
 
 
 class TimerContractMixin:
@@ -180,6 +188,40 @@ class LockContractMixin:
 class SessionContractMixin:
     def make_sessions(self) -> Any:
         raise NotImplementedError
+
+    def test_parent_session_id_persisted_and_filtered(self) -> None:
+        store = self.make_sessions()
+        store.save(SessionRef(session_id="main", inbox_id="proj:hibernaut", work_key="wk", executor_id="claude"))
+        store.save(
+            SessionRef(
+                session_id="child",
+                inbox_id="proj:hibernaut",
+                work_key="wk",
+                executor_id="grok",
+                parent_session_id="main",
+            )
+        )
+        store.save(SessionRef(session_id="other", inbox_id="proj:hibernaut", parent_session_id="elsewhere"))
+
+        child = store.get("child")
+        assert child is not None
+        self.assertEqual(child.parent_session_id, "main")
+        main = store.get("main")
+        assert main is not None
+        self.assertIsNone(main.parent_session_id)
+
+        self.assertEqual([s.session_id for s in store.list_sessions(parent_session_id="main")], ["child"])
+        self.assertEqual(store.list_sessions(parent_session_id="main", status="closed"), [])
+        self.assertEqual(len(store.list_sessions(inbox_id="proj:hibernaut")), 3)
+        # The child counts toward the shared worktree reference until it closes.
+        self.assertEqual(store.count_active_by_work_key("wk"), 2)
+        store.close_session("main")
+        self.assertEqual(store.count_active_by_work_key("wk"), 1)
+        store.close_session("child")
+        self.assertEqual(store.count_active_by_work_key("wk"), 0)
+        closed_child = store.get("child")
+        assert closed_child is not None
+        self.assertEqual(closed_child.parent_session_id, "main")
 
     def test_save_get_and_find_by_request_id(self) -> None:
         store = self.make_sessions()

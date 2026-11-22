@@ -465,15 +465,21 @@ class DriveResultWriter:
             )
         return False
 
-    def handle_failed_event(self, event: Event) -> bool:
+    def handle_failed_event(
+        self,
+        event: Event,
+        *,
+        error: str | None = None,
+        attempts: int = 0,
+    ) -> bool:
         file_id = extract_gdrive_file_id(event.correlation_key)
         if not file_id:
             return False
         return self.write_failure(
             file_id,
-            error=event.last_error or "executor failed",
+            error=error or "executor failed",
             event_id=event.event_id,
-            attempts=event.attempts,
+            attempts=attempts,
             session_id=event.session_id,
             dedup_key=f"failed:{event.event_id}",
         )
