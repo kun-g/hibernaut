@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Never, assert_never
+from typing import Any, Never, assert_never
 
 from agent_runtime.core.models import (
     Emit,
@@ -64,6 +64,7 @@ class _RunInterrupted(Exception):
 # Payload keys that pick where/how an executor runs (e.g. LocalCLIExecutor's workdir and CLI
 # template). Events that disagree on them must not share a Run.
 _TARGET_PAYLOAD_KEYS = ("executor_id", "explicit_workdir", "executor")
+_REPLY_PAYLOAD_KEYS = ("reply_channel", "reply_target")
 
 
 class AgentWorker:
@@ -325,6 +326,7 @@ class AgentWorker:
                             final_corr,
                             final_work_key,
                             selected_executor,
+                            report_metadata=self._report_metadata(batch + folded_events, final_corr),
                         )
                         all_done_ids = batch_ids + [evt.event_id for evt in folded_events]
                         if final_session_id is not None and final_session_id != active_session.session_id:
@@ -565,6 +567,21 @@ class AgentWorker:
         return session_ref.correlation_key if session_ref is not None else None
 
     @staticmethod
+    def _report_metadata(events: list[Event], correlation_key: str | None) -> dict[str, Any]:
+        # Routing hints a channel needs to answer where the work came from; extra keys are ignored by
+        # channels that do not read them.
+        meta: dict[str, Any] = {"run_id": new_id("run")}
+        if correlation_key:
+            meta["correlation_key"] = correlation_key
+        for key in _REPLY_PAYLOAD_KEYS:
+            for evt in reversed(events):
+                value = evt.payload.get(key)
+                if isinstance(value, str) and value:
+                    meta[key] = value
+                    break
+        return meta
+
+    @staticmethod
     def _extract_parent_session_id(
         events: list[Event],
         session_ref: SessionRef | None,
@@ -747,7 +764,10 @@ class AgentWorker:
         correlation_key: str | None,
         work_key: str | None,
         selected_executor: ExecutorPort,
+        *,
+        report_metadata: Mapping[str, Any] | None = None,
     ) -> str | None:
+        extra: dict[str, Any] = dict(report_metadata or {})
         match outcome:
             case Silent(executor_session_id=exec_sid):
                 exec_id, bound_exec_sid = self._resolve_executor_binding(
@@ -781,13 +801,13 @@ class AgentWorker:
                     session_ref,
                     exec_sid,
                 )
+                target_sid = emit_session_id or session_ref.session_id
                 for text in messages:
                     self._outbox.enqueue(
                         inbox_id=inbox_id,
                         content=text,
-                        metadata={"kind": "emit"},
+                        metadata={**extra, "kind": "emit", "outcome_kind": "emit", "session_id": target_sid},
                     )
-                target_sid = emit_session_id or session_ref.session_id
                 if target_sid != session_ref.session_id:
                     # Session rotation: archive old session while new session inherits correlation_key & work_key.
                     self._sessions.archive_session(session_ref.session_id)
@@ -845,9 +865,12 @@ class AgentWorker:
                     inbox_id=inbox_id,
                     content=prompt,
                     metadata={
+                        **extra,
                         "kind": "approval_request",
                         "request_id": request_id,
                         "session_id": target_sid,
+                        "outcome_kind": "suspend",
+                        "approval_request_id": request_id,
                     },
                 )
                 return target_sid

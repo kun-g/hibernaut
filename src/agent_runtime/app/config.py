@@ -147,6 +147,18 @@ class GDriveConfig:
     default_inbox_id: str = "default"
 
 
+SwitchboardMode = Literal["in_process"]
+
+
+@dataclass(frozen=True, slots=True)
+class SwitchboardLinkConfig:
+    enabled: bool = False
+    # "relay" (Stage B) will deliver over the network; only the same-process bridge exists today.
+    mode: SwitchboardMode = "in_process"
+    config_path: str | None = None
+    consumer_id: str = "hibernaut"
+
+
 @dataclass(frozen=True, slots=True)
 class HibernautConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -157,6 +169,34 @@ class HibernautConfig:
     roles: dict[str, RoleConfig] = field(default_factory=dict)
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     gdrive: GDriveConfig = field(default_factory=GDriveConfig)
+    switchboard: SwitchboardLinkConfig = field(default_factory=SwitchboardLinkConfig)
+
+
+def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> SwitchboardLinkConfig:
+    if raw is None:
+        return SwitchboardLinkConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("[switchboard] must be a table")
+    section = cast(dict[str, Any], raw)
+    enabled = section.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("switchboard.enabled must be true or false")
+    mode = str(section.get("mode", "in_process")).strip()
+    if mode != "in_process":
+        raise ValueError('switchboard.mode must be "in_process"')
+    consumer_id = str(section.get("consumer_id", "hibernaut")).strip()
+    if not consumer_id:
+        raise ValueError("switchboard.consumer_id must not be empty")
+    path_raw = str(section.get("config_path") or "").strip()
+    config_path: str | None = None
+    if path_raw:
+        resolved = Path(path_raw).expanduser()
+        if not resolved.is_absolute() and base_dir is not None:
+            resolved = base_dir / resolved
+        config_path = str(resolved)
+    if enabled and config_path is None:
+        raise ValueError("switchboard.enabled needs switchboard.config_path (the switchboard.toml to run in process)")
+    return SwitchboardLinkConfig(enabled=enabled, mode="in_process", config_path=config_path, consumer_id=consumer_id)
 
 
 def load_config(path: str | Path) -> HibernautConfig:
@@ -401,4 +441,5 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         roles=roles,
         projects=projects,
         gdrive=gdrive,
+        switchboard=parse_switchboard_link(raw.get("switchboard"), base_dir=base_dir),
     )
