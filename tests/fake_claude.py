@@ -115,6 +115,8 @@ def run_interactive():
     # Interactive conversation: the first instruction is the positional argument after `--`, later ones arrive on
     # stdin the way `orca terminal send` types them. Each conversation keeps its turn count, like a resumable
     # transcript. Work is fetched and the result returned through the launcher's handoff MCP tools.
+    if os.environ.get("FAKE_INTERACTIVE_PIDFILE"):
+        park(os.environ["FAKE_INTERACTIVE_PIDFILE"])
     if "--add-dir" in argv:
         # A directory this session has not worked in opens a blocking trust dialog in a real terminal.
         write_log(blocked="add-dir trust dialog")
@@ -183,6 +185,18 @@ def run_interactive():
 model = argv[argv.index("--model") + 1]
 source = os.environ.get("FAKE_API_KEY_SOURCE") or ("ANTHROPIC_API_KEY" if "ANTHROPIC_API_KEY" in os.environ else "none")
 session_id = argv[argv.index("--resume") + 1] if "--resume" in argv else f"fake-{role}-{os.getpid()}"
+
+
+def park(pidfile):
+    # Records this process and a child of its own, then waits: for closing a terminal while they run.
+    child = subprocess.Popen(["sleep", "60"])
+    Path(pidfile).write_text(f"{os.getpid()} {child.pid}")
+    time.sleep(60)
+    sys.exit(0)
+
+
+if probe and os.environ.get("FAKE_PROBE_PIDFILE"):
+    park(os.environ["FAKE_PROBE_PIDFILE"])  # a probe that never reports
 if probe:
     emit({"type": "system", "subtype": "init", "apiKeySource": source, "model": os.environ.get("FAKE_MODEL", model)})
     time.sleep(60)  # a probe is stopped at init; outliving the check would stall the test
