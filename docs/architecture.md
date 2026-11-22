@@ -104,3 +104,7 @@
 | **`session_id`** | 隶属于某个 `inbox_id` 的跨 Run 对话转录与 `Suspend` 断点上下文单元（4 态 `active` / `suspended` / `archived` / `closed`） | 一个 `inbox_id` 下可有多个 `session_id`，绑定 `executor_id` / `executor_session_id` / `work_key`；轮换标 `archived`，结案标 `closed` 且引用归零触发回收 |
 | **`correlation_key`** | 外部业务实体的确定性关联键（如 `github:kun-g/hibernaut#42`、`feishu:<chat>:<thread>`） | 经 `SessionStorePort.find_by_correlation_key()` 映射到当前活跃 `session_id`，同时作为 `workspaces` 表动态 worktree 复用键 |
 | **Run / Lease** | 单次唤醒执行周期 / 以 `inbox_id` 为主键的限时互斥租约 | `Suspend` 立即释放租约；进程崩溃后租约到期自动接管 |
+
+## 7. 架构决策记录（ADR）
+
+- [ADR-0001：跨项目协议采用 JSON Schema（暂不引入 Protobuf）](adr/0001-cross-project-protocol-schema.md)
