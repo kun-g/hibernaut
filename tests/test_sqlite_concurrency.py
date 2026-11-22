@@ -104,7 +104,7 @@ class TestSQLiteThreadSafety(unittest.TestCase):
                 inserted.set()
                 other.start()
                 # A shared implicit transaction would let the other thread's commit publish this row.
-                self.assertFalse(other_done.wait(timeout=0.2))
+                self.assertFalse(other_done.wait(timeout=0.05))
                 raise RuntimeError("abort")
         other.join(timeout=5)
 
@@ -276,12 +276,12 @@ class TestSQLiteThreadSafety(unittest.TestCase):
             workspace_store=store,
             backend="git",
             runner=runner,
-            reclaim_stale_after_seconds=0.3,
+            reclaim_stale_after_seconds=0.15,
         )
         with ThreadPoolExecutor(max_workers=1) as pool:
             first = pool.submit(manager.reclaim, "x")
             self.assertTrue(in_remove.wait(timeout=5))
-            threading.Event().wait(0.6)  # past the stale window; heartbeat must have renewed
+            threading.Event().wait(0.3)  # past the stale window; heartbeat must have renewed
             second = manager.reclaim("x")
             finish_remove.set()
             self.assertTrue(first.result(timeout=5).reclaimed)
@@ -327,12 +327,12 @@ class TestSQLiteThreadSafety(unittest.TestCase):
             workspace_store=store,
             backend="git",
             runner=runner,
-            reclaim_stale_after_seconds=0.45,
+            reclaim_stale_after_seconds=0.2,
         )
         with ThreadPoolExecutor(max_workers=1) as pool:
             first = pool.submit(manager.reclaim, "x")
             self.assertTrue(in_remove.wait(timeout=5))
-            threading.Event().wait(0.9)  # two stale windows after the failed renewal
+            threading.Event().wait(0.45)  # two stale windows after the failed renewal
             second = manager.reclaim("x")
             finish_remove.set()
             self.assertTrue(first.result(timeout=5).reclaimed)

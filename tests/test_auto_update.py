@@ -62,9 +62,16 @@ class AutoUpdateTests(unittest.TestCase):
         log_path = self.root / "daemon.log"
         log = self.enterContext(log_path.open("w"))
         proc = subprocess.Popen(
-            [sys.executable, "scripts/run_updating.py", "--interval", "1", "--port", str(port), "--db", str(db)],
+            [
+                sys.executable,
+                "scripts/run_updating.py",
+                "--interval", "0.1",
+                "--outbox-interval", "0.02",
+                "--port", str(port),
+                "--db", str(db),
+            ],
             stdout=log,
-            cwd=self.checkout, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            cwd=self.checkout, env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"},
         )
 
         def send_until_reply(prefix):
@@ -82,7 +89,7 @@ class AutoUpdateTests(unittest.TestCase):
                     with sqlite3.connect(db) as conn:
                         if conn.execute("SELECT 1 FROM outbox WHERE content = ? AND status = 'sent'", (prefix + prefix,)).fetchone():
                             return
-                time.sleep(.15)
+                time.sleep(.03)
             self.fail(f"Missing reply for {prefix!r}")
 
         try:

@@ -433,7 +433,7 @@ class RelayEndToEndTests(unittest.TestCase):
         self.assertNotIn(RELAY_TOKEN, json.dumps(h.audit.records))
 
     def test_invalid_token_and_missing_hello_close_with_4001(self) -> None:
-        h = RelayHarness(relay={"auth_timeout_sec": 0.3, "heartbeat_sec": 30})
+        h = RelayHarness(relay={"auth_timeout_sec": 0.12, "heartbeat_sec": 30})
         self.addCleanup(h.close)
 
         ws = connect(h.url, timeout=5)
@@ -449,7 +449,7 @@ class RelayEndToEndTests(unittest.TestCase):
         elapsed = time.monotonic() - started
         ws.close()
         self.assertEqual(received, Close(CLOSE_AUTH_FAILED, "hello timeout"))
-        self.assertGreaterEqual(elapsed, 0.25)
+        self.assertGreaterEqual(elapsed, 0.08)
         self.assertLess(elapsed, 3)
         self.assertTrue(wait_until(lambda: len(h.relay_audits("auth_timeout")) == 1))
 
@@ -504,12 +504,12 @@ class RelayEndToEndTests(unittest.TestCase):
         new.close()
 
     def test_offline_delivery_never_counts_as_an_attempt(self) -> None:
-        h = RelayHarness(relay={"heartbeat_sec": 30}, delivery={"retry_backoff_seconds": [0.02] * 5})
+        h = RelayHarness(relay={"heartbeat_sec": 30}, delivery={"retry_backoff_seconds": [0.01] * 5})
         self.addCleanup(h.close)
         event = ready_event(1, "proj:a")
         h.board.bus.publish(event)
-        # ~25 offline rounds; counted as attempts this would dead-letter after 6.
-        time.sleep(0.5)
+        # ~15 offline rounds; counted as attempts this would dead-letter after 6.
+        time.sleep(0.15)
         self.assertEqual(h.delivery(event.event_id), ("pending", 0))
 
     def test_reconnect_replays_backlog_at_once_in_scope_order(self) -> None:
@@ -545,8 +545,8 @@ class RelayEndToEndTests(unittest.TestCase):
 
     def test_online_nack_and_ack_timeout_dead_letter_without_blocking_other_scopes(self) -> None:
         h = RelayHarness(
-            relay={"heartbeat_sec": 30, "ack_timeout_sec": 0.3},
-            delivery={"retry_backoff_seconds": [0.05, 0.05, 0.05, 0.05, 0.05]},
+            relay={"heartbeat_sec": 30, "ack_timeout_sec": 0.1},
+            delivery={"retry_backoff_seconds": [0.01, 0.01, 0.01, 0.01, 0.01]},
         )
         self.addCleanup(h.close)
         failing, behind, other = ready_event(1, "proj:a"), ready_event(2, "proj:a"), ready_event(3, "proj:b")
@@ -562,7 +562,7 @@ class RelayEndToEndTests(unittest.TestCase):
             # Even calls outlive ack_timeout_sec; the late reply is still a failure, because a
             # late ack for the same event_id would legitimately settle the next attempt.
             if count % 2 == 0:
-                time.sleep(0.5)
+                time.sleep(0.18)
             return "nack"
 
         agent = h.agent(handler)
@@ -584,7 +584,7 @@ class RelayEndToEndTests(unittest.TestCase):
         )
 
     def test_heartbeat_loss_evicts_consumer_and_agent_reconnects_to_redeliver(self) -> None:
-        h = RelayHarness(relay={"heartbeat_sec": 0.2, "ack_timeout_sec": 10})
+        h = RelayHarness(relay={"heartbeat_sec": 0.1, "ack_timeout_sec": 10})
         self.addCleanup(h.close)
         proxy = FreezableProxy(h.board.relay_port)
         self.addCleanup(proxy.close)
@@ -596,7 +596,7 @@ class RelayEndToEndTests(unittest.TestCase):
                 # Half-open from here on: the ack and every heartbeat vanish.
                 proxy.freeze()
 
-        agent = h.agent(handler, url=proxy.url(h.board.relay_path), idle_timeout_sec=2.5)
+        agent = h.agent(handler, url=proxy.url(h.board.relay_path), idle_timeout_sec=0.55)
         self.assertTrue(agent.connected.wait(5))
         event = ready_event(1, "proj:a")
         h.board.bus.publish(event)

@@ -13,11 +13,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Cache dev virtualenv and pyright
+        id: venv-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .venv
+            ~/.cache/pyright-python
+          key: venv-${{ runner.os }}-py312-${{ hashFiles('pyproject.toml') }}
       - name: Install dev dependencies
-        run: pip install -e ".[dev]"
-      - name: Gate 1 - Static import boundaries (import-linter)
-        run: lint-imports
-      - name: Gate 2 - Contract & E2E tests (pytest)
-        run: pytest -v
-      - name: Gate 3 - Strict static typing (pyright)
-        run: pyright
+        if: steps.venv-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --disable-pip-version-check -e ".[dev]"
+      - name: Run architecture, test and type gates in parallel
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/.venv/bin:$PATH"
+          lint-imports > /tmp/gate-lint.log 2>&1 &
+          pid_lint=$!
+          pyright > /tmp/gate-pyright.log 2>&1 &
+          pid_pyright=$!
+          pytest -n auto --dist worksteal -v > /tmp/gate-pytest.log 2>&1 &
+          pid_pytest=$!
+
+          rc=0
+          wait "$pid_lint" || rc=$?
+          echo "=== Gate 1 - Static import boundaries (import-linter) ==="
+          cat /tmp/gate-lint.log
+
+          wait "$pid_pyright" || rc=$?
+          echo "=== Gate 3 - Strict static typing (pyright) ==="
+          cat /tmp/gate-pyright.log
+
+          wait "$pid_pytest" || rc=$?
+          echo "=== Gate 2 - Contract & E2E tests (pytest) ==="
+          cat /tmp/gate-pytest.log
+
+          exit "$rc"

@@ -28,7 +28,13 @@ class TestConfigReload(unittest.TestCase):
             log = root / 'daemon.log'
             with log.open('w') as stream:
                 proc = subprocess.Popen(
-                    [sys.executable, str(repo / 'scripts/run_updating.py'), '--config', str(path), '--interval', '3600'],
+                    [
+                        sys.executable,
+                        str(repo / 'scripts/run_updating.py'),
+                        '--config', str(path),
+                        '--interval', '3600',
+                        '--config-poll-interval', '0.02',
+                    ],
                     cwd=root, stdout=stream, stderr=stream,
                     env={**os.environ, 'PATH': f'{root}{os.pathsep}{os.environ["PATH"]}',
                          'HIBERNAUT_MCP_TOKEN': 'reload-test'},
@@ -58,7 +64,7 @@ class TestConfigReload(unittest.TestCase):
                             return
                     except ConnectionRefusedError:
                         pass
-                    time.sleep(.05)
+                    time.sleep(.01)
                 self.fail(log.read_text())
 
             try:

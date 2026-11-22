@@ -196,7 +196,7 @@ def _post_event(port: int, external_id: str) -> tuple[int, dict[str, object]]:
 class TestWebhookServerConcurrency(unittest.TestCase):
     def _serve(self, handler: EventHandler) -> tuple[int, WebhookHTTPServer]:
         server = create_webhook_server("127.0.0.1", 0, handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)
         return server.server_address[1], server
@@ -236,7 +236,7 @@ class TestWebhookServerConcurrency(unittest.TestCase):
 
         stopper = threading.Thread(target=server.shutdown)
         stopper.start()
-        stopper.join(timeout=0.3)
+        stopper.join(timeout=0.05)
         self.assertTrue(stopper.is_alive())
 
         release.set()
@@ -275,7 +275,7 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
             feishu_adapter=daemon.feishu_webhook,
         )
         port = server.server_address[1]
-        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         server_thread.start()
 
         stop = asyncio.Event()

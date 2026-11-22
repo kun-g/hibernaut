@@ -52,7 +52,7 @@ class TestUnmatchedProjectHold(_DispatchCase):
                                       correlation_key="task:x1")
                 await daemon.pool.wait_until_idle(timeout_seconds=60)
                 # Idle means no requeue loop; nothing re-logs while the event waits.
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.05)
                 self.assertTrue(daemon.pool._idle_event.is_set())
                 (first,) = self.assert_held(ORPHAN, 1)
                 self.assertEqual(len(logs.records), 1, [r.getMessage() for r in logs.records])
@@ -61,7 +61,7 @@ class TestUnmatchedProjectHold(_DispatchCase):
                 daemon.handler.ingest(inbox_id=ORPHAN, source="test", external_id="o2",
                                       payload={"text": "orphan-2"}, correlation_key="task:o2")
                 await daemon.pool.wait_until_idle(timeout_seconds=60)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.05)
         finally:
             stop.set()
             await pool
@@ -128,17 +128,17 @@ class TestUnmatchedProjectHold(_DispatchCase):
             deadline = time.monotonic() + 30
             while not check():
                 self.assertLess(time.monotonic(), deadline)
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.01)
 
         stop = asyncio.Event()
         with patch.dict(os.environ, {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}):
-            serving = asyncio.create_task(serve_configured(path, config, daemon, stop))
+            serving = asyncio.create_task(serve_configured(path, config, daemon, stop, reload_interval=0.02))
             try:
                 with self.assertLogs(HOLD_LOGGER, level="WARNING"):
                     result = daemon.handler.ingest(inbox_id=ORPHAN, source="test", external_id="o1",
                                                    payload={"text": "orphan"}, correlation_key="task:o1")
                     await wait_for(lambda: bool(self.event_rows(ORPHAN)))
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(0.15)
                 self.assertEqual(status(), ("pending", 0))
 
                 path.write_text(path.read_text() + project_table("orphan", ORPHAN, self.repo))
@@ -146,7 +146,7 @@ class TestUnmatchedProjectHold(_DispatchCase):
                 # The same delivery again is a duplicate, so the event runs only once.
                 self.assertTrue(daemon.handler.ingest(inbox_id=ORPHAN, source="test", external_id="o1",
                                                       payload={"text": "orphan"}).duplicate)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.08)
             finally:
                 stop.set()
                 await serving
