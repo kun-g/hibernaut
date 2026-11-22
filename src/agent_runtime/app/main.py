@@ -7,7 +7,7 @@ import os
 import signal
 import sys
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -29,6 +29,7 @@ from agent_runtime.adapters.channels import (
     build_feishu_or_console_channel,
 )
 from agent_runtime.adapters.channels.channels import webhook_request_handler
+from agent_runtime.adapters.channels.switchboard_bridge import SwitchboardChannelAdapter, SwitchboardInboundBridge
 from agent_runtime.adapters.delivery import DeliveryConfig, PRDelivery
 from agent_runtime.adapters.executor_cli import (
     CODER_REVIEWER_ROLE,
@@ -59,7 +60,13 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteTaskMetadataStore,
     SQLiteWorkspaceStore,
 )
-from agent_runtime.app.config import HibernautConfig, RoleConfig, config_changes, load_config
+from agent_runtime.app.config import (
+    HibernautConfig,
+    RoleConfig,
+    SwitchboardLinkConfig,
+    config_changes,
+    load_config,
+)
 from agent_runtime.app.projects import ProjectRouter, UnmatchedProjectHold
 from agent_runtime.core.models import NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, RunCapabilities
@@ -71,6 +78,10 @@ from agent_runtime.engine import (
     TimerScheduler,
 )
 from agent_runtime.engine.worker import ExecutorFailed
+from switchboard.app import EnvCredentialBroker, Switchboard, build_switchboard
+from switchboard.config import load_config as load_switchboard_config
+
+SWITCHBOARD_SECRET_PREFIX = "SWITCHBOARD_"
 
 
 class AsyncWorkerPool:
@@ -210,6 +221,7 @@ class AlwaysOnDaemon:
     gdrive_poller: DriveTaskPoller | None = None
     gdrive_result_writer: DriveResultWriter | None = None
     mcp_server: MCPServerAdapter | None = None
+    switchboard_bridge: SwitchboardInboundBridge | None = None
     poll_interval_seconds: float = 60.0
     gdrive_poll_interval_seconds: float = 30.0
     ingest_only: bool = False
@@ -519,6 +531,7 @@ def build_daemon_from_config(
     database: SQLiteDatabase | None = None,
     demo: bool = False,
     gdrive_client: DriveClientProtocol | None = None,
+    switchboard: Switchboard | None = None,
 ) -> AlwaysOnDaemon:
     # Every inbox -> project lookup goes through the router, so pattern-matched inboxes get their project's settings
     # and an inbox matching two projects raises AmbiguousProjectMatch instead of picking one.
@@ -544,6 +557,9 @@ def build_daemon_from_config(
         default_chat_id=config.channels.feishu_default_chat_id or None,
         inbox_chat_map=inbox_chat_map,
     )
+    if switchboard is not None:
+        # Replies with an origin go out through the Switchboard gateway; session-less notices keep the old channel.
+        resolved_channel = SwitchboardChannelAdapter(switchboard.bus.publish, fallback=resolved_channel)
 
     gh_secret = os.environ.get(config.channels.github_webhook_secret_env) or None
     feishu_token = os.environ.get(config.channels.feishu_verification_token_env) or None
@@ -801,7 +817,34 @@ def build_daemon_from_config(
             failed_folder_id=config.gdrive.failed_folder_id or None,
         )
 
+    if switchboard is not None:
+        attach_switchboard(daemon, switchboard, config.switchboard.consumer_id)
+
     return daemon
+
+
+def take_switchboard_secrets(environ: MutableMapping[str, str] | None = None) -> dict[str, str]:
+    # Executor subprocesses inherit os.environ; moving the Switchboard tokens out keeps them away from agents.
+    env = os.environ if environ is None else environ
+    return {name: env.pop(name) for name in [n for n in env if n.startswith(SWITCHBOARD_SECRET_PREFIX)]}
+
+
+def start_switchboard(link: SwitchboardLinkConfig) -> Switchboard | None:
+    if not link.enabled:
+        return None
+    assert link.config_path is not None
+    board = build_switchboard(load_switchboard_config(link.config_path), credentials=EnvCredentialBroker(take_switchboard_secrets()))
+    board.start()
+    print(f"[hibernaut] [switchboard] in-process switchboard listening on {board.http.base_url}", file=sys.stderr, flush=True)
+    return board
+
+
+def attach_switchboard(daemon: AlwaysOnDaemon, board: Switchboard, consumer_id: str) -> SwitchboardInboundBridge:
+    # Subscribing again replaces the previous handler, so a config reload re-points delivery at the new daemon.
+    bridge = SwitchboardInboundBridge(daemon.handler)
+    board.bus.subscribe(consumer_id, bridge.handle_canonical_event)
+    daemon.switchboard_bridge = bridge
+    return bridge
 
 
 async def serve_configured(
@@ -811,6 +854,7 @@ async def serve_configured(
     stop: asyncio.Event,
     *,
     demo: bool = False,
+    switchboard: Switchboard | None = None,
 ) -> None:
     server = WebhookHTTPServer((config.channels.host, config.channels.port), daemon.http_handler())
     changes = config_changes(path, stop)
@@ -834,12 +878,20 @@ async def serve_configured(
                                 flush=True,
                             )
                             continue
+                        if candidate.switchboard != config.switchboard:
+                            print(
+                                "[config] [switchboard] changes require a restart.",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            continue
                         address = (candidate.channels.host, candidate.channels.port)
                         try:
                             replacement = build_daemon_from_config(
                                 candidate,
                                 database=daemon.db,
                                 demo=demo,
+                                switchboard=switchboard,
                             )
                             handler = replacement.http_handler()
                             if address != (config.channels.host, config.channels.port):
@@ -897,9 +949,12 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=banner)
     args = parser.parse_args()
 
+    board: Switchboard | None = None
     if args.config:
         cfg = load_config(args.config)
-        daemon = build_daemon_from_config(cfg, demo=args.demo)
+        # The stdio MCP companion runs beside a daemon that already owns the Switchboard port.
+        board = None if args.mcp_stdio else start_switchboard(cfg.switchboard)
+        daemon = build_daemon_from_config(cfg, demo=args.demo, switchboard=board)
         host = cfg.channels.host
         port = cfg.channels.port
     else:
@@ -922,6 +977,8 @@ def main() -> None:
             daemon.mcp_server.serve_stdio(sys.stdin, sys.stdout)
         finally:
             daemon.close()
+            if board is not None:
+                board.stop()
         return
 
     print(banner, flush=True)
@@ -942,11 +999,14 @@ def main() -> None:
                     daemon,
                     stop_event,
                     demo=args.demo,
+                    switchboard=board,
                 )
             else:
                 await daemon.run(stop_event=stop_event, webhook_host=host, webhook_port=port)
         finally:
             daemon.close()
+            if board is not None:
+                board.stop()
 
     asyncio.run(_serve())
 

@@ -518,7 +518,8 @@ class DriveResultWriter:
                 session_id=session.session_id if session else None,
                 dedup_key=f"suspend:{req_id}" if req_id else None,
             )
-        elif kind == "emit":
+        elif kind == "emit" and "run_id" not in metadata:
+            # A worker Emit carries run_id and is already written by handle_run_report.
             await asyncio.to_thread(
                 self.write_emit,
                 file_id,

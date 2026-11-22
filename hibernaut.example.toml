@@ -153,3 +153,11 @@ gh_command = "gh"
 # in_progress_folder_id = ""
 # done_folder_id = ""
 # failed_folder_id = ""
+
+# Stage A: run Switchboard in this process (off by default). Tokens come only from SWITCHBOARD_* env vars,
+# which are moved out of the process environment at startup so executor subprocesses do not inherit them.
+# [switchboard]
+# enabled = true
+# mode = "in_process"
+# config_path = "switchboard.toml"   # relative to this file
+# consumer_id = "hibernaut"

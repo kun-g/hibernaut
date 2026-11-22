@@ -145,6 +145,17 @@
 - **SQLite**（`store_sqlite.py`）：WAL、`busy_timeout=5000`、`foreign_keys=ON`；一条连接在一把进程内锁下串行，写入用 `BEGIN IMMEDIATE`。三张表 `inbound_events`、`delivery_log`、`outbound_messages` 及索引 `idx_inbound_corr`、`idx_delivery_sched`、`idx_delivery_order`、`idx_outbound_sched`。
 - **HTTP**（`http_server.py`）：单端口 `ThreadingHTTPServer` 挂 `/webhooks/github`、`/webhooks/feishu`、`/mcp`、`/healthz`；按 `Content-Length` 先拒超限请求，入库后立即返回，不等下游。组装根是 `switchboard/app.py`（`python -m switchboard.app --config switchboard.toml`）。
 
+### 7.1 Stage A：Hibernaut 同进程桥接（`adapters/channels/switchboard_bridge.py`）
+
+`hibernaut.toml` 的 `[switchboard]` 段默认 `enabled = false`，此时不启动 Switchboard，GitHub / 飞书 / MCP / Drive 旧通道行为不变（旧通道退场留待 Stage C）。开启后 `app/main.py` 启动时用 `load_config(config_path)` + `build_switchboard(..., credentials=EnvCredentialBroker(...))` 建同进程 Switchboard 并 `start()`，进程退出（SIGINT/SIGTERM）时 `stop()`。只有 L3 `adapters` 与 `app` 依赖 `switchboard`；L0/L1/L2 不导入它。
+
+- **入站桥 `SwitchboardInboundBridge.handle_canonical_event`**（符合 `ConsumerHandler`，以 `consumer_id`（默认 `hibernaut`）`bus.subscribe`）：`CanonicalEvent` → `EventHandler.ingest(inbox_id=scope, source="sb:<source>", external_id=event_id, correlation_key=...)`。`external_id` 用 Switchboard 全局 `event_id`，At-Least-Once 重推命中 `(inbox_id, source, external_id)` 去重记为 `dropped`，仍回 `acked`；落库异常回 `nack`，由 `DeliveryWorker` 退避重试。payload 含 `event_type/subject/title/body/actor/external_id/occurred_at` 与原样 `metadata`，并把引擎读取的 `approval_request_id`、`decision`、`work_key`、`reply_channel`、`reply_target` 提到顶层（`approval.decided` 由此按 `approval_request_id` 恢复挂起会话）。
+- **`work.closed` 联动**：入站桥给事件加 `action = "close_session"`，由 Worker 在 Inbox 租约内走既有的关闭流程：关闭该 `(inbox_id, correlation_key)` 会话，`count_active_by_work_key(work_key, inbox_id) == 0` 时触发 worktree 回收；找不到会话则只标记完成。不在投递线程里直接改会话，避免与正在运行的 Run 竞争（Run 结束时会把会话写回 active）。
+- **出站桥 `SwitchboardChannelAdapter`**（实现 L1 `ChannelPort`）：Outbox 消息 → `execution.reported`（`source="hibernaut"`、`scope=inbox_id`、`actor="hibernaut"`、`subject` 取 metadata 的 `title`/`subject`，缺省 `Hibernaut update`，`body=content`），metadata 带 `run_id/session_id/outcome_kind`，并透传 `approval_request_id`、`reply_channel`、`reply_target`、`task_id`、`executor_id`、`error_kind`、`notify_channels`、`approval_channel`、`approval_target`。`outcome_kind` 取 metadata 显式值，否则按 `kind`：`emit → emit`、`approval_request → suspend`、`silent →` 不发布、其余 → `error`。`external_id = outbox:<message_id>`，没有 `message_id` 时用 `(inbox_id, content, metadata)` 的确定性哈希，Outbox 重试不会重复发卡。发布回调 `publish: Callable[[CanonicalEvent], Any]` 由构造函数注入（Stage A 为 `switchboard.bus.publish`，Stage B 换 RelayAgent 不改翻译逻辑）；返回 `invalid` 时抛异常，由 `OutboxDispatcher` 记失败并重试。缺 `correlation_key` 或 `session_id` 的消息（如 worktree 回收告警）没有可回复的来源，交给 `fallback`（原飞书/控制台通道）。
+- **Outbox 元数据**：`AgentWorker` 写 Emit / Suspend 时补齐 `run_id`（每批一次）、`correlation_key`、`session_id`、`outcome_kind`，Suspend 另带 `approval_request_id`，并透传批内事件 payload 的 `reply_channel` / `reply_target`；原有 `kind`、`request_id` 不变。`DriveResultWriter` 对带 `run_id` 的 Emit 不再经通道写 Drive（已由 `handle_run_report` 写入），避免重复。
+- **凭据**：Stage A 的 `EnvCredentialBroker` 让 Hibernaut 进程持有 `SWITCHBOARD_*` 令牌，与「零真实密钥」契约有缺口。启动时把这些变量从 `os.environ` 移到 broker 私有副本，执行器子进程继承不到；彻底解决留待 Stage B 把 Switchboard 移出 Agent 进程或改走外置凭据代理。
+- **重载**：`[switchboard]` 段变化需重启；其它配置热重载时重新 `subscribe`，入站桥指向新的 daemon。
+
 ## 8. 架构决策记录（ADR）
 
 - [ADR-0001：跨项目协议采用 JSON Schema（暂不引入 Protobuf）](adr/0001-cross-project-protocol-schema.md)

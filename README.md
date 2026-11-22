@@ -417,6 +417,20 @@ Secrets are read through `CredentialBrokerPort`; the default `EnvCredentialBroke
 
 See `docs/architecture.md` section 7 for the full design.
 
+### Running Switchboard inside Hibernaut (Stage A)
+
+Off by default. To run Switchboard in the Hibernaut process, add to `hibernaut.toml`:
+
+```toml
+[switchboard]
+enabled = true
+mode = "in_process"                  # the only mode today; "relay" is reserved for Stage B
+config_path = "switchboard.toml"     # relative to hibernaut.toml
+consumer_id = "hibernaut"
+```
+
+Hibernaut then starts the Switchboard endpoints from `switchboard.toml` beside its own, subscribes as `consumer_id`, and turns `conversation.message`, `work.ready`, `approval.decided` and `work.closed` deliveries into `event_inbox` events (`source = "sb:<source>"`, deduplicated by the Switchboard `event_id`). Emit and Suspend replies that know their `correlation_key` and session go out as `execution.reported` through the Switchboard gateway (GitHub comments, Feishu approval cards); messages without an origin, such as worktree reclaim alerts, still use the Feishu/console channel. `work.closed` closes the matching session and reclaims its worktree when no active session still uses it. The `SWITCHBOARD_*` variables are moved out of the process environment at startup, so executor subprocesses do not inherit them. Changing `[switchboard]` needs a restart. The existing GitHub, Feishu, MCP and Drive channels keep working alongside it.
+
 ## Anti-Corruption Gates (CI)
 
 ```bash
