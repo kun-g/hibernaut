@@ -11,7 +11,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 多入口接单 | `POST /events`、GitHub Webhook 与 Issue 轮询、飞书消息与审批卡片、MCP、Google Drive 任务队列、定时器；重复事件只执行一次 |
 | 按 Inbox 并发 | 每个 `inbox_id` 一条串行队列，不同 Inbox 并行；同一个 Issue、Drive 文件或飞书话题的事件接着同一会话和 worktree 做 |
 | 多执行器 | claude / cursor-agent / grok / dsh 等 CLI 和角色执行器；按事件、会话、项目、全局四级选择，会话粘在首次选定的执行器上 |
-| SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `executor_id = "sde"`（Drive 任务 frontmatter 写 `executor_id: sde`），项目也可设为默认执行器 |
+| SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `executor_id = "sde"`（Drive 任务 frontmatter 写 `executor_id: sde`），项目也可设为默认执行器；GitHub Issue 以 `# 标题` + 正文为需求、标题为 PR 标题 |
 | 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok，模板写 `terminal = "orca"` 可在 Orca 终端里旁观评审）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested` |
 | PR 交付 | SDE 完成后由 Hibernaut 合入主干、按改动类型定版本号、跑检查、推分支、开 PR，可选在评审通过且 CI 绿后自动合并；合入主干冲突（版本号以外）或合入后检查失败时交回同一开发会话解决，评审增量后自动续交付，超过次数上限才挂起等人；合并后删除源分支并结案；与任务来源无关 |
 | 可见终端 | 运行在 Orca 终端里打开，人可以旁观、回答提问，后续事件回到同一对话 |
