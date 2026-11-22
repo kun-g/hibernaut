@@ -39,6 +39,15 @@ def branch_head(bare, branch):
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
+def conflicting(bare, pr):
+    # Like GitHub's mergeStateStatus DIRTY: the PR head does not merge cleanly into its base.
+    if pr["state"] != "OPEN" or not branch_head(bare, pr["head"]):
+        return False
+    proc = subprocess.run(["git", "-C", bare, "merge-tree", "--write-tree", f"refs/heads/{pr['base']}",
+                           f"refs/heads/{pr['head']}"], capture_output=True, text=True)
+    return proc.returncode == 1
+
+
 def main(argv):
     state = load()
     state.setdefault("calls", []).append(argv)
@@ -82,7 +91,10 @@ def main(argv):
         return
     if cmd == "checks":
         checks = state.get("checks", [{"name": "gates", "state": "SUCCESS", "bucket": "pass"}])
-        if state.get("checks_sequence"):
+        if state.get("dirty_blocks_ci") and conflicting(bare, pr):
+            # GitHub runs no pull_request workflow for a PR that conflicts with its base.
+            checks = []
+        elif state.get("checks_sequence"):
             checks = state["checks_sequence"].pop(0)
             save(state)
         if not checks:
@@ -92,8 +104,12 @@ def main(argv):
         sys.exit(8 if any(c["bucket"] == "pending" for c in checks) else 0)
     if cmd == "view":
         head = state.get("view_head_override") or pr.get("merged_head") or branch_head(bare, pr["head"])
-        print(json.dumps({"state": pr["state"], "url": pr["url"], "headRefOid": head,
-                          "mergeCommit": {"oid": pr["merge_sha"]} if pr.get("merge_sha") else None}))
+        view = {"state": pr["state"], "url": pr["url"], "headRefOid": head,
+                "mergeCommit": {"oid": pr["merge_sha"]} if pr.get("merge_sha") else None}
+        if "mergeStateStatus" in opt(argv, "--json", ""):
+            dirty = conflicting(bare, pr)
+            view.update(mergeable="CONFLICTING" if dirty else "MERGEABLE", mergeStateStatus="DIRTY" if dirty else "CLEAN")
+        print(json.dumps(view))
         return
     if cmd == "merge":
         fail(state, "merge")

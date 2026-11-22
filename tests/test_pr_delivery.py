@@ -53,10 +53,18 @@ class TestVersionRules(unittest.TestCase):
             "each a non-empty list of strings": {"checks": ["pytest -v"]},
             "merge_method must be one of": {"merge_method": "fast-forward"},
             "open_pr must be true or false": {"open_pr": "yes"},
+            "max_handbacks must be a non-negative integer": {"max_handbacks": -1},
         }
         for message, raw in cases.items():
             with self.subTest(message), self.assertRaisesRegex(ValueError, message):
                 parse_delivery("d", raw, repo="o/r")
+
+    def test_hand_backs_to_the_developer_default_to_two_and_can_be_turned_off(self):
+        self.assertEqual(parse_delivery("d", {}, repo="o/r").max_handbacks, 2)
+        self.assertEqual(parse_delivery("d", {"max_handbacks": 0}, repo="o/r").max_handbacks, 0)
+        for bad in (True, 1.5, "2"):
+            with self.subTest(bad), self.assertRaisesRegex(ValueError, "max_handbacks must be a non-negative integer"):
+                parse_delivery("d", {"max_handbacks": bad}, repo="o/r")
 
 
 @functools.lru_cache(maxsize=1)
@@ -283,6 +291,37 @@ class TestOpenPullRequest(DeliveryCase):
         self.assertEqual(git(wt, "status", "--porcelain"), "")
         self.assertFalse((wt / ".git" / "MERGE_HEAD").exists())
         self.assertEqual(self.remote_head("hb/task-a"), "")
+        # The developer can resolve it: the record says what conflicted and which base commits caused it.
+        main_sha = git(self.bare, "rev-parse", "main")
+        self.assertEqual(rec.handback, {
+            "kind": "conflict", "base": "origin/main", "base_sha": main_sha, "branch": "hb/task-a",
+            "files": ["calc.py"], "commits": f"{main_sha[:7]} main moves",
+        })
+
+    def test_a_conflict_only_in_the_version_file_is_resolved_without_a_hand_back(self):
+        wt = self.task("task-a", {VERSION_FILE: '"""pkg"""\n__version__ = "0.4.1"\n', "calc.py": "y = 2\n"})
+        self.push_main({VERSION_FILE: '"""pkg"""\n__version__ = "0.5.0"\n'})
+        rec = self.delivery().deliver(self.request(wt, kind="fix"), permissions=InMemoryPermission())
+        self.assertEqual((rec.state, rec.problem, rec.handback, rec.version), ("pr_open", "", {}, "0.5.1"))
+
+    def test_failing_checks_after_merging_the_base_are_handed_back(self):
+        wt = self.task("task-a", {"calc.py": "x = 1\n"})
+        self.push_main({"main.txt": "new on main\n"})
+        check = ("/bin/sh", "-c", "test ! -f main.txt || { echo 'main.txt needs ok.txt'; exit 1; }")
+        rec = self.delivery(checks=(check,)).deliver(self.request(wt), permissions=InMemoryPermission())
+        self.assertIn("repository checks failed", rec.problem)
+        self.assertEqual(rec.handback["kind"], "checks")
+        self.assertEqual(rec.handback["base_sha"], git(self.bare, "rev-parse", "main"))
+        self.assertEqual(rec.handback["head"], git(wt, "rev-parse", "HEAD"))
+        self.assertIn("main.txt needs ok.txt", rec.handback["failed"])
+        self.assertEqual(self.remote_head("hb/task-a"), "")
+
+    def test_a_missing_check_command_is_not_handed_back(self):
+        wt = self.task("task-a", {"calc.py": "x = 1\n"})
+        rec = self.delivery(checks=(("no-such-check-command",),)).deliver(self.request(wt),
+                                                                       permissions=InMemoryPermission())
+        self.assertIn("command not found", rec.problem)
+        self.assertEqual(rec.handback, {})
 
 
 class TestMerge(DeliveryCase):
@@ -387,6 +426,31 @@ class TestMerge(DeliveryCase):
         self.assertEqual((rb.state, rb.problem, rb.version), ("merged", "", "0.5.1"))
         self.assertIn('"0.5.1"', self.main_file())
         self.assertEqual(rb.merge_sha, git(self.bare, "rev-parse", "main"))
+
+    def test_a_pr_that_conflicts_while_waiting_for_ci_is_prepared_again_without_waiting_for_the_timeout(self):
+        a = self.task("task-a", {"calc.py": "a = 1\n"})
+        b = self.task("task-b", {"other.py": "b = 1\n"})
+        self.delivery().deliver(self.request(a), permissions=InMemoryPermission())
+        merged_a: list[object] = []
+        waits: list[float] = []
+
+        def merge_a_while_b_waits(seconds):
+            waits.append(seconds)
+            if not merged_a:
+                merged_a.append(self.merging().deliver(self.request(a), permissions=InMemoryPermission()))
+
+        pending = [{"name": "gates", "state": "IN_PROGRESS", "bucket": "pending"}]
+        # Both PRs set the version: once a merges, b conflicts and GitHub reports no checks for it.
+        self.set_gh(checks_sequence=[pending], dirty_blocks_ci=True)
+        rb = self.merging(sleep=merge_a_while_b_waits, ci_timeout_seconds=600).deliver(
+            self.request(b, kind="fix"), permissions=InMemoryPermission())
+        self.assertEqual(merged_a[0].state, "merged")  # type: ignore[attr-defined]
+        self.assertEqual((rb.state, rb.problem, rb.version), ("merged", "", "0.5.1"))
+        self.assertEqual(len(waits), 1)
+        self.assertIn("PR #2 conflicts with origin/main while waiting for CI; merging origin/main again",
+                      rb.history)
+        self.assertIn('"0.5.1"', self.main_file())
+        self.assertEqual(self.main_file("other.py"), "b = 1")
 
     def test_a_pr_merged_by_a_person_is_adopted_not_bumped_again(self):
         wt = self.task("task-a", {"calc.py": "x = 1\n"})

@@ -63,8 +63,11 @@ def next_step(name):
 
 
 def apply_work(step):
-    # A developer step writes its files and commits them like a developer finishing a task; "commit": null leaves
-    # the work uncommitted and "write_uncommitted" adds files after the commit.
+    # A developer step runs its commands (e.g. a git merge that may conflict), writes its files and commits them
+    # like a developer finishing a task; "commit": null leaves the work uncommitted and "write_uncommitted" adds
+    # files after the commit.
+    for cmd in step.get("run", []):
+        subprocess.run(cmd, capture_output=True)
     for rel, content in step.get("write", {}).items():
         target = Path.cwd() / rel
         target.parent.mkdir(parents=True, exist_ok=True)
