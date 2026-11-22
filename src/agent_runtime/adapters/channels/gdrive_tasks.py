@@ -446,7 +446,8 @@ class DriveResultWriter:
         session = self._sessions.get(report.session_id)
         if session is None:
             return False
-        file_id = extract_gdrive_file_id(session.correlation_key)
+        # A finished task's session is closed after its Run, which clears its correlation_key.
+        file_id = extract_gdrive_file_id(report.correlation_key or session.correlation_key)
         if not file_id:
             return False
         dedup = f"report:{report.session_id}:{','.join(report.event_ids)}"

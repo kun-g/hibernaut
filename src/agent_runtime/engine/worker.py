@@ -54,6 +54,8 @@ class RunReport:
     session_id: str | None
     event_ids: tuple[str, ...]
     outcome: RunOutcome
+    # Kept on the report: a session closed after its Run no longer carries it.
+    correlation_key: str | None = None
 
 
 class ExecutorFailed(RuntimeError):
@@ -379,8 +381,13 @@ class AgentWorker:
                                 session_id=final_session_id,
                                 event_ids=tuple(all_done_ids),
                                 outcome=outcome,
+                                correlation_key=final_corr,
                             )
                         )
+                        if isinstance(outcome, Emit) and outcome.close_session and final_session_id is not None:
+                            # After the result and its events are written, so the reclaim gates no longer see them.
+                            async with self._lease_heartbeat(inbox_id):
+                                await self._close_finished(final_session_id)
                 finally:
                     # Any held-back or unfinished claimed events return to pending for the next pass.
                     straggler_ids = [
@@ -484,13 +491,26 @@ class AgentWorker:
                         break
         if target is None:
             return None
+        self._close_and_reclaim(target)
+        return target.session_id
+
+    def _close_and_reclaim(self, target: SessionRef) -> None:
         self._sessions.close_session(target.session_id)
         if target.work_key and self._on_worktree_reclaim is not None:
             # Counted within the inbox: another inbox with the same work_key has its own worktree, and the
             # reclaim callback re-checks whatever its workspace is shared with.
             if self._sessions.count_active_by_work_key(target.work_key, target.inbox_id) == 0:
                 self._on_worktree_reclaim(target.work_key)
-        return target.session_id
+
+    async def _close_finished(self, session_id: str) -> None:
+        # The Run already wrote its result; a failing close or reclaim is logged and never fails or repeats it.
+        target = self._sessions.get(session_id)
+        if target is None:
+            return
+        try:
+            await asyncio.to_thread(self._close_and_reclaim, target)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception("Closing finished session %s failed", session_id)
 
     def _select_executor(
         self,
