@@ -7,6 +7,9 @@ memory_root = "./agent_memory"
 max_concurrency = 4
 new_event_policy = "defer"   # defer | fold | interrupt
 default_executor = "claude"
+# 后台回收清扫：启动时一轮，之后每隔这么多秒一轮，回收交付时因排队事件、在线会话等被跳过、PR 已合并且已无人使用的 hb-* worktree；
+# 门禁与回收方式同交付时的回收，跳过只记日志，回收成功才发一条通知；0 = 关闭
+worktree_sweep_interval_seconds = 300.0
 
 [channels]
 host = "127.0.0.1"

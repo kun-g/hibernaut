@@ -282,11 +282,7 @@ class OrcaWorktreeManager:
             msg = f"Refused reclaim for '{record.workdir}': owned by {record.inbox_id!r}, not {inbox_id!r}"
             self._alert(notify_outbox, inbox_id, msg)
             return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
-        sessions_key = work_key
-        if inbox_id is None and record.inbox_id and key.startswith(f"{record.inbox_id}/"):
-            sessions_key = key.removeprefix(f"{record.inbox_id}/")
-
-        owner = (record.inbox_id or inbox_id or self._primary_inbox_id) if self._isolate else None
+        sessions_key, owner = self._users_scope(record, work_key, inbox_id)
         workdir = Path(record.workdir)
         refusal = self._refusal(sessions_key, record.branch, record.repo_checkout, workdir, owner, key)
         if refusal is not None:
@@ -365,7 +361,34 @@ class OrcaWorktreeManager:
             return False, f"local branch {branch} kept: {res.stderr.strip()}"
         return True, f"deleted local branch {branch} (merged as {merged_head[:12]})"
 
-    def _refusal(self, work_key: str, branch: str, repo_checkout: str, workdir: Path, owner: str | None, storage_key: str) -> str | None:
+    def _users_scope(self, record: WorkspaceRecord, work_key: str, inbox_id: str | None) -> tuple[str, str | None]:
+        # The sessions' work_key and the owning inbox whose sessions count, for a record found by its storage key.
+        sessions_key = work_key
+        if inbox_id is None and record.inbox_id and record.work_key.startswith(f"{record.inbox_id}/"):
+            sessions_key = record.work_key.removeprefix(f"{record.inbox_id}/")
+        owner = (record.inbox_id or inbox_id or self._primary_inbox_id) if self._isolate else None
+        return sessions_key, owner
+
+    def in_use(self, record: WorkspaceRecord) -> str | None:
+        # Gates 0 and 1 only, read from the database: why the worktree cannot go yet, or None.
+        sessions_key, owner = self._users_scope(record, record.work_key, None)
+        return self._in_use(sessions_key, owner, record.work_key)
+
+    def merged_at_head(self, record: WorkspaceRecord) -> bool | None:
+        # Whether GitHub reports a merged PR for the branch whose head is the worktree's HEAD, so the work in this
+        # worktree is what was merged. None when it cannot be told (no worktree, git or gh failed).
+        workdir = Path(record.workdir)
+        if not workdir.is_dir():
+            return None
+        head = self._runner(["git", "rev-parse", "HEAD"], workdir)
+        if head.returncode != 0 or not head.stdout.strip():
+            return None
+        merged = self._pr_list(record.branch, "merged", "number,headRefOid", workdir)
+        if merged is None:
+            return None
+        return any(pr.get("headRefOid") == head.stdout.strip() for pr in merged)
+
+    def _in_use(self, work_key: str, owner: str | None, storage_key: str) -> str | None:
         # Gate 0: no active or suspended session, child included, still references work_key.
         if self._session_store is not None:
             active_refs = self._session_store.count_active_by_work_key(work_key, owner)
@@ -382,6 +405,12 @@ class OrcaWorktreeManager:
                 blockers = [*blockers, *self._usage(storage_key)]
             if blockers:
                 return f"Skipped reclaim for '{work_key}': still in use: {'; '.join(blockers)}"
+        return None
+
+    def _refusal(self, work_key: str, branch: str, repo_checkout: str, workdir: Path, owner: str | None, storage_key: str) -> str | None:
+        in_use = self._in_use(work_key, owner, storage_key)
+        if in_use is not None:
+            return in_use
 
         if not workdir.name.startswith("hb-"):
             return f"Refused reclaim for '{workdir}': directory name lacks 'hb-' prefix"

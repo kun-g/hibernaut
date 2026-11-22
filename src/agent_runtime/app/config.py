@@ -23,6 +23,7 @@ from agent_runtime.adapters.executor_cli.executor import CLI_TERMINALS, DEFAULT_
 from agent_runtime.adapters.executor_cli.reviewer import CODE_REVIEWER_ROLE
 from agent_runtime.adapters.executor_cli.role_skills import ROLE_ALIASES, canonical_role
 from agent_runtime.adapters.executor_cli.sde import SDE_OPTION_KEYS, SDE_ROLE, SDEOptions
+from agent_runtime.adapters.executor_cli.reclaim_sweep import DEFAULT_SWEEP_INTERVAL_SECONDS
 from agent_runtime.adapters.executor_cli.worktree import WorktreeBackend
 from agent_runtime.adapters.permissions.security import proxy_service_url
 from agent_runtime.app.projects import InboxRule, parse_inbox_rules, validate_project_rules
@@ -36,6 +37,8 @@ class RuntimeConfig:
     max_concurrency: int = 4
     new_event_policy: NewEventPolicy = "defer"
     default_executor: str = "claude"
+    # Background reclaim of merged task worktrees a delivery-time reclaim had to skip; 0 turns it off.
+    worktree_sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,10 +346,16 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         max_concurrency=int(rt_raw.get("max_concurrency", 4)),
         new_event_policy=cast(NewEventPolicy, policy),
         default_executor=str(rt_raw.get("default_executor", "claude")),
+        worktree_sweep_interval_seconds=float(
+            rt_raw.get("worktree_sweep_interval_seconds", DEFAULT_SWEEP_INTERVAL_SECONDS)
+        ),
     )
 
     if runtime.max_concurrency < 1:
         raise ValueError("runtime.max_concurrency must be at least 1")
+    sweep = runtime.worktree_sweep_interval_seconds
+    if not math.isfinite(sweep) or sweep < 0:
+        raise ValueError("runtime.worktree_sweep_interval_seconds must be finite and not negative (0 turns it off)")
 
     ch_raw = raw.get("channels", {})
     _warn_obsolete(ch_raw, "channels", "github_webhook_secret_env", "github_token_env")
