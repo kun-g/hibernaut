@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Collection, Sequence
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 from agent_runtime.adapters.storage_sqlite import EventDiagnostics
@@ -208,22 +209,39 @@ class InMemoryOutbox:
         self._order.append(msg.message_id)
         return msg
 
-    def fetch_pending(self, limit: int = 20) -> list[OutboxMessage]:
+    def fetch_pending(self, limit: int = 20, *, now_iso: str | None = None) -> list[OutboxMessage]:
+        now = datetime.fromisoformat(now_iso) if now_iso else datetime.now(timezone.utc)
         pending = [
             self._messages[mid]
             for mid in self._order
             if self._messages[mid].status == "pending"
+            and (
+                self._messages[mid].next_retry_at is None
+                or datetime.fromisoformat(str(self._messages[mid].next_retry_at)) <= now
+            )
         ]
         return pending[:limit]
 
+    def get(self, message_id: str) -> OutboxMessage:
+        return self._messages[message_id]
+
     def mark_sent(self, message_id: str) -> None:
         msg = self._messages[message_id]
-        self._messages[message_id] = replace(msg, status="sent")
+        self._messages[message_id] = replace(msg, status="sent", next_retry_at=None)
+
+    def schedule_retry(self, message_id: str, error: str, next_retry_at: str) -> None:
+        msg = self._messages[message_id]
+        if msg.status != "pending":
+            return
+        self.last_errors[message_id] = error
+        self._messages[message_id] = replace(msg, attempts=msg.attempts + 1, next_retry_at=next_retry_at)
 
     def mark_failed(self, message_id: str, error: str) -> None:
         msg = self._messages[message_id]
+        if msg.status != "pending":
+            return
         self.last_errors[message_id] = error
-        self._messages[message_id] = replace(msg, attempts=msg.attempts + 1)
+        self._messages[message_id] = replace(msg, status="failed", attempts=msg.attempts + 1, next_retry_at=None)
 
 
 class InMemoryLock:

@@ -24,6 +24,11 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Fixed-width UTC form, so stored retry times order correctly as plain strings (SQLite compares them as TEXT).
+def to_utc_iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
 
@@ -98,6 +103,8 @@ class OutboxMessage:
     status: OutboxStatus = "pending"
     attempts: int = 0
     metadata: dict[str, Any] = field(default_factory=_empty_dict)
+    # None means due now; otherwise a to_utc_iso() time before which the message is not fetched.
+    next_retry_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

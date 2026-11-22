@@ -165,13 +165,13 @@ class AsyncWorkerPool:
         self._idle_event.clear()
         self._queue.put_nowait(inbox_id)
 
-    def retire(self, handoff: Callable[[str], None]) -> None:
+    def retire(self, handoff: Callable[[str], None], *, interruptible: bool = True) -> None:
         # Called on the event loop when a config reload replaces this pool. Runs in progress finish with this
         # generation's executors; queued inboxes, later wakes and each inbox whose lease is released go to handoff,
         # which wakes the current pool. worker_leases keeps the two pools off the same inbox.
         self._handoff = handoff
         for worker in self._active.values():
-            worker.retire()
+            worker.retire(interruptible=interruptible)
         self._requeue.clear()
         while not self._queue.empty():
             inbox_id = self._queue.get_nowait()
@@ -180,6 +180,11 @@ class AsyncWorkerPool:
             handoff(inbox_id)
         if not self._active:
             self._idle_event.set()
+
+    def drain(self) -> None:
+        # Called on the event loop when the process stops: Runs in progress finish and write their results, nothing
+        # new is claimed, and wakes are dropped; their events stay pending for the next process's startup scan.
+        self.retire(lambda _inbox_id: None, interruptible=False)
 
     async def _worker_loop(self, worker_idx: int, stop_event: asyncio.Event) -> None:
         worker_id = f"{self._pool_id}-worker-{worker_idx}"
@@ -304,6 +309,7 @@ class AlwaysOnDaemon:
         *,
         server: HTTPServer | None = None,
         stop_event: asyncio.Event | None = None,
+        force_stop_event: asyncio.Event | None = None,
         timer_interval_seconds: float = 5.0,
         outbox_interval_seconds: float = 1.0,
         webhook_host: str | None = None,
@@ -324,28 +330,30 @@ class AlwaysOnDaemon:
             server_thread.start()
 
         workers_stop = asyncio.Event()
+        services_stop = asyncio.Event()
         async with asyncio.TaskGroup() as tasks:
-            if not self.ingest_only:
-                tasks.create_task(self.pool.run_forever(workers_stop))
+            runs = [] if self.ingest_only else [tasks.create_task(self.pool.run_forever(workers_stop))]
             services = tasks.create_task(
                 self.run_services(
-                    stopper,
+                    services_stop,
                     timer_interval_seconds=timer_interval_seconds,
                     outbox_interval_seconds=outbox_interval_seconds,
                 )
             )
             try:
                 await stopper.wait()
-                await services
             finally:
-                # Keep workers available until the last accepted webhook has queued its wake.
+                # Ingress and services keep running until the Runs in progress finish.
+                await drain_pools([self.pool], runs, force_stop_event)
+                workers_stop.set()
                 if server is not None:
                     await asyncio.to_thread(server.shutdown)
                     if owns_server:
                         server.server_close()
                 if server_thread is not None:
                     server_thread.join()
-                workers_stop.set()
+                services_stop.set()
+                await services
 
     async def run_services(
         self,
@@ -375,6 +383,48 @@ class AlwaysOnDaemon:
 
     def close(self) -> None:
         self.db.close()
+
+
+async def drain_pools(
+    pools: Iterable[AsyncWorkerPool],
+    runs: Iterable[asyncio.Task[None]],
+    force_stop: asyncio.Event | None,
+) -> None:
+    # First stage of a stop: no pool claims anything new while the Runs in progress (each pool's run_forever task)
+    # finish. force_stop (the second signal) cancels them instead; a cancelled Run writes nothing to the Outbox and
+    # its events return to pending, as on interrupt.
+    for pool in pools:
+        pool.drain()
+    pending: set[asyncio.Future[Any]] = {task for task in runs if not task.done()}
+    if not pending:
+        return
+    print(
+        "[hibernaut] Stopping: waiting for runs in progress; ingress, Outbox delivery, timers and polling keep "
+        "running. Send SIGINT or SIGTERM again to exit without waiting.",
+        file=sys.stderr,
+        flush=True,
+    )
+    forced = asyncio.ensure_future(force_stop.wait()) if force_stop is not None else None
+    try:
+        while pending:
+            done, _ = await asyncio.wait(
+                pending | ({forced} if forced is not None else set()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            pending -= done
+            if forced is not None and forced in done and pending:
+                print(
+                    "[hibernaut] Second stop signal: cancelling runs in progress; their events stay pending.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.wait(pending)
+                return
+    finally:
+        if forced is not None:
+            forced.cancel()
 
 
 def _report_failed_events(inbox: SQLiteInboxAdapter, writer: DriveResultWriter, inbox_id: str) -> None:
@@ -528,6 +578,8 @@ def build_daemon(
         max_concurrency=max_concurrency,
         on_run_reports=_on_reports if gdrive_writer is not None else None,
         on_inbox_failed=_on_failed if gdrive_writer is not None else None,
+        # Events a stopped process accepted while draining are picked up here.
+        pending_inboxes=inbox.pending_inbox_ids,
     )
     # An ingest-only pool never runs but still collects wakes, so a config reload can hand them to a running pool.
     handler = EventHandler(inbox=inbox, on_wake=pool.wake)
@@ -998,6 +1050,7 @@ async def serve_configured(
     daemon: AlwaysOnDaemon,
     stop: asyncio.Event,
     *,
+    force_stop: asyncio.Event | None = None,
     demo: bool = False,
     switchboard: SwitchboardHandle | None = None,
     reload_interval: float = 1.0,
@@ -1005,12 +1058,15 @@ async def serve_configured(
 ) -> None:
     # A reload never waits for Runs in progress: the listener stays up and takes the new handler, services restart
     # within one tick, and the old worker pool is retired (no new claims) while its last Runs finish in the
-    # background. worker_leases keeps the old and new pools off the same inbox.
+    # background. worker_leases keeps the old and new pools off the same inbox. A stop follows the same principle:
+    # see drain_pools().
     server = WebhookHTTPServer((config.channels.host, config.channels.port), daemon.http_handler())
     changes = config_changes(path, stop, interval=reload_interval)
 
     async with asyncio.TaskGroup() as tasks:
         generation = _Generation.start(daemon, tasks, outbox_interval_seconds=outbox_interval_seconds)
+        # Every generation whose pool may still hold Runs: the current one and those retired by reloads.
+        generations = [generation]
         server_thread = _serve_in_thread(server)
 
         def wake_current(inbox_id: str) -> None:
@@ -1062,6 +1118,7 @@ async def serve_configured(
                 # Stop the old services first so two dispatchers never send the same Outbox row.
                 await previous.stop_services()
                 generation = _Generation.start(replacement, tasks, outbox_interval_seconds=outbox_interval_seconds)
+                generations = [g for g in generations if g.runs is not None and not g.runs.done()] + [generation]
                 # From here every wake reaching the old pool, from its in-flight requests or released leases,
                 # is forwarded to the new one.
                 previous.retire_pool(wake_current)
@@ -1076,10 +1133,17 @@ async def serve_configured(
                 print(f"[config] Reloaded {path}", file=sys.stderr, flush=True)
         finally:
             await changes.aclose()
-            await generation.stop_services()
+            # A stop drains first: ingress and services keep running until every pool, retired or current, has
+            # finished its Runs; only then do the listener (after its accepted requests) and the services close.
+            await drain_pools(
+                [g.daemon.pool for g in generations],
+                [g.runs for g in generations if g.runs is not None],
+                force_stop,
+            )
+            for g in generations:
+                g.pool_stop.set()
             await _close_server(server, server_thread)
-            # Exit keeps its old semantics: the TaskGroup waits for the Runs every pool, retired or current, holds.
-            generation.pool_stop.set()
+            await generation.stop_services()
 
 
 @dataclass
@@ -1088,6 +1152,7 @@ class _Generation:
     services: asyncio.Task[None]
     services_stop: asyncio.Event
     pool_stop: asyncio.Event
+    runs: asyncio.Task[None] | None
 
     @classmethod
     def start(
@@ -1100,12 +1165,11 @@ class _Generation:
         services_stop = asyncio.Event()
         pool_stop = asyncio.Event()
         daemon.pool.bind(asyncio.get_running_loop())
-        if not daemon.ingest_only:
-            tasks.create_task(daemon.pool.run_forever(pool_stop))
+        runs = None if daemon.ingest_only else tasks.create_task(daemon.pool.run_forever(pool_stop))
         services = tasks.create_task(
             daemon.run_services(services_stop, outbox_interval_seconds=outbox_interval_seconds)
         )
-        return cls(daemon, services, services_stop, pool_stop)
+        return cls(daemon, services, services_stop, pool_stop, runs)
 
     async def stop_services(self) -> None:
         self.services_stop.set()
@@ -1193,10 +1257,18 @@ def main() -> None:
 
     async def _serve() -> None:
         stop_event = asyncio.Event()
+        force_stop = asyncio.Event()
+
+        def _on_stop_signal() -> None:
+            # The first signal drains; a second one exits without waiting for Runs in progress.
+            if stop_event.is_set():
+                force_stop.set()
+            stop_event.set()
+
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(sig, stop_event.set)
+                loop.add_signal_handler(sig, _on_stop_signal)
             except NotImplementedError:
                 pass
         try:
@@ -1206,6 +1278,7 @@ def main() -> None:
                     cfg,
                     daemon,
                     stop_event,
+                    force_stop=force_stop,
                     demo=args.demo,
                     switchboard=board,
                     reload_interval=args.config_poll_interval,
@@ -1214,6 +1287,7 @@ def main() -> None:
             else:
                 await daemon.run(
                     stop_event=stop_event,
+                    force_stop_event=force_stop,
                     webhook_host=host,
                     webhook_port=port,
                     outbox_interval_seconds=args.outbox_interval,

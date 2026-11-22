@@ -155,13 +155,44 @@ class OutboxContractMixin:
         pending = outbox.fetch_pending(limit=10)
         self.assertEqual([m.message_id for m in pending], [m1.message_id, m2.message_id])
 
-        outbox.mark_failed(m1.message_id, "timeout")
-        pending_after_fail = outbox.fetch_pending(limit=10)
+        outbox.schedule_retry(m1.message_id, "timeout", "2026-11-22T08:00:05.000000+00:00")
+        pending_after_fail = outbox.fetch_pending(limit=10, now_iso="2026-11-22T08:00:05.000000+00:00")
         self.assertEqual(pending_after_fail[0].attempts, 1)
+        self.assertEqual(pending_after_fail[0].next_retry_at, "2026-11-22T08:00:05.000000+00:00")
 
         outbox.mark_sent(m1.message_id)
         remaining = outbox.fetch_pending(limit=10)
         self.assertEqual([m.message_id for m in remaining], [m2.message_id])
+
+    def test_backoff_hides_a_message_until_next_retry_at(self) -> None:
+        outbox = self.make_outbox()
+        m1 = outbox.enqueue("u1", "first")
+        m2 = outbox.enqueue("u1", "second")
+        self.assertIsNone(m1.next_retry_at)
+
+        outbox.schedule_retry(m1.message_id, "connection refused", "2026-11-22T08:00:05.000000+00:00")
+        before = outbox.fetch_pending(limit=10, now_iso="2026-11-22T08:00:04.999999+00:00")
+        self.assertEqual([m.message_id for m in before], [m2.message_id])
+
+        due = outbox.fetch_pending(limit=10, now_iso="2026-11-22T08:00:05.000000+00:00")
+        self.assertEqual([m.message_id for m in due], [m1.message_id, m2.message_id])
+        self.assertEqual((due[0].status, due[0].attempts), ("pending", 1))
+
+        outbox.schedule_retry(m1.message_id, "again", "2026-11-22T08:00:20.000000+00:00")
+        (again,) = [m for m in outbox.fetch_pending(limit=10, now_iso="2026-11-22T09:00:00.000000+00:00")
+                    if m.message_id == m1.message_id]
+        self.assertEqual((again.attempts, again.next_retry_at), (2, "2026-11-22T08:00:20.000000+00:00"))
+
+    def test_mark_failed_is_terminal(self) -> None:
+        outbox = self.make_outbox()
+        m1 = outbox.enqueue("u1", "doomed")
+        outbox.schedule_retry(m1.message_id, "first", "2026-11-22T08:00:05.000000+00:00")
+        outbox.mark_failed(m1.message_id, "exhausted")
+        self.assertEqual(outbox.fetch_pending(limit=10, now_iso="2999-01-01T00:00:00.000000+00:00"), [])
+        self.assertEqual(self.outbox_row(outbox, m1.message_id), ("failed", 2, "exhausted"))
+
+    def outbox_row(self, outbox: Any, message_id: str) -> tuple[str, int, str | None]:
+        raise NotImplementedError
 
 
 class LockContractMixin:
@@ -363,6 +394,10 @@ class TestInMemoryContracts(
     def make_outbox(self) -> Any:
         return InMemoryOutbox()
 
+    def outbox_row(self, outbox: Any, message_id: str) -> tuple[str, int, str | None]:
+        msg = outbox.get(message_id)
+        return msg.status, msg.attempts, outbox.last_errors.get(message_id)
+
     def make_lock_and_clock(self) -> tuple[Any, list[float]]:
         now_box = [1000.0]
         return InMemoryLock(clock=lambda: now_box[0]), now_box
@@ -399,6 +434,11 @@ class TestSQLiteAndFileSystemContracts(
 
     def make_outbox(self) -> Any:
         return SQLiteOutboxAdapter(self._db)
+
+    def outbox_row(self, outbox: Any, message_id: str) -> tuple[str, int, str | None]:
+        row = self._db.fetchone("SELECT status, attempts, last_error FROM outbox WHERE message_id = ?", (message_id,))
+        assert row is not None
+        return str(row["status"]), int(row["attempts"]), row["last_error"]
 
     def make_lock_and_clock(self) -> tuple[Any, list[float]]:
         now_box = [1000.0]

@@ -19,7 +19,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 项目规范注入 | 读取被改仓库的 `AGENTS.md` 与 `guidance.toml`，按任务类型挑选规范文档，从固定 commit 读取 |
 | 人工审批 | 权限门禁返回 `defer`、agent 需要人回答或交付受阻时挂起，审批后从断点继续 |
 | 安全 | agent 进程不持有真实密钥：API key 由外置代理注入，Drive 密钥由独立系统用户保管，GitHub 走宿主机凭据 |
-| 运维 | 配置热加载、跟随 `origin/main` 自动更新、轮询失败退避 |
+| 运维 | 配置热加载、跟随 `origin/main` 自动更新、轮询失败退避；Outbox 上报失败按 5/15/45/135/405 秒持久化退避，重启不丢进度 |
 | Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard |
 
 ## 工作方式
@@ -82,7 +82,9 @@ curl -s localhost:8080/events -H 'Content-Type: application/json' -d @docs/dispa
 python3 scripts/run_updating.py --config hibernaut.toml
 ```
 
-除 `--interval` 外的参数原样传给 daemon。它每 300 秒检查一次 `origin/main`，能快进时让旧 daemon 关闭入口、处理完已接收的工作，再更新代码并重启；检出不干净、不在 `main` 或历史分叉时保持现状。origin 必须是你信任其提供可执行代码的来源。
+除 `--interval` 外的参数原样传给 daemon。它每 300 秒检查一次 `origin/main`，能快进时让旧 daemon 停机排空，旧 daemon 退出后再更新代码并重启；检出不干净、不在 `main` 或历史分叉时保持现状，排空期间检出被改动则跳过这次更新。origin 必须是你信任其提供可执行代码的来源。
+
+停机（SIGINT / SIGTERM，自动更新也走这条路）分两步：先只停止认领新事件，进行中的 Run 照常跑完并写回结果，期间 HTTP 入口（`/events`、Webhook、`/mcp`）照常接收入库并返回 202、留给下一个进程处理，Outbox 投递、定时器和轮询照常运行；Run 全部结束后才关闭 HTTP（等已接收的请求写完）、停后台服务并退出。入口只在旧进程退出到新进程开始监听之间中断，以秒计。再发一次 SIGINT / SIGTERM（直接发给 daemon，或发给 `run_updating.py`，它会转给 daemon）则不再等待：进行中的 Run 按中断处理，不写半成品，事件回到 `pending`，由下一个进程重跑。
 
 查看版本：`PYTHONPATH=src python3 -m agent_runtime.app.main --version`。版本规则见 [`docs/process/versioning.md`](docs/process/versioning.md)。
 

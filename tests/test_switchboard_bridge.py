@@ -279,8 +279,10 @@ class OutboundBridgeTests(_Stack):
         dispatcher = OutboxDispatcher(outbox=self.outbox, channel=channel)
         self.outbox.enqueue(SCOPE, "x", {"kind": "emit", "correlation_key": KEY, "session_id": "s1"})
         self.assertEqual(await dispatcher.dispatch_once(), 0)
-        (failed,) = self.outbox.fetch_pending()
+        self.assertEqual(self.outbox.fetch_pending(), [])
+        (failed,) = self.outbox.fetch_pending(now_iso="2999-01-01T00:00:00.000000+00:00")
         self.assertEqual(failed.attempts, 1)
+        self.assertIsNotNone(failed.next_retry_at)
 
 
 class ClosedLoopTests(_Stack):
