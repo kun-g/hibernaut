@@ -103,7 +103,7 @@ Taskboard 不设传统看板里的 `waiting_human` 与 `blocked` 状态：
 | `ready` | `cancelled` | `work.closed` / 显式迁移 | 取消就绪任务。 |
 | `in_progress` | `in_progress` | 重复的 `claim` 等运行中上报 | 幂等空操作，不算非法迁移。 |
 | `in_progress` | `done` | `execution.reported`（`complete`）/ `work.closed`（`state=closed`） | 完成后**当场**触发下游解锁扫描。 |
-| `in_progress` | `ready` | `execution.reported`（`release`） | 执行方放弃或人工释放，回到就绪态重新派发。 |
+| `in_progress` | `ready` | `execution.reported`（`release`） | 执行方放弃或人工释放：回到 `ready` 并刷新 `ready_at`，**不派发**（不发 `work.ready`，也不发 `human_todo`）。之后只有作为下游遇到上游完成或删边时才会再派发，届时领新的 `dispatch_seq`。 |
 | `in_progress` | `cancelled` | `work.closed`（`state=cancelled`）/ 显式迁移 | 强行终止正在执行的任务。 |
 | `done` | `in_progress` | 显式重开（`reopen=True`） | 上游返工；`ready` 的下游退回 `backlog`，`in_progress` / `done` 的下游收到 `dependency_invalidated` 通知。 |
 | `done` | `ready` | 显式重开（`reopen=True`） | 返工并回到待派发；下游处理同上。 |
@@ -120,8 +120,8 @@ Taskboard 不设传统看板里的 `waiting_human` 与 `blocked` 状态：
 TB 用两层解耦底层调度的简单与上层业务的多样：
 
 1. **第 1 层：核心调度**，由 5 态 `status` 与单字段 `assignee` 决定。`assignee` 用前缀划分命名空间（校验正则 `^(agent|human):[a-z0-9.:_-]+$`，默认 `agent:default`）：
-   - `agent:{agent_id}` 或 `agent:role:{role_name}`：`status == 'ready'` 且无阻塞时发出 `work.ready`。
-   - `human:{user_id}` 或 `human:group:{group_name}`：`status == 'ready'` 且无阻塞时发人工待办通知，**不唤醒** Agent 调度。
+   - `agent:{agent_id}` 或 `agent:role:{role_name}`：派发时（触发路径见 [4.1](#41-不做调度策略没有-dispatchpolicyport)）发出 `work.ready`。
+   - `human:{user_id}` 或 `human:group:{group_name}`：派发时发人工待办通知，**不唤醒** Agent 调度。
 2. **第 2 层：业务多样性**，由自由字符串 `task_type` 与 `stage` 表达。
    - `task_type`：任务工种（如 `code_review`、`deployment`、`data_analysis`；默认 `general`，Flow 父任务为 `flow_group`）。
    - `stage`：单任务内部的小阶段（如 `syntax_checking`、`building`、`waiting_pr_merge`）。
@@ -344,9 +344,15 @@ WHERE task_id = :target_task_id
 Taskboard 不承担流控、限流与并发管理：
 
 - 没有 `DispatchPolicyPort`、并发度限制或 Agent 忙闲检测。
-- **零背压直发**：任务满足 `status == 'ready'` 且无未完成上游，即按 `(priority ASC, ready_at ASC)` 排序后立即派发（`priority` 取值 0–3，数值小者优先）。
-  - `assignee` 为 `agent:*`：向事件总线发 `work.ready`；
-  - `assignee` 为 `human:*`：发 `notify_kind="human_todo"` 的 `execution.reported`。
+- **零背压直发**：下列路径让任务进入（或停在）`ready` 后会调用 `UnlockDispatcher.dispatch_ready_task()`，只要无未完成上游就立即派发；一次解锁多个下游时按 `(priority ASC, ready_at ASC)` 排序（`priority` 取值 0–3，数值小者优先）：
+  - 新建即为 `ready`（`tb_create_task`、`work.opened`），以及 `work.opened` 重投时任务已是 `ready`；
+  - `backlog → ready` 的显式迁移；
+  - `done` 经 `reopen=True` 回到 `ready`；
+  - 上游完成后解锁的下游，连同该上游下已经是 `ready` 的下游；
+  - 删边后前置归零的下游（从 `backlog` 提升，或本就是 `ready`）；
+  - Flow 展开后 `ready` 的根节点。
+
+  派发时 `assignee` 为 `agent:*` 发 `work.ready`；为 `human:*` 发 `notify_kind="human_todo"` 的 `execution.reported`。**并非任意 `ready` 任务都会直发**：`in_progress → ready`（`execution.reported` 的 `release`，或 `tb_transition_task(target_status="ready")`）只把状态改回 `ready` 并刷新 `ready_at`，不派发，TB 也没有扫描 `ready` 任务补派发的轮询。
 - **排队与限流归属**：Agent 是否空闲、单机并发度、`worker_leases` 租约竞争与 `event_inbox` 缓冲，全部交给下游 **Hibernaut**。TB 发完即交棒。
 
 ```text
