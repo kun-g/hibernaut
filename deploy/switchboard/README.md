@@ -57,6 +57,61 @@ chmod 600 .env
 
 改 `switchboard.toml` 或 `.env` 后执行 `docker compose up -d --force-recreate switchboard`（Switchboard 不热加载）。改 `Caddyfile` 后执行 `docker compose restart caddy`。
 
+## 已有反向代理（如 Dokploy / Traefik）
+
+主机的 80/443 已被现有反向代理占用（如 Dokploy 的 Traefik）时，Caddy 起不来，改为：
+
+- 只部署 `switchboard` 服务，不要 `caddy` 服务，也不映射宿主机端口。
+- 由反向代理把域名转发到容器的 8790，并负责 TLS。Traefik 能直接透传 WebSocket，`/ws/relay` 不需要额外规则。
+
+`switchboard.toml` 的内容和约束与上文「部署」第 2 步相同，六个变量与第 3 步相同。
+
+### Dokploy
+
+1. 新建 Compose 服务，类型选 raw compose，填入下面的模板：
+
+   ```yaml
+   services:
+     switchboard:
+       build:
+         # 固定到一个 commit，升级时只改这里
+         context: https://github.com/kun-g/hibernaut.git#<commit>
+         dockerfile: deploy/switchboard/Dockerfile
+       restart: unless-stopped
+       environment:
+         SWITCHBOARD_RELAY_WEBHOOK_SECRET: ${SWITCHBOARD_RELAY_WEBHOOK_SECRET}
+         SWITCHBOARD_MCP_WEBHOOK_SECRET: ${SWITCHBOARD_MCP_WEBHOOK_SECRET}
+         SWITCHBOARD_GITHUB_WEBHOOK_SECRET: ${SWITCHBOARD_GITHUB_WEBHOOK_SECRET}
+         SWITCHBOARD_GITHUB_TOKEN: ${SWITCHBOARD_GITHUB_TOKEN}
+         SWITCHBOARD_FEISHU_WEBHOOK_SECRET: ${SWITCHBOARD_FEISHU_WEBHOOK_SECRET}
+         SWITCHBOARD_FEISHU_TOKEN: ${SWITCHBOARD_FEISHU_TOKEN}
+       configs:
+         - source: switchboard_toml
+           target: /etc/switchboard/switchboard.toml
+       volumes:
+         - switchboard_data:/data
+
+   configs:
+     switchboard_toml:
+       content: |
+         # 粘贴 switchboard.docker.toml 改好后的全文，整体缩进到这一层
+
+   volumes:
+     switchboard_data:
+   ```
+
+   - `build.context` 是本仓库带固定 commit 的 git URL，`<commit>` 换成要部署的 commit；`dockerfile` 是相对仓库根的路径。
+   - `switchboard.toml` 用 `configs.<name>.content` 内联，挂到 `/etc/switchboard/switchboard.toml`，不需要在主机上放文件。内容里的 `$` 会被 compose 当作变量插值，要写成 `$$`。
+   - 不写 `ports:`。
+
+2. 在 Dokploy 该服务的 Environment 里填六个变量（`NAME=value` 每行一个），compose 里的 `${...}` 从这里取值。
+3. 在 Domains 里给 compose 的 `switchboard` 服务绑域名：Service Name 选 `switchboard`，Container Port 填 `8790`，打开 HTTPS，证书选 Let's Encrypt。
+4. Deploy。服务日志出现 `[switchboard] relay endpoint ... (transport=hybrid)` 后，按下文「冒烟验收」检查；其中第 5 步的端口检查同样适用，第 6 步的 `docker compose exec` 改在 Dokploy 的容器终端里执行。
+
+**证书坑**：Traefik 只在路由首次加载时申请证书。DNS 记录如果晚于部署才建好，证书申请会失败并一直用默认自签证书；DNS 生效后要改一下域名配置（比如把 HTTPS 关掉再打开）并重新部署，才会重新申请。
+
+**升级**：改 `build.context` 里的 commit 后重新部署。回滚同理，改回上一个可用的 commit；新版本改过表结构时，要连同数据卷一起恢复到升级前的备份（见下文「回滚」）。
+
 ## 本机 Hibernaut 配对
 
 本机（如 Mac）的 `hibernaut.toml`：
