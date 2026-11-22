@@ -422,6 +422,31 @@ class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
         self.assertIn("also log rejected divisions", self.calls("reviewer")[1]["prompt"])
         self.assertIn("review=pass", self.emits()[-1])
 
+    async def test_follow_up_batched_with_the_approval_reaches_developer_and_reviewer(self):
+        self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?"), dev(FIXED)], reviewer=[PASS])
+        await self.task()
+        request_id = self.cards()[0].metadata["request_id"]
+        # Both arrive before the worker claims the inbox, so they run as one batch.
+        self.handler.ingest(inbox_id="proj:x", source="test", external_id="b1",
+                            payload={"text": "Raise ValueError naming b"}, correlation_key="task:1")
+        self.handler.ingest(inbox_id="proj:x", source="test", external_id="b2",
+                            payload={"approval_request_id": request_id, "approved": True})
+        await self.worker().process_inbox("proj:x")
+        self.assertIn("Raise ValueError naming b", self.calls("sde")[1]["prompt"])
+        self.assertNotIn("approved without comment", self.calls("sde")[1]["prompt"])
+        self.assertIn("Raise ValueError naming b", self.calls("reviewer")[0]["prompt"])
+        self.assertIn("review=pass", self.emits()[-1])
+
+    async def test_rejected_review_retry_lists_unprocessed_follow_ups(self):
+        self.set_plan(sde=[dev(FIXED)], reviewer=[{"error": "reviewer crashed"}])
+        await self.task()
+        await self.send({"text": "also log rejected divisions"})
+        await self.decide(False)
+        text = self.emits()[-1]
+        self.assertIn("review=pending", text)
+        self.assertIn("Unprocessed follow-ups", text)
+        self.assertIn("also log rejected divisions", text)
+
     async def test_deferred_launch_resumes_on_approval(self):
         self.permissions = InMemoryPermission({"sde.launch": PermissionDecision(action="defer", reason="approve sde")})
         self.set_plan(sde=[dev(BUGGY), dev(FIXED)], reviewer=[CHANGES_REQUESTED, PASS])

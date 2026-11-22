@@ -14,7 +14,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     child_env,
     run_claude_code,
 )
-from agent_runtime.adapters.executor_cli.process import join_text, last_text, target_events
+from agent_runtime.adapters.executor_cli.process import is_approval, join_text, last_text, target_events
 from agent_runtime.adapters.executor_cli.reviewer import (
     CoderReviewerExecutor,
     ReviewAborted,
@@ -179,6 +179,10 @@ class SDEExecutor:
                         state.followups.append(text)
                     return self._suspend(session_id, native, state, request_id=pending_id)
                 approved, comment = answer
+                # Messages claimed in the same batch as the decision count as follow-ups too.
+                batched = join_text([e for e in events if not is_approval(e)], ("requirements", "text"))
+                if batched:
+                    state.followups.append(batched)
                 if not approved:
                     if state.stage == "review_pending":
                         return self._deliver(session_id, native, state, review="pending",
@@ -401,6 +405,8 @@ class SDEExecutor:
             lines.append(f"Review history: {'; '.join(state.history)}")
         if state.last_review:
             lines.append(f"Last review:\n{state.last_review}")
+        if state.followups:
+            lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
         return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native)
 
     def _stopped(self, session_id: str, native: str | None, state: _State, why: str) -> Emit:
