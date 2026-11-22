@@ -153,6 +153,17 @@ curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
 - Delivery: one Outbox message `[sde] delivered (review=pass after N round(s) | review=off | review=pending; harness=... launcher=... billing=... model=... effort=...)` with workdir, summary, test evidence, review history and the last review.
 - Hot reload: all four launch settings and `review` take effect on the next run; invalid values keep the running settings. Billing and launcher rules are the same as for `coder-reviewer`. `sde.launch` is allowed by default in the auto-mode permission adapter.
 
+## Visible Role Terminals (Orca)
+
+In projects with `worktree_backend = "orca"`, `sde` and `coder-reviewer` runs open an interactive Claude Code terminal in the target worktree instead of running headless. Set `visible = false` on a role executor to keep it headless; direct Git worktrees and the fallback executors always run headless.
+
+- Terminals: titled `sde · <task>`, `coder-reviewer · review of <task> round <n>` (built-in review) and `coder-reviewer · review of <task>` (independent `review_of` event). Watch progress and answer the agent there. The delivery and review messages list the Orca terminal handle and the Claude Code session ID.
+- Settings: the same role prompt, tools, launcher, billing, model and effort as a headless run, with `--permission-mode dontAsk`. A launcher in the terminal first runs the same session check as a headless run (subscription vs. proxy billing, model), then starts the conversation; a failed check closes the terminal and reports the reason.
+- Result: the launcher gives Claude Code a `hibernaut_handoff` MCP server. The agent calls `get_task` to read its task and `submit_result` to return the structured result. The server checks the result against the role schema and rejects a malformed one so the agent can fix it. The agent never reads or writes the handoff directory, so no `--add-dir` trust dialog appears. Claude Code still asks once if the worktree itself is not yet trusted.
+- Continuation: SDE follow-up events, answers after `needs_input` and review fix rounds go back to the task's live terminal, or `--resume` its conversation in a new terminal once the tab is closed. Every review is a new conversation; a re-review receives the previous findings in its prompt.
+- Read-only review: the visible reviewer has no file-writing tool; Edit, Write, MultiEdit and NotebookEdit are denied. The worktree fingerprint check still discards a review if anything changed.
+- Timeout and cancel: `timeout_seconds` includes time spent waiting for a person. A timeout or interrupt closes the terminal and writes nothing to the Outbox. The SDE conversation stays bound and resumes on the next event.
+
 ## MCP Server Integration (`stdio` & Remote `/mcp`)
 
 Hibernaut exposes 7 MCP tools (`hibernaut_ingest_event`, `hibernaut_list_sessions`, `hibernaut_list_events`, `hibernaut_list_workspaces`, `hibernaut_resolve_approval`, `hibernaut_reclaim_workspace`, `hibernaut_close_session`).

@@ -14,6 +14,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     child_env,
     run_claude_code,
 )
+from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, terminal_title
 from agent_runtime.adapters.executor_cli.process import is_approval, join_text, last_text, target_events
 from agent_runtime.adapters.executor_cli.reviewer import (
     CoderReviewerExecutor,
@@ -45,11 +46,11 @@ SDE_SCHEMA: dict[str, Any] = {
     "required": ["status", "summary", "test_evidence"],
 }
 
-_ROLE_ARGS = (
+_VISIBLE_ROLE_ARGS = (
     "--allowedTools", ",".join(_DEV_TOOLS),
     "--disallowedTools", ",".join(_DEV_DENIED),
-    "--json-schema", json.dumps(SDE_SCHEMA),
 )
+_ROLE_ARGS = (*_VISIBLE_ROLE_ARGS, "--json-schema", json.dumps(SDE_SCHEMA))
 
 _SDE_RULES = """You are sde, a software development engineer. Implement the task below in the current git worktree.
 
@@ -98,6 +99,9 @@ class _State:
     # Messages that arrived while suspended; folded into the requirements when the run resumes.
     followups: list[str] = field(default_factory=_no_history)
     pending_prompt: str = ""
+    work_key: str = ""
+    # Orca terminal of the last visible development turn.
+    terminal: str = ""
 
     def dump(self) -> str:
         return json.dumps({_CHECKPOINT_KEY: {f: getattr(self, f) for f in self.__slots__}}, ensure_ascii=False)
@@ -137,6 +141,7 @@ class SDEExecutor:
         worktree_manager: OrcaWorktreeManager,
         inbox_checkout_map: Mapping[str, str | Path],
         interrupt_poll_interval: float = 0.05,
+        visible: OrcaVisibleRunner | None = None,
     ) -> None:
         if options.review and reviewer is None:
             raise ValueError(f"executors.{profile.name}: review is on but no reviewer was given")
@@ -146,6 +151,8 @@ class SDEExecutor:
         self._worktrees = worktree_manager
         self._checkouts = {k: Path(v).resolve() for k, v in inbox_checkout_map.items()}
         self._poll = interrupt_poll_interval
+        # Set in Orca worktree deployments: development runs in a visible terminal bound to the task session.
+        self._visible = visible
 
     @property
     def executor_id(self) -> str:
@@ -242,8 +249,10 @@ class SDEExecutor:
             primary_checkout=checkout or Path(str(explicit)),
             explicit_workdir=explicit,
         )
+        if not workdir.is_dir():
+            raise ReviewAborted(f"workdir {workdir} does not exist")
         return _State(stage="develop", workdir=str(workdir), base_ref=last_text(targets, "base_ref") or "",
-                      requirements=requirements)
+                      requirements=requirements, work_key=work_key)
 
     def _first_prompt(self, state: _State, caps: RunCapabilities) -> str:
         parts = [_SDE_RULES]
@@ -264,9 +273,24 @@ class SDEExecutor:
         )
 
     async def _develop(
-        self, native: str | None, state: _State, prompt: str, caps: RunCapabilities
+        self, session_id: str, native: str | None, state: _State, prompt: str, caps: RunCapabilities
     ) -> tuple[dict[str, Any], str | None]:
         p = self._profile
+        if self._visible is not None:
+            # Fix rounds and later events continue the task's conversation: its live terminal, else --resume.
+            reply = await self._visible.converse(
+                p,
+                title=terminal_title(p.name, SDE_ROLE, state.work_key or Path(state.workdir).name),
+                workdir=Path(state.workdir),
+                prompt=prompt,
+                schema=SDE_SCHEMA,
+                role_args=_VISIBLE_ROLE_ARGS,
+                is_interrupted=caps.is_interrupted,
+                session_id=session_id,
+                native=native,
+            )
+            state.terminal = reply.handle
+            return _validate_report(reply.data), reply.native_session_id
         role_args: tuple[str, ...] = (*_ROLE_ARGS, "--resume", native) if native else _ROLE_ARGS
         result = await run_claude_code(
             p,
@@ -305,7 +329,7 @@ class SDEExecutor:
                         return self._suspend(session_id, native, state)
                 approved_launch = False
                 state.pending_prompt = ""
-                report, native = await self._develop(native, state, prompt, caps)
+                report, native = await self._develop(session_id, native, state, prompt, caps)
                 if report["status"] == "needs_input":
                     state.stage, state.reason = "needs_input", report["question"]
                     return self._suspend(session_id, native, state)
@@ -326,10 +350,12 @@ class SDEExecutor:
                         f"## Previous review round\n{state.last_review}\n\n"
                         f"## Changes since the previous review\n```diff\n{delta}\n```"
                     )
+                subject = state.work_key or workdir.name
                 review = await reviewer.review(
                     ReviewRequest(workdir=workdir, requirements=state.requirements,
                                   test_evidence=state.test_evidence, base_ref=state.base_ref,
-                                  previous_round=previous),
+                                  previous_round=previous,
+                                  label=f"review of {subject} round {len(state.history) + 1}"),
                     caps,
                 )
             except (ReviewAborted, ClaudeCodeError) as exc:
@@ -398,6 +424,7 @@ class SDEExecutor:
         lines = [
             f"[{name}] delivered ({status}; {self._settings()})",
             f"Workdir: {state.workdir}",
+            *([f"Orca terminal: {state.terminal} (Claude Code session {native})"] if state.terminal else []),
             f"Summary: {state.summary or '(none)'}",
             f"Test evidence:\n{state.test_evidence or '(none)'}",
         ]

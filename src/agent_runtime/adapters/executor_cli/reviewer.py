@@ -17,6 +17,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     child_env,
     run_claude_code,
 )
+from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, terminal_title
 from agent_runtime.adapters.executor_cli.process import join_text, last_text, target_events
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.core.models import Emit, Event, PermissionDecision, RunOutcome, SessionRef, Suspend, new_id
@@ -65,6 +66,11 @@ _ROLE_ARGS = (
     "--disallowedTools", ",".join(_WRITE_TOOLS),
     "--json-schema", json.dumps(REVIEW_SCHEMA),
 )
+# Interactive: no file-writing tool at all; the result goes back through the launcher's handoff tool.
+_VISIBLE_ROLE_ARGS = (
+    "--allowedTools", ",".join(_READ_ONLY_TOOLS),
+    "--disallowedTools", ",".join(_WRITE_TOOLS),
+)
 
 _REVIEW_RULES = """You are coder-reviewer, an independent code reviewer. Another agent wrote the change below; judge it, do not fix it.
 
@@ -90,6 +96,8 @@ class ReviewRequest:
     base_ref: str
     # Earlier findings plus the diff since that review; empty on a first review.
     previous_round: str = ""
+    # What the review is for, shown in the visible terminal's title.
+    label: str = ""
 
 
 class CoderReviewerExecutor:
@@ -99,10 +107,13 @@ class CoderReviewerExecutor:
         profile: ClaudeCodeProfile,
         workspaces: SQLiteWorkspaceStore,
         interrupt_poll_interval: float = 0.05,
+        visible: OrcaVisibleRunner | None = None,
     ) -> None:
         self._profile = profile
         self._workspaces = workspaces
         self._interrupt_poll_interval = interrupt_poll_interval
+        # Set in Orca worktree deployments: every review runs in its own visible terminal.
+        self._visible = visible
 
     @property
     def executor_id(self) -> str:
@@ -132,7 +143,8 @@ class CoderReviewerExecutor:
                     session_id=session_id,
                 )
             review = await self.review(request, caps)
-            return Emit(messages=(self.format_review(review),), session_id=session_id)
+            return Emit(messages=(self.format_review(review),), session_id=session_id,
+                        executor_session_id=review.get("native_session_id"))
         except (ReviewAborted, ClaudeCodeError) as exc:
             return self._emit(session_id, str(exc))
 
@@ -157,23 +169,39 @@ class CoderReviewerExecutor:
         env = child_env(p, os.environ)
         evidence = await asyncio.to_thread(_collect_diff, request.workdir, request.base_ref)
         before = await asyncio.to_thread(worktree_fingerprint, request.workdir)
-        result = await run_claude_code(
-            p,
-            cwd=request.workdir,
-            prompt=self._prompt(request, evidence),
-            permission_mode="dontAsk",
-            role_args=_ROLE_ARGS,
-            env=env,
-            is_interrupted=caps.is_interrupted,
-            poll_interval=self._interrupt_poll_interval,
-        )
+        extra: dict[str, str] = {}
+        if self._visible is not None:
+            # A fresh conversation every time: a re-review gets the earlier findings in its prompt, not its context.
+            reply = await self._visible.converse(
+                p,
+                title=terminal_title(p.name, CODER_REVIEWER_ROLE, request.label or request.workdir.name),
+                workdir=request.workdir,
+                prompt=self._prompt(request, evidence),
+                schema=REVIEW_SCHEMA,
+                role_args=_VISIBLE_ROLE_ARGS,
+                is_interrupted=caps.is_interrupted,
+            )
+            raw: object = reply.data
+            extra = {"terminal": reply.handle, "native_session_id": reply.native_session_id}
+        else:
+            result = await run_claude_code(
+                p,
+                cwd=request.workdir,
+                prompt=self._prompt(request, evidence),
+                permission_mode="dontAsk",
+                role_args=_ROLE_ARGS,
+                env=env,
+                is_interrupted=caps.is_interrupted,
+                poll_interval=self._interrupt_poll_interval,
+            )
+            raw = result.get("structured_output")
         after = await asyncio.to_thread(worktree_fingerprint, request.workdir)
         if after != before:
             raise ReviewAborted(
                 f"the working tree in {request.workdir} changed during the review; findings discarded, "
                 "check the change and submit again"
             )
-        return _validate_review(result.get("structured_output"))
+        return {**_validate_review(raw), **extra}
 
     def _emit(self, session_id: str, detail: str) -> Emit:
         return Emit(messages=(f"[{self._profile.name}] review failed: {detail}",), session_id=session_id)
@@ -202,11 +230,13 @@ class CoderReviewerExecutor:
             workdir = Path(record.workdir)
         if not workdir.is_dir():
             raise ReviewAborted(f"workdir {workdir} does not exist")
+        subject = last_text(target, "review_of") or target[0].correlation_key or workdir.name
         return ReviewRequest(
             workdir=workdir,
             requirements=requirements,
             test_evidence=join_text(target, ("test_evidence",)) or "(none provided)",
             base_ref=last_text(target, "base_ref") or "",
+            label=f"review of {subject}",
         )
 
     def _prompt(self, request: ReviewRequest, evidence: str) -> str:
@@ -227,6 +257,8 @@ class CoderReviewerExecutor:
             f"(harness={p.harness} launcher={p.launcher.name} billing={p.billing} model={p.model} effort={p.effort})",
             f"Summary: {review['summary']}",
         ]
+        if review.get("terminal"):
+            lines.insert(1, f"Orca terminal: {review['terminal']} (Claude Code session {review.get('native_session_id')})")
         blocking: list[dict[str, str]] = review["blocking"]
         if blocking:
             lines.append("Blocking:")
