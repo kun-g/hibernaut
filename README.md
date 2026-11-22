@@ -15,7 +15,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok，模板写 `terminal = "orca"` 可在 Orca 终端里旁观评审）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested` |
 | PR 交付 | SDE 完成后由 Hibernaut 合入主干、按改动类型定版本号、跑检查、推分支、开 PR，可选在评审通过且 CI 绿后自动合并；合入主干冲突（版本号以外）或合入后检查失败时交回同一开发会话解决，评审增量后自动续交付，超过次数上限才挂起等人；合并后删除源分支并结案；与任务来源无关 |
 | 可见终端 | 运行在 Orca 终端里打开，人可以旁观、回答提问，后续事件回到同一对话 |
-| 工作区管理 | 按任务自动建 `hb-*` worktree、复用，证据齐全（PR 已合并、无未提交改动等）后才回收；交付合并 PR 后自动关闭会话并回收 worktree 和本地分支 |
+| 工作区管理 | 按任务自动建 `hb-*` worktree、复用，证据齐全（PR 已合并、无未提交改动等）后才回收；交付合并 PR 后自动关闭会话并回收 worktree 和本地分支；当时被排队事件或在线会话挡住的，由后台清扫（启动时一轮，之后默认每 5 分钟，`[runtime] worktree_sweep_interval_seconds`）在其结束后回收 |
 | 项目规范注入 | 读取被改仓库的 `AGENTS.md` 与 `guidance.toml`，按任务类型挑选规范文档，从固定 commit 读取 |
 | 人工审批 | 权限门禁返回 `defer`、agent 需要人回答或交付受阻时挂起，审批后从断点继续 |
 | 安全 | agent 进程不持有真实密钥：API key 由外置代理注入，Drive 密钥由独立系统用户保管，GitHub 走宿主机凭据 |
@@ -84,7 +84,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 
 除 `--interval` 与 `--wait-log-interval` 外的参数原样传给 daemon。它每 300 秒检查一次 `origin/main`，能快进时让旧 daemon 停机排空，旧 daemon 退出后再更新代码并重启；检出不干净、不在 `main` 或历史分叉时保持现状，排空期间检出被改动则跳过这次更新。origin 必须是你信任其提供可执行代码的来源。
 
-停机（SIGINT / SIGTERM，自动更新也走这条路）分两步：先只停止认领新事件，进行中的 Run 照常跑完并写回结果，期间 HTTP 入口（`/events`、Webhook、`/mcp`）照常接收入库并返回 202、留给下一个进程处理，Outbox 投递、定时器和轮询照常运行；Run 全部结束后才关闭 HTTP（等已接收的请求写完）、停后台服务并退出。入口只在旧进程退出到新进程开始监听之间中断，以秒计。再发一次 SIGINT / SIGTERM（直接发给 daemon，或发给 `run_updating.py`，它会转给 daemon）则不再等待：进行中的 Run 按中断处理，不写半成品，事件回到 `pending`，由下一个进程重跑。
+停机（SIGINT / SIGTERM，自动更新也走这条路）分两步：先只停止认领新事件，进行中的 Run 照常跑完并写回结果，期间 HTTP 入口（`/events`、Webhook、`/mcp`）照常接收入库并返回 202、留给下一个进程处理，Outbox 投递、定时器和轮询照常运行（worktree 回收清扫不再开始新一轮）；Run 全部结束后才关闭 HTTP（等已接收的请求写完）、停后台服务并退出。入口只在旧进程退出到新进程开始监听之间中断，以秒计。再发一次 SIGINT / SIGTERM（直接发给 daemon，或发给 `run_updating.py`，它会转给 daemon）则不再等待：进行中的 Run 按中断处理，不写半成品，事件回到 `pending`，由下一个进程重跑。
 
 `run_updating.py` 把 daemon 放在独立会话里运行，终端的 Ctrl-C 只到监督进程、由它转给 daemon。监督进程收到 SIGHUP（如关闭终端、断开 SSH）也按停机处理，排空后连同 daemon 一起退出。SIGKILL 无法捕获：监督进程被 `kill -9` 时 daemon 不会收到信号，会继续运行，需另行停止（`pgrep -f agent_runtime.app.main` 查找）。监督进程等 daemon 退出不设上限（不会因排空太久而强杀），但每 `--wait-log-interval` 秒（默认 60）在 stderr 记一行监督进程 PID、daemon PID 与已等待秒数；daemon 卡住不退时据此找到它，再发一次信号或手动处理。
 
