@@ -19,7 +19,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 项目规范注入 | 读取被改仓库的 `AGENTS.md` 与 `guidance.toml`，按任务类型挑选规范文档，从固定 commit 读取 |
 | 人工审批 | 权限门禁返回 `defer`、agent 需要人回答或交付受阻时挂起，审批后从断点继续 |
 | 安全 | agent 进程不持有真实密钥：API key 由外置代理注入，Drive 密钥由独立系统用户保管，GitHub 走宿主机凭据 |
-| 运维 | 配置热加载、跟随 `origin/main` 自动更新、轮询失败退避 |
+| 运维 | 配置热加载、跟随 `origin/main` 自动更新、轮询失败退避；Outbox 上报失败按 5/15/45/135/405 秒持久化退避，重启不丢进度 |
 | Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard |
 
 ## 工作方式

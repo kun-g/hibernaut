@@ -5,6 +5,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
@@ -19,6 +20,7 @@ from agent_runtime.core.models import (
     TimerSpec,
     TimerStatus,
     new_id,
+    to_utc_iso,
     utc_now_iso,
 )
 
@@ -383,16 +385,16 @@ class SQLiteOutboxAdapter:
             )
         return msg
 
-    def fetch_pending(self, limit: int = 20) -> list[OutboxMessage]:
+    def fetch_pending(self, limit: int = 20, *, now_iso: str | None = None) -> list[OutboxMessage]:
         rows = self._db.fetchall(
             """
-            SELECT message_id, inbox_id, created_at, content, status, attempts, metadata_json
+            SELECT message_id, inbox_id, created_at, content, status, attempts, metadata_json, next_retry_at
             FROM outbox
-            WHERE status = 'pending'
+            WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?)
             ORDER BY seq ASC
             LIMIT ?
             """,
-            (limit,),
+            (now_iso or to_utc_iso(datetime.now(timezone.utc)), limit),
         )
         return [
             OutboxMessage(
@@ -403,6 +405,7 @@ class SQLiteOutboxAdapter:
                 status=cast(OutboxStatus, str(row["status"])),
                 attempts=int(row["attempts"]),
                 metadata=json.loads(str(row["metadata_json"])),
+                next_retry_at=None if row["next_retry_at"] is None else str(row["next_retry_at"]),
             )
             for row in rows
         ]
@@ -410,14 +413,27 @@ class SQLiteOutboxAdapter:
     def mark_sent(self, message_id: str) -> None:
         with self._db.transaction() as conn:
             conn.execute(
-                "UPDATE outbox SET status = 'sent' WHERE message_id = ?",
+                "UPDATE outbox SET status = 'sent', next_retry_at = NULL WHERE message_id = ?",
                 (message_id,),
+            )
+
+    def schedule_retry(self, message_id: str, error: str, next_retry_at: str) -> None:
+        with self._db.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE outbox SET attempts = attempts + 1, last_error = ?, next_retry_at = ?
+                WHERE message_id = ? AND status = 'pending'
+                """,
+                (error, next_retry_at, message_id),
             )
 
     def mark_failed(self, message_id: str, error: str) -> None:
         with self._db.transaction() as conn:
             conn.execute(
-                "UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE message_id = ?",
+                """
+                UPDATE outbox SET status = 'failed', attempts = attempts + 1, last_error = ?, next_retry_at = NULL
+                WHERE message_id = ? AND status = 'pending'
+                """,
                 (error, message_id),
             )
 

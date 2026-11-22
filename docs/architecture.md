@@ -34,7 +34,7 @@
 | `TimerPort` | 持久化定时器存储（单次 `follow_up` 与周期 `schedule`） |
 | `MemoryPort` | 跨 Run 目录记忆（必载基线 `instructions.md` / `index.md` / `reported.md` + 按需 `notes/*` / `progress/*`） |
 | `PermissionPort` | 每次工具调用前置三态门禁（`allow` / `block` / `defer`） |
-| `OutboxPort` | 待发消息持久队列，解耦推理与外部通道投递 |
+| `OutboxPort` | 待发消息持久队列，解耦推理与外部通道投递；`fetch_pending(limit, *, now_iso)` 只返回 `next_retry_at` 为空或已到期的 `pending` 消息，`schedule_retry()` 记一次失败并排期，`mark_failed()` 为终态 |
 | `LockPort` | 以 `inbox_id` 为主键的单活租约锁（`acquire` / `renew` / `release`），支持进程崩溃后租约到期自动接管 |
 | `SessionStorePort` | 跨 Run 会话元数据（4 态 `active` / `suspended` / `archived` / `closed`、`work_key`）、执行器绑定（`executor_id` / `executor_session_id`）、`Suspend` 审批断点（`find_by_request_id`）、活跃引用计数（`count_active_by_work_key`）、按 `inbox_id` / `status` / `parent_session_id` 过滤的 `list_sessions`、`archive_session` / `close_session` 及外部关联键映射（`find_by_correlation_key` 仅命中 `active`/`suspended`） |
 | `ChannelPort` | 外部投递通道（`FeishuChannelAdapter`、`ConsoleChannelAdapter`、`WebhookChannelAdapter`；`FileOutboxChannel` 包在最外层） |
@@ -61,7 +61,7 @@
 - **L3 飞书出站通道**（`FeishuChannelAdapter`，`adapters/channels/feishu_channel.py`）：仅用标准库 `urllib.request`，基于 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 自动缓存刷新 `tenant_access_token`，发送普通文本通知与 `Suspend` 交互审批卡片；未配置凭据时自动降级为 `ConsoleChannelAdapter`。
 - **L3 文件 Outbox**（`FileOutboxChannel`，`adapters/channels/file_outbox.py`）：`[channels] outbox_dir` 设置后（相对路径以 `hibernaut.toml` 所在目录为准，支持 `~`；不设置时不建目录、不写文件，行为不变），`build_daemon` 把它包在通道链最外层：先写文件，再把原样的 `(inbox_id, content, metadata)` 交给内层（Drive 回写 → Switchboard → 飞书 / 控制台）。
   - **文件**：每条消息一个 Markdown 文件，文件名是本地时间到毫秒（`20261122-181305.123.md`），按名排序即时间顺序；同一写入者在同一毫秒内的下一条会等时钟走过这一毫秒（最多约 5 ms），与目录里已有文件重名则加 `-2`、`-3` 后缀，从不覆盖。目录不存在时自动创建。先写入隐藏临时文件并 `fsync`，再用 `os.link()` 原子地以最终名发布（目标已存在即失败，不覆盖），最后删除临时名，读到的 `.md` 总是完整的。
-  - **失败与重试**：写文件失败记 ERROR 日志并抛出，`OutboxDispatcher` 照常 `mark_failed` 并重试，内层通道这次不投递，消息不丢。文件写成但内层投递失败时，重试复用已写的文件，不重复写。
+  - **失败与重试**：写文件失败记 ERROR 日志并抛出，`OutboxDispatcher` 照常按退避排期重试（`schedule_retry`，见 7.3「上行退避」），内层通道这次不投递，消息不丢。文件写成但内层投递失败时，重试复用已写的文件，不重复写。
   - **控制台**：启用时 `ConsoleChannelAdapter(echo=False)` 不再打印全文，`FileOutboxChannel` 每条打一行摘要 `[OUTBOX] <时间> <状态> | <任务标题> | <文件路径>`。
 - **Outbox 上下文头**（`outbox_context()` 读出 `OutboxContext`，`render_header()` / `render_summary()` 渲染，文件与控制台摘要共用）：任务标题、来源（事件 `source`，加可读名：GitHub / Drive / MCP / 飞书 / Switchboard / 定时器 / `/events`）、`inbox_id`、`correlation_key`、会话 ID、执行器、状态、需要人做什么、时间，之后是 `## 正文` 与原文。缺的字段写「无」（如 worktree 回收告警这类非 Worker 消息）。等待审批的消息另有 `## 审批`：审批请求 ID、可直接执行的批准 / 拒绝 `curl`（POST 到本机 `/events`，地址取 `[channels] host/port`，通配地址换成回环；body 为 `inbox_id`、`source = "events:approval"`、`external_id = approval:<id>:approve|reject`、`payload.approval_request_id`、`payload.approved`，可加 `payload.comment`）与 MCP `hibernaut_resolve_approval` 的参数。飞书与 Switchboard 出站正文不变。
 - **状态来源**：执行器在 L0 `Emit.status`（`EmitStatus = done | failed | stopped | refused`，缺省 `done`，旧代码不传即为完成）上明确标注结束方式，不解析正文：SDE `development failed` 为 `failed`、`stopped:` 为 `stopped`；评审者 `review failed` 为 `failed`、权限 `block` 为 `refused`；`LocalCLIExecutor` 无检出 / 未知模板 / 非零退出为 `failed`、工作区隔离拒绝为 `refused`；Orca 启动被 `block` 为 `refused`、续接被拒为 `stopped`。`Suspend` 的消息状态为 `awaiting_approval`。
@@ -194,6 +194,9 @@
 - **上行**：`SwitchboardMCPPublisher.publish(event)` 只接受 `execution.reported`，以 `tools/call report_execution` 发 JSON-RPC 到 `mcp_url`，参数是信封字段（不含本地 `event_id`），解析 `structuredContent` 为 `IngestResult`。网络错误、非 200、非 JSON、JSON-RPC `error`、工具错误一律抛 `PublishError`（不回显 Hub 响应体），由 `OutboxDispatcher` 记失败重试；`invalid` 作为结果返回，`SwitchboardChannelAdapter` 照 Stage A 抛错。`external_id = outbox:<message_id>` 不变，Outbox 在 Hub 已收下但响应丢失后重试，Hub 判 `duplicate`，不会重复发评论或卡片。
 - **凭据**：节点只持两个客户端令牌，`SWITCHBOARD_RELAY_TOKEN`（`issue_ephemeral("relay")`，Hub 侧对应 `SWITCHBOARD_RELAY_WEBHOOK_SECRET`）与 `SWITCHBOARD_MCP_TOKEN`（`issue_ephemeral("mcp")`，Hub 侧对应 `SWITCHBOARD_MCP_WEBHOOK_SECRET`），启动时与其他 `SWITCHBOARD_*` 一起移出 `os.environ`，执行器子进程继承不到；任一缺失则启动失败。非回环地址用 `ws://` / `http://` 时打印明文告警。
 - **进程**：`--mcp-stdio` 伴随进程不建链接，否则第二个同 `consumer_id` 的 Agent 会以 4009 顶掉 daemon 的连接。退出时 `stop()` 发 Close 1000 并停止 Agent。
+- **上行退避**（`OutboxDispatcher`，L2）：发送抛异常时按 `retry_backoff_seconds`（默认 5/15/45/135/405 秒，与 Switchboard 下行对称）排期：第 n 次失败（n ≤ 退避表长度）调 `OutboxPort.schedule_retry()`，消息保持 `pending`、`attempts + 1`，`next_retry_at = utc_clock() + 第 n 档`，写入 `last_error`；退避表用完后再失败（默认共 6 次尝试）才 `mark_failed()` 置 `failed`。显式传 `max_attempts` 时以它为总尝试上限，超出退避表的重试沿用最后一档。拉取时以 `utc_clock()` 的 `to_utc_iso()` 字符串作 `now_iso`，未到期的消息不出现在批次里，不占 `limit`；`attempts` 已达上限的遗留 `pending` 行（旧版本只计次不置终态）直接置 `failed`。`attempts` 与 `next_retry_at` 存在 SQLite `outbox` 表，进程重启后从原档位续接。Hub 重启或网络抖动几秒，消息在下一档到期时自动补发；`external_id` 不变，Hub 已收下的重发判 `duplicate`。
+- **存储迁移**：`outbox` 新增 `next_retry_at TEXT`（`to_utc_iso()` 定宽 UTC 字符串，按文本比较即按时间排序）与索引 `idx_outbox_sched(status, next_retry_at, seq)`；旧库启动时 `ALTER TABLE` 补列（缺 `last_error` 一并补），已有行 `next_retry_at` 为空即立即可发；补列时一次性把 `attempts >= 3` 的 `pending` 行置为 `failed`（旧版默认上限 3 次后放弃但未置终态），避免升级后重发早已放弃的消息。
+- **双进程验收**（`tests/test_switchboard_dual_process_e2e.py`）：临时目录、随机端口与测试占位令牌，真实拉起 `python -m switchboard.app`（`[relay] transport = "hybrid"`）与 Hibernaut `main()`（`mode = "relay"`；入口 `tests/dual_process_hibernaut.py` 以 `--demo` 运行，只把演示 LLM 换成回显消息正文的确定性实现）。覆盖：`/mcp post_message` → Relay 下行 → Emit → `report_execution` 上行 → `outbound_messages` 落盘；Hibernaut SIGTERM 期间积压事件 `delivery_log` 保持 `pending, attempts = 0`，重启后按序补推并全部 `acked`；Switchboard SIGTERM 后上报首次失败进入退避（`pending` 且 `next_retry_at` 非空），重启 Hub 后到期自动重发并 `sent`。
 
 ## 8. 架构决策记录（ADR）
 
