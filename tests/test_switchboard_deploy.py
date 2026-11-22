@@ -71,7 +71,8 @@ class DockerKitTests(unittest.TestCase):
                 "SWITCHBOARD_GITHUB_WEBHOOK_SECRET=",
                 "SWITCHBOARD_GITHUB_TOKEN=",
                 "SWITCHBOARD_FEISHU_WEBHOOK_SECRET=",
-                "SWITCHBOARD_FEISHU_TOKEN=",
+                "SWITCHBOARD_FEISHU_APP_ID=",
+                "SWITCHBOARD_FEISHU_APP_SECRET=",
             ],
         )
 
