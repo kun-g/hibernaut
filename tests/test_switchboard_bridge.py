@@ -190,6 +190,24 @@ class InboundBridgeTests(_Stack):
                 self.assertEqual(evt.payload["metadata"]["github_event"], metadata["github_event"])
                 self.assertEqual(source_issue([evt], evt.correlation_key), "")
 
+    def test_work_events_routed_to_hibernaut_name_an_issue_but_never_a_pull_request(self) -> None:
+        # [routing.event_consumers] can send work.* straight to Hibernaut (no Taskboard): an issue's work.opened
+        # names the issue, a pull request's never does.
+        cases = {"issue": "kun-g/hibernaut#42", "pull_request": ""}
+        for kind, expected in cases.items():
+            work = CanonicalEvent(
+                source="github", event_type="work.opened", external_id=f"{kind}:kun-g/hibernaut#42:opened:t",
+                scope=SCOPE, correlation_key=KEY, subject="t", body="b",
+                metadata={"work_kind": kind, "state": "open", "repo": "kun-g/hibernaut", "number": 42,
+                          "github_event": "pull_request" if kind == "pull_request" else "issues"},
+            )
+            self.assertEqual(self.bridge.handle_canonical_event(work), "acked")
+        stored = {evt.payload["metadata"]["work_kind"]: evt for evt in self.inbox.fetch_pending(SCOPE)}
+        for kind, expected in cases.items():
+            with self.subTest(kind):
+                evt = stored[kind]
+                self.assertEqual(source_issue([evt], evt.correlation_key), expected)
+
     def test_redelivery_is_deduplicated_and_still_acked(self) -> None:
         msg = message_event()
         self.assertEqual(self.bridge.handle_canonical_event(msg), "acked")
