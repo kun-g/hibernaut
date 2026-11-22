@@ -119,6 +119,40 @@ curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
 - Billing: both modes remove `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL` and the Bedrock/Vertex/Foundry switches from the daemon environment before starting the launcher. `subscription` uses the launcher's own login and stops at session start if Claude Code reports any paid credential source. `api` points Claude Code at `<credential_proxy.url>/proxy/anthropic` with a placeholder key; the external proxy injects the real key, and the run stops if Claude Code authenticates any other way. Credentials never go in `hibernaut.toml` (the parser rejects them).
 - Hot reload: save the settings (including launcher) and the next review uses them. Invalid values or combinations print `[config] Invalid ... (ValueError: <reason>)` and keep the running settings.
 
+## SDE Executor (`sde`)
+
+An SDE develops a task test-first in its own worktree and delivers the change with red/green test evidence. Register it next to a reviewer (defaults shown; only `role` is required):
+
+```toml
+[executors.sde]
+role = "sde"
+harness = "claude-code"
+launcher = "claude"
+billing = "subscription"
+model = "claude-opus-5-5"
+effort = "high"
+review = true                # runtime switch: false delivers after tests and repo checks
+reviewer = "coder-reviewer"  # a role = "coder-reviewer" executor; required while review = true
+max_review_rounds = 3
+```
+
+Dispatch with `executor_id = "sde"`:
+
+```bash
+curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
+  "inbox_id": "proj:hibernaut", "external_id": "task-42", "correlation_key": "task-42",
+  "payload": {"executor_id": "sde", "text": "Task requirements", "base_ref": "main"}}'
+```
+
+- Workspace: `explicit_workdir`, else the task worktree for `correlation_key` (created on first use, reused afterwards), like other executors.
+- Development: the launcher starts Claude Code with `--permission-mode dontAsk`, read/edit/write tools and Bash allowed, `git push` and `gh pr create/merge` denied. The prompt requires a failing test first, the smallest fix, the repository's full checks and a commit on the task branch. The run returns a structured report (`summary`, `test_evidence`); a question for a person becomes a `Suspend`: answer by replying on the task (same `correlation_key`) or with an approval `comment`, then approve. Rejecting stops the task with `[sde] stopped: question declined`.
+- Review on: the SDE sends the requirements, the diff it computes from the worktree (not the developer's own description) and the test evidence to the configured `coder-reviewer`, which runs as its own read-only session with its own launcher, billing and model. `changes_requested` sends every blocking item back to the same developer session for a fix; the re-review also gets the previous findings and the diff since that review. `pass` delivers. If the review cannot finish (reviewer error, malformed verdict, model or billing mismatch) or rounds run out, the run suspends as `review pending`: approve to retry (another fix round when changes were requested), reject to deliver marked `review=pending`.
+- Review off: the SDE delivers after its own tests and checks (`review=off`).
+- While suspended: messages on the same task are kept with the suspended state (the open approval card is not posted again). Messages that arrive in the same batch as the decision count too. On approval they are added to the requirements, developed first, and shown to the reviewer; a rejected review retry lists them as unprocessed in the delivery.
+- Permission gate `sde.launch` runs before every developer launch, fix rounds included. `defer` suspends with the full state; approval runs that launch, rejection stops with `[sde] stopped: launch declined`; `block` stops with `[sde] stopped: launch blocked`.
+- Delivery: one Outbox message `[sde] delivered (review=pass after N round(s) | review=off | review=pending; harness=... launcher=... billing=... model=... effort=...)` with workdir, summary, test evidence, review history and the last review.
+- Hot reload: all four launch settings and `review` take effect on the next run; invalid values keep the running settings. Billing and launcher rules are the same as for `coder-reviewer`. `sde.launch` is allowed by default in the auto-mode permission adapter.
+
 ## MCP Server Integration (`stdio` & Remote `/mcp`)
 
 Hibernaut exposes 7 MCP tools (`hibernaut_ingest_event`, `hibernaut_list_sessions`, `hibernaut_list_events`, `hibernaut_list_workspaces`, `hibernaut_resolve_approval`, `hibernaut_reclaim_workspace`, `hibernaut_close_session`).

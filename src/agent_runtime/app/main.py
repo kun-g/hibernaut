@@ -30,6 +30,7 @@ from agent_runtime.adapters.executor_cli import (
     CoderReviewerExecutor,
     LocalCLIExecutor,
     OrcaWorktreeManager,
+    SDEExecutor,
 )
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
@@ -473,11 +474,27 @@ def build_daemon_from_config(
     if has_configured_executor and not demo:
         # Instantiate all configured [executors.<id>] per project so AgentWorker can sticky-route.
         # Role executors are rebuilt with each config reload, so the next run uses the new profile and launcher.
-        reviewer_executors: dict[str, ExecutorPort] = {
+        reviewers: dict[str, CoderReviewerExecutor] = {
             name: CoderReviewerExecutor(profile=role.profile, workspaces=daemon.workspaces)
             for name, role in config.roles.items()
             if role.role == CODER_REVIEWER_ROLE
         }
+        reviewer_executors: dict[str, ExecutorPort] = dict(reviewers)
+
+        def _sde_executors(wt_mgr: OrcaWorktreeManager) -> dict[str, ExecutorPort]:
+            # Each SDE run reviews through the reviewer built from the same config generation.
+            return {
+                name: SDEExecutor(
+                    profile=role.profile,
+                    options=role.sde,
+                    reviewer=reviewers.get(role.sde.reviewer) if role.sde.review else None,
+                    worktree_manager=wt_mgr,
+                    inbox_checkout_map=inbox_checkout_map,
+                )
+                for name, role in config.roles.items()
+                if role.sde is not None
+            }
+
         terminal_bindings = SQLiteTerminalBindingStore(daemon.db)
         executors_by_inbox: dict[str, dict[str, ExecutorPort]] = {}
         wt_mgr_by_inbox: dict[str, OrcaWorktreeManager] = {}
@@ -501,6 +518,7 @@ def build_daemon_from_config(
                 for exec_name in config.executors
             }
             executors_by_inbox[proj.inbox_id].update(reviewer_executors)
+            executors_by_inbox[proj.inbox_id].update(_sde_executors(wt_mgr))
 
         default_mgr = OrcaWorktreeManager(
             workspace_store=daemon.workspaces,
@@ -516,6 +534,7 @@ def build_daemon_from_config(
             for exec_name in config.executors
         }
         fallback_executors.update(reviewer_executors)
+        fallback_executors.update(_sde_executors(default_mgr))
 
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
             return AgentWorker(

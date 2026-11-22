@@ -33,6 +33,25 @@ class _OtherExecutor:
         return Silent()
 
 
+class _ReSuspendingExecutor:
+    executor_id = "holder"
+
+    def __init__(self) -> None:
+        self.next_request: str | None = None
+
+    async def execute(
+        self,
+        events: Sequence[Event],
+        session: SessionRef | None,
+        caps: RunCapabilities,
+    ) -> RunOutcome:
+        _ = caps
+        text = str(events[-1].payload.get("text", ""))
+        request = self.next_request or (session.pending_request_id if session is not None else None) or "req-1"
+        return Suspend(request_id=request, prompt=f"waiting ({text})", session_checkpoint=text,
+                       session_id=session.session_id if session is not None else None)
+
+
 class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="e2e_agent_")
@@ -364,6 +383,28 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(other.calls, [])
         pending = self.app.db.fetchall("SELECT external_id FROM event_inbox WHERE status = 'pending'")
         self.assertEqual([r["external_id"] for r in pending], ["appr-email-6"])
+
+    async def test_resuspending_under_the_open_request_updates_the_checkpoint_without_a_new_card(self) -> None:
+        holder = _ReSuspendingExecutor()
+        self.app.worker._executors["holder"] = holder  # pyright: ignore[reportPrivateUsage]
+
+        def cards() -> list[str]:
+            return [m.content for m in self.app.outbox.fetch_pending(100) if m.metadata.get("kind") == "approval_request"]
+
+        for n, text in enumerate(("first", "follow-up")):
+            self.app.handler.ingest(inbox_id="u1", source="im", external_id=f"rs-{n}",
+                                    payload={"text": text, "executor_id": "holder"}, correlation_key="rs")
+            await self.app.worker.process_inbox("u1")
+        self.assertEqual(cards(), ["waiting (first)"])
+        session = self.app.worker._sessions.find_by_correlation_key("u1", "rs")  # pyright: ignore[reportPrivateUsage]
+        assert session is not None
+        self.assertEqual((session.status, session.pending_request_id, session.checkpoint), ("suspended", "req-1", "follow-up"))
+
+        holder.next_request = "req-2"
+        self.app.handler.ingest(inbox_id="u1", source="im", external_id="rs-2",
+                                payload={"text": "new question"}, correlation_key="rs")
+        await self.app.worker.process_inbox("u1")
+        self.assertEqual(cards(), ["waiting (first)", "waiting (new question)"])
 
     async def test_auto_mode_blocks_dangerous_tool_call(self) -> None:
         self.app.handler.ingest(

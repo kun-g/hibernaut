@@ -769,6 +769,8 @@ class AgentWorker:
                     exec_sid,
                 )
                 target_sid = suspend_session_id or session_ref.session_id
+                # Re-suspending under the open request only updates the checkpoint; the card is already out.
+                repeated = request_id == session_ref.pending_request_id and target_sid == session_ref.session_id
                 if target_sid != session_ref.session_id:
                     self._sessions.archive_session(session_ref.session_id)
                 self._sessions.save(
@@ -785,6 +787,8 @@ class AgentWorker:
                         updated_at=utc_now_iso(),
                     )
                 )
+                if repeated:
+                    return target_sid
                 self._outbox.enqueue(
                     inbox_id=inbox_id,
                     content=prompt,

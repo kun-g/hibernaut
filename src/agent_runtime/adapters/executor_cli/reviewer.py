@@ -19,7 +19,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
 )
 from agent_runtime.adapters.executor_cli.process import join_text, last_text, target_events
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
-from agent_runtime.core.models import Emit, Event, RunOutcome, SessionRef, Suspend, new_id
+from agent_runtime.core.models import Emit, Event, PermissionDecision, RunOutcome, SessionRef, Suspend, new_id
 from agent_runtime.core.ports import RunCapabilities
 
 CODER_REVIEWER_ROLE = "coder-reviewer"
@@ -83,11 +83,13 @@ class ReviewAborted(Exception):
 
 
 @dataclass(frozen=True, slots=True)
-class _ReviewInput:
+class ReviewRequest:
     workdir: Path
     requirements: str
     test_evidence: str
     base_ref: str
+    # Earlier findings plus the diff since that review; empty on a first review.
+    previous_round: str = ""
 
 
 class CoderReviewerExecutor:
@@ -117,21 +119,9 @@ class CoderReviewerExecutor:
         caps: RunCapabilities,
     ) -> RunOutcome:
         session_id = session.session_id if session is not None else new_id("sess")
-        p = self._profile
         try:
-            review = self._review_input(events, session)
-            decision = caps.permissions.check(
-                "coder_reviewer.launch",
-                {
-                    "executor": p.name,
-                    "workdir": str(review.workdir),
-                    "harness": p.harness,
-                    "launcher": p.launcher.name,
-                    "billing": p.billing,
-                    "model": p.model,
-                    "effort": p.effort,
-                },
-            )
+            request = self._review_input(events, session)
+            decision = self.check_launch(caps, request.workdir)
             if decision.action == "block":
                 return self._emit(session_id, decision.reason)
             if decision.action == "defer":
@@ -141,33 +131,54 @@ class CoderReviewerExecutor:
                     session_checkpoint="{}",
                     session_id=session_id,
                 )
-            env = child_env(p, os.environ)
-            evidence = await asyncio.to_thread(_collect_diff, review.workdir, review.base_ref)
-            before = await asyncio.to_thread(worktree_fingerprint, review.workdir)
-            result = await run_claude_code(
-                p,
-                cwd=review.workdir,
-                prompt=self._prompt(review, evidence),
-                permission_mode="dontAsk",
-                role_args=_ROLE_ARGS,
-                env=env,
-                is_interrupted=caps.is_interrupted,
-                poll_interval=self._interrupt_poll_interval,
-            )
-            after = await asyncio.to_thread(worktree_fingerprint, review.workdir)
-            if after != before:
-                raise ReviewAborted(
-                    f"the working tree in {review.workdir} changed during the review; findings discarded, "
-                    "check the change and submit again"
-                )
-            return Emit(messages=(self._format(_validate_review(result.get("structured_output"))),), session_id=session_id)
+            review = await self.review(request, caps)
+            return Emit(messages=(self.format_review(review),), session_id=session_id)
         except (ReviewAborted, ClaudeCodeError) as exc:
             return self._emit(session_id, str(exc))
+
+    def check_launch(self, caps: RunCapabilities, workdir: Path) -> PermissionDecision:
+        p = self._profile
+        return caps.permissions.check(
+            "coder_reviewer.launch",
+            {
+                "executor": p.name,
+                "workdir": str(workdir),
+                "harness": p.harness,
+                "launcher": p.launcher.name,
+                "billing": p.billing,
+                "model": p.model,
+                "effort": p.effort,
+            },
+        )
+
+    async def review(self, request: ReviewRequest, caps: RunCapabilities) -> dict[str, Any]:
+        # Callers run check_launch() first; raises ReviewAborted or ClaudeCodeError when no verdict is reached.
+        p = self._profile
+        env = child_env(p, os.environ)
+        evidence = await asyncio.to_thread(_collect_diff, request.workdir, request.base_ref)
+        before = await asyncio.to_thread(worktree_fingerprint, request.workdir)
+        result = await run_claude_code(
+            p,
+            cwd=request.workdir,
+            prompt=self._prompt(request, evidence),
+            permission_mode="dontAsk",
+            role_args=_ROLE_ARGS,
+            env=env,
+            is_interrupted=caps.is_interrupted,
+            poll_interval=self._interrupt_poll_interval,
+        )
+        after = await asyncio.to_thread(worktree_fingerprint, request.workdir)
+        if after != before:
+            raise ReviewAborted(
+                f"the working tree in {request.workdir} changed during the review; findings discarded, "
+                "check the change and submit again"
+            )
+        return _validate_review(result.get("structured_output"))
 
     def _emit(self, session_id: str, detail: str) -> Emit:
         return Emit(messages=(f"[{self._profile.name}] review failed: {detail}",), session_id=session_id)
 
-    def _review_input(self, events: Sequence[Event], session: SessionRef | None) -> _ReviewInput:
+    def _review_input(self, events: Sequence[Event], session: SessionRef | None) -> ReviewRequest:
         target = target_events(events)
         requirements = join_text(target, ("requirements", "text"))
         if not requirements:
@@ -191,24 +202,25 @@ class CoderReviewerExecutor:
             workdir = Path(record.workdir)
         if not workdir.is_dir():
             raise ReviewAborted(f"workdir {workdir} does not exist")
-        return _ReviewInput(
+        return ReviewRequest(
             workdir=workdir,
             requirements=requirements,
             test_evidence=join_text(target, ("test_evidence",)) or "(none provided)",
             base_ref=last_text(target, "base_ref") or "",
         )
 
-    def _prompt(self, review: _ReviewInput, evidence: str) -> str:
-        return "\n\n".join(
-            (
-                _REVIEW_RULES,
-                f"## Task requirements\n{review.requirements}",
-                f"## Test evidence\n{review.test_evidence}",
-                f"## Code diff\n{evidence}",
-            )
-        )
+    def _prompt(self, request: ReviewRequest, evidence: str) -> str:
+        parts = [
+            _REVIEW_RULES,
+            f"## Task requirements\n{request.requirements}",
+            f"## Test evidence\n{request.test_evidence}",
+            f"## Code diff\n{evidence}",
+        ]
+        if request.previous_round:
+            parts.append(request.previous_round)
+        return "\n\n".join(parts)
 
-    def _format(self, review: Mapping[str, Any]) -> str:
+    def format_review(self, review: Mapping[str, Any]) -> str:
         p = self._profile
         lines = [
             f"[{p.name}] verdict={review['verdict']} "
@@ -218,18 +230,24 @@ class CoderReviewerExecutor:
         blocking: list[dict[str, str]] = review["blocking"]
         if blocking:
             lines.append("Blocking:")
-            for i, item in enumerate(blocking, 1):
-                lines.append(f"{i}. {item['location']}")
-                lines.append(f"   Trigger: {item['trigger']}")
-                lines.append(f"   Impact: {item['impact']}")
-                if item.get("fix"):
-                    lines.append(f"   Fix: {item['fix']}")
+            lines.append(format_blocking(blocking))
             lines.append(f"After fixing, submit again with executor_id={p.name} for a fresh review.")
         notes: list[str] = review.get("notes", [])
         if notes:
             lines.append("Notes:")
             lines.extend(f"- {note}" for note in notes)
         return "\n".join(lines)
+
+
+def format_blocking(blocking: Sequence[Mapping[str, str]]) -> str:
+    lines: list[str] = []
+    for i, item in enumerate(blocking, 1):
+        lines.append(f"{i}. {item['location']}")
+        lines.append(f"   Trigger: {item['trigger']}")
+        lines.append(f"   Impact: {item['impact']}")
+        if item.get("fix"):
+            lines.append(f"   Fix: {item['fix']}")
+    return "\n".join(lines)
 
 
 def _validate_review(raw: object) -> dict[str, Any]:
@@ -278,6 +296,14 @@ def worktree_fingerprint(workdir: Path) -> str:
         _git(workdir, "add", "-A", env=env)
         tree = _git(workdir, "write-tree", env=env).strip()
     return f"{head}:{tree}"
+
+
+def snapshot_diff(workdir: Path, before: str, after: str) -> str:
+    # Fingerprints are "<head>:<tree>"; their tree objects stay in the object store, so two snapshots diff directly.
+    diff = _git(workdir, "diff", before.split(":", 1)[1], after.split(":", 1)[1])
+    if len(diff) > _MAX_DIFF_CHARS:
+        diff = diff[:_MAX_DIFF_CHARS] + f"\n[diff truncated at {_MAX_DIFF_CHARS} characters]"
+    return diff
 
 
 def _collect_diff(workdir: Path, base_ref: str) -> str:

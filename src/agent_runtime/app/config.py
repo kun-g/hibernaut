@@ -18,6 +18,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
 )
 from agent_runtime.adapters.executor_cli.executor import CLITemplate
 from agent_runtime.adapters.executor_cli.reviewer import CODER_REVIEWER_ROLE
+from agent_runtime.adapters.executor_cli.sde import SDE_OPTION_KEYS, SDE_ROLE, SDEOptions
 from agent_runtime.adapters.executor_cli.worktree import WorktreeBackend
 from agent_runtime.adapters.permissions.security import proxy_service_url
 from agent_runtime.core.models import NewEventPolicy
@@ -61,13 +62,27 @@ class ProjectConfig:
     executor: str | None = None
 
 
-ROLES = (CODER_REVIEWER_ROLE,)
+ROLES = (CODER_REVIEWER_ROLE, SDE_ROLE)
 
 
 @dataclass(frozen=True, slots=True)
 class RoleConfig:
     role: str
     profile: ClaudeCodeProfile
+    sde: SDEOptions | None = None
+
+
+def _sde_options(name: str, item: dict[str, Any]) -> SDEOptions:
+    where = f"executors.{name}"
+    defaults = SDEOptions()
+    review = item.get("review", defaults.review)
+    if not isinstance(review, bool):
+        raise ValueError(f"{where}: review must be true or false")
+    rounds = item.get("max_review_rounds", defaults.max_review_rounds)
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
+        raise ValueError(f"{where}: max_review_rounds must be a positive integer")
+    reviewer = str(item.get("reviewer", defaults.reviewer)).strip()
+    return SDEOptions(review=review, reviewer=reviewer, max_review_rounds=rounds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,10 +215,13 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
         if role is not None:
             if role not in ROLES:
                 raise ValueError(f"executors.{name}: unsupported role '{role}' (supported: {', '.join(ROLES)})")
+            extra = SDE_OPTION_KEYS if role == SDE_ROLE else frozenset[str]()
             profile = parse_profile(
-                str(name), item, role=str(role), launchers=launchers, credential_proxy_url=anthropic_url
+                str(name), item, role=str(role), launchers=launchers, credential_proxy_url=anthropic_url,
+                extra_keys=extra,
             )
-            roles[str(name)] = RoleConfig(role=str(role), profile=profile)
+            options = _sde_options(str(name), item) if role == SDE_ROLE else None
+            roles[str(name)] = RoleConfig(role=str(role), profile=profile, sde=options)
             continue
         env_raw = item.get("env", {})
         resume_raw = item.get("resume_args")
@@ -224,6 +242,17 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
             timeout_seconds=timeout,
             orca_agent=orca_agent,
         )
+
+    for name, role_cfg in roles.items():
+        opts = role_cfg.sde
+        if opts is None or not opts.review:
+            continue
+        target = roles.get(opts.reviewer)
+        if target is None or target.role != CODER_REVIEWER_ROLE:
+            raise ValueError(
+                f"executors.{name}: reviewer '{opts.reviewer}' is not a coder-reviewer executor; "
+                f"declare [executors.{opts.reviewer}] with role = \"{CODER_REVIEWER_ROLE}\" or set review = false"
+            )
 
     projects: dict[str, ProjectConfig] = {}
     for name, item in raw.get("projects", {}).items():
