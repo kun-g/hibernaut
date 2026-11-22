@@ -1,5 +1,8 @@
 [importlinter]
-root_package = agent_runtime
+root_packages =
+    agent_runtime
+    switchboard
+include_external_packages = True
 
 [importlinter:contract:clean-layers]
 name = Clean Architecture L0-L3 dependency direction
@@ -26,3 +29,14 @@ source_modules =
     agent_runtime.core.models
 forbidden_modules =
     agent_runtime.core.ports
+
+[importlinter:contract:switchboard-zero-business-deps]
+name = Switchboard must not depend on business packages
+type = forbidden
+source_modules =
+    switchboard
+forbidden_modules =
+    taskboard
+    agent_runtime
+    runner
+    memory_hub

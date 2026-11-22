@@ -1,0 +1,38 @@
+# Switchboard Phase 1 config. Secrets never go here: the default EnvCredentialBroker reads
+# SWITCHBOARD_GITHUB_WEBHOOK_SECRET, SWITCHBOARD_FEISHU_WEBHOOK_SECRET (verification token),
+# SWITCHBOARD_MCP_WEBHOOK_SECRET (bearer token), SWITCHBOARD_GITHUB_TOKEN and
+# SWITCHBOARD_FEISHU_TOKEN (tenant access token) from the environment.
+
+[http]
+host = "127.0.0.1"
+port = 8790
+max_body_bytes = 1048576
+
+[sqlite]
+path = "switchboard.db"
+busy_timeout_ms = 5000
+
+[routing]
+default_scope = "user:main"
+unmatched_policy = "fallback"  # or "reject"
+
+[routing.github_repos]
+"kun-g/hibernaut" = "proj:hibernaut"
+
+[routing.feishu_chats]
+# "oc_xxx" = "proj:hibernaut"
+
+[feishu]
+group_require_mention = true
+# bot_open_id = "ou_xxx"
+
+[delivery]
+retry_backoff_seconds = [5, 15, 45, 135, 405]
+# dead_letter_alert_channel = "feishu"
+# dead_letter_alert_target = "oc_xxx"
+
+[outbound]
+rate_limit_per_target_rpm = 30
+max_retry_attempts = 5
+approval_channel = "feishu"
+# approval_target = "oc_xxx"

@@ -1,6 +1,7 @@
 from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
 from agent_runtime.adapters.storage_sqlite.deliveries import SQLiteDeliveryStore
 from agent_runtime.adapters.storage_sqlite.stores import (
+    EventDiagnostics,
     SQLiteInboxAdapter,
     SQLiteLeaseLockAdapter,
     SQLiteOutboxAdapter,
@@ -15,6 +16,7 @@ from agent_runtime.adapters.storage_sqlite.workspaces import (
 )
 
 __all__ = [
+    "EventDiagnostics",
     "SQLiteDatabase",
     "SQLiteDeliveryStore",
     "SQLiteInboxAdapter",

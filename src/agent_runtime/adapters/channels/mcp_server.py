@@ -38,11 +38,12 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "hibernaut_list_sessions",
-        "description": "List Hibernaut sessions filtered by inbox_id or lifecycle status.",
+        "description": "List Hibernaut sessions filtered by inbox_id, lifecycle status or parent_session_id.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "inbox_id": {"type": "string"},
+                "parent_session_id": {"type": "string"},
                 "status": {
                     "type": "string",
                     "enum": ["active", "suspended", "archived", "closed"],
@@ -265,7 +266,14 @@ class MCPServerAdapter:
             status = str(args["status"]) if args.get("status") is not None else None
             if status is not None and status not in ("active", "suspended", "archived", "closed"):
                 raise ValueError(f"Unsupported session status: {status}")
-            rows = self._sessions.list_sessions(inbox_id=inbox_id, status=status)
+            parent_session_id = (
+                str(args["parent_session_id"]) if args.get("parent_session_id") is not None else None
+            )
+            rows = self._sessions.list_sessions(
+                inbox_id=inbox_id,
+                status=status,
+                parent_session_id=parent_session_id,
+            )
             return {
                 "sessions": [
                     {
@@ -277,6 +285,7 @@ class MCPServerAdapter:
                         "executor_id": s.executor_id,
                         "executor_session_id": s.executor_session_id,
                         "pending_approval_id": s.pending_request_id,
+                        "parent_session_id": s.parent_session_id,
                         "updated_at": s.updated_at,
                     }
                     for s in rows
@@ -298,6 +307,7 @@ class MCPServerAdapter:
                 raise ValueError(f"Unsupported event status: {status}")
             limit = int(args.get("limit", 50))
             events = self._inbox.list_events(inbox_id=inbox_id, status=status, limit=limit)
+            diagnostics = self._inbox.diagnostics([e.event_id for e in events])
             return {
                 "events": [
                     {
@@ -306,8 +316,8 @@ class MCPServerAdapter:
                         "source": e.source,
                         "external_id": e.external_id,
                         "status": e.status,
-                        "attempts": e.attempts,
-                        "last_error": e.last_error,
+                        "attempts": diag.attempts if (diag := diagnostics.get(e.event_id)) else 0,
+                        "last_error": diag.last_error if diag else None,
                         "correlation_key": e.correlation_key,
                         "session_id": e.session_id,
                         "created_at": e.occurred_at,

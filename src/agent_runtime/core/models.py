@@ -37,8 +37,6 @@ class Event:
     session_id: str | None = None
     correlation_key: str | None = None
     status: EventStatus = "pending"
-    attempts: int = 0
-    last_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +51,8 @@ class SessionRef:
     checkpoint: str | None = None
     pending_request_id: str | None = None
     updated_at: str = field(default_factory=utc_now_iso)
+    # Set on a delegated child session; the child shares the parent's work_key so the worktree stays referenced.
+    parent_session_id: str | None = None
 
 
 def resolve_executor_id(
