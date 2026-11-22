@@ -25,7 +25,7 @@ src/agent_runtime/
 │   ├── memory_fs/         # FileSystemMemoryAdapter + PartitionedMemoryAdapter & WorkspacePartitionRegistry
 │   ├── permissions/       # Auto Mode classifier (allow / block / defer) + external CredentialProxyClient
 │   ├── executor_whitebox/ # Whitebox Executor (prompt-cacheable baseline, permission gate, fold/interrupt, Suspend/Resume)
-│   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + resume_args + magpie env) & OrcaWorktreeManager (3 safety gates)
+│   ├── executor_cli/      # LocalCLIExecutor (claude/cursor-agent/grok/dsh + resume_args + magpie env), shared Claude Code launch adapter (claude_code.py), CoderReviewerExecutor (read-only review) & OrcaWorktreeManager (3 safety gates)
 │   └── channels/          # Multi-route HTTP (/events, /webhooks/github, /webhooks/feishu, /mcp), MCPServerAdapter, GitHubIssuePoller, FeishuChannelAdapter, Console
 └── app/
     ├── config.py          # Stdlib tomllib loader for hibernaut.toml
@@ -57,7 +57,7 @@ The HTTP endpoints handle requests on parallel threads (backlog 128); stopping o
 
 Hibernaut checks local branch names when allocating a worktree, including branches without a checkout. If Orca adds a numeric suffix during creation, Hibernaut records the branch and path from the creation receipt after verifying both against the primary repository's Git worktree list. On the next wake, it repairs stale SQLite paths for registered worktrees. On lease acquire, a worker recovers any orphaned `processing` events back to `pending`, claims pending events (`attempts += 1`), ensures an `active` `SessionRef` and binds `event_inbox.session_id` before execution, commits `done` immediately after `Silent`/`Emit`/`Suspend` side effects, requeues on `interrupt`, and marks `failed` with `last_error` once retries are exhausted. Session rotation archives the previous session (`archived`) while keeping the worktree reference count at 1; closing a session (`closed` via event or `hibernaut_close_session`) triggers worktree reclaim only once `count_active_by_work_key(work_key) == 0`.
 
-For a visible agent session, set `orca_agent = "claude"` under `[executors.claude]` and use `worktree_backend = "orca"` for the project. Restart the daemon after installing this version. Each managed run opens an Orca terminal in the background where you can watch progress and respond to permission prompts. The agent returns its `Silent`, `Emit`, or `Suspend` outcome in a per-run temporary file. Successful terminal tabs stay open. `timeout_seconds` includes time spent waiting for input. Configure agent accounts and environment in Orca. The template's `command`, `args`, and `env` apply to direct CLI runs, including Git worktrees and explicit directory overrides.
+For a visible agent session, set `orca_agent = "claude"` under `[executors.claude]` and use `worktree_backend = "orca"` for the project. Restart the daemon after installing this version. Each managed run opens an Orca terminal in the background where you can watch progress and respond to permission prompts. The agent returns its `Silent`, `Emit`, or `Suspend` outcome in a per-run temporary file. Successful terminal tabs stay open, and later events for the same session (same `session_id` or `correlation_key`) go back to that conversation: the live terminal when its process is unchanged, otherwise `<command> --resume <native session id>` in a new terminal. The native session ID is confirmed from the Claude Code transcript that holds the run's unique result path and is stored in `sessions.executor_session_id`. When neither is available the run suspends with the reason and sends nothing; approve to start a new conversation. `timeout_seconds` includes time spent waiting for input. Configure agent accounts and environment in Orca. The template's `command`, `args`, and `env` apply to direct CLI runs, including Git worktrees and explicit directory overrides.
 
 ### Versioning
 
@@ -76,6 +76,48 @@ python3 scripts/run_updating.py --port 8080
 The supervisor checks the configured `origin/main` every 300 seconds. Use `--interval 60` for one-minute checks. Daemon options such as `--db`, `--memory-root`, `--workers`, and `--policy` are forwarded across restarts. Stop with `Ctrl+C`.
 
 Use an origin you trust to supply executable code. A dirty checkout (including untracked files), another branch, a divergent history, or a failed fetch leaves the running daemon in place. On a fast-forward, the old daemon closes ingress and drains accepted work before the supervisor applies the commit and relaunches. Clients should retry during this short interruption using the same external event ID. Keep runtime state in ignored paths or outside the checkout. The supervisor reuses those paths. If a new daemon fails to start, the supervisor exits with its status for operator recovery.
+
+## Independent Code Review (`coder-reviewer`)
+
+Register a reviewer in `hibernaut.toml` (defaults shown; only `role` is required). Role, harness, launcher, billing and model are separate settings:
+
+```toml
+[launchers.claude-sg]       # optional; built-in "claude" runs `claude`
+command = "claude-sg"       # trusted launcher on the deployment host
+
+[credential_proxy]          # required only for billing = "api"
+url = "http://127.0.0.1:9000"
+
+[executors.coder-reviewer]
+role = "coder-reviewer"
+harness = "claude-code"    # only claude-code
+launcher = "claude"        # a [launchers.<name>] entry
+billing = "subscription"   # subscription | api
+model = "claude-opus-5-5"  # Claude full name or alias (opus, sonnet, haiku, fable)
+effort = "high"            # low | medium | high | xhigh | max
+```
+
+Dispatch a review with `executor_id = "coder-reviewer"`:
+
+```bash
+curl -s localhost:8080/events -H 'Content-Type: application/json' -d '{
+  "inbox_id": "proj:hibernaut", "external_id": "review-42-r1", "correlation_key": "review:task-42",
+  "payload": {
+    "executor_id": "coder-reviewer",
+    "text": "Task requirements the change must meet",
+    "test_evidence": "pytest -v: 119 passed; pyright: 0 errors",
+    "review_of": "task-42",
+    "base_ref": "origin/main"
+  }}'
+```
+
+- Workspace: `explicit_workdir`, or the ready workspace of `review_of` (the developer task's `correlation_key`). The reviewer never creates a worktree. Use its own `correlation_key` so the developer session stays bound to its executor.
+- Diff: computed by the executor from the merge base with `base_ref` (default `origin/HEAD`, then `main`), including uncommitted and untracked files.
+- Result: one Outbox message with `verdict=pass` or `verdict=changes_requested`. Each blocking item lists location, trigger, impact and an optional fix. After a fix, send a new event (new `external_id`) for a fresh, independent review.
+- Read-only: edit tools are denied and the working tree is fingerprinted before and after; any change discards the review.
+- Launcher: chosen only in `hibernaut.toml`; event payloads cannot name a launcher or command. The launcher may set its own config dir, account, gateway or proxy (like `claude-sg`) and receives `-p --output-format stream-json --verbose --model --effort --permission-mode dontAsk` plus the reviewer's tool and schema arguments unchanged. The permission mode is always explicit, so a launcher's own default (such as `bypassPermissions`) never applies.
+- Billing: both modes remove `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_BASE_URL` and the Bedrock/Vertex/Foundry switches from the daemon environment before starting the launcher. `subscription` uses the launcher's own login and stops at session start if Claude Code reports any paid credential source. `api` points Claude Code at `<credential_proxy.url>/proxy/anthropic` with a placeholder key; the external proxy injects the real key, and the run stops if Claude Code authenticates any other way. Credentials never go in `hibernaut.toml` (the parser rejects them).
+- Hot reload: save the settings (including launcher) and the next review uses them. Invalid values or combinations print `[config] Invalid ... (ValueError: <reason>)` and keep the running settings.
 
 ## MCP Server Integration (`stdio` & Remote `/mcp`)
 

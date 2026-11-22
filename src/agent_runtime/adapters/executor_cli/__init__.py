@@ -1,7 +1,15 @@
+from agent_runtime.adapters.executor_cli.claude_code import (
+    ClaudeCodeLauncher,
+    ClaudeCodeProfile,
+)
 from agent_runtime.adapters.executor_cli.executor import (
     DEFAULT_CLI_TEMPLATES,
     CLITemplate,
     LocalCLIExecutor,
+)
+from agent_runtime.adapters.executor_cli.reviewer import (
+    CODER_REVIEWER_ROLE,
+    CoderReviewerExecutor,
 )
 from agent_runtime.adapters.executor_cli.worktree import (
     CommandResult,
@@ -11,7 +19,11 @@ from agent_runtime.adapters.executor_cli.worktree import (
 )
 
 __all__ = [
+    "CODER_REVIEWER_ROLE",
     "CLITemplate",
+    "ClaudeCodeLauncher",
+    "ClaudeCodeProfile",
+    "CoderReviewerExecutor",
     "CommandResult",
     "DEFAULT_CLI_TEMPLATES",
     "LocalCLIExecutor",

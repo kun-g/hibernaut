@@ -7,8 +7,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent_runtime.adapters.executor_cli.orca import run_visible
+from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner
+from agent_runtime.adapters.executor_cli.process import ProcessTimeout, last_text, supervise, target_events
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
+from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.core.models import (
     Emit,
     Event,
@@ -54,8 +56,11 @@ class LocalCLIExecutor:
         default_executor: str = "claude",
         interrupt_poll_interval: float = 0.05,
         orca_workspace: bool = False,
+        terminal_bindings: SQLiteTerminalBindingStore | None = None,
+        visible_runner: OrcaVisibleRunner | None = None,
     ) -> None:
         self._orca_workspace = orca_workspace
+        self._visible = visible_runner or OrcaVisibleRunner(bindings=terminal_bindings)
         self._worktree_manager = worktree_manager
         self._inbox_checkout_map: dict[str, Path] = {
             k: Path(v).resolve() for k, v in inbox_checkout_map.items()
@@ -83,10 +88,8 @@ class LocalCLIExecutor:
         inbox_id = events[0].inbox_id
         session_id = session.session_id if session is not None else new_id("sess")
 
-        # The Run target (workdir, CLI template) comes from the batch's ordinary events; an
-        # approval reply resumes their Run and only supplies a target when it runs alone.
-        target_events = [e for e in events if not _is_approval(e)] or list(events)
-        explicit_workdir = self._extract_explicit_workdir(target_events)
+        targets = target_events(events)
+        explicit_workdir = self._extract_explicit_workdir(targets)
         work_key = (
             events[0].correlation_key
             or (session.correlation_key if session is not None else None)
@@ -106,7 +109,7 @@ class LocalCLIExecutor:
             explicit_workdir=explicit_workdir,
         )
 
-        executor_name = self._extract_executor(target_events) or self._default_executor
+        executor_name = self._extract_executor(targets) or self._default_executor
         template = self._templates.get(executor_name)
         if template is None:
             return Emit(
@@ -116,7 +119,20 @@ class LocalCLIExecutor:
 
         prompt = self._build_prompt(events, session, caps)
         if self._orca_workspace and template.orca_agent and explicit_workdir is None:
-            return await run_visible(template.orca_agent, workdir, prompt, session_id, caps, template.timeout_seconds)
+            config_dir = template.env.get("CLAUDE_CONFIG_DIR")
+            return await self._visible.run(
+                executor_id=template.name,
+                agent=template.orca_agent,
+                command=template.command,
+                workdir=workdir,
+                prompt=prompt,
+                session=session,
+                session_id=session_id,
+                events=events,
+                caps=caps,
+                timeout=template.timeout_seconds,
+                transcript_dirs=(config_dir,) if config_dir else (),
+            )
         cli_args = self._render_cli_args(template, prompt=prompt, session=session)
         env = dict(os.environ)
         env.update(template.env)
@@ -184,55 +200,23 @@ class LocalCLIExecutor:
         caps: RunCapabilities,
         timeout_seconds: float,
     ) -> tuple[bytes, bytes, int]:
-        comm_task = asyncio.create_task(proc.communicate())
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout_seconds
-
         try:
-            while not comm_task.done():
-                if caps.is_interrupted():
-                    await self._terminate_process(proc)
-                    comm_task.cancel()
-                    raise asyncio.CancelledError("CLI subprocess interrupted by new event")
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    await self._terminate_process(proc)
-                    comm_task.cancel()
-                    return b"", f"CLI timed out after {timeout_seconds}s".encode("utf-8"), 124
-                try:
-                    stdout, stderr = await asyncio.wait_for(
-                        asyncio.shield(comm_task),
-                        timeout=min(self._interrupt_poll_interval, remaining),
-                    )
-                    return stdout, stderr, int(proc.returncode or 0)
-                except asyncio.TimeoutError:
-                    continue
-            stdout, stderr = await comm_task
-            return stdout, stderr, int(proc.returncode or 0)
-        except asyncio.CancelledError:
-            await self._terminate_process(proc)
-            if not comm_task.done():
-                comm_task.cancel()
-            raise
-
-    async def _terminate_process(self, proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is not None:
-            return
-        try:
-            proc.terminate()
-            await asyncio.wait_for(proc.wait(), timeout=1.0)
-        except (ProcessLookupError, asyncio.TimeoutError):
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+            stdout, stderr = await supervise(
+                proc,
+                proc.communicate(),
+                is_interrupted=caps.is_interrupted,
+                timeout_seconds=timeout_seconds,
+                poll_interval=self._interrupt_poll_interval,
+            )
+        except ProcessTimeout:
+            return b"", f"CLI timed out after {timeout_seconds}s".encode("utf-8"), 124
+        return stdout, stderr, int(proc.returncode or 0)
 
     def _extract_explicit_workdir(self, events: Sequence[Event]) -> str | None:
-        return _last_text(events, "explicit_workdir")
+        return last_text(events, "explicit_workdir")
 
     def _extract_executor(self, events: Sequence[Event]) -> str | None:
-        return _last_text(events, "executor")
+        return last_text(events, "executor")
 
     def _build_prompt(
         self,
@@ -304,15 +288,3 @@ class LocalCLIExecutor:
 
         return Emit(messages=(stdout,), session_id=session_id)
 
-
-def _is_approval(event: Event) -> bool:
-    request_id = event.payload.get("approval_request_id")
-    return isinstance(request_id, str) and bool(request_id)
-
-
-def _last_text(events: Sequence[Event], key: str) -> str | None:
-    for evt in reversed(events):
-        val = evt.payload.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    return None

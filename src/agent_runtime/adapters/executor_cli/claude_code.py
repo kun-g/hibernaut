@@ -1,0 +1,304 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import math
+import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, cast
+
+from agent_runtime.adapters.executor_cli.process import ProcessTimeout, supervise
+
+CLAUDE_CODE = "claude-code"
+HARNESSES = (CLAUDE_CODE,)
+BILLINGS = ("subscription", "api")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_LAUNCHER = "claude"
+# Stands in for the key the external credential proxy injects; the real key never reaches the harness.
+PROXY_PLACEHOLDER_KEY = "hibernaut-credential-proxy"
+_CLAUDE_MODEL_RE = re.compile(r"(claude-[a-z0-9][a-z0-9.-]*(\[1m\])?|opus|sonnet|haiku|fable)")
+# Any of these makes Claude Code bill an API key or a cloud provider instead of the subscription.
+_PAID_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+# Billing alone decides the account and endpoint: a daemon-wide token or base URL would override the
+# launcher's own login, or send the subscription token to a gateway the operator did not pick for it.
+_ROUTING_ENV_KEYS = (*_PAID_ENV_KEYS, "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN")
+_CREDENTIAL_ENV_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD)", re.IGNORECASE)
+_STREAM_LIMIT = 16 * 1024 * 1024
+PROFILE_KEYS = frozenset({"harness", "launcher", "billing", "model", "effort", "timeout_seconds", "env"})
+
+
+def _empty_env() -> dict[str, str]:
+    return {}
+
+
+def _check_env(where: str, env: Mapping[str, str]) -> None:
+    for key in env:
+        if key in _ROUTING_ENV_KEYS or _CREDENTIAL_ENV_RE.search(key):
+            raise ValueError(
+                f"{where}: env.{key} looks like a credential or billing switch; credentials stay in the "
+                "launcher or the credential proxy and never in hibernaut.toml"
+            )
+
+
+def _str_env(where: str, raw: object) -> dict[str, str]:
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{where}: env must be a table")
+    return {str(k): str(v) for k, v in cast(Mapping[object, object], raw).items()}
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeCodeLauncher:
+    # A trusted command that starts the harness; it may pick its own config dir, account, gateway or proxy,
+    # and must pass model, effort and role arguments through unchanged.
+    name: str
+    command: str
+    harness: str = CLAUDE_CODE
+    env: dict[str, str] = field(default_factory=_empty_env)
+
+    def __post_init__(self) -> None:
+        where = f"launchers.{self.name}"
+        if self.harness not in HARNESSES:
+            raise ValueError(f"{where}: unsupported harness '{self.harness}' (supported: {', '.join(HARNESSES)})")
+        if not self.command.strip():
+            raise ValueError(f"{where}: command must not be empty")
+        _check_env(where, self.env)
+
+
+BUILTIN_LAUNCHERS: dict[str, ClaudeCodeLauncher] = {
+    DEFAULT_LAUNCHER: ClaudeCodeLauncher(name=DEFAULT_LAUNCHER, command="claude"),
+}
+
+
+def _default_launcher() -> ClaudeCodeLauncher:
+    return BUILTIN_LAUNCHERS[DEFAULT_LAUNCHER]
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeCodeProfile:
+    name: str
+    harness: str = CLAUDE_CODE
+    launcher: ClaudeCodeLauncher = field(default_factory=_default_launcher)
+    billing: str = "subscription"
+    model: str = "claude-opus-5-5"
+    effort: str = "high"
+    timeout_seconds: float = 1800.0
+    env: dict[str, str] = field(default_factory=_empty_env)
+    # Anthropic base URL on the external credential proxy; billing "api" sends every request there.
+    credential_proxy_url: str = ""
+
+    def __post_init__(self) -> None:
+        where = f"executors.{self.name}"
+        if self.harness not in HARNESSES:
+            raise ValueError(f"{where}: unsupported harness '{self.harness}' (supported: {', '.join(HARNESSES)})")
+        if self.launcher.harness != self.harness:
+            raise ValueError(
+                f"{where}: launcher '{self.launcher.name}' starts harness '{self.launcher.harness}', not '{self.harness}'"
+            )
+        if self.billing not in BILLINGS:
+            raise ValueError(f"{where}: unsupported billing '{self.billing}' (supported: {', '.join(BILLINGS)})")
+        if self.billing == "api" and not self.credential_proxy_url:
+            raise ValueError(f"{where}: billing 'api' needs [credential_proxy] url; real keys never reach the harness")
+        if self.effort not in EFFORTS:
+            raise ValueError(f"{where}: unsupported effort '{self.effort}' (supported: {', '.join(EFFORTS)})")
+        if not _CLAUDE_MODEL_RE.fullmatch(self.model):
+            raise ValueError(f"{where}: model '{self.model}' is not a Claude model, which harness '{self.harness}' requires")
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError(f"{where}: timeout_seconds must be finite and positive")
+        _check_env(where, self.env)
+
+
+def parse_launchers(raw: Mapping[str, Any]) -> dict[str, ClaudeCodeLauncher]:
+    launchers = dict(BUILTIN_LAUNCHERS)
+    for name, item in raw.items():
+        where = f"launchers.{name}"
+        if not isinstance(item, Mapping):
+            raise ValueError(f"{where} must be a table")
+        entry = cast(Mapping[str, Any], item)
+        unknown = sorted(set(entry) - {"harness", "command", "env"})
+        if unknown:
+            raise ValueError(f"{where}: {', '.join(unknown)} not supported")
+        if "command" not in entry:
+            raise ValueError(f"{where}: command is required")
+        launchers[str(name)] = ClaudeCodeLauncher(
+            name=str(name),
+            command=str(entry["command"]),
+            harness=str(entry.get("harness", CLAUDE_CODE)),
+            env=_str_env(where, entry.get("env", {})),
+        )
+    return launchers
+
+
+def parse_profile(
+    name: str,
+    item: Mapping[str, Any],
+    *,
+    role: str,
+    launchers: Mapping[str, ClaudeCodeLauncher],
+    credential_proxy_url: str,
+) -> ClaudeCodeProfile:
+    where = f"executors.{name}"
+    unknown = sorted(set(item) - PROFILE_KEYS - {"role"})
+    if unknown:
+        raise ValueError(f"{where}: {', '.join(unknown)} not supported for role '{role}'")
+    launcher_name = str(item.get("launcher", DEFAULT_LAUNCHER))
+    launcher = launchers.get(launcher_name)
+    if launcher is None:
+        raise ValueError(f"{where}: unknown launcher '{launcher_name}' (configured: {', '.join(sorted(launchers))})")
+    defaults = ClaudeCodeProfile(name=name)
+    return ClaudeCodeProfile(
+        name=name,
+        harness=str(item.get("harness", defaults.harness)),
+        launcher=launcher,
+        billing=str(item.get("billing", defaults.billing)),
+        model=str(item.get("model", defaults.model)),
+        effort=str(item.get("effort", defaults.effort)),
+        timeout_seconds=float(item.get("timeout_seconds", defaults.timeout_seconds)),
+        env=_str_env(where, item.get("env", {})),
+        credential_proxy_url=credential_proxy_url,
+    )
+
+
+def child_env(profile: ClaudeCodeProfile, base: Mapping[str, str]) -> dict[str, str]:
+    env = {k: v for k, v in base.items() if k not in _ROUTING_ENV_KEYS}
+    env.update(profile.launcher.env)
+    env.update(profile.env)
+    if profile.billing == "api":
+        env["ANTHROPIC_BASE_URL"] = profile.credential_proxy_url
+        env["ANTHROPIC_API_KEY"] = PROXY_PLACEHOLDER_KEY
+    return env
+
+
+def harness_args(profile: ClaudeCodeProfile, *, permission_mode: str, role_args: Sequence[str]) -> list[str]:
+    # An explicit mode is mandatory: launchers such as claude-sg fall back to bypassPermissions without one.
+    return [
+        "-p",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--model", profile.model,
+        "--effort", profile.effort,
+        "--permission-mode", permission_mode,
+        *role_args,
+    ]
+
+
+class ClaudeCodeError(Exception):
+    pass
+
+
+async def run_claude_code(
+    profile: ClaudeCodeProfile,
+    *,
+    cwd: Path,
+    prompt: str,
+    permission_mode: str,
+    role_args: Sequence[str],
+    env: Mapping[str, str],
+    is_interrupted: Callable[[], bool],
+    poll_interval: float,
+) -> dict[str, Any]:
+    launcher = profile.launcher
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            launcher.command,
+            *harness_args(profile, permission_mode=permission_mode, role_args=role_args),
+            cwd=str(cwd),
+            env=dict(env),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_LIMIT,
+        )
+    except OSError as exc:
+        raise ClaudeCodeError(
+            f"cannot start launcher '{launcher.name}' ({launcher.command}): {exc.strerror or exc}"
+        ) from exc
+    try:
+        return await supervise(
+            proc,
+            _consume(profile, proc, prompt),
+            is_interrupted=is_interrupted,
+            timeout_seconds=profile.timeout_seconds,
+            poll_interval=poll_interval,
+        )
+    except ProcessTimeout as exc:
+        raise ClaudeCodeError(str(exc)) from exc
+
+
+async def _consume(profile: ClaudeCodeProfile, proc: asyncio.subprocess.Process, prompt: str) -> dict[str, Any]:
+    assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+    stdin = proc.stdin
+
+    async def feed() -> None:
+        try:
+            stdin.write(prompt.encode("utf-8"))
+            await stdin.drain()
+            stdin.close()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    stderr_task = asyncio.create_task(proc.stderr.read())
+    feed_task = asyncio.create_task(feed())
+    try:
+        return await _read_stream(profile, proc, stderr_task)
+    finally:
+        for task in (feed_task, stderr_task):
+            if not task.done():
+                task.cancel()
+
+
+async def _read_stream(
+    profile: ClaudeCodeProfile, proc: asyncio.subprocess.Process, stderr_task: asyncio.Task[bytes]
+) -> dict[str, Any]:
+    assert proc.stdout is not None
+    initialized = False
+    result: dict[str, Any] | None = None
+    while line := await proc.stdout.readline():
+        try:
+            parsed: object = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        message = cast(dict[str, Any], parsed)
+        if message.get("type") == "system" and message.get("subtype") == "init":
+            # init precedes the first model request, so a wrong account or model is stopped at session start.
+            check_init(profile, message)
+            initialized = True
+        elif message.get("type") == "result":
+            result = message
+    returncode = await proc.wait()
+    stderr = (await stderr_task).decode("utf-8", errors="replace").strip()
+    who = f"{profile.harness} (launcher '{profile.launcher.name}')"
+    if not initialized:
+        raise ClaudeCodeError(f"{who} exited ({returncode}) before reporting its session: {stderr[-2000:]}")
+    if result is None:
+        raise ClaudeCodeError(f"{who} exited ({returncode}) without a result: {stderr[-2000:]}")
+    if result.get("is_error") or result.get("subtype") != "success":
+        raise ClaudeCodeError(f"{who} reported an error: {str(result.get('result', ''))[:2000]}")
+    return result
+
+
+def check_init(profile: ClaudeCodeProfile, init: Mapping[str, Any]) -> None:
+    source = str(init.get("apiKeySource", ""))
+    launcher = profile.launcher.name
+    if profile.billing == "subscription" and source != "none":
+        raise ClaudeCodeError(
+            f"billing is 'subscription' but Claude Code (launcher '{launcher}') would authenticate with "
+            f"'{source}'; stopped at session start. Remove that credential source or set billing = \"api\""
+        )
+    if profile.billing == "api" and source != "ANTHROPIC_API_KEY":
+        raise ClaudeCodeError(
+            f"billing is 'api' but Claude Code (launcher '{launcher}') authenticated with '{source or 'none'}' "
+            "instead of the credential proxy route; stopped at session start"
+        )
+    actual = str(init.get("model", ""))
+    if profile.model.startswith("claude-") and actual.removesuffix("[1m]") != profile.model.removesuffix("[1m]"):
+        raise ClaudeCodeError(f"configured model '{profile.model}' but Claude Code selected '{actual}'")

@@ -10,8 +10,16 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from agent_runtime.adapters.channels.github_poller import PollMode
+from agent_runtime.adapters.executor_cli.claude_code import (
+    ClaudeCodeLauncher,
+    ClaudeCodeProfile,
+    parse_launchers,
+    parse_profile,
+)
 from agent_runtime.adapters.executor_cli.executor import CLITemplate
+from agent_runtime.adapters.executor_cli.reviewer import CODER_REVIEWER_ROLE
 from agent_runtime.adapters.executor_cli.worktree import WorktreeBackend
+from agent_runtime.adapters.permissions.security import proxy_service_url
 from agent_runtime.core.models import NewEventPolicy
 
 
@@ -53,11 +61,29 @@ class ProjectConfig:
     executor: str | None = None
 
 
+ROLES = (CODER_REVIEWER_ROLE,)
+
+
+@dataclass(frozen=True, slots=True)
+class RoleConfig:
+    role: str
+    profile: ClaudeCodeProfile
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialProxyConfig:
+    url: str = ""
+    anthropic_service: str = "anthropic"
+
+
 @dataclass(frozen=True, slots=True)
 class HibernautConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
     executors: dict[str, CLITemplate] = field(default_factory=dict)
+    launchers: dict[str, ClaudeCodeLauncher] = field(default_factory=dict)
+    credential_proxy: CredentialProxyConfig = field(default_factory=CredentialProxyConfig)
+    roles: dict[str, RoleConfig] = field(default_factory=dict)
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
 
@@ -100,8 +126,9 @@ async def config_changes(
                 raise ValueError("empty configuration")
             config = parse_config(raw)
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+            detail = f": {exc}" if type(exc) is ValueError else ""
             print(
-                f"[config] Invalid {path} ({type(exc).__name__}); keeping current settings.",
+                f"[config] Invalid {path} ({type(exc).__name__}{detail}); keeping current settings.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -151,8 +178,33 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
         mcp_token_env=str(ch_raw.get("mcp_token_env", "HIBERNAUT_MCP_TOKEN")),
     )
 
+    proxy_raw = raw.get("credential_proxy", {})
+    credential_proxy = CredentialProxyConfig(
+        url=str(proxy_raw.get("url", "")).strip(),
+        anthropic_service=str(proxy_raw.get("anthropic_service", "anthropic")).strip(),
+    )
+    if credential_proxy.url and not credential_proxy.url.startswith(("http://", "https://")):
+        raise ValueError("credential_proxy.url must be an http(s) URL")
+    if not credential_proxy.anthropic_service:
+        raise ValueError("credential_proxy.anthropic_service must not be empty")
+    anthropic_url = (
+        proxy_service_url(credential_proxy.url, credential_proxy.anthropic_service) if credential_proxy.url else ""
+    )
+    # Launchers come only from this trusted deployment file; events cannot name a command.
+    launchers = parse_launchers(raw.get("launchers", {}))
+
     executors: dict[str, CLITemplate] = {}
+    roles: dict[str, RoleConfig] = {}
     for name, item in raw.get("executors", {}).items():
+        role = item.get("role")
+        if role is not None:
+            if role not in ROLES:
+                raise ValueError(f"executors.{name}: unsupported role '{role}' (supported: {', '.join(ROLES)})")
+            profile = parse_profile(
+                str(name), item, role=str(role), launchers=launchers, credential_proxy_url=anthropic_url
+            )
+            roles[str(name)] = RoleConfig(role=str(role), profile=profile)
+            continue
         env_raw = item.get("env", {})
         resume_raw = item.get("resume_args")
         orca_agent = item.get("orca_agent")
@@ -196,5 +248,8 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
         runtime=runtime,
         channels=channels,
         executors=executors,
+        launchers=launchers,
+        credential_proxy=credential_proxy,
+        roles=roles,
         projects=projects,
     )
