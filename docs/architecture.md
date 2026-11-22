@@ -248,6 +248,8 @@
 
 ## 10. Taskboard（Phase 1）：多源任务归集与 DAG 依赖编排
 
+完整设计方案（定位与职责边界、5 态状态机、字段所有权、DAG 解锁与异常传播、Flow 展开、Schema 契约、DDL、门禁与里程碑）见 [`taskboard.md`](taskboard.md)；本节只记实现要点。
+
 `src/taskboard/` 是与 `agent_runtime`、`switchboard` 并列的独立包，运行时只依赖标准库，L3 适配器另依赖 `switchboard` 的 `CanonicalEvent` 与 `EventBusPort`。本包尚未接入 daemon，也没有在 Switchboard 进程里订阅 `taskboard` 消费方；没部署 Taskboard 时按 §7 的 `[routing.event_consumers]` 把 `work.*` 直接投给 Hibernaut。
 
 - **分层与门禁**：`core/`（L0：`models.py`、`errors.py`、`state_machine.py`、`merge.py`、`dag.py`）→ `ports.py`（L1：`TaskStorePort`、`EventPublisherPort`、`AuditSinkPort`）→ `engine/`（L2：`IngestionService`、`UnlockDispatcher`、`FlowExpander`）→ `adapters/`（L3：`SQLiteTaskStore`、`SwitchboardAdapter`、审计适配器）。`.importlinter` 三条契约：`taskboard-no-runtime-deps`（禁止导入 `agent_runtime`、`runner`、`hibernaut`、`broker`、`memory`、`memory_hub`）、`taskboard-clean-layers`（上述四层单向）、`taskboard-core-pure`（L0 不得导入 `sqlite3`、`switchboard` 及外层）；`tests/taskboard/test_m4_architecture_and_schemas.py` 另用 AST 检查。
