@@ -774,6 +774,9 @@ class SDEExecutor:
         *, declined: str = "", exit_note: str = "",
     ) -> Emit:
         name = self._profile.name
+        # Only a merge (by this delivery or confirmed elsewhere) finishes the task; a PR or local commits keep it open,
+        # and so do follow-ups nobody has developed yet.
+        finished = delivery is not None and delivery.state == "merged" and not delivery.problem and not state.followups
         lines = [
             f"[{name}] delivered ({self._review_status(state)}; {self._settings()})",
             f"Workdir: {state.workdir}",
@@ -783,6 +786,8 @@ class SDEExecutor:
             *(delivery.render() if delivery is not None else []),
             *([declined] if declined else []),
             *([exit_note] if exit_note else []),
+            *([f"Worktree: the PR is merged, so this session closes and {state.workdir} is reclaimed after this "
+               "run; if a safety gate keeps it, a reclaim notice says why"] if finished else []),
             f"Test evidence:\n{state.test_evidence or '(none)'}",
         ]
         if state.history:
@@ -791,7 +796,8 @@ class SDEExecutor:
             lines.append(f"Last review:\n{state.last_review}")
         if state.followups:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
-        return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native)
+        return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native,
+                    close_session=finished)
 
     def _stopped(self, session_id: str, native: str | None, state: _State, why: str) -> Emit:
         lines = [f"[{self._profile.name}] stopped: {why} ({self._settings()})", f"Workdir: {state.workdir}"]

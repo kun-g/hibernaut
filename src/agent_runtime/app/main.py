@@ -36,7 +36,7 @@ from agent_runtime.adapters.channels import (
 from agent_runtime.adapters.channels.channels import webhook_request_handler
 from agent_runtime.adapters.channels.switchboard_bridge import SwitchboardChannelAdapter, SwitchboardInboundBridge
 from agent_runtime.adapters.channels.switchboard_relay import SwitchboardBus, SwitchboardRelayLink
-from agent_runtime.adapters.delivery import DeliveryConfig, PRDelivery
+from agent_runtime.adapters.delivery import DeliveryConfig, PRDelivery, merged_head
 from agent_runtime.adapters.executor_cli import (
     CODE_REVIEWER_ROLE,
     DEFAULT_CLI_TEMPLATES,
@@ -48,6 +48,7 @@ from agent_runtime.adapters.executor_cli import (
     SDEExecutor,
 )
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, default_transcript_roots
+from agent_runtime.adapters.executor_cli.worktree import ReclaimResult
 from agent_runtime.adapters.executor_cli.peer import DeveloperPeerResolver, registry_dirs
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
@@ -78,7 +79,7 @@ from agent_runtime.app.config import (
 )
 from agent_runtime.app.projects import ProjectRouter, UnmatchedProjectHold
 from agent_runtime.core.models import NewEventPolicy
-from agent_runtime.core.ports import ChannelPort, ExecutorPort, RunCapabilities
+from agent_runtime.core.ports import ChannelPort, ExecutorPort, OutboxPort, RunCapabilities
 from agent_runtime.engine import (
     AgentWorker,
     EventHandler,
@@ -420,6 +421,22 @@ async def drain_pools(
     finally:
         if forced is not None:
             forced.cancel()
+
+
+def worktree_reclaimer(
+    manager: OrcaWorktreeManager,
+    *,
+    outbox: OutboxPort,
+    inbox_id: str,
+    delivery: DeliveryConfig | None,
+    deliveries: SQLiteDeliveryStore,
+) -> Callable[[str], ReclaimResult]:
+    # A task whose delivery merged its PR loses its local branch with the worktree (delivery.delete_branch).
+    def reclaim(work_key: str) -> ReclaimResult:
+        head = merged_head(delivery, deliveries, manager.workspace_key(inbox_id, work_key))
+        return manager.reclaim(work_key, notify_outbox=outbox, inbox_id=inbox_id, merged_head=head)
+
+    return reclaim
 
 
 def _report_failed_events(inbox: SQLiteInboxAdapter, writer: DriveResultWriter, inbox_id: str) -> None:
@@ -876,6 +893,9 @@ def build_daemon_from_config(
             # Raises AmbiguousProjectMatch before any lease, executor or workspace exists for the inbox.
             project = router.resolve(inbox_id)
             wt_mgr = wt_mgr_by_project[project.name] if project is not None else default_mgr
+            reclaim = worktree_reclaimer(wt_mgr, outbox=daemon.outbox, inbox_id=inbox_id,
+                                         delivery=project.delivery if project is not None else None,
+                                         deliveries=deliveries)
             return AgentWorker(
                 worker_id=worker_id,
                 inbox=daemon.inbox,
@@ -886,7 +906,7 @@ def build_daemon_from_config(
                 executors=executors_by_project[project.name] if project is not None else fallback_executors,
                 project_default_executor=project.executor if project is not None else None,
                 global_default_executor=config.runtime.default_executor,
-                on_worktree_reclaim=lambda wk: wt_mgr.reclaim(wk, notify_outbox=daemon.outbox, inbox_id=inbox_id),
+                on_worktree_reclaim=reclaim,
                 hold=unmatched_hold if project is None else None,
                 lock=daemon.lock,
                 sessions=daemon.sessions,

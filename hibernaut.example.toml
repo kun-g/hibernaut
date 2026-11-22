@@ -140,6 +140,8 @@ ci_timeout_seconds = 1800.0     # 等 CI 的上限；超时则挂起，批准后
 ci_poll_seconds = 30.0
 merge_method = "squash"         # squash | merge | rebase
 close_terminal = true           # 交付有证据后（PR 头即已推送且检查通过的提交；授权合并时须已合并）自动关闭 SDE 终端；先记下 SHA、PR 与可恢复会话 ID，worktree 不动
+delete_branch = true            # PR 合并后删除远端源分支（不强推；已不存在算成功），worktree 回收时一并删除本地分支；false 则都保留
+# PR 合并后任务自动结案：会话关闭并按回收门禁回收 worktree，被门禁拒绝时只发一条说明原因的通知
 # git / gh 由宿主机自己的凭据（gh auth login、git credential helper、SSH agent）或下面的可信包装命令认证；
 # Hibernaut 调用前剥离 GH_TOKEN / GITHUB_TOKEN 等变量，进程里不持有 token。
 git_command = "git"
