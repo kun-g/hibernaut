@@ -28,6 +28,8 @@ from tests.test_project_inbox_rules import _DispatchCase, project_table
 
 PENDING, PROGRESS, DONE, FAILED = "dir-pending", "dir-progress", "dir-done", "dir-failed"
 WORKER_LOGGER = "agent_runtime.engine.worker"
+# The Drive listener logs its own failed start move, so the Run still gets the task's attachments.
+DRIVE_LOGGER = "agent_runtime.adapters.channels.gdrive_tasks"
 
 
 class _FlakyDriveClient(_FakeDriveClient):
@@ -182,11 +184,11 @@ class TestDriveMovesOnRunStart(unittest.IsolatedAsyncioTestCase):
         # Separate passes: a failing batch discards the RunReports of earlier batches in the same pass.
         self.drive.add_file("ok", "ok.md", "Build it.", modified_time="2026-11-22T03:00:00Z")
         self.poller.poll_once()
-        with self.assertLogs(WORKER_LOGGER, level="WARNING") as logs:
+        with self.assertLogs(DRIVE_LOGGER, level="WARNING") as logs:
             await self.run_pool_until_idle()
         self.drive.add_file("bad", "bad.md", "FORCE_FAIL here", modified_time="2026-11-22T03:01:00Z")
         self.poller.poll_once()
-        with self.assertLogs(WORKER_LOGGER, level="WARNING") as more_logs:
+        with self.assertLogs(DRIVE_LOGGER, level="WARNING") as more_logs:
             with self.assertLogs("agent_runtime.app.main", level="ERROR"):
                 await self.run_pool_until_idle()
         self.assertTrue(any("refused 'move'" in line for line in more_logs.output), more_logs.output)
@@ -202,7 +204,7 @@ class TestDriveMovesOnRunStart(unittest.IsolatedAsyncioTestCase):
         self.drive.add_file("s1", "approve.md", "NEED_APPROVAL first")
         self.poller.poll_once()
         self.drive.refuse_moves_into[PROGRESS] = 1
-        with self.assertLogs(WORKER_LOGGER, level="WARNING"):
+        with self.assertLogs(DRIVE_LOGGER, level="WARNING"):
             await self.run_pool_until_idle()
         self.assertEqual(self.executor.parents_at_start, [(PENDING,)])
         self.assertEqual(self.drive.files["s1"].parents, (PROGRESS,))
@@ -257,14 +259,20 @@ class TestDriveMovesOnRunStart(unittest.IsolatedAsyncioTestCase):
 
 
 class _Listener:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, bodies: dict[str, str] | None = None) -> None:
         self.calls: list[tuple[str, list[str], str | None]] = []
         self.fail = fail
+        # external_id -> body the listener hands the executor instead of the stored one
+        self.bodies = bodies or {}
 
-    def on_run_started(self, inbox_id: str, events: Sequence[Event], correlation_key: str | None) -> None:
+    def on_run_started(
+        self, inbox_id: str, events: Sequence[Event], correlation_key: str | None
+    ) -> dict[str, dict[str, object]] | None:
         self.calls.append((inbox_id, [e.external_id for e in events], correlation_key))
         if self.fail:
             raise RuntimeError("listener down")
+        return {e.event_id: {**e.payload, "body": self.bodies[e.external_id]}
+                for e in events if e.external_id in self.bodies} or None
 
 
 class _SilentExecutor:
@@ -273,9 +281,11 @@ class _SilentExecutor:
     def __init__(self, listener: _Listener) -> None:
         self.listener = listener
         self.calls_seen_at_start: list[int] = []
+        self.payloads: list[list[dict[str, object]]] = []
 
     async def execute(self, events: Sequence[Event], session: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
         self.calls_seen_at_start.append(len(self.listener.calls))
+        self.payloads.append([dict(e.payload) for e in events])
         return Emit(messages=("ok",))
 
 
@@ -308,6 +318,17 @@ class TestWorkerRunStartListener(unittest.IsolatedAsyncioTestCase):
         await worker.process_inbox("i")
         self.assertEqual(listener.calls, [("i", ["a1", "a2"], "k:a"), ("i", ["b1"], "k:b")])
         self.assertEqual(executor.calls_seen_at_start, [1, 2])
+
+    async def test_replacement_payloads_reach_the_executor_for_this_run_only(self) -> None:
+        listener = _Listener(bodies={"a2": "task\n\n## 附件\n- `b.zip`"})
+        worker, inbox, executor = self.build(listener)
+        inbox.append(Event(inbox_id="i", source="t", external_id="a1", payload={"body": "old"}, correlation_key="k:a"))
+        inbox.append(Event(inbox_id="i", source="t", external_id="a2", payload={"body": "task", "n": 2},
+                           correlation_key="k:a"))
+        await worker.process_inbox("i")
+        self.assertEqual(executor.payloads, [[{"body": "old"}, {"body": "task\n\n## 附件\n- `b.zip`", "n": 2}]])
+        stored = {e.external_id: e.payload for e in inbox._events}  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(stored["a2"], {"body": "task", "n": 2})
 
     async def test_a_failing_listener_is_logged_and_the_run_completes(self) -> None:
         listener = _Listener(fail=True)

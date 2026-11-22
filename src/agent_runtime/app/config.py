@@ -170,6 +170,9 @@ class GDriveConfig:
     in_progress_folder_id: str = ""
     done_folder_id: str = ""
     failed_folder_id: str = ""
+    attachments_folder_id: str = ""
+    # Where task attachments are downloaded, outside every worktree; "" puts them next to runtime.db_path.
+    attachments_dir: str = ""
     poll_interval_seconds: float = 30.0
     default_inbox_id: str = "default"
 
@@ -494,6 +497,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             raise ValueError("gdrive.enabled needs gdrive.proxy_token_file (the local client token for the Drive queue proxy)")
         if not gd_service:
             raise ValueError("gdrive.proxy_service must not be empty")
+    gd_attachments_dir = str(gd_raw.get("attachments_dir", "")).strip()
     gdrive = GDriveConfig(
         enabled=gd_enabled,
         proxy_url=gd_proxy_url,
@@ -504,6 +508,8 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         in_progress_folder_id=str(gd_raw.get("in_progress_folder_id", "")).strip(),
         done_folder_id=str(gd_raw.get("done_folder_id", "")).strip(),
         failed_folder_id=str(gd_raw.get("failed_folder_id", "")).strip(),
+        attachments_folder_id=str(gd_raw.get("attachments_folder_id", "")).strip(),
+        attachments_dir=_resolve_path(gd_attachments_dir, base_dir) if gd_attachments_dir else "",
         poll_interval_seconds=gd_interval,
         default_inbox_id=str(gd_raw.get("default_inbox_id", "default")).strip() or "default",
     )
