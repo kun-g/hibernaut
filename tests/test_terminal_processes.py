@@ -10,16 +10,18 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from agent_runtime.adapters.executor_cli import cli_terminal
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.orca import (
     CLI_TERMINAL_SCRIPT,
     OrcaCommandTerminal,
     OrcaVisibleRunner,
     TerminalRunFailed,
+    _close_quietly,  # pyright: ignore[reportPrivateUsage]
     close_terminals,
 )
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase
-from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
+from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore, TerminalBinding
 from tests.test_coder_reviewer import fake_command
 from tests.test_visible_roles import FakeOrcaTerminals
 
@@ -167,24 +169,127 @@ class TestCLITerminalScript(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await until(lambda: not any(alive(p) for p in pids)))
 
 
+class TestCLIGroupSignals(unittest.TestCase):
+    # The CLI's process group is named by its leader's pid. Once the leader is reaped that pid can name an unrelated
+    # group, so every signal to the group must go out while the leader is still unreaped (running or a zombie).
+    def setUp(self):
+        self.root = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
+        self.sent: list[tuple[int, int, bool]] = []
+        real = os.killpg
+
+        def record(pgid, sig):
+            try:
+                os.waitid(os.P_PID, pgid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                reaped = False
+            except ChildProcessError:
+                reaped = True
+            self.sent.append((pgid, sig, reaped))
+            return real(pgid, sig)
+
+        self.enterContext(patch("os.killpg", new=record))
+
+    def popen(self, script):
+        proc = subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        return proc
+
+    def assert_never_after_reaping(self):
+        self.assertTrue(self.sent)
+        self.assertEqual([s for s in self.sent if s[2]], [], f"signalled a reaped group: {self.sent}")
+
+    def test_a_cli_that_exits_on_its_own_is_never_signalled_after_it_is_reaped(self):
+        spec = {"title": "t", "cwd": str(self.root), "env": {}, "timeout_seconds": 30, "argv": ["/bin/sh", "-c", "exit 3"],
+                **{name: str(self.root / name) for name in ("stdout", "stderr", "exit.json")}}
+        (self.root / "spec.json").write_text(json.dumps(spec))
+        running: list = []
+        with patch.object(sys, "stdout", open(os.devnull, "w")), patch.object(sys, "stderr", open(os.devnull, "w")):
+            self.assertEqual(cli_terminal._run(self.root / "spec.json", running), 0)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(json.loads((self.root / "exit.json").read_text()), {"exit": 3})
+        self.assert_never_after_reaping()
+
+    def test_a_stopped_cli_that_ends_within_the_grace_is_not_signalled_after_it_is_reaped(self):
+        proc = self.popen("sleep 60")
+        time.sleep(0.2)
+        cli_terminal.end_group(proc)
+        self.assertEqual(proc.returncode, -signal.SIGTERM)
+        # SIGKILL still goes out for anything left in the group, but while the leader is an unreaped zombie.
+        self.assertEqual([s[1] for s in self.sent], [signal.SIGTERM, signal.SIGKILL])
+        self.assert_never_after_reaping()
+
+    def test_a_cli_that_ignores_sigterm_is_killed_while_it_is_still_running(self):
+        proc = self.popen("trap '' TERM; sleep 60 & wait; sleep 60")
+        time.sleep(0.2)
+        cli_terminal.end_group(proc, grace=0.3)
+        self.assertEqual(proc.returncode, -signal.SIGKILL)
+        self.assertEqual([s[1] for s in self.sent], [signal.SIGTERM, signal.SIGKILL])
+        self.assert_never_after_reaping()
+
+
 class TestGateProcesses(Case):
-    async def test_closing_the_terminal_during_the_session_check_ends_the_probe(self):
-        probe_pid = self.root / "probe.pid"
-        self.enterContext(patch.dict(os.environ, {"FAKE_PROBE_PIDFILE": str(probe_pid)}))
-        db = SQLiteDatabase(":memory:")
-        self.addCleanup(db.close)
-        runner = OrcaVisibleRunner(bindings=SQLiteTerminalBindingStore(db), poll_interval=0.02, liveness_interval=0.2,
-                                   handoff_root=self.root / "handoff")
+    # claude_gate.py runs the session check and then the interactive agent as children it supervises, so a close
+    # that reaches it, or one that Orca loses (Hibernaut drops the terminal's lease either way), ends them all.
+    def setUp(self):
+        super().setUp()
+        self.db = SQLiteDatabase(":memory:")
+        self.addCleanup(self.db.close)
+        self.bindings = SQLiteTerminalBindingStore(self.db)
+        self.runner = OrcaVisibleRunner(bindings=self.bindings, poll_interval=0.02, liveness_interval=0.2,
+                                        handoff_root=self.root / "handoff")
+        self.turn = self.root / "turn"
+        self.turn.mkdir()
+
+    async def start_gate(self, args=("--session-id", "s1"), **env):
+        self.enterContext(patch.dict(os.environ, env))
         profile = ClaudeCodeProfile(name="sde", launcher=ClaudeCodeLauncher(name="fake", command=fake_command(self.root)))
-        turn = self.root / "turn"
-        turn.mkdir()
-        handle, _ = await runner._start(profile, "sde · task:1", self.repo, turn, (), "go")  # pyright: ignore
-        self.assertTrue(await until(probe_pid.exists), "the probe did not start")
-        pid = int(probe_pid.read_text())
-        self.pids.write_text(str(pid))
+        handle, _ = await self.runner._start(  # pyright: ignore[reportPrivateUsage]
+            profile, "sde · task:1", self.repo, self.turn, args, "go")
+        return handle, self.orca.terminals[handle]["proc"]
+
+    async def test_closing_the_terminal_during_the_session_check_ends_the_probe_and_its_children(self):
+        handle, gate = await self.start_gate(FAKE_PROBE_PIDFILE=str(self.pids))
+        pids = await self.started(2)
         await self.orca("terminal", "close", "--terminal", handle, cwd=self.repo)
-        self.assertEqual(self.orca.terminals[handle]["proc"].returncode, 1)
-        await self.all_gone([pid])
+        self.assertEqual(gate.returncode, 128 + signal.SIGTERM)
+        await self.all_gone(pids)
+
+    async def test_a_lost_close_during_the_session_check_ends_the_probe(self):
+        handle, gate = await self.start_gate(FAKE_PROBE_PIDFILE=str(self.pids))
+        pids = await self.started(2)
+        self.orca.lose_closes = True
+        self.assertTrue(await _close_quietly(handle, self.repo))
+        self.assertEqual(await asyncio.wait_for(gate.wait(), 8), 1)
+        await self.all_gone(pids)
+
+    async def test_closing_the_terminal_of_a_live_agent_ends_it_and_its_children(self):
+        handle, gate = await self.start_gate(FAKE_INTERACTIVE_PIDFILE=str(self.pids))
+        pids = await self.started(2)
+        await self.orca("terminal", "close", "--terminal", handle, cwd=self.repo)
+        self.assertEqual(gate.returncode, 128 + signal.SIGTERM)
+        await self.all_gone(pids)
+
+    async def test_a_lost_close_ends_the_live_agent_and_its_children(self):
+        handle, gate = await self.start_gate(FAKE_INTERACTIVE_PIDFILE=str(self.pids))
+        pids = await self.started(2)
+        self.orca.lose_closes = True
+        self.assertTrue(await _close_quietly(handle, self.repo))
+        self.assertEqual(await asyncio.wait_for(gate.wait(), 8), 1)
+        await self.all_gone(pids)
+
+    async def test_releasing_a_delivered_conversation_ends_the_agent_even_when_orca_loses_the_close(self):
+        handle, gate = await self.start_gate(FAKE_INTERACTIVE_PIDFILE=str(self.pids))
+        pids = await self.started(2)
+        self.bindings.save(TerminalBinding(session_id="s1", executor_id="sde", agent="claude", workdir=str(self.repo),
+                                           handle=handle, native_session_id="n1"))
+        self.orca.lose_closes = True
+        self.assertEqual(await self.runner.release("s1", self.repo), f"closed {handle}")
+        self.assertEqual(await asyncio.wait_for(gate.wait(), 8), 1)
+        await self.all_gone(pids)
+
+    async def test_an_agent_that_exits_ends_the_gate_with_its_code(self):
+        # --add-dir makes the fake agent stop at a trust dialog and exit with code 4.
+        handle, gate = await self.start_gate(args=("--add-dir", str(self.repo), "--session-id", "s1"))
+        self.assertEqual(await asyncio.wait_for(gate.wait(), 8), 4)
+        self.assertIn("Is this a directory you trust?", self.orca.screen(handle))
 
 
 if __name__ == "__main__":

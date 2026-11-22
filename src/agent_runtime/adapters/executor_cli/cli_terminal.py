@@ -2,7 +2,7 @@
 # Runs inside a visible Orca terminal: starts the CLI from the spec file, shows its stdout and stderr as they come
 # and copies both into the run's files, writes the exit code and exits, which ends the terminal. Hibernaut reads
 # only those files, never the screen. Started as `python -I <this file> <spec.json>` and uses only the standard
-# library, so it imports nothing from the worktree it runs in.
+# library, so it imports nothing from the worktree it runs in. claude_gate.py imports its process-group helpers.
 #
 # Orca can report a terminal closed without its signal ever reaching this process, so the wrapper also stops on its
 # own: on SIGHUP/SIGTERM/SIGINT, when Hibernaut removes the run directory while the CLI still runs, and at the CLI's
@@ -16,22 +16,73 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Any
 
-_POLL_SECONDS = 0.25
-_GRACE_SECONDS = 3.0
-_STOP_SIGNALS = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+POLL_SECONDS = 0.25
+GRACE_SECONDS = 3.0
+STOP_SIGNALS = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
 
 
-class _Stopped(Exception):
+class Stopped(Exception):
     def __init__(self, signum: int) -> None:
         super().__init__(signum)
         self.signum = signum
 
 
 def _on_signal(signum: int, _frame: object) -> None:
-    raise _Stopped(signum)
+    raise Stopped(signum)
+
+
+def stop_on_signals() -> None:
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, _on_signal)
+
+
+def ignore_signals() -> None:
+    # Once cleanup starts, a second signal must not cut it short.
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+
+
+def exited(pid: int, seconds: float) -> bool:
+    # Waits up to `seconds` for the child to exit without reaping it: an unreaped child, even a zombie, keeps its
+    # pid, so the process group it leads cannot be taken over by another process.
+    end = time.monotonic() + seconds
+    while os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+        if time.monotonic() >= end:
+            return False
+        time.sleep(min(0.05, max(0.0, end - time.monotonic())))
+    return True
+
+
+@contextmanager
+def _signals_held() -> Iterator[None]:
+    # Reaping and recording the exit status must not be split by a signal, or the cleanup would see a live leader.
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+
+
+def end_group(proc: subprocess.Popen[bytes], grace: float | None = None) -> None:
+    # Ends the process group `proc` leads (it was started in its own session or group) and reaps `proc`. Every
+    # signal goes out while `proc` is unreaped; once it is reaped its pid is never signalled again.
+    if proc.returncode is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        exited(proc.pid, GRACE_SECONDS if grace is None else grace)
+        # The leader is still running or a zombie here, so this reaches only what is left of its own group.
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # macOS answers EPERM for a group whose only member is the zombie leader.
+        pass
+    with _signals_held():
+        proc.wait()
 
 
 def _write_atomic(path: Path, body: dict[str, Any]) -> None:
@@ -52,37 +103,17 @@ def _tee(source: IO[bytes], screen: IO[bytes], path: str) -> None:
                 pass
 
 
-def _end_group(proc: subprocess.Popen[bytes]) -> None:
-    # The CLI leads its own session and process group, so this also reaches anything it started.
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return
-    try:
-        proc.wait(timeout=_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-    proc.wait()
-
-
 def main(spec_path: str) -> int:
     running: list[subprocess.Popen[bytes]] = []
-    for sig in _STOP_SIGNALS:
-        signal.signal(sig, _on_signal)
+    stop_on_signals()
     try:
         return _run(Path(spec_path), running)
-    except _Stopped as stop:
+    except Stopped as stop:
         return 128 + stop.signum
     finally:
-        # A second signal must not cut the cleanup short.
-        for sig in _STOP_SIGNALS:
-            signal.signal(sig, signal.SIG_IGN)
+        ignore_signals()
         for proc in running:
-            _end_group(proc)
+            end_group(proc)
 
 
 def _run(spec_path: Path, running: list[subprocess.Popen[bytes]]) -> int:
@@ -108,12 +139,7 @@ def _run(spec_path: Path, running: list[subprocess.Popen[bytes]]) -> int:
     ]
     for thread in threads:
         thread.start()
-    while True:
-        try:
-            code = proc.wait(timeout=_POLL_SECONDS)
-            break
-        except subprocess.TimeoutExpired:
-            pass
+    while not exited(proc.pid, POLL_SECONDS):
         # Hibernaut removes the run directory once it stops waiting (timeout, interrupt, failure) and then closes the
         # terminal; this covers a close that never arrives.
         if not spec_path.exists():
@@ -122,15 +148,14 @@ def _run(spec_path: Path, running: list[subprocess.Popen[bytes]]) -> int:
         if time.monotonic() >= deadline:
             print(f"\n[hibernaut] {argv[0]} passed its deadline; stopping it.", flush=True)
             return 1
-    # Whatever the finished CLI left behind could hold the pipes open and outlive the run.
-    _end_group(proc)
-    # The group is gone and its ID may be reused, so it is never signalled again.
-    running.clear()
+    # Whatever the finished CLI left in its group could hold the pipes open and outlive the run.
+    end_group(proc)
+    running.remove(proc)
     for thread in threads:
-        thread.join(timeout=_GRACE_SECONDS)
+        thread.join(timeout=GRACE_SECONDS)
     # Written last: its presence means both copies are complete.
-    _write_atomic(exit_path, {"exit": code})
-    print(f"\n[hibernaut] {argv[0]} exited with code {code}.", flush=True)
+    _write_atomic(exit_path, {"exit": proc.returncode})
+    print(f"\n[hibernaut] {argv[0]} exited with code {proc.returncode}.", flush=True)
     return 0
 
 

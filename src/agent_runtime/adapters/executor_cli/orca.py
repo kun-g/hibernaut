@@ -45,6 +45,9 @@ HANDOFF_SERVER = "hibernaut_handoff"
 HANDOFF_TOOLS = (f"mcp__{HANDOFF_SERVER}__get_task", f"mcp__{HANDOFF_SERVER}__submit_result")
 _PROBE_TIMEOUT_SECONDS = 120
 _WRAPPER_DEADLINE_MARGIN_SECONDS = 60
+# One lease file per gate terminal: the gate ends its agent once the file is gone, and Hibernaut removes it whenever it
+# closes that terminal, so a close Orca reports but never delivers still ends the agent.
+LEASE_ROOT = Path(tempfile.gettempdir()) / "hibernaut-terminal-leases"
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
 _ORCA_ERRORS = (OSError, TimeoutError, ValueError, RuntimeError, KeyError)
 
@@ -306,11 +309,14 @@ class OrcaVisibleRunner:
         binding = self._bindings.get(session_id) if self._bindings is not None else None
         if binding is None or not binding.handle:
             return "no live terminal is bound to this session"
+        workdir = Path(os.path.realpath(workdir))
+        _drop_lease(binding.handle)
         try:
-            await _orca("terminal", "close", "--terminal", binding.handle, cwd=Path(os.path.realpath(workdir)))
+            await _orca("terminal", "close", "--terminal", binding.handle, cwd=workdir)
         except _ORCA_ERRORS as exc:
             # The binding keeps the handle: a live terminal must not look closed, or a resume would run beside it.
-            return f"could not close {binding.handle}: {type(exc).__name__} {exc}"
+            if await _still_listed(binding.handle, workdir):
+                return f"could not close {binding.handle}: {type(exc).__name__} {exc}"
         self._save(dataclasses.replace(binding, handle=None, incarnation_id=None))
         return f"closed {binding.handle}"
 
@@ -333,13 +339,21 @@ class OrcaVisibleRunner:
                      instruction],
             "status": str(turn / "gate-status.json"),
         }
+        lease = _new_lease()
+        spec["lease"] = str(lease)
         spec_path = turn / "gate.json"
         fd = os.open(spec_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(spec, stream)
-        # `exec` lets the terminal end with the agent, so a crashed or exited agent is seen as a closed terminal.
+        # The gate exits with the agent, and `exec` ends the terminal with it, so an exited agent is a closed terminal.
         command = shlex.join(["exec", sys.executable, "-I", str(GATE_SCRIPT), str(spec_path)])
-        return await _create_terminal(workdir, title, command)
+        try:
+            handle, incarnation = await _create_terminal(workdir, title, command)
+        except BaseException:
+            lease.unlink(missing_ok=True)
+            raise
+        _bind_lease(handle, lease)
+        return handle, incarnation
 
     async def _poll(
         self, read: Callable[[], Any], handle: str, workdir: Path, is_interrupted: Callable[[], bool], waiting_for: str
@@ -618,15 +632,49 @@ class OrcaVisibleRunner:
             raise ValueError(f"terminal {binding.handle} changed process before delivery was confirmed")
 
 
+def _new_lease() -> Path:
+    LEASE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lease = LEASE_ROOT / f"lease-{uuid.uuid4().hex}"
+    lease.touch(mode=0o600, exist_ok=False)
+    return lease
+
+
+def _lease_index(handle: str) -> Path:
+    return LEASE_ROOT / f"handle-{_SAFE_NAME_RE.sub('_', handle)}"
+
+
+def _bind_lease(handle: str, lease: Path) -> None:
+    _lease_index(handle).write_text(lease.name, encoding="utf-8")
+
+
+def _drop_lease(handle: str) -> None:
+    index = _lease_index(handle)
+    try:
+        name = index.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if name.startswith("lease-") and _SAFE_NAME_RE.search(name) is None:
+        (LEASE_ROOT / name).unlink(missing_ok=True)
+    index.unlink(missing_ok=True)
+
+
+async def _still_listed(handle: str, workdir: Path) -> bool:
+    # A terminal whose command already ended (a finished CLI run ends its own) counts as closed; when Orca cannot
+    # answer, it does not.
+    try:
+        return await _terminal_alive(handle, workdir)
+    except _ORCA_ERRORS:
+        return True
+
+
 async def _close_quietly(handle: str, workdir: Path) -> bool:
-    # A terminal whose command already ended (a finished CLI run ends its own) counts as closed.
+    _drop_lease(handle)
     try:
         await _orca("terminal", "close", "--terminal", handle, cwd=workdir)
     except _ORCA_ERRORS:
-        with contextlib.suppress(*_ORCA_ERRORS):
-            if not await _terminal_alive(handle, workdir):
-                _log.info("Orca terminal %s had already ended", handle)
-                return True
+        if not await _still_listed(handle, workdir):
+            _log.info("Orca terminal %s had already ended", handle)
+            return True
         _log.exception("Could not close Orca terminal %s", handle)
         return False
     return True
