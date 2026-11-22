@@ -1,0 +1,35 @@
+# Run from deploy/switchboard/ after copying the templates (see README.md):
+#   docker compose up -d --build
+# Only Caddy publishes ports; Switchboard's 8790 stays on the compose network.
+name: switchboard
+
+services:
+  switchboard:
+    build:
+      context: ../..
+      dockerfile: deploy/switchboard/Dockerfile
+    image: switchboard:local
+    restart: unless-stopped
+    env_file: [".env"]
+    volumes:
+      - ./switchboard.toml:/etc/switchboard/switchboard.toml:ro
+      - switchboard_data:/data
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      switchboard:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  switchboard_data:
+  caddy_data:
+  caddy_config:
