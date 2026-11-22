@@ -65,9 +65,14 @@ class UnlockDispatcher:
             return None
 
         self._guard_hops(hop_count, task_id=task.task_id)
-        claimed = self._store.try_claim_dispatch(task.task_id, expected_version=task.version)
-        if claimed is None:
-            return None
+        if task.claimed_ready_at is not None and task.claimed_ready_at == task.ready_at:
+            # Replay: this ready episode already owns dispatch_seq, so the same external_id is
+            # republished and Switchboard dedupes it.
+            claimed = task
+        else:
+            claimed = self._store.try_claim_dispatch(task.task_id, expected_version=task.version)
+            if claimed is None:
+                return None
 
         effective_trace = trace_id or new_trace_id()
         next_hop = hop_count + 1
@@ -87,6 +92,7 @@ class UnlockDispatcher:
                     trace_id=effective_trace,
                     hop_count=next_hop,
                     target_assignee=claimed.assignee,
+                    dedupe_key=f"d{claimed.dispatch_seq}",
                 )
 
         self._safe_audit(
@@ -120,6 +126,15 @@ class UnlockDispatcher:
             )
             if updated is not None:
                 promoted.append(updated)
+
+        # Rows already ready are included so a redelivered completion finishes a fan-out that a
+        # failed publish cut short.
+        promoted_ids = {item.task_id for item in promoted}
+        promoted.extend(
+            item
+            for item in self._store.list_downstream_tasks(completed_task_id, kind="blocks")
+            if item.status == "ready" and item.task_id not in promoted_ids
+        )
 
         # Zero backpressure: sort by (priority ASC, ready_at ASC) and emit immediately.
         promoted.sort(key=lambda item: (item.priority, item.ready_at or ""))
@@ -236,6 +251,10 @@ class UnlockDispatcher:
         downstream_list = self._store.list_downstream_tasks(cancelled_task_id, kind="blocks")
         affected: list[TaskItem] = []
         effective_trace = trace_id or new_trace_id()
+        cancelled = self._store.get_task(cancelled_task_id)
+        # Keyed on the upstream's terminal version: a replay repeats the id, a later
+        # reopen-and-cancel gets a new one.
+        dedupe_key = f"u{cancelled_task_id}:v{cancelled.version if cancelled else 0}"
 
         for item in downstream_list:
             updated = item
@@ -264,6 +283,7 @@ class UnlockDispatcher:
                     trace_id=effective_trace,
                     hop_count=hop_count + 1,
                     target_assignee=updated.assignee,
+                    dedupe_key=dedupe_key,
                 )
             self._safe_audit(
                 "upstream_cancelled",

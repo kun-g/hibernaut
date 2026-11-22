@@ -13,6 +13,7 @@ from switchboard.ports import DeliverStatus, EventBusPort
 from taskboard.core.errors import (
     IllegalTransitionError,
     MaxHopsExceededError,
+    PublishFailedError,
     SchemaValidationError,
 )
 from taskboard.core.merge import MergeResult
@@ -189,25 +190,28 @@ class SwitchboardAdapter:
         if task.parent_task_id:
             metadata["parent_task_id"] = task.parent_task_id
 
-        validate_against_schema(
-            "work_ready.metadata.schema.json",
-            metadata,
-            schemas_dir=self._schemas_dir,
-        )
-
-        event = CanonicalEvent(
-            source="taskboard",
-            event_type="work.ready",
-            external_id=f"tb:{task.task_id}:d{task.dispatch_seq}",
-            scope=task.scope or "user:main",
-            correlation_key=task.source_ref or task.task_id,
-            actor="taskboard",
-            subject=task.title,
-            body=task.description,
-            metadata=metadata,
-        )
-        validate_envelope(event)
-        self._bus.publish(event)
+        external_id = f"tb:{task.task_id}:d{task.dispatch_seq}"
+        try:
+            validate_against_schema(
+                "work_ready.metadata.schema.json",
+                metadata,
+                schemas_dir=self._schemas_dir,
+            )
+            event = CanonicalEvent(
+                source="taskboard",
+                event_type="work.ready",
+                external_id=external_id,
+                scope=task.scope or "user:main",
+                correlation_key=task.source_ref or task.task_id,
+                actor="taskboard",
+                subject=task.title,
+                body=task.description,
+                metadata=metadata,
+            )
+            validate_envelope(event)
+            self._bus.publish(event)
+        except Exception as exc:
+            raise PublishFailedError("work.ready", external_id, exc) from exc
 
     def publish_notification(
         self,
@@ -218,6 +222,7 @@ class SwitchboardAdapter:
         trace_id: str,
         hop_count: int,
         target_assignee: str | None = None,
+        dedupe_key: str | None = None,
     ) -> None:
         if hop_count > MAX_HOPS:
             self._safe_audit(
@@ -243,25 +248,30 @@ class SwitchboardAdapter:
         if task.reply_target:
             metadata["reply_target"] = task.reply_target
 
-        validate_against_schema(
-            "execution_reported.metadata.schema.json",
-            metadata,
-            schemas_dir=self._schemas_dir,
-        )
-
-        event = CanonicalEvent(
-            source="taskboard",
-            event_type="execution.reported",
-            external_id=f"tb:notify:{notify_kind}:{task.task_id}:v{task.version}:d{task.dispatch_seq}",
-            scope=task.scope or "user:main",
-            correlation_key=task.source_ref or task.task_id,
-            actor="taskboard",
-            subject=f"[{notify_kind}] {task.title}",
-            body=reason,
-            metadata=metadata,
-        )
-        validate_envelope(event)
-        self._bus.publish(event)
+        # A caller-supplied dedupe_key keeps the id stable when a fan-out is replayed.
+        key = dedupe_key or f"v{task.version}:d{task.dispatch_seq}"
+        external_id = f"tb:notify:{notify_kind}:{task.task_id}:{key}"
+        try:
+            validate_against_schema(
+                "execution_reported.metadata.schema.json",
+                metadata,
+                schemas_dir=self._schemas_dir,
+            )
+            event = CanonicalEvent(
+                source="taskboard",
+                event_type="execution.reported",
+                external_id=external_id,
+                scope=task.scope or "user:main",
+                correlation_key=task.source_ref or task.task_id,
+                actor="taskboard",
+                subject=f"[{notify_kind}] {task.title}",
+                body=reason,
+                metadata=metadata,
+            )
+            validate_envelope(event)
+            self._bus.publish(event)
+        except Exception as exc:
+            raise PublishFailedError("execution.reported", external_id, exc) from exc
 
     # --- Inbound consumer handling ---
 
@@ -372,6 +382,14 @@ class SwitchboardAdapter:
         try:
             self.ingest_event(event)
             return "acked"
+        except PublishFailedError as exc:
+            # Outbound failure after state was committed: nack so the redelivery replays the fan-out.
+            self._safe_audit(
+                "outbound_publish_failed",
+                task_id=cast(str | None, event.metadata.get("task_id")),
+                detail={"event_id": event.event_id, "error": str(exc)},
+            )
+            return "nack"
         except (SchemaValidationError, MaxHopsExceededError, IllegalTransitionError) as exc:
             self._safe_audit(
                 "inbound_event_rejected",

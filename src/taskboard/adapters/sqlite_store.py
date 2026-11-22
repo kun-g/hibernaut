@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     version INTEGER NOT NULL DEFAULT 1,
     last_source_event_at INTEGER NOT NULL DEFAULT 0,
     ready_at TEXT DEFAULT NULL,
+    claimed_ready_at TEXT DEFAULT NULL,
     artifact_ref TEXT DEFAULT NULL,
     reply_target TEXT DEFAULT NULL,
     created_at TEXT NOT NULL,
@@ -119,6 +120,7 @@ def _row_to_task(row: sqlite3.Row) -> TaskItem:
         version=int(row["version"]),
         last_source_event_at=int(row["last_source_event_at"]),
         ready_at=cast(str | None, row["ready_at"]),
+        claimed_ready_at=cast(str | None, row["claimed_ready_at"]),
         artifact_ref=cast(str | None, row["artifact_ref"]),
         reply_target=cast(str | None, row["reply_target"]),
         created_at=str(row["created_at"]),
@@ -168,8 +170,8 @@ class SQLiteTaskStore:
                 task_type, stage, priority, preferred_executor, scope,
                 parent_task_id, manual_override_fields, blocked_reason,
                 dispatch_seq, version, last_source_event_at, ready_at,
-                artifact_ref, reply_target, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                claimed_ready_at, artifact_ref, reply_target, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task.task_id,
@@ -190,6 +192,7 @@ class SQLiteTaskStore:
                 task.version,
                 task.last_source_event_at,
                 task.ready_at,
+                task.claimed_ready_at,
                 task.artifact_ref,
                 task.reply_target,
                 task.created_at,
@@ -338,6 +341,7 @@ class SQLiteTaskStore:
                         version = ?,
                         last_source_event_at = ?,
                         ready_at = ?,
+                        claimed_ready_at = ?,
                         artifact_ref = ?,
                         reply_target = ?,
                         updated_at = ?
@@ -361,6 +365,7 @@ class SQLiteTaskStore:
                         next_version,
                         task.last_source_event_at,
                         task.ready_at,
+                        task.claimed_ready_at,
                         task.artifact_ref,
                         task.reply_target,
                         task.updated_at,
@@ -560,6 +565,14 @@ class SQLiteTaskStore:
                     WHERE task_id = ?
                       AND status = 'backlog'
                       AND version = ?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM task_dependencies d
+                          JOIN tasks u ON d.upstream_task_id = u.task_id
+                          WHERE d.downstream_task_id = tasks.task_id
+                            AND d.kind = 'blocks'
+                            AND u.status != 'done'
+                      )
                     """,
                     (ready_at, ready_at, task_id, expected_version),
                 )
@@ -591,6 +604,7 @@ class SQLiteTaskStore:
                     """
                     UPDATE tasks
                     SET dispatch_seq = dispatch_seq + 1,
+                        claimed_ready_at = ready_at,
                         version = version + 1,
                         updated_at = ?
                     WHERE task_id = ?

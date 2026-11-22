@@ -137,6 +137,15 @@ class IngestionService:
                 trace_id=trace_id,
                 hop_count=hop_count,
             )
+            # A redelivered work.opened finishes a dispatch whose publish failed the first time.
+            if result.task.status == "ready":
+                dispatched = self._dispatcher.dispatch_ready_task(
+                    result.task,
+                    trace_id=trace_id or new_trace_id(),
+                    hop_count=hop_count,
+                )
+                if dispatched is not None:
+                    return dispatched
             return result.task
 
         # Strict existence check before creating task: never create ghost placeholders.
@@ -245,7 +254,14 @@ class IngestionService:
             )
             return current
         if current.status in TERMINAL_STATUSES:
-            return current
+            # Redelivery after the terminal write: replay the fan-out the first attempt may have lost.
+            return self.tb_transition_task(
+                current.task_id,
+                current.status,
+                reason=reason or f"work.closed:{state}",
+                trace_id=trace_id,
+                hop_count=hop_count,
+            )
 
         target: TaskStatus = "cancelled" if state == "cancelled" else (
             "done" if current.status == "in_progress" else "cancelled"
@@ -476,6 +492,9 @@ class IngestionService:
         effective_trace = trace_id or new_trace_id()
         for _ in range(_MAX_CAS_RETRIES):
             current = self._resolve_task(task_id=task_id)
+            if current.status in TERMINAL_STATUSES and target_status == current.status and not reopen:
+                self._replay_terminal_fanout(current, trace_id=effective_trace, hop_count=hop_count)
+                return current
             blockers = self._store.list_incomplete_blocker_ids(current.task_id)
             validate_transition(
                 current.status,
@@ -540,6 +559,15 @@ class IngestionService:
                     return dispatched
             return saved
         raise OptimisticLockError(task_id, -1)
+
+    def _replay_terminal_fanout(self, task: TaskItem, *, trace_id: str, hop_count: int) -> None:
+        # The terminal write commits before the fan-out publishes, so a publish failure leaves
+        # downstream work undispatched; repeating the same terminal transition finishes it.
+        self._safe_audit("terminal_fanout_replayed", task_id=task.task_id, detail={"status": task.status})
+        if task.status == "done":
+            self._dispatcher.on_task_completed(task.task_id, trace_id=trace_id, hop_count=hop_count)
+        elif task.status == "cancelled":
+            self._dispatcher.on_task_cancelled(task.task_id, trace_id=trace_id, hop_count=hop_count)
 
     def tb_link_source(
         self,

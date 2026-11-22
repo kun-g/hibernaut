@@ -113,6 +113,7 @@ class EventPublisherPort(Protocol):
         trace_id: str,
         hop_count: int,
         target_assignee: str | None = None,
+        dedupe_key: str | None = None,
     ) -> None: ...
 
 

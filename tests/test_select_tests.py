@@ -27,6 +27,7 @@ class TestSelectTests(unittest.TestCase):
             (
                 "tests/taskboard/test_m3_engine_and_switchboard.py",
                 "tests/taskboard/test_m4_architecture_and_schemas.py",
+                "tests/taskboard/test_m5_publish_replay.py",
             ),
         )
 

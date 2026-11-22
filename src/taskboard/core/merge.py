@@ -13,7 +13,15 @@ LAYER2_MANUAL_PROTECTED: Final[frozenset[str]] = frozenset(
     {"priority", "assignee", "preferred_executor", "scope", "task_type"}
 )
 LAYER3_STATE_MACHINE_EXCLUSIVE: Final[frozenset[str]] = frozenset(
-    {"status", "dispatch_seq", "version", "ready_at", "blocked_reason", "last_source_event_at"}
+    {
+        "status",
+        "dispatch_seq",
+        "version",
+        "ready_at",
+        "claimed_ready_at",
+        "blocked_reason",
+        "last_source_event_at",
+    }
 )
 _MANUAL_EXTRA_EDITABLE: Final[frozenset[str]] = frozenset({"stage", "parent_task_id"})
 

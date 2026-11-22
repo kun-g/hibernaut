@@ -44,8 +44,9 @@ class _RecordingPublisher:
         trace_id: str,
         hop_count: int,
         target_assignee: str | None = None,
+        dedupe_key: str | None = None,
     ) -> None:
-        del trace_id, hop_count, target_assignee
+        del trace_id, hop_count, target_assignee, dedupe_key
         with self._lock:
             self.notifications.append((notify_kind, task.task_id, reason))
 

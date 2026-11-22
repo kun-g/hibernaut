@@ -75,6 +75,9 @@ class TaskItem:
     version: int = 1
     last_source_event_at: int = 0
     ready_at: str | None = None
+    # ready_at of the ready episode whose dispatch was claimed; equal to ready_at means this
+    # episode already owns dispatch_seq, so a replay republishes instead of claiming again.
+    claimed_ready_at: str | None = None
     artifact_ref: str | None = None
     reply_target: str | None = None
     created_at: str = field(default_factory=utc_now_iso)

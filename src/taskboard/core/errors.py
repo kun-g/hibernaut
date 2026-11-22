@@ -61,6 +61,13 @@ class SchemaValidationError(TaskboardError):
         self.problems: tuple[str, ...] = items
 
 
+class PublishFailedError(TaskboardError):
+    def __init__(self, event_type: str, external_id: str, cause: BaseException) -> None:
+        super().__init__(f"publishing {event_type} {external_id} failed: {cause!r}")
+        self.event_type = event_type
+        self.external_id = external_id
+
+
 class MaxHopsExceededError(TaskboardError):
     def __init__(self, hop_count: int, max_hops: int = 8) -> None:
         super().__init__(f"hop_count {hop_count} reached/exceeded limit {max_hops}")
