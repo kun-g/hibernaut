@@ -134,7 +134,7 @@
 
 ## 6. 三道防腐化门禁与术语基准
 
-提交前与 `.github/workflows/ci.yml` 强制执行：`lint-imports`、`pytest -v`、`pyright`（strict，覆盖 `agent_runtime/core`、`agent_runtime/engine` 与 `switchboard`）。
+提交前与 `.github/workflows/ci.yml` 强制执行：`lint-imports`、`pytest -v`、`pyright`（strict，覆盖 `agent_runtime/core`、`agent_runtime/engine` 与 `switchboard`）。PR 上由 `scripts/select_tests.py` 按 Python AST 反向依赖图与资源映射仅跑受影响测试（加 `full-ci` 标签或合入 `main` 时跑全量兜底）。
 
 术语定义以 [`docs/glossary.md`](glossary.md) 为唯一基准，本文不再重复定义。以下是术语在当前实现中的落地约束：
 

@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+import unittest
+
+from scripts.select_tests import select_tests
+
+
+class TestSelectTests(unittest.TestCase):
+    def test_switchboard_change_selects_only_switchboard_and_bridge_tests(self) -> None:
+        res = select_tests(["src/switchboard/relay_hub.py"])
+        self.assertFalse(res.full_suite)
+        self.assertIn("tests/test_switchboard_relay.py", res.tests)
+        self.assertIn("tests/test_switchboard_core.py", res.tests)
+        self.assertNotIn("tests/test_guidance_catalog.py", res.tests)
+        self.assertNotIn("tests/test_pr_delivery.py", res.tests)
+
+    def test_delivery_and_channel_changes_stay_scoped_to_affected_tests(self) -> None:
+        delivery = select_tests(["src/agent_runtime/adapters/delivery/pr_delivery.py"])
+        self.assertFalse(delivery.full_suite)
+        self.assertIn("tests/test_pr_delivery.py", delivery.tests)
+        self.assertIn("tests/test_sde_delivery.py", delivery.tests)
+        self.assertIn("tests/test_verified_delivery.py", delivery.tests)
+        self.assertIn("tests/test_architecture_boundaries.py", delivery.tests)
+        self.assertNotIn("tests/test_switchboard_inbound.py", delivery.tests)
+        self.assertNotIn("tests/test_gdrive_credential_proxy.py", delivery.tests)
+
+        poller = select_tests(["src/agent_runtime/adapters/channels/github_poller.py"])
+        self.assertFalse(poller.full_suite)
+        self.assertIn("tests/test_github_poller_resilience.py", poller.tests)
+        self.assertIn("tests/test_architecture_boundaries.py", poller.tests)
+        self.assertNotIn("tests/test_guidance_catalog.py", poller.tests)
+        self.assertNotIn("tests/test_pr_delivery.py", poller.tests)
+        self.assertNotIn("tests/test_switchboard_relay.py", poller.tests)
+
+        mcp = select_tests(["src/agent_runtime/adapters/channels/mcp_server.py"])
+        self.assertFalse(mcp.full_suite)
+        self.assertIn("tests/test_mcp_server.py", mcp.tests)
+        self.assertIn("tests/test_architecture_boundaries.py", mcp.tests)
+        self.assertNotIn("tests/test_guidance_catalog.py", mcp.tests)
+        self.assertNotIn("tests/test_pr_delivery.py", mcp.tests)
+        self.assertNotIn("tests/test_switchboard_relay.py", mcp.tests)
+
+    def test_sibling_script_and_skill_data_fan_out_through_graph(self) -> None:
+        gate = select_tests(["src/agent_runtime/adapters/executor_cli/claude_gate.py"])
+        self.assertFalse(gate.full_suite)
+        self.assertIn("tests/test_visible_roles.py", gate.tests)
+
+        fake_gh = select_tests(["tests/fake_gh.py"])
+        self.assertFalse(fake_gh.full_suite)
+        self.assertIn("tests/test_pr_delivery.py", fake_gh.tests)
+        self.assertIn("tests/test_sde_delivery.py", fake_gh.tests)
+
+        skill = select_tests(["src/agent_runtime/adapters/executor_cli/skills/sde/SKILL.md"])
+        self.assertFalse(skill.full_suite)
+        self.assertIn("tests/test_role_skills_and_project_guidance.py", skill.tests)
+
+    def test_run_updating_and_resource_rules_select_targeted_tests(self) -> None:
+        updater = select_tests(["scripts/run_updating.py"])
+        self.assertFalse(updater.full_suite)
+        self.assertEqual(updater.tests, ("tests/test_auto_update.py", "tests/test_config_reload.py"))
+
+        readme = select_tests(["README.md"])
+        self.assertFalse(readme.full_suite)
+        self.assertEqual(readme.tests, ("tests/test_sde_delivery.py",))
+
+        pure_doc = select_tests(["docs/architecture.md"])
+        self.assertFalse(pure_doc.full_suite)
+        self.assertEqual(pure_doc.tests, ())
+
+    def test_global_unknown_or_deleted_code_falls_back_to_full_suite(self) -> None:
+        for path in ("pyproject.toml", ".github/workflows/ci.yml", "src/agent_runtime/deleted_mod.py"):
+            with self.subTest(path=path):
+                res = select_tests([path])
+                self.assertTrue(res.full_suite)
+                self.assertGreater(len(res.tests), 30)
+
+        deleted_test = select_tests(["tests/test_nonexistent_removed.py"])
+        self.assertFalse(deleted_test.full_suite)
+        self.assertEqual(deleted_test.tests, ())
+
+
+if __name__ == "__main__":
+    unittest.main()
