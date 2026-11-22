@@ -21,3 +21,9 @@ agent_memory/
 outbox/
 .env
 .env.*
+
+# Switchboard container deployment: only templates are tracked
+deploy/switchboard/.env
+deploy/switchboard/switchboard.toml
+deploy/switchboard/Caddyfile
+!deploy/switchboard/.env.example
