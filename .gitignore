@@ -21,6 +21,8 @@ agent_memory/
 outbox/
 # Drive task attachments (gdrive.attachments_dir defaults next to the database)
 /attachments/
+# Open Run state for restart resume (runs_root sits next to the database); untracked files block auto-update
+/runs/
 .env
 .env.*
 
