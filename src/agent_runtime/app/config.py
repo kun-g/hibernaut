@@ -52,6 +52,8 @@ class ChannelsConfig:
     feishu_default_chat_id: str = ""
     mcp_enabled: bool = False
     mcp_token_env: str = "HIBERNAUT_MCP_TOKEN"
+    # Directory for the file Outbox (one Markdown file per delivered message); "" leaves it off.
+    outbox_dir: str = ""
 
 
 TerminalBackend = Literal["orca", "none"]
@@ -216,6 +218,14 @@ def _resolve_path(raw: str, base_dir: Path | None) -> str:
     return str(resolved)
 
 
+def _outbox_dir(raw: Any, base_dir: Path | None) -> str:
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise ValueError("channels.outbox_dir must be a path string")
+    return _resolve_path(raw.strip(), base_dir) if raw.strip() else ""
+
+
 def _switchboard_url(section: dict[str, Any], key: str, schemes: tuple[str, ...]) -> str | None:
     raw = str(section.get(key) or "").strip()
     if not raw:
@@ -353,6 +363,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         feishu_default_chat_id=str(ch_raw.get("feishu_default_chat_id", "")),
         mcp_enabled=bool(ch_raw.get("mcp_enabled", False)),
         mcp_token_env=str(ch_raw.get("mcp_token_env", "HIBERNAUT_MCP_TOKEN")),
+        outbox_dir=_outbox_dir(ch_raw.get("outbox_dir"), base_dir),
     )
 
     proxy_raw = raw.get("credential_proxy", {})

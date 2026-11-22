@@ -808,11 +808,11 @@ class SDEExecutor:
             lines.append(f"Review history: {'; '.join(state.history)}")
         if state.followups:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
-        return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native)
+        return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native, status="stopped")
 
     def _fail(self, session_id: str, native: str | None, detail: str) -> Emit:
         return Emit(messages=(f"[{self._profile.name}] development failed: {detail}",),
-                    session_id=session_id, executor_session_id=native)
+                    session_id=session_id, executor_session_id=native, status="failed")
 
 
 def _validate_report(raw: object) -> dict[str, Any]:

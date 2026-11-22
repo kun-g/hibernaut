@@ -337,7 +337,7 @@ class TestVisibleLaunchSafety(unittest.IsolatedAsyncioTestCase):
 
     async def test_permission_block_prevents_launch(self):
         self.caps.permissions = InMemoryPermission({"orca.agent.launch": PermissionDecision(action="block", reason="denied")})
-        self.assertEqual(await self.run_task(), Emit(messages=("denied",), session_id="s1"))
+        self.assertEqual(await self.run_task(), Emit(messages=("denied",), session_id="s1", status="refused"))
         self.command.assert_not_awaited()
 
 
