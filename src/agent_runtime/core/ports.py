@@ -18,6 +18,8 @@ from agent_runtime.core.models import (
 class InboxPort(Protocol):
     # Dedup key: (inbox_id, source, external_id); duplicates return status='dropped'.
     def append(self, event: Event) -> tuple[Event, bool]: ...
+    # True while the event with this dedup key is pending or processing; lets a poller skip it without a dropped row.
+    def has_open_event(self, inbox_id: str, source: str, external_id: str) -> bool: ...
     def fetch_pending(self, inbox_id: str) -> list[Event]: ...
     def fetch_processing(self, inbox_id: str) -> list[Event]: ...
     # event_ids limits the claim to those still-pending events of the inbox; None claims every pending event.
@@ -99,6 +101,17 @@ class ChannelPort(Protocol):
         inbox_id: str,
         content: str,
         metadata: dict[str, Any],
+    ) -> None: ...
+
+
+class RunStartListener(Protocol):
+    # Called once per batch after it is claimed and bound to a session, just before its executor starts.
+    # A failure is logged by the worker and never fails or delays the Run.
+    def on_run_started(
+        self,
+        inbox_id: str,
+        events: Sequence[Event],
+        correlation_key: str | None,
     ) -> None: ...
 
 

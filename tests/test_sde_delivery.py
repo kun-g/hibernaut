@@ -391,6 +391,7 @@ class TestProjectAdoption(unittest.TestCase):
         drive = _FakeDriveClient()
         drive.add_file("f1", "sde-task.md", (REPO / "docs/dispatch/sde-task.drive.md").read_text(encoding="utf-8"))
         handler = Mock()
+        handler.has_open_event.return_value = False
         handler.ingest.return_value = Mock(duplicate=False)
         DriveTaskPoller(handler, client=drive, default_inbox_id="proj:hibernaut", root_folder_id="root-1").poll_once()
         payload = handler.ingest.call_args.kwargs["payload"]

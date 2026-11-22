@@ -544,6 +544,7 @@ def build_daemon(
                 ),
                 lock=lock,
                 sessions=sessions,
+                run_start_listener=gdrive_writer,
                 lease_ttl_seconds=lease_ttl_seconds,
                 new_event_policy=new_event_policy,
             )
@@ -561,10 +562,12 @@ def build_daemon(
             ),
             lock=lock,
             sessions=sessions,
+            run_start_listener=gdrive_writer,
             lease_ttl_seconds=lease_ttl_seconds,
             new_event_policy=new_event_policy,
         )
 
+    # Read by _make_worker when the pool builds a worker; a queued Drive file moves to 执行中/ as its Run starts.
     gdrive_writer: DriveResultWriter | None = None
     if gdrive_client is not None:
         gdrive_writer = DriveResultWriter(
@@ -910,6 +913,7 @@ def build_daemon_from_config(
                 global_default_executor=config.runtime.default_executor,
                 on_worktree_reclaim=reclaim,
                 hold=unmatched_hold if project is None else None,
+                run_start_listener=daemon.gdrive_result_writer,
                 lock=daemon.lock,
                 sessions=daemon.sessions,
                 new_event_policy=config.runtime.new_event_policy,

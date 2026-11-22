@@ -26,6 +26,7 @@ from agent_runtime.core.ports import (
     OutboxPort,
     PermissionPort,
     RunCapabilities,
+    RunStartListener,
     SessionStorePort,
     TimerPort,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "PermissionDecision",
     "PermissionPort",
     "RunCapabilities",
+    "RunStartListener",
     "RunOutcome",
     "SessionRef",
     "SessionStorePort",

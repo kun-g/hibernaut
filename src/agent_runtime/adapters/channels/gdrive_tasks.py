@@ -15,6 +15,7 @@ from agent_runtime.engine.worker import RunReport
 _GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 _DEFAULT_FOLDER_NAMES = ("待执行", "执行中", "已完成", "失败")
 _GDRIVE_KEY_PREFIX = "gdrive:"
+_SOURCE = "gdrive:task"
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +223,10 @@ class DriveTaskPoller:
             failed_folder_id,
         )
         self._folders: DriveQueueFolders | None = None
+        # external_id -> inbox_id of revisions seen in 待执行/ by the last poll.
+        self._inbox_by_revision: dict[str, str] = {}
+        # Revisions whose ingest was a dropped duplicate: re-ingesting them every poll would add a row each time.
+        self._dropped_revisions: set[str] = set()
 
     def ensure_folders(self) -> DriveQueueFolders:
         if self._folders is None:
@@ -243,17 +248,32 @@ class DriveTaskPoller:
             return True
         return meta.mime_type.startswith("text/")
 
+    def _is_open(self, inbox_id: str, external_id: str) -> bool:
+        return self._handler.has_open_event(inbox_id=inbox_id, source=_SOURCE, external_id=external_id)
+
     def poll_once(self) -> list[IngestResult]:
+        # A file stays in 待执行/ until its Run starts (DriveResultWriter.on_run_started moves it), so every poll
+        # sees queued files again: the Inbox state, not the folder, says whether one is already taken.
         folders = self.ensure_folders()
         files = self._client.list_files(folders.pending_id)
         results: list[IngestResult] = []
+        listed: dict[str, str] = {}
         for meta in files:
             if not self._is_supported_task_file(meta):
                 continue
+            external_id = f"gdrive:{meta.file_id}:{meta.modified_time}"
+            known_inbox = self._inbox_by_revision.get(external_id)
+            if known_inbox is not None:
+                # Same revision as an earlier poll: skip the read while it is queued or after it was dropped.
+                listed[external_id] = known_inbox
+                if external_id in self._dropped_revisions or self._is_open(known_inbox, external_id):
+                    continue
             raw_text = self._client.read_text(meta)
             frontmatter, body = parse_task_markdown(raw_text)
             inbox_id = frontmatter.get("scope") or self._default_inbox_id
-            external_id = f"gdrive:{meta.file_id}:{meta.modified_time}"
+            listed[external_id] = inbox_id
+            if self._is_open(inbox_id, external_id):
+                continue
             correlation_key = f"gdrive:{meta.file_id}"
             payload: dict[str, Any] = {
                 "title": frontmatter.get("title") or meta.name,
@@ -273,18 +293,23 @@ class DriveTaskPoller:
 
             ingest_res = self._handler.ingest(
                 inbox_id=inbox_id,
-                source="gdrive:task",
+                source=_SOURCE,
                 external_id=external_id,
                 correlation_key=correlation_key,
                 payload=payload,
             )
-            # Move out of 待执行/ immediately after ingest to prevent duplicate pickup.
-            self._client.move_file(
-                meta.file_id,
-                add_parent=folders.in_progress_id,
-                remove_parent=folders.pending_id,
-            )
+            if ingest_res.duplicate:
+                self._dropped_revisions.add(external_id)
+                logging.getLogger(__name__).warning(
+                    "Drive task %s (%s) in 待执行 was already processed at revision %s; edit it to run it again",
+                    meta.file_id,
+                    meta.name,
+                    meta.modified_time,
+                )
             results.append(ingest_res)
+        # Forget revisions no longer queued, so the memory stays bounded by the 待执行/ listing.
+        self._inbox_by_revision = listed
+        self._dropped_revisions &= listed.keys()
         return results
 
     async def run_forever(
@@ -356,6 +381,29 @@ class DriveResultWriter:
                 remove_parent=remove_parent,
             )
 
+    def _move_out_of_pending(self, file_id: str, meta: DriveFileMeta, target_folder_id: str) -> None:
+        folders = self.ensure_folders()
+        if folders.pending_id in meta.parents:
+            self._client.move_file(file_id, add_parent=target_folder_id, remove_parent=folders.pending_id)
+
+    def on_run_started(
+        self,
+        inbox_id: str,
+        events: Sequence[Event],
+        correlation_key: str | None,
+    ) -> None:
+        # RunStartListener: a queued file moves to 执行中/ only once a Worker starts its Run. A file someone already
+        # moved elsewhere (or a resumed task already in 执行中/) is left where it is.
+        _ = inbox_id
+        file_ids = {
+            fid
+            for key in (correlation_key, *(evt.correlation_key for evt in events))
+            if (fid := extract_gdrive_file_id(key))
+        }
+        folders = self.ensure_folders()
+        for file_id in sorted(file_ids):
+            self._move_out_of_pending(file_id, self._client.get_file_meta(file_id), folders.in_progress_id)
+
     def write_emit(
         self,
         file_id: str,
@@ -397,6 +445,9 @@ class DriveResultWriter:
         if dedup_key and dedup_key in self._reported_keys:
             return False
         meta = self._client.get_file_meta(file_id)
+        # The start move may have failed. Park the file in 执行中/ before appending: the append changes its
+        # modifiedTime, and a poll seeing that new revision in 待执行/ would queue the suspended task again.
+        self._move_out_of_pending(file_id, meta, self.ensure_folders().in_progress_id)
         block = (
             "## 执行结果（Hibernaut）\n"
             f"- 时间：{utc_now_iso()}\n"
