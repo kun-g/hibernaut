@@ -1,6 +1,6 @@
 ---
 name: sde
-description: Hibernaut's default way of working for the sde role — develop a task test-first in its worktree and report raw red/green evidence.
+description: Hibernaut's default way of working for the sde role — develop a task test-first in its worktree, bump the version, open or update a pull request, and report raw red/green evidence.
 ---
 
 # Test-first development
@@ -15,5 +15,13 @@ Work test-first:
 
 The project guidance quotes the documents selected for this task and lists the rest in a catalog. When the catalog lists a document for the kind of work you turn out to be doing (for example how to write an issue, change a version or cut a release), read it at the pinned commit (`git show <commit>:<path>`) before you start that part and follow it. Editing the project's guidance files does not change the guidance this task is reviewed against.
 
+# Versioning and pull request
+
+Before finishing:
+
+- Locate the repository's version definition (follow the project guidance or README when specified; otherwise inspect standard project files such as `src/*/__init__.py`, `pyproject.toml`, `package.json`, `Cargo.toml`, or `VERSION`). If the repository tracks a version, bump it according to the project's versioning rules (default SemVer: patch for fixes, minor for compatible features, major for breaking changes). On a rework round where this branch already bumped the version, keep that bump unless the change scope grew.
+- Re-run the repository's full checks after bumping the version so the final commit is verified.
+- Commit on the current branch, push with a normal push (never force-push), and open a pull request with `gh pr create` (if an open pull request already exists for this branch, pushing updates it).
+
 Report test_evidence with each test's command and raw output, failing first and then passing, followed by the
-full-check results. The summary says what changed and where.
+full-check results. The summary says what changed and where, the version bump, and the pull request URL.

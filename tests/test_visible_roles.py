@@ -195,7 +195,11 @@ class TestVisibleSDE(VisibleCase):
         self.assertEqual((arg(dev_call, "--model"), arg(dev_call, "--effort")), ("claude-opus-5-5", "high"))
         self.assertEqual(arg(dev_call, "--permission-mode"), "dontAsk")
         self.assertIn("Edit", arg(dev_call, "--allowedTools").split(","))
-        self.assertIn("Bash(git push:*)", arg(dev_call, "--disallowedTools"))
+        dev_disallowed = arg(dev_call, "--disallowedTools").split(",")
+        self.assertIn("Bash(git push --force*)", dev_disallowed)
+        self.assertIn("Bash(git push * -f)", dev_disallowed)
+        for allowed_cmd in ("Bash(git push:*)", "Bash(gh pr create:*)", "Bash(gh pr merge:*)"):
+            self.assertNotIn(allowed_cmd, dev_disallowed)
         self.assertIn("failing test", arg(dev_call, "--append-system-prompt"))
         self.assertIn("Review only", arg(review_call, "--append-system-prompt"))
         self.assertIn("divide must reject a zero divisor", dev_call["prompt"])
