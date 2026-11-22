@@ -47,6 +47,8 @@ launchctl bootout gui/$(id -u)/com.hibernaut.ccpeer        # 停止并卸载
 launchctl kickstart -k gui/$(id -u)/com.hibernaut.ccpeer   # 代码更新后重启
 ```
 
+`PYTHONPATH` 指向 Hibernaut 自动更新的那份检出时，`src/ccpeer/` 有改动的版本合入后，接收端仍跑着旧代码，直到 `kickstart -k`；其他改动不需要重启它。
+
 收件箱不会因重启丢失；读取方保存游标（`inbox` 的 `cursor=` 字节偏移或最后一条 `msg_id`），重启后从原位置续读。
 
 ## 手工排查
