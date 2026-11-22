@@ -243,6 +243,7 @@ checks = [["lint-imports"], ["pytest", "-v"], ["pyright"]]
 require_review = true           # merge only after the independent review passed
 require_ci = true               # merge only after every PR check passed
 merge_method = "squash"
+close_terminal = true           # close the SDE terminal once delivery is evidenced (see Verified delivery)
 # base_branch = "main", remote = "origin", check_timeout_seconds, ci_timeout_seconds = 1800, ci_poll_seconds = 30,
 # git_command = "git", gh_command = "gh"
 ```
@@ -262,6 +263,16 @@ After the SDE reports `done` (and the review passed, or with `review = false`), 
 - Receipt: the delivery message lists `Delivery: <state>`, `PR:`, `Version: <base> -> <new> (<bump> for <kind>)`, `Checks:`, `CI:`, `Merge commit:` and the notes that explain what did not happen (for example `not merged: this project does not authorize merging`). A Drive task gets the same text in its file.
 - Authentication: `git` and `gh` run with `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` removed from their environment and prompts disabled. They authenticate through the host's own credential store (`gh auth login`, a git credential helper, an SSH agent) or a trusted wrapper named in `gh_command` / `git_command`; the daemon never holds a GitHub token. `-R <projects.<name>.repo>` pins every `gh` call to the configured repository.
 - Permissions: `delivery.open_pr` and `delivery.merge` are allowed by the auto-mode permission adapter, because the project's `open_pr` / `auto_merge` are the explicit grants; a deployment that wants a person to confirm each one moves it to the defer list.
+
+### Verified delivery, terminal exit and worktree reclamation
+
+Processing an event can finish before the change is delivered: a delivery that waits suspends the task, and the event is done. What counts as delivered is checked separately at each stage.
+
+- Code delivery: after every `done` report Hibernaut inspects the task worktree itself (`git status --porcelain --untracked-files=all` and `git rev-list --count <base>..HEAD`, where the base is the commit pinned when the task started). A tool result, an idle prompt or a clean tree alone is not delivery. Staged, unstaged or untracked files (tests and docs included), or a branch with no commit since the base, send the developer back once automatically; if the work is still unfinished the task suspends as `[sde] incomplete: <what is left>` and keeps the worktree, session and terminal. Approve sends the developer back again; reject stops with `[sde] stopped: incomplete work left in place` and still keeps them. This applies with or without a delivery step.
+- No-code outcome: a task that needs no repository change reports `code_change: false`. With a clean tree and no commit since the base, it ends as `[sde] finished without a code change` with no review and no delivery. Commits on the branch make it a change whatever the report says; a dirty tree makes it incomplete. Reviews (`coder-reviewer`) are read-only and never take this path.
+- PR evidence: after creating or reusing the PR, Hibernaut reads the remote branch (`git ls-remote`) and the PR head (`gh pr view --json headRefOid`). Both must be the pushed commit, which is the commit the checks passed on; otherwise the delivery suspends with `PR #<n> is not at the pushed commit`. A local commit without a PR keeps the worktree, and approval continues the PR flow from the recorded state.
+- Terminal exit (`close_terminal = true`): the SDE terminal closes only when the delivery target is evidenced (open PR at the checked commit; with `auto_merge = true` the PR must also be merged) and no human question or live reviewer exchange is open (`review:<task>` sessions or queued `review_of` events). Before closing, the SHA, PR URL, Hibernaut session and Claude Code session IDs are saved in the `deliveries` record; the terminal binding keeps the native ID so the next event resumes with `--resume`. The receipt says `Terminal: closed <handle>; resume with Claude Code session <id>` or `Terminal: kept <handle> (<reason>)`. A terminal that fails to close stays bound. Closing a terminal never removes the worktree.
+- Reclamation: runs only when the last session on the work key closes, and rechecks everything immediately before and again right after claiming the worktree. It needs: no active or suspended session or child; no reviewer session, queued or running event on the task, and no unfinished delivery (`SQLiteWorkUsage`); GitHub reporting no open PR for the branch; no staged, unstaged or untracked file; and every commit of the worktree on a remote, or a merged PR whose head is exactly the local `HEAD` and whose merge commit a remote branch contains (a squash merge). A check that cannot run (for example `gh` failing) counts as missing evidence and leaves the worktree in place.
 
 ## Interactive Role Sessions
 

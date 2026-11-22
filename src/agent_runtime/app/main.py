@@ -50,6 +50,7 @@ from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindin
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
     SQLiteDeliveryStore,
+    SQLiteWorkUsage,
     SQLiteInboxAdapter,
     SQLiteLeaseLockAdapter,
     SQLiteOutboxAdapter,
@@ -354,6 +355,7 @@ def build_daemon(
     resolved_wt_mgr = worktree_manager or OrcaWorktreeManager(
         workspace_store=workspaces,
         session_store=sessions,
+        usage=SQLiteWorkUsage(db).blockers,
     )
 
     def _make_worker(inbox_id: str, worker_id: str) -> AgentWorker:
@@ -612,6 +614,7 @@ def build_daemon_from_config(
         tasks = SQLiteTaskMetadataStore(daemon.db)
 
         deliveries = SQLiteDeliveryStore(daemon.db)
+        usage = SQLiteWorkUsage(daemon.db)
 
         def _role_executors(
             wt_mgr: OrcaWorktreeManager, no_terminal: str | None, delivery: DeliveryConfig | None = None,
@@ -642,6 +645,7 @@ def build_daemon_from_config(
                     terminal=terminal(role),
                     tasks=tasks,
                     delivery=PRDelivery(delivery, deliveries) if delivery is not None else None,
+                    live_peers=usage.peers,
                 )
             return built
 
@@ -653,6 +657,7 @@ def build_daemon_from_config(
                 session_store=daemon.sessions,
                 backend=proj.worktree_backend,
                 create_terminal=proj.orca_create_terminal,
+                usage=usage.blockers,
             )
             wt_mgr_by_inbox[proj.inbox_id] = wt_mgr
             executors_by_inbox[proj.inbox_id] = {
@@ -676,6 +681,7 @@ def build_daemon_from_config(
         default_mgr = OrcaWorktreeManager(
             workspace_store=daemon.workspaces,
             session_store=daemon.sessions,
+            usage=usage.blockers,
         )
         fallback_executors: dict[str, ExecutorPort] = {
             exec_name: LocalCLIExecutor(

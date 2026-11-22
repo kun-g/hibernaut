@@ -302,14 +302,19 @@ class TestDevelopmentAndBuiltInReview(_Harness):
         }
         fix = dev({"src/pkg/__init__.py": "__version__ = '1.1.0'  # fixed\n"},
                   write_uncommitted={"docs/issues.md": "RELAXED-UNCOMMITTED\n"})
-        self.set_plan(sde=[dev(relaxed, commit="relax guidance"), fix], reviewer=[CITES_VERSIONING, PASS])
+        # The uncommitted edit is sent back once by the worktree check; the developer then commits it.
+        tidy = dev(commit="commit the draft")
+        self.set_plan(sde=[dev(relaxed, commit="relax guidance"), fix, tidy], reviewer=[CITES_VERSIONING, PASS])
         outcome = await self.run_sde(activities=["versioning"])
         self.assertIn("review=pass after 2 round(s)", outcome.messages[0])
         self.assertNotEqual(head(self.repo), self.start)
         roles = [c["role"] for c in self.calls()]
-        self.assertEqual(roles, ["sde", "reviewer", "sde", "reviewer"])
-        dev_call, _, fix, _ = self.calls()
+        self.assertEqual(roles, ["sde", "reviewer", "sde", "sde", "reviewer"])
+        dev_call, _, fix, nudge, _ = self.calls()
+        self.assertIn("uncommitted changes", nudge["prompt"])
+        self.assertIn("docs/issues.md", nudge["prompt"])
         self.assertNotIn("RELAXED", fix["prompt"])
+        self.assertNotIn("RELAXED", nudge["prompt"])
         self.assertNotIn("DRAFT-AT-START", dev_call["prompt"])
         for call in (dev_call, *self.calls("reviewer")):
             guidance = section(call["prompt"])

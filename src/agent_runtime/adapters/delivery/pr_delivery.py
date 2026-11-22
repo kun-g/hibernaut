@@ -71,6 +71,8 @@ class DeliveryConfig:
     merge_method: MergeMethod = "squash"
     git_command: str = "git"
     gh_command: str = "gh"
+    # Close the SDE's interactive terminal once the PR is verified and recorded (never for local-only delivery).
+    close_terminal: bool = False
 
 
 _DELIVERY_KEYS = frozenset(f.name for f in dataclasses.fields(DeliveryConfig)) - {"repo"}
@@ -157,6 +159,7 @@ def parse_delivery(where: str, raw: object, *, repo: str) -> DeliveryConfig:
         merge_method=method,
         git_command=_text(where, item, "git_command", d.git_command),
         gh_command=_text(where, item, "gh_command", d.gh_command),
+        close_terminal=_flag(where, item, "close_terminal", d.close_terminal),
     )
 
 
@@ -195,6 +198,8 @@ class DeliveryRecord:
     checked_sha: str = ""
     checks: list[dict[str, Any]] = field(default_factory=_checks)
     pushed_sha: str = ""
+    # The head GitHub reports for the PR, confirmed equal to pushed_sha after the PR step.
+    verified_sha: str = ""
     pr_number: int = 0
     pr_url: str = ""
     ci: str = ""
@@ -207,6 +212,10 @@ class DeliveryRecord:
     # The permission tool that deferred to a person in this attempt.
     approval: str = ""
     history: list[str] = field(default_factory=_strs)
+    # Where the developer conversation can be resumed, recorded before its terminal closes.
+    session_id: str = ""
+    native_session_id: str = ""
+    terminal: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
@@ -308,6 +317,31 @@ class PRDelivery:
     def record(self, work_key: str) -> DeliveryRecord:
         return DeliveryRecord.from_dict(self._store.get(work_key))
 
+    def record_session(self, work_key: str, *, session_id: str, native_session_id: str, terminal: str) -> None:
+        rec = self.record(work_key)
+        rec.session_id, rec.native_session_id, rec.terminal = session_id, native_session_id, terminal
+        self._store.save(work_key, rec.to_dict())
+
+    def unverified(self, rec: DeliveryRecord) -> list[str]:
+        # What is still missing before the change counts as delivered to this project's target: an open PR whose
+        # head GitHub reports at the pushed and checked commit, or the merge itself where merging is authorized.
+        cfg = self._config
+        if not cfg.open_pr:
+            return ["this project delivers local commits, so there is no PR to confirm"]
+        gaps: list[str] = []
+        if rec.problem:
+            gaps.append(f"delivery problem: {rec.problem}")
+        if rec.state not in ("pr_open", "merged") or not rec.pr_url:
+            gaps.append("no PR is recorded")
+        elif cfg.auto_merge and rec.state != "merged":
+            gaps.append("merging is authorized but the PR is not merged")
+        if not rec.pushed_sha or rec.verified_sha != rec.pushed_sha:
+            gaps.append("GitHub has not confirmed the PR head at the pushed commit")
+        if cfg.checks and (rec.checked_sha != rec.pushed_sha or not rec.checks
+                           or any(c.get("exit_code") != 0 for c in rec.checks)):
+            gaps.append("the required checks have not passed on the pushed commit")
+        return gaps
+
     def instructions(self) -> str:
         cfg = self._config
         version = (
@@ -356,6 +390,7 @@ class PRDelivery:
             self._prepare(req, rec, is_interrupted)
             self._push(req, rec)
             self._open_pr(req, rec)
+            self._confirm(req, rec)
             if rec.state != "pr_open":
                 return rec
             if not cfg.auto_merge:
@@ -656,6 +691,28 @@ class PRDelivery:
         rec.pr_number, rec.pr_url, rec.state = int(number), url, "pr_open"
         rec.history.append(f"PR #{rec.pr_number} created")
 
+    def _confirm(self, req: DeliveryRequest, rec: DeliveryRecord) -> None:
+        # A gh result alone is not evidence: GitHub must report the pushed commit as the PR's head.
+        if rec.state == "merged" and rec.verified_sha == rec.pushed_sha:
+            return
+        listed = self._git(req.workdir, "ls-remote", self._config.remote, f"refs/heads/{rec.branch}").stdout.split()
+        remote = listed[0] if listed else ""
+        view = self._gh(req.workdir, "pr", "view", str(rec.pr_number), "--json", "headRefOid,state,url")
+        try:
+            data = cast(dict[str, Any], json.loads(view.stdout))
+        except (json.JSONDecodeError, TypeError):
+            raise _Problem(f"gh pr view returned no JSON: {_tail(view.stdout, 300)}") from None
+        head = str(data.get("headRefOid") or "")
+        if rec.state == "merged":
+            head = head or rec.pushed_sha
+        elif remote != rec.pushed_sha or head != rec.pushed_sha:
+            rec.verified_sha = ""
+            raise _Problem(
+                f"PR #{rec.pr_number} is not at the pushed commit: expected {rec.pushed_sha[:12]}, "
+                f"{self._config.remote}/{rec.branch} is {remote[:12] or '(missing)'}, the PR head is {head[:12] or '(unknown)'}"
+            )
+        rec.verified_sha = head
+
     # --- merge ---
 
     def _merge(
@@ -688,12 +745,14 @@ class PRDelivery:
                     if data.get("state") != "MERGED":
                         raise _Problem(f"PR #{rec.pr_number} is {data.get('state')} after merging")
                     rec.state, rec.merge_sha = "merged", self._merge_oid(data)
+                    rec.verified_sha = rec.pushed_sha
                     rec.history.append(f"PR #{rec.pr_number} merged as {rec.merge_sha[:12]}")
                     return
             # The base's version changed after this PR computed its own (a concurrent PR merged first).
             self._prepare(req, rec, is_interrupted)
             self._push(req, rec)
             self._open_pr(req, rec)
+            self._confirm(req, rec)
             if rec.state == "merged":
                 return
         raise _Problem(f"{cfg.remote}/{cfg.base_branch} kept changing its version; approve to retry the merge")

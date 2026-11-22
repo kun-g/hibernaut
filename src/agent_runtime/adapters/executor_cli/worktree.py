@@ -9,7 +9,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.core.ports import OutboxPort, SessionStorePort
@@ -87,8 +87,11 @@ class OrcaWorktreeManager:
         runner: CommandRunner | None = None,
         worktree_base_dir: str | Path | None = None,
         reclaim_stale_after_seconds: float = 600.0,
+        usage: Callable[[str], list[str]] | None = None,
     ) -> None:
         self._store = workspace_store
+        # Reports who else still needs a task's worktree (reviewers, queued events, an unfinished delivery).
+        self._usage = usage
         self._session_store = session_store
         self._reclaim_stale_after_seconds = reclaim_stale_after_seconds
         self._backend: WorktreeBackend = backend
@@ -179,60 +182,17 @@ class OrcaWorktreeManager:
         notify_outbox: OutboxPort | None = None,
         inbox_id: str | None = None,
     ) -> ReclaimResult:
-        # Safety 3: dual ownership check (DB record + 'hb-' basename prefix) + 3 safety gates.
+        # Dual ownership (DB record + 'hb-' basename prefix), then evidence gates that fail closed: a check that
+        # cannot run or answers ambiguously leaves the worktree in place. Closing a terminal never comes here.
         record = self._store.get(work_key)
         if record is None:
             return ReclaimResult(reclaimed=False, reason="workspace not managed in workspaces table")
 
-        # Gate 0: refuse reclaim while any active or suspended session still references work_key.
-        if self._session_store is not None:
-            active_refs = self._session_store.count_active_by_work_key(work_key)
-            if active_refs > 0:
-                list_fn = getattr(self._session_store, "list_active_by_work_key", None)
-                occupying = list_fn(work_key) if callable(list_fn) else []
-                suffix = f" ({', '.join(occupying)})" if occupying else f" ({active_refs} active)"
-                msg = f"Skipped reclaim for '{work_key}': active/suspended session(s) still referencing worktree{suffix}"
-                self._alert(notify_outbox, inbox_id, msg)
-                return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
-
         workdir = Path(record.workdir)
-        if not workdir.name.startswith("hb-"):
-            msg = f"Refused reclaim for '{workdir}': directory name lacks 'hb-' prefix"
-            self._alert(notify_outbox, inbox_id, msg)
-            return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
-
-        # Gate 1: no open PR for this branch.
-        pr_check = self._runner(
-            ["gh", "pr", "list", "--head", record.branch, "--state", "open", "--json", "number"],
-            workdir if workdir.is_dir() else Path(record.repo_checkout),
-        )
-        if pr_check.returncode == 0 and pr_check.stdout.strip():
-            try:
-                open_prs = json.loads(pr_check.stdout)
-            except json.JSONDecodeError:
-                open_prs = []
-            if isinstance(open_prs, list) and len(open_prs) > 0:
-                msg = f"Skipped reclaim for '{workdir}': branch '{record.branch}' has open PR(s)"
-                self._alert(notify_outbox, inbox_id, msg)
-                return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
-
-        # Gate 2: no uncommitted changes.
-        if workdir.is_dir():
-            status_res = self._runner(["git", "status", "--porcelain"], workdir)
-            if status_res.returncode != 0 or status_res.stdout.strip():
-                msg = f"Skipped reclaim for '{workdir}': uncommitted changes present"
-                self._alert(notify_outbox, inbox_id, msg)
-                return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
-
-            # Gate 3: no unpushed local commits.
-            unpushed = self._runner(
-                ["git", "log", "--branches", "--not", "--remotes", "--oneline"],
-                workdir,
-            )
-            if unpushed.returncode != 0 or unpushed.stdout.strip():
-                msg = f"Skipped reclaim for '{workdir}': unpushed commits present"
-                self._alert(notify_outbox, inbox_id, msg)
-                return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
+        refusal = self._refusal(work_key, record.branch, record.repo_checkout, workdir)
+        if refusal is not None:
+            self._alert(notify_outbox, inbox_id, refusal)
+            return ReclaimResult(reclaimed=False, reason=refusal, workdir=record.workdir)
 
         stale_before = (
             datetime.now(timezone.utc) - timedelta(seconds=self._reclaim_stale_after_seconds)
@@ -248,6 +208,13 @@ class OrcaWorktreeManager:
                 reason="workspace changed or is being reclaimed by another caller",
                 workdir=record.workdir,
             )
+        # The gates ran before the claim; a session, event or commit may have arrived since.
+        late = self._refusal(work_key, record.branch, record.repo_checkout, workdir)
+        if late is not None:
+            self._store.release_reclaim(work_key, claim=claim, status=record.status)
+            msg = f"{late} (on recheck after claiming the worktree)"
+            self._alert(notify_outbox, inbox_id, msg)
+            return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
         primary = Path(record.repo_checkout)
         heartbeat = _ClaimHeartbeat(
             self._store,
@@ -276,6 +243,87 @@ class OrcaWorktreeManager:
             self._alert(notify_outbox, inbox_id, msg)
             return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
         return ReclaimResult(reclaimed=True, reason="reclaimed", workdir=record.workdir)
+
+    def _refusal(self, work_key: str, branch: str, repo_checkout: str, workdir: Path) -> str | None:
+        # Gate 0: no active or suspended session, child included, still references work_key.
+        if self._session_store is not None:
+            active_refs = self._session_store.count_active_by_work_key(work_key)
+            if active_refs > 0:
+                list_fn = getattr(self._session_store, "list_active_by_work_key", None)
+                occupying = list_fn(work_key) if callable(list_fn) else []
+                suffix = f" ({', '.join(occupying)})" if occupying else f" ({active_refs} active)"
+                return f"Skipped reclaim for '{work_key}': active/suspended session(s) still referencing worktree{suffix}"
+
+        # Gate 1: no reviewer, queued event or unfinished delivery still needs the worktree.
+        if self._usage is not None:
+            blockers = self._usage(work_key)
+            if blockers:
+                return f"Skipped reclaim for '{work_key}': still in use: {'; '.join(blockers)}"
+
+        if not workdir.name.startswith("hb-"):
+            return f"Refused reclaim for '{workdir}': directory name lacks 'hb-' prefix"
+
+        cwd = workdir if workdir.is_dir() else Path(repo_checkout)
+        # Gate 2: GitHub confirms there is no open PR for this branch.
+        open_prs = self._pr_list(branch, "open", "number", cwd)
+        if open_prs is None:
+            return f"Skipped reclaim for '{workdir}': could not check for open PRs on '{branch}'"
+        if open_prs:
+            return f"Skipped reclaim for '{workdir}': branch '{branch}' has open PR(s)"
+
+        if workdir.is_dir():
+            # Gate 3: nothing staged, unstaged or untracked.
+            status_res = self._runner(["git", "status", "--porcelain", "--untracked-files=all"], workdir)
+            if status_res.returncode != 0 or status_res.stdout.strip():
+                return f"Skipped reclaim for '{workdir}': uncommitted changes present"
+
+            # Gate 4: every commit of this worktree is on a remote, or its PR was squash-merged at exactly this head.
+            unpushed = self._runner(["git", "log", "HEAD", "--not", "--remotes", "--oneline"], workdir)
+            if unpushed.returncode != 0:
+                return f"Skipped reclaim for '{workdir}': could not list unpushed commits"
+            if unpushed.stdout.strip() and not self._squash_merged(branch, workdir):
+                return f"Skipped reclaim for '{workdir}': unpushed commits present"
+        return None
+
+    def _pr_list(self, branch: str, state: str, fields: str, cwd: Path) -> list[dict[str, object]] | None:
+        res = self._runner(["gh", "pr", "list", "--head", branch, "--state", state, "--json", fields], cwd)
+        if res.returncode != 0:
+            return None
+        if not res.stdout.strip():
+            return []
+        try:
+            rows: object = json.loads(res.stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(rows, list):
+            return None
+        return [cast(dict[str, object], r) for r in cast(list[object], rows) if isinstance(r, dict)]
+
+    def _squash_merged(self, branch: str, workdir: Path) -> bool:
+        # A squash merge leaves the branch's own commits off every remote; the evidence is a merged PR whose head is
+        # this worktree's HEAD and whose merge commit a remote branch contains.
+        head = self._runner(["git", "rev-parse", "HEAD"], workdir)
+        if head.returncode != 0 or not head.stdout.strip():
+            return False
+        merged = self._pr_list(branch, "merged", "number,headRefOid,mergeCommit", workdir) or []
+        for pr in merged:
+            commit = pr.get("mergeCommit")
+            oid = cast(dict[str, object], commit).get("oid") if isinstance(commit, dict) else None
+            if pr.get("headRefOid") != head.stdout.strip() or not isinstance(oid, str) or not oid:
+                continue
+            if self._on_remote(oid, workdir):
+                return True
+        return False
+
+    def _on_remote(self, oid: str, workdir: Path) -> bool:
+        def contains() -> bool:
+            res = self._runner(["git", "branch", "-r", "--contains", oid], workdir)
+            return res.returncode == 0 and bool(res.stdout.strip())
+
+        if contains():
+            return True
+        self._runner(["git", "fetch", "--quiet", "--all"], workdir)
+        return contains()
 
     def _resolve_base_commit(self, primary: Path) -> str:
         res = self._runner(["git", "rev-parse", "origin/HEAD"], primary)

@@ -211,10 +211,10 @@ class TestSkillsAndGuidanceReachTheRoles(_Harness):
 
     async def test_default_skills_and_project_guidance_reach_both_roles_from_distinct_sources(self):
         self.set_plan(sde=[dev(FIXED)], reviewer=[PASS])
+        source = f"Source: {head(self.repo)}:AGENTS.md"
         outcome = await self.sde().execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Emit), outcome
         dev_call, review_call = self.calls()
-        source = f"Source: {head(self.repo)}:AGENTS.md"
         for call, own, other in ((dev_call, "sde", "coder-reviewer"), (review_call, "coder-reviewer", "sde")):
             sp = system(call)
             # Role: trusted skill text with its absolute resource directory, in the system prompt only.
@@ -480,7 +480,8 @@ class TestTwoProjectsThroughTheDaemon(unittest.TestCase):
             self.assertNotEqual(workdir, checkout.resolve())
             for call in mine:
                 self.assertEqual(Path(call["cwd"]).resolve(), workdir)
-                self.assertIn(f"Source: {git_out(workdir, 'rev-parse', 'HEAD')}:AGENTS.md", call["prompt"])
+                # The pin is the task's start; the developer's one commit sits on top of it.
+                self.assertIn(f"Source: {git_out(workdir, 'rev-parse', 'HEAD~1')}:AGENTS.md", call["prompt"])
                 self.assertIn(f"in {workdir}.", call["prompt"])
                 self.assertIn(own_rule, call["prompt"])
                 self.assertIn(own_doc, call["prompt"])

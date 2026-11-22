@@ -91,7 +91,9 @@ def main(argv):
         print(json.dumps(checks))
         sys.exit(8 if any(c["bucket"] == "pending" for c in checks) else 0)
     if cmd == "view":
-        print(json.dumps({"state": pr["state"], "mergeCommit": {"oid": pr["merge_sha"]} if pr.get("merge_sha") else None}))
+        head = state.get("view_head_override") or pr.get("merged_head") or branch_head(bare, pr["head"])
+        print(json.dumps({"state": pr["state"], "url": pr["url"], "headRefOid": head,
+                          "mergeCommit": {"oid": pr["merge_sha"]} if pr.get("merge_sha") else None}))
         return
     if cmd == "merge":
         fail(state, "merge")
