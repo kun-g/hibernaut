@@ -15,6 +15,7 @@ from agent_runtime.adapters.delivery import (
     DeliveryRecord,
     DeliveryRequest,
     PRDelivery,
+    source_issue,
 )
 from agent_runtime.adapters.executor_cli.claude_code import (
     ClaudeCodeError,
@@ -205,6 +206,8 @@ class _State:
     handback_log: list[str] = field(default_factory=_no_history)
     # Why passed work is reviewed again (a hand-back); the next review sees only the changes since it passed.
     recheck: str = ""
+    # The GitHub Issue the task came from ("owner/repo#n"), named in the PR body; "" for any other source.
+    issue: str = ""
 
     def dump(self) -> str:
         return json.dumps({_CHECKPOINT_KEY: {f: getattr(self, f) for f in self.__slots__}}, ensure_ascii=False)
@@ -400,7 +403,8 @@ class SDEExecutor:
         if not workdir.is_dir():
             raise ReviewAborted(f"workdir {workdir} does not exist")
         state = _State(stage="develop", workdir=str(workdir), base_ref=last_text(targets, "base_ref") or "",
-                       requirements=requirements, work_key=work_key, inbox_id=inbox_id, title=last_text(targets, "title") or "")
+                       requirements=requirements, work_key=work_key, inbox_id=inbox_id, title=last_text(targets, "title") or "",
+                       issue=source_issue(targets, work_key))
         try:
             await asyncio.to_thread(self._pin, state, Selection.from_events(targets))
         except ValueError as exc:
@@ -757,6 +761,7 @@ class SDEExecutor:
             rationale=state.change_rationale,
             review=review,
             review_detail="; ".join([self._review_status(state), *state.history]),
+            issue=state.issue,
         )
         record = await asyncio.to_thread(
             self._delivery.deliver, request, permissions=caps.permissions, approved=approved,
