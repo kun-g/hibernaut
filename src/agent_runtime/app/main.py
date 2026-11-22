@@ -16,8 +16,13 @@ from typing import Any
 from agent_runtime import __version__
 from agent_runtime.adapters.channels import (
     ConsoleChannelAdapter,
+    DriveClientProtocol,
+    DriveResultWriter,
+    DriveTaskPoller,
     FeishuWebhookAdapter,
     GitHubIssuePoller,
+    GoogleDriveHTTPClient,
+    ServiceAccountTokenProvider,
     GitHubWebhookAdapter,
     MCPServerAdapter,
     PollTarget,
@@ -69,11 +74,15 @@ class AsyncWorkerPool:
         *,
         worker_factory: Callable[[str, str], AgentWorker],
         max_concurrency: int = 4,
+        on_run_reports: Callable[[list[RunReport]], None] | None = None,
+        on_inbox_failed: Callable[[str], None] | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be >= 1")
         self._worker_factory = worker_factory
         self._max_concurrency = max_concurrency
+        self._on_run_reports = on_run_reports
+        self._on_inbox_failed = on_inbox_failed
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._queued: set[str] = set()
         self._active: dict[str, AgentWorker] = {}
@@ -120,11 +129,27 @@ class AsyncWorkerPool:
             try:
                 batch_reports = await worker.process_inbox(inbox_id)
                 self.reports.extend(batch_reports)
+                if batch_reports and self._on_run_reports is not None:
+                    try:
+                        await asyncio.to_thread(self._on_run_reports, batch_reports)
+                    except Exception:  # noqa: BLE001
+                        logging.getLogger(__name__).exception(
+                            "Post-run callback failed for inbox %s",
+                            inbox_id,
+                        )
             except ExecutorFailed:
                 logging.getLogger(__name__).exception(
                     "Executor failed for inbox %s; batch remains pending",
                     inbox_id,
                 )
+                if self._on_inbox_failed is not None:
+                    try:
+                        await asyncio.to_thread(self._on_inbox_failed, inbox_id)
+                    except Exception:  # noqa: BLE001
+                        logging.getLogger(__name__).exception(
+                            "Failure callback failed for inbox %s",
+                            inbox_id,
+                        )
             finally:
                 self._active.pop(inbox_id, None)
                 self._queue.task_done()
@@ -169,8 +194,11 @@ class AlwaysOnDaemon:
     github_webhook: GitHubWebhookAdapter | None = None
     feishu_webhook: FeishuWebhookAdapter | None = None
     github_poller: GitHubIssuePoller | None = None
+    gdrive_poller: DriveTaskPoller | None = None
+    gdrive_result_writer: DriveResultWriter | None = None
     mcp_server: MCPServerAdapter | None = None
     poll_interval_seconds: float = 60.0
+    gdrive_poll_interval_seconds: float = 30.0
     ingest_only: bool = False
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -222,10 +250,20 @@ class AlwaysOnDaemon:
                         stop_event=stopper,
                     )
                 )
+            gdrive_task = None
+            if self.gdrive_poller is not None:
+                gdrive_task = tasks.create_task(
+                    self.gdrive_poller.run_forever(
+                        interval_seconds=self.gdrive_poll_interval_seconds,
+                        stop_event=stopper,
+                    )
+                )
             try:
                 await stopper.wait()
                 if poll_task is not None:
                     await poll_task
+                if gdrive_task is not None:
+                    await gdrive_task
             finally:
                 # Keep workers available until the last accepted webhook has queued its wake.
                 if server is not None:
@@ -264,6 +302,14 @@ def build_daemon(
     mcp_bearer_token: str | None = None,
     worktree_manager: OrcaWorktreeManager | None = None,
     ingest_only: bool = False,
+    gdrive_client: DriveClientProtocol | None = None,
+    gdrive_root_folder_id: str | None = None,
+    gdrive_pending_folder_id: str | None = None,
+    gdrive_in_progress_folder_id: str | None = None,
+    gdrive_done_folder_id: str | None = None,
+    gdrive_failed_folder_id: str | None = None,
+    gdrive_poll_interval_seconds: float = 30.0,
+    gdrive_default_inbox_id: str = "default",
 ) -> AlwaysOnDaemon:
     db = database if database is not None else SQLiteDatabase(db_path)
     inbox = SQLiteInboxAdapter(db)
@@ -333,9 +379,37 @@ def build_daemon(
             new_event_policy=new_event_policy,
         )
 
+    gdrive_writer: DriveResultWriter | None = None
+    if gdrive_client is not None:
+        gdrive_writer = DriveResultWriter(
+            client=gdrive_client,
+            sessions=sessions,
+            inner_channel=resolved_channel,
+            root_folder_id=gdrive_root_folder_id or None,
+            pending_folder_id=gdrive_pending_folder_id or None,
+            in_progress_folder_id=gdrive_in_progress_folder_id or None,
+            done_folder_id=gdrive_done_folder_id or None,
+            failed_folder_id=gdrive_failed_folder_id or None,
+        )
+        resolved_channel = gdrive_writer
+
+    def _on_reports(reports: list[RunReport]) -> None:
+        if gdrive_writer is None:
+            return
+        for rep in reports:
+            gdrive_writer.handle_run_report(rep)
+
+    def _on_failed(inbox_id: str) -> None:
+        if gdrive_writer is None:
+            return
+        for failed_evt in inbox.list_events(inbox_id=inbox_id, status="failed", limit=20):
+            gdrive_writer.handle_failed_event(failed_evt)
+
     pool = AsyncWorkerPool(
         worker_factory=_make_worker,
         max_concurrency=max_concurrency,
+        on_run_reports=_on_reports if gdrive_writer is not None else None,
+        on_inbox_failed=_on_failed if gdrive_writer is not None else None,
     )
     wake_cb = None if ingest_only else pool.wake
     handler = EventHandler(inbox=inbox, on_wake=wake_cb)
@@ -391,8 +465,24 @@ def build_daemon(
         github_webhook=github_webhook,
         feishu_webhook=feishu_webhook,
         github_poller=github_poller,
+        gdrive_poller=(
+            DriveTaskPoller(
+                handler,
+                client=gdrive_client,
+                default_inbox_id=gdrive_default_inbox_id,
+                root_folder_id=gdrive_root_folder_id or None,
+                pending_folder_id=gdrive_pending_folder_id or None,
+                in_progress_folder_id=gdrive_in_progress_folder_id or None,
+                done_folder_id=gdrive_done_folder_id or None,
+                failed_folder_id=gdrive_failed_folder_id or None,
+            )
+            if gdrive_client is not None
+            else None
+        ),
+        gdrive_result_writer=gdrive_writer,
         mcp_server=mcp_server,
         poll_interval_seconds=poll_interval_seconds,
+        gdrive_poll_interval_seconds=gdrive_poll_interval_seconds,
         ingest_only=ingest_only,
     )
 
@@ -403,6 +493,7 @@ def build_daemon_from_config(
     channel: ChannelPort | None = None,
     database: SQLiteDatabase | None = None,
     demo: bool = False,
+    gdrive_client: DriveClientProtocol | None = None,
 ) -> AlwaysOnDaemon:
     repo_inbox_map: dict[str, str] = {}
     inbox_checkout_map: dict[str, str] = {}
@@ -455,6 +546,21 @@ def build_daemon_from_config(
             flush=True,
         )
 
+    resolved_gdrive_client: DriveClientProtocol | None = gdrive_client
+    if resolved_gdrive_client is None and config.gdrive.enabled:
+        sa_key_path = os.environ.get(config.gdrive.service_account_key_env, "").strip()
+        if not sa_key_path:
+            print(
+                f"[hibernaut] [gdrive] enabled=true but env '{config.gdrive.service_account_key_env}' "
+                "is unset; skipping Google Drive task poller.",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            resolved_gdrive_client = GoogleDriveHTTPClient(
+                token_provider=ServiceAccountTokenProvider(key_path=sa_key_path)
+            )
+
     daemon = build_daemon(
         db_path=config.runtime.db_path,
         database=database,
@@ -470,6 +576,14 @@ def build_daemon_from_config(
         poll_interval_seconds=config.runtime.poll_interval_seconds,
         mcp_bearer_token=mcp_token,
         ingest_only=ingest_only,
+        gdrive_client=resolved_gdrive_client,
+        gdrive_root_folder_id=config.gdrive.root_folder_id or None,
+        gdrive_pending_folder_id=config.gdrive.pending_folder_id or None,
+        gdrive_in_progress_folder_id=config.gdrive.in_progress_folder_id or None,
+        gdrive_done_folder_id=config.gdrive.done_folder_id or None,
+        gdrive_failed_folder_id=config.gdrive.failed_folder_id or None,
+        gdrive_poll_interval_seconds=config.gdrive.poll_interval_seconds,
+        gdrive_default_inbox_id=config.gdrive.default_inbox_id,
     )
 
     if has_configured_executor and not demo:
@@ -559,9 +673,23 @@ def build_daemon_from_config(
                 new_event_policy=config.runtime.new_event_policy,
             )
 
+        def _cli_on_reports(reports: list[RunReport]) -> None:
+            if daemon.gdrive_result_writer is None:
+                return
+            for rep in reports:
+                daemon.gdrive_result_writer.handle_run_report(rep)
+
+        def _cli_on_failed(inbox_id: str) -> None:
+            if daemon.gdrive_result_writer is None:
+                return
+            for failed_evt in daemon.inbox.list_events(inbox_id=inbox_id, status="failed", limit=20):
+                daemon.gdrive_result_writer.handle_failed_event(failed_evt)
+
         daemon.pool = AsyncWorkerPool(
             worker_factory=_cli_worker_factory,
             max_concurrency=config.runtime.max_concurrency,
+            on_run_reports=_cli_on_reports if daemon.gdrive_result_writer is not None else None,
+            on_inbox_failed=_cli_on_failed if daemon.gdrive_result_writer is not None else None,
         )
         daemon.handler = EventHandler(inbox=daemon.inbox, on_wake=daemon.pool.wake)
         daemon.scheduler = TimerScheduler(
@@ -596,6 +724,18 @@ def build_daemon_from_config(
             mode=config.runtime.poll_mode,
             github_token_env=config.channels.github_token_env,
             repo_inbox_map=repo_inbox_map,
+        )
+
+    if resolved_gdrive_client is not None:
+        daemon.gdrive_poller = DriveTaskPoller(
+            daemon.handler,
+            client=resolved_gdrive_client,
+            default_inbox_id=config.gdrive.default_inbox_id,
+            root_folder_id=config.gdrive.root_folder_id or None,
+            pending_folder_id=config.gdrive.pending_folder_id or None,
+            in_progress_folder_id=config.gdrive.in_progress_folder_id or None,
+            done_folder_id=config.gdrive.done_folder_id or None,
+            failed_folder_id=config.gdrive.failed_folder_id or None,
         )
 
     return daemon

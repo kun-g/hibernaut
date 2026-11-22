@@ -99,3 +99,16 @@ orca_create_terminal = false    # agent launch opens its own terminal
 feishu_chat_id = ""
 # 可选：项目级默认执行器（未设置时回退到 runtime.default_executor）
 # executor = "claude"
+
+# 可选：Google Drive 任务队列入站与回写闭环（将「任务队列」根目录单独共享给 GCP Service Account 邮箱）
+# [gdrive]
+# enabled = true
+# service_account_key_env = "HIBERNAUT_GDRIVE_SA_KEY"
+# root_folder_id = "your_task_queue_root_folder_id"
+# poll_interval_seconds = 30.0
+# default_inbox_id = "proj:hibernaut"
+# 可选显式覆盖四个子目录 ID（不填则自动按名称发现：待执行 / 执行中 / 已完成 / 失败）
+# pending_folder_id = ""
+# in_progress_folder_id = ""
+# done_folder_id = ""
+# failed_folder_id = ""

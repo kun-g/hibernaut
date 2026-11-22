@@ -200,6 +200,20 @@ cloudflared tunnel --url http://127.0.0.1:8080
 
 Remote clients call `POST https://<your-tunnel-host>/mcp` with header `Authorization: Bearer <HIBERNAUT_MCP_TOKEN>`. If `HIBERNAUT_MCP_TOKEN` is unset or `mcp_enabled = false`, `/mcp` stays disabled (404).
 
+## Google Drive Task Queue (`DriveTaskPoller` + `DriveResultWriter`)
+
+Run a tunnel-free cloud-to-local task loop via Google Drive (`待执行/` → `执行中/` → `已完成/` / `失败/`), supporting `.md` files with optional YAML frontmatter (`scope`, `executor_id`, `priority`, `title`) and Google Docs (auto-exported as `text/plain`). Re-editing a file and moving it back to `待执行/` automatically continues the same `Session` and `hb-*` worktree via `correlation_key = "gdrive:<file_id>"`.
+
+### 3-Step GCP Service Account Single-Folder Setup
+
+1. **Create a GCP Service Account & JSON key**: In Google Cloud Console, enable the **Google Drive API**, create a Service Account (no broad IAM roles needed), generate a JSON key, and save it locally (e.g., `~/.config/hibernaut/gdrive-sa.json`, `chmod 600`).
+2. **Share only the Task Queue root folder**: In Google Drive, create `任务队列/{待执行, 执行中, 已完成, 失败}`, right-click the `任务队列` root folder → **Share**, and grant **Editor** access solely to the Service Account email (`<name>@<project>.iam.gserviceaccount.com`) so it cannot see anything outside that folder.
+3. **Enable `[gdrive]` in `hibernaut.toml` and export the key path**:
+   ```bash
+   export HIBERNAUT_GDRIVE_SA_KEY="$HOME/.config/hibernaut/gdrive-sa.json"
+   ```
+   Uncomment `[gdrive]` in `hibernaut.toml`, set `enabled = true`, `root_folder_id = "<folder_id_from_url>"`, and `default_inbox_id = "proj:hibernaut"`, then start Hibernaut.
+
 ## Anti-Corruption Gates (CI)
 
 ```bash

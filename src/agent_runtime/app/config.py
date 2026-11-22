@@ -96,6 +96,19 @@ class CredentialProxyConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GDriveConfig:
+    enabled: bool = False
+    service_account_key_env: str = "HIBERNAUT_GDRIVE_SA_KEY"
+    root_folder_id: str = ""
+    pending_folder_id: str = ""
+    in_progress_folder_id: str = ""
+    done_folder_id: str = ""
+    failed_folder_id: str = ""
+    poll_interval_seconds: float = 30.0
+    default_inbox_id: str = "default"
+
+
+@dataclass(frozen=True, slots=True)
 class HibernautConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
@@ -104,6 +117,7 @@ class HibernautConfig:
     credential_proxy: CredentialProxyConfig = field(default_factory=CredentialProxyConfig)
     roles: dict[str, RoleConfig] = field(default_factory=dict)
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
+    gdrive: GDriveConfig = field(default_factory=GDriveConfig)
 
 
 def load_config(path: str | Path) -> HibernautConfig:
@@ -280,6 +294,22 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
             executor=proj_exec or None,
         )
 
+    gd_raw = raw.get("gdrive", {})
+    gd_interval = float(gd_raw.get("poll_interval_seconds", 30.0))
+    if not math.isfinite(gd_interval) or gd_interval <= 0:
+        raise ValueError("gdrive.poll_interval_seconds must be finite and positive")
+    gdrive = GDriveConfig(
+        enabled=bool(gd_raw.get("enabled", False)),
+        service_account_key_env=str(gd_raw.get("service_account_key_env", "HIBERNAUT_GDRIVE_SA_KEY")),
+        root_folder_id=str(gd_raw.get("root_folder_id", "")).strip(),
+        pending_folder_id=str(gd_raw.get("pending_folder_id", "")).strip(),
+        in_progress_folder_id=str(gd_raw.get("in_progress_folder_id", "")).strip(),
+        done_folder_id=str(gd_raw.get("done_folder_id", "")).strip(),
+        failed_folder_id=str(gd_raw.get("failed_folder_id", "")).strip(),
+        poll_interval_seconds=gd_interval,
+        default_inbox_id=str(gd_raw.get("default_inbox_id", "default")).strip() or "default",
+    )
+
     return HibernautConfig(
         runtime=runtime,
         channels=channels,
@@ -288,4 +318,5 @@ def parse_config(raw: dict[str, Any]) -> HibernautConfig:
         credential_proxy=credential_proxy,
         roles=roles,
         projects=projects,
+        gdrive=gdrive,
     )
