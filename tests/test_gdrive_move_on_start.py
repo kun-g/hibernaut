@@ -59,7 +59,11 @@ class _ParentsAtStartExecutor(_DriveTestExecutor):
         session: SessionRef | None,
         caps: RunCapabilities,
     ) -> RunOutcome:
-        file_id = str(events[-1].payload["drive_file_id"])
+        # An approval resuming a suspended task carries no Drive payload; its session holds gdrive:<file_id>.
+        raw_id = events[-1].payload.get("drive_file_id")
+        if raw_id is None and session is not None and session.correlation_key:
+            raw_id = session.correlation_key.removeprefix("gdrive:")
+        file_id = str(raw_id)
         self.parents_at_start.append(self.drive.files[file_id].parents)
         self.batches.append(list(events))
         await self.release.wait()
@@ -205,6 +209,38 @@ class TestDriveMovesOnRunStart(unittest.IsolatedAsyncioTestCase):
         self.assertIn("等待审批", self.drive.contents["s1"])
         # Parked in 执行中/, so the next poll does not pick the suspended task up again.
         self.assertEqual(self.poller.poll_once(), [])
+
+    async def test_resuming_after_approval_does_not_move_the_file_again(self) -> None:
+        self.drive.add_file("s1", "approve.md", "NEED_APPROVAL first")
+        self.poller.poll_once()
+        await self.run_pool_until_idle()
+        self.assertEqual(self.drive.files["s1"].parents, (PROGRESS,))
+        self.assertEqual(self.drive.move_history, [("s1", PENDING, PROGRESS)])
+
+        # The approval carries no correlation_key; the resumed batch takes gdrive:s1 from the suspended session.
+        self.daemon.handler.ingest(
+            inbox_id="proj:drive",
+            source="events:approval",
+            external_id="approval:req-gd-1:approve",
+            payload={"approval_request_id": "req-gd-1", "approved": True},
+        )
+        with self.assertNoLogs(WORKER_LOGGER, level="WARNING"):
+            await self.run_pool_until_idle()
+        self.assertEqual(len(self.executor.batches), 2)
+        self.assertEqual(self.executor.parents_at_start[1], (PROGRESS,))
+        self.assertEqual(self.drive.move_history, [("s1", PENDING, PROGRESS), ("s1", PROGRESS, DONE)])
+
+    async def test_a_repeated_run_start_for_the_same_file_moves_it_once(self) -> None:
+        # An interrupted batch is requeued and started again; the file is already in 执行中/ by then.
+        writer = self.daemon.gdrive_result_writer
+        assert writer is not None
+        self.drive.add_file("f1", "task.md", "x")
+        evt = Event(inbox_id="proj:drive", source="gdrive:task", external_id="gdrive:f1:t", payload={},
+                    correlation_key="gdrive:f1")
+        writer.on_run_started("proj:drive", [evt], "gdrive:f1")
+        writer.on_run_started("proj:drive", [evt], "gdrive:f1")
+        self.assertEqual(self.drive.move_history, [("f1", PENDING, PROGRESS)])
+        self.assertEqual(self.drive.files["f1"].parents, (PROGRESS,))
 
     async def test_the_start_move_ignores_a_file_no_longer_queued(self) -> None:
         writer = self.daemon.gdrive_result_writer

@@ -73,6 +73,11 @@ class _FakeDriveClient:
 
     def move_file(self, file_id: str, *, add_parent: str, remove_parent: str) -> None:
         meta = self.files[file_id]
+        # Same refusals as DriveQueueGuard's 'move', so a move from the wrong folder fails here as in production.
+        if add_parent == remove_parent:
+            raise RuntimeError("Drive queue proxy refused 'move' (HTTP 400): 'add_parent' and 'remove_parent' must differ")
+        if remove_parent not in meta.parents:
+            raise RuntimeError("Drive queue proxy refused 'move' (HTTP 403): file is not in 'remove_parent'")
         new_parents = tuple(p for p in meta.parents if p != remove_parent) + (add_parent,)
         self.files[file_id] = DriveFileMeta(
             file_id=meta.file_id,
