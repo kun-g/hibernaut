@@ -117,6 +117,35 @@ class TestSourceIssue(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(source_issue(events, key), "")
 
+    def test_events_about_a_pull_request_name_no_issue_even_with_the_task_key(self):
+        # Called the way SDEExecutor._new_state calls it: the batch's github key as the second argument.
+        key = "github:o/r#5"
+        repo = {"full_name": "o/r"}
+        pr_issue = {"number": 5, "pull_request": {"url": "https://api.github.example/repos/o/r/pulls/5"}}
+        cases = {
+            "webhook issues on a PR": _evt("github:issues", {"repository": repo, "issue": pr_issue}, key),
+            "webhook issue_comment on a PR": _evt("github:issue_comment", {"repository": repo, "issue": pr_issue}, key),
+            "switchboard review": _evt("sb:github", {"event_type": "conversation.message", "body": "[review approved]",
+                                                     "metadata": {"github_event": "pull_request_review",
+                                                                  "number": 5}}, key),
+            "switchboard review comment": _evt("sb:github", {"metadata": {
+                "github_event": "pull_request_review_comment", "number": 5}}, key),
+            "switchboard PR closed": _evt("sb:github", {"event_type": "work.closed", "metadata": {
+                "work_kind": "pull_request", "github_event": "pull_request", "number": 5}}, key),
+            "switchboard comment on a PR": _evt("sb:github", {"metadata": {
+                "github_event": "issue_comment", "work_kind": "pull_request", "number": 5}}, key),
+        }
+        for name, evt in cases.items():
+            with self.subTest(name):
+                self.assertEqual(source_issue([evt], key), "")
+
+    def test_switchboard_issue_events_still_name_the_issue(self):
+        key = "github:o/r#7"
+        for metadata in ({"work_kind": "issue", "github_event": "issues"},
+                         {"work_kind": "issue", "github_event": "issue_comment"}):
+            with self.subTest(**metadata):
+                self.assertEqual(source_issue([_evt("sb:github", {"metadata": metadata}, key)], key), "o/r#7")
+
 
 @functools.lru_cache(maxsize=1)
 def _delivery_template() -> tuple[Path, Path]:

@@ -224,10 +224,27 @@ def _event_issue(evt: Event) -> str:
     return ref if _ISSUE_REF.fullmatch(ref) else ""
 
 
+def _about_pull_request(evt: Event) -> bool:
+    # GitHub sends issues / issue_comment events for pull requests too (issue.pull_request is set), and Switchboard
+    # marks relayed PR events in its metadata; all of them carry the PR's number in the github:<repo>#<n> key.
+    if evt.source.startswith("github:pull_request"):
+        return True
+    issue = evt.payload.get("issue")
+    if isinstance(issue, dict) and "pull_request" in issue:
+        return True
+    meta = evt.payload.get("metadata")
+    if isinstance(meta, dict):
+        info = cast(dict[str, Any], meta)
+        event = info.get("github_event")
+        return info.get("work_kind") == "pull_request" or (isinstance(event, str)
+                                                            and event.startswith("pull_request"))
+    return False
+
+
 def source_issue(events: Sequence[Event], correlation_key: str | None = None) -> str:
-    # The GitHub Issue a task came from, as "owner/repo#n", or "" when the task did not come from one. Pull request
-    # events share the "github:<repo>#<n>" key shape but name a PR, so a task they start names no issue.
-    if any(e.source.startswith("github:pull_request") for e in events):
+    # The GitHub Issue a task came from, as "owner/repo#n", or "" when the task did not come from one. A task
+    # started by events about a pull request names no issue, and its key is not read as one.
+    if any(_about_pull_request(e) for e in events):
         return ""
     for evt in events:
         ref = _event_issue(evt)
