@@ -21,6 +21,7 @@ from switchboard.ports import RecordingAuditSink
 GITHUB_SECRET = "test-github-secret"
 FEISHU_TOKEN = "test-feishu-verification-token"
 MCP_TOKEN = "test-mcp-bearer"
+RELAY_TOKEN = "test-relay-token"
 
 
 class FakeClock:
@@ -36,8 +37,17 @@ class FakeClock:
 
 class StaticCredentials:
     def __init__(self) -> None:
-        self.secrets = {"github": GITHUB_SECRET, "feishu": FEISHU_TOKEN, "mcp": MCP_TOKEN}
-        self.tokens = {"github": "ephemeral-github", "feishu": "ephemeral-feishu"}
+        self.secrets = {
+            "github": GITHUB_SECRET,
+            "feishu": FEISHU_TOKEN,
+            "mcp": MCP_TOKEN,
+            "relay": RELAY_TOKEN,
+        }
+        self.tokens = {
+            "github": "ephemeral-github",
+            "feishu": "ephemeral-feishu",
+            "relay": RELAY_TOKEN,
+        }
 
     def get_webhook_secret(self, channel: str) -> str | None:
         return self.secrets.get(channel)
