@@ -168,8 +168,6 @@ class TestTerminalBackendThroughDaemon(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan),
                                                   "FAKE_SESSIONS": str(root / "sessions")}))
         self.stderr = self.enterContext(patch("sys.stderr", new_callable=_Capture))
-        self.enterContext(patch("agent_runtime.adapters.channels.github_poller.GitHubIssuePoller.poll_once",
-                                return_value=0))
 
     def post(self, inbox_id, key, payload):
         body = {"inbox_id": inbox_id, "external_id": key, "correlation_key": key, "payload": payload}

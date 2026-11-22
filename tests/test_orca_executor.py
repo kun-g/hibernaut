@@ -391,7 +391,6 @@ class TestContinuationThroughEvents(unittest.TestCase):
 
             config = load_config(path)
             daemon = build_daemon_from_config(config)
-            daemon.github_poller = None  # the fake repo has no GitHub remote
             daemon.workspaces.reserve_creating(work_key="task:demo", repo_checkout=str(repo.resolve()),
                                                workdir=str(workdir.resolve()), branch="hb/task-1")
             daemon.workspaces.mark_ready("task:demo", workdir=str(workdir.resolve()), branch="hb/task-1")

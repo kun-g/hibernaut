@@ -51,7 +51,6 @@ def project_block(plan: Plan) -> str:
 inbox_id = ["proj:{plan.name}", "proj:{plan.name}:.+"]
 repo = "{plan.repo}"
 checkout = "{plan.checkout}"
-github_poll = false
 worktree_backend = "orca"
 executor = "sde"
 
@@ -115,7 +114,9 @@ def onboard(argv: Sequence[str] | None = None, *, run: Runner = _run) -> Plan:
     parser.add_argument("--config", default="hibernaut.toml")
     parser.add_argument("--name", help="project name and inbox suffix (default: lower-cased repository name)")
     parser.add_argument("--checkout", help="default: next to the Hibernaut checkout, <config dir>/../<name>")
-    parser.add_argument("--label", default="hibernaut")
+    parser.add_argument(
+        "--label", default="hibernaut", help="repository label to create (match Switchboard [github] require_label)",
+    )
     parser.add_argument("--auto-merge", action="store_true", help="merge after review and CI pass")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)

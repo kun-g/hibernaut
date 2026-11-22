@@ -326,6 +326,21 @@ class OutboundBridgeTests(_Stack):
 
 
 class ClosedLoopTests(_Stack):
+    async def test_pr_comment_and_review_continue_the_same_session(self) -> None:
+        comment = comment_payload()
+        comment["issue"]["pull_request"] = {"url": "https://api.github.com/repos/kun-g/hibernaut/pulls/42"}
+        review = {"action": "submitted", "pull_request": {"number": 42}, "review": {"id": 8, "body": "Looks good"},
+                  "repository": comment["repository"], "sender": comment["sender"]}
+        session_ids = []
+        for event_type, payload in (("issue_comment", comment), ("pull_request_review", review)):
+            status, _ = send_github(self.h.url, payload, event=event_type, delivery=event_type)
+            self.assertEqual(status, 202)
+            self.h.board.worker.run_once()
+            (report,) = await self.worker.process_inbox(SCOPE)
+            self.assertIsNotNone(report.session_id)
+            session_ids.append(report.session_id)
+        self.assertEqual(session_ids[0], session_ids[1])
+
     async def test_github_comment_to_worker_emit_to_github_comment(self) -> None:
         status, _ = send_github(self.h.url, comment_payload(), event="issue_comment", delivery="d-c1")
         self.assertEqual(status, 202)

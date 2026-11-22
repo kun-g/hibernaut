@@ -120,7 +120,7 @@ chmod 600 .env
 - **收事件**：在 GitHub App 的设置里打开 Webhook，URL 填 `https://<域名>/webhooks/github`，Secret 用 `SWITCHBOARD_GITHUB_WEBHOOK_SECRET`，订阅 Issues、Issue comment、Pull request、Pull request review、Pull request review comment。App 装到哪些账号，哪些仓库的事件就会发来，所以 `[routing] unmatched_policy` 要设为 `"reject"`；`[routing.github_owners]` 让某个账号下的新仓库自动路由到 `proj:<仓库名>`，不用再逐个改 `github_repos`。
 - **回写哪里**：运行结果默认不回帖到发起任务的 GitHub Issue，只留在 Hibernaut 本机 Outbox；任务显式带 `reply_channel = "github"`、`reply_target = "<owner>/<repo>#<n>"` 时才评论到那个 Issue。`[outbound] reply_to_origin` 列出允许自动回到来源的渠道（默认只有飞书）。
 - **回写评论**：`.env` 填 `SWITCHBOARD_GITHUB_APP_ID` 和 `SWITCHBOARD_GITHUB_APP_PRIVATE_KEY`（PEM 整体 base64 成一行），`[outbound] github_app_owners` 列出允许签令牌的账号。Switchboard 每次按仓库签一个只含 Issues、Pull requests 写权限、只覆盖该仓库的安装令牌（缓存到过期前 10 分钟），评论作者是 App 的 bot；名单外的仓库直接拒绝，不调 GitHub。启动日志出现 `[switchboard] GitHub comments as App <id> for <owners>`。私钥能给 App 的所有安装签令牌，只放在 Switchboard 的环境变量里。
-- **接入新仓库**：本机在 Hibernaut 检出里执行 `python3 scripts/onboard_project.py <owner>/<repo>`，它克隆仓库到 Hibernaut 检出旁边、建 `hibernaut` 标签、在 `hibernaut.toml` 追加 `[projects.<repo>]`（`github_poll = false`，PR 交付、不自动合并；`--auto-merge` 改为自动合并），守护进程热加载后生效。重复执行不改动已有内容，`--dry-run` 只打印将做的事。
+- **接入新仓库**：本机在 Hibernaut 检出里执行 `python3 scripts/onboard_project.py <owner>/<repo>`，它克隆仓库到 Hibernaut 检出旁边、建 `hibernaut` 标签、在 `hibernaut.toml` 追加 `[projects.<repo>]`（默认开 PR 供人合并，`--auto-merge` 改为自动合并），守护进程热加载后生效。重复执行不改动已有内容，`--dry-run` 只打印将做的事。
 
 ## 本机 Hibernaut 配对
 
@@ -195,17 +195,17 @@ export SWITCHBOARD_MCP_TOKEN=<VPS .env 里的 SWITCHBOARD_MCP_WEBHOOK_SECRET>
 
 ## 灰度切流
 
-Hibernaut 现有的 GitHub / 飞书 / MCP 通道在 Stage B 仍然保留，可以逐个入口切换，每步都能单独回退。
+GitHub Webhook 只能投到 Switchboard。Hibernaut 通过 Relay 接收公网 Hub 的事件，飞书与 MCP 也可继续走原有的本地入口。
 
 1. 部署 VPS 并完成冒烟验收 1–5。此时还没有外部事件发到 VPS。
 2. 本机 Hibernaut 改为 `mode = "relay"`（见上文）并重启。确认启动日志无报错、没有明文告警；用冒烟第 6 步确认 `delivery_log` 中 `hibernaut` 的投递为 `acked`、没有积压的 `pending` / `retry`。
-3. 切一个入口：先在一个仓库的 GitHub Webhook 里把 Payload URL 改为 `https://sb.example.com/webhooks/github`（Content type `application/json`，Secret 用 `SWITCHBOARD_GITHUB_WEBHOOK_SECRET`），在 Recent Deliveries 确认 2xx，再发一个带 `hibernaut` 标签的测试 Issue 确认 Hibernaut 收到并回写评论（回写的评论末尾有隐藏标记 `<!-- switchboard:outbound -->`，回流时被丢弃，不会再触发 Run）。同时把该项目 `hibernaut.toml` 的 `poll_labels` 改为 `[]`：轮询和 Webhook 的 `external_id` 不同，两路都开时同一个 Issue 会跑两次。
+3. 切一个入口：先在一个仓库的 GitHub Webhook 里把 Payload URL 改为 `https://sb.example.com/webhooks/github`（Content type `application/json`，Secret 用 `SWITCHBOARD_GITHUB_WEBHOOK_SECRET`），在 Recent Deliveries 确认 2xx。给一个测试 Issue 加上 `[github] require_label` 指定的标签，确认 Switchboard 的 `delivery_log` 显示 `hibernaut` 已 ACK，并在 Hibernaut 中查到对应的 `sb:github` 事件。
 4. 观察一段时间（建议至少一天）没有 `dead_letter` 后，再切飞书事件订阅地址到 `https://sb.example.com/webhooks/feishu`，以及其余仓库。
 
 ## 回滚
 
-- **单个入口**：把 GitHub Webhook / 飞书事件订阅地址改回原来的 Hibernaut 地址。
-- **Hibernaut 侧**：`hibernaut.toml` 的 `[switchboard]` 改回原来的 `mode = "in_process"` 或 `enabled = false`，重启 Hibernaut。切换前先确认 VPS 上没有发给 `hibernaut` 的 `pending` 投递，否则这些事件要等重新连上才会推送。
+- **单个入口**：GitHub Webhook 可切回此前可用的 Switchboard 监听地址。飞书事件订阅可切回 Hibernaut 的本地 Webhook。
+- **Hibernaut 侧**：`hibernaut.toml` 的 `[switchboard]` 改回原来的 `mode = "in_process"` 并设置原有 `config_path`，重启 Hibernaut，同时把 GitHub Webhook 切到该 Switchboard。`enabled = false` 会暂停 GitHub 入站。切换前先确认 VPS 上没有发给 `hibernaut` 的 `pending` 投递，否则这些事件要等重新连上才会推送。
 - **VPS 版本**：升级前先备份数据卷，回滚时检出上一个版本重新构建：
 
   ```bash
