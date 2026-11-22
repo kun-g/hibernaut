@@ -18,6 +18,10 @@ unmatched_policy = "fallback"  # or "reject"
 [routing.github_repos]
 "kun-g/hibernaut" = "proj:hibernaut"
 
+[routing.github_owners]
+# Every repo of these owners routes to proj:<lower-cased repo name> unless github_repos lists it.
+# "kun-g" = "proj:{repo}"
+
 [routing.feishu_chats]
 # "oc_xxx" = "proj:hibernaut"
 
@@ -47,6 +51,8 @@ max_retry_attempts = 5
 approval_channel = "feishu"
 # approval_target = "oc_xxx"
 
+# With SWITCHBOARD_GITHUB_APP_ID/_PRIVATE_KEY set, comments are posted as the App, only for these owners.
+# github_app_owners = ["kun-g"]
 [relay]
 enabled = true
 path = "/ws/relay"

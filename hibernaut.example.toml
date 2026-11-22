@@ -126,6 +126,7 @@ inbox_id = "proj:hibernaut"
 repo = "kun-g/hibernaut"
 checkout = "/absolute/path/to/your/hibernaut"
 poll_labels = ["hibernaut"]
+# github_poll = false        # Issue 经 Switchboard Webhook 送达时关掉轮询；poll_labels = [] 不是关闭，而是轮询全部 Issue
 worktree_backend = "orca"    # orca | git
 terminal_backend = "orca"    # orca | none；交互角色会话的后端，与 worktree_backend 独立。默认：orca 项目为 orca，git 项目为 none
 orca_create_terminal = false    # agent launch opens its own terminal
