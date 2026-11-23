@@ -156,12 +156,15 @@ class MemoryContractMixin:
     def make_memory(self) -> Any:
         raise NotImplementedError
 
+    def write_instructions(self, memory: Any, content: str) -> None:
+        memory.write("instructions.md", content)
+
     def test_baseline_and_on_demand_read_write(self) -> None:
         memory = self.make_memory()
         baseline = memory.load_baseline()
         self.assertEqual(set(baseline.keys()), {"instructions.md", "index.md", "reported.md"})
 
-        memory.write("instructions.md", "Be concise.")
+        self.write_instructions(memory, "Be concise.")
         memory.write("notes/user_prefs.md", "Prefers UTC+8")
         memory.write("progress/task_1.md", "Step 1 done")
 
@@ -489,8 +492,16 @@ class TestPartitionedMemoryContract(MemoryContractMixin, unittest.TestCase):
         self._tmp.cleanup()
 
     def make_memory(self) -> Any:
-        registry = WorkspacePartitionRegistry(Path(self._tmp.name))
-        return registry.memory_for("proj:contract-test")
+        self._registry = WorkspacePartitionRegistry(Path(self._tmp.name))
+        self.addCleanup(self._registry.hub.close)
+        return self._registry.memory_for("proj:contract-test")
+
+    def write_instructions(self, memory: Any, content: str) -> None:
+        # Memory Hub holds a project's instructions back until a person approves them.
+        memory.write("instructions.md", content)
+        self.assertEqual(memory.load_baseline()["instructions.md"], "")
+        (pending,) = self._registry.hub.list_proposals()
+        self._registry.hub.approve_proposal(pending["proposal_id"], actor="human")
 
 
 if __name__ == "__main__":

@@ -119,6 +119,13 @@ class TestMCPServerAdapter(unittest.IsolatedAsyncioTestCase):
                 "hibernaut_list_audits",
                 "hibernaut_executor_stats",
                 "hibernaut_replay_event",
+                "memory_read",
+                "memory_search",
+                "memory_propose_write",
+                "memory_approve_proposal",
+                "memory_list_proposals",
+                "memory_reject_proposal",
+                "memory_record_postmortem",
             ],
         )
 

@@ -24,7 +24,7 @@
 | **L0 领域契约层** | `core/models.py` | 不可变领域数据结构（含 `Event.correlation_key`、`SessionRef.correlation_key / executor_id / executor_session_id / parent_session_id`；`Event` 只承载事件事实与 `status`，认领次数与失败原因属 L3 存储内部）、强类型终态 `RunOutcome`（携带 `executor_session_id`，以及只供执行账本使用、不参与相等比较的 `RunTelemetry`）、执行账本条目 `RunLedgerEntry` 与失败路由 `FailureRoute`、`NewEventPolicy`，Inbox 绑定与转投契约（`InboxBinding`、`InboxMatchRule`、`InboxRoute`、`ForwardSpec`、`MAX_FORWARD_HOPS`）与 5 级选路纯函数 `resolve_agent_id()`（不带绑定的旧函数 `resolve_executor_id()` 保留） | 零外部依赖，仅 Python 标准库 |
 | **L1 核心端口层** | `core/ports.py` | 定义纯抽象 `Protocol` 端口（含 `ExecutorPort.executor_id`、可选的 `RunStartListener`、`RunLedgerPort` 与可接回的 `ResumableExecutorPort`）及 `RunCapabilities` / `RunContext` 控制钩子 | 仅依赖 Python 标准库 + L0 |
 | **L2 生命周期编排层** | `engine/` | `EventHandler`、`AgentWorker`（支持 `executors: Mapping[str, ExecutorPort]` 查表路由）、`TimerScheduler`、`OutboxDispatcher`、转投规则 `forwarding.py` | 仅依赖 L0 + L1，严禁 `import adapters/` 或 `app/` |
-| **L3 基础设施与组装层** | `adapters/` + `app/` | SQLite 存储（含 `workspaces` 表与旧库兼容迁移）、分区 Memory、Auto Mode + Credential Proxy、外置 Drive 队列凭据代理（独立进程）、SDE 交付步骤 `PRDelivery`、白盒执行器、`LocalCLIExecutor` + `OrcaWorktreeManager`、Switchboard 入站桥、Drive 轮询、`MCPServerAdapter`、Switchboard 出站桥、`config.py`、`bootstrap.py`、`main.py` | 实现 L1 端口或驱动 L2 `EventHandler`，仅在 `app/` 组装注入 |
+| **L3 基础设施与组装层** | `adapters/` + `app/` | SQLite 存储（含 `workspaces` 表与旧库兼容迁移）、按项目分区的 Memory（委托 Memory Hub，§14）、Auto Mode + Credential Proxy、外置 Drive 队列凭据代理（独立进程）、SDE 交付步骤 `PRDelivery`、白盒执行器、`LocalCLIExecutor` + `OrcaWorktreeManager`、Switchboard 入站桥、Drive 轮询、`MCPServerAdapter`、Switchboard 出站桥、`config.py`、`bootstrap.py`、`main.py` | 实现 L1 端口或驱动 L2 `EventHandler`，仅在 `app/` 组装注入 |
 
 ### L1 核心端口与 RunCapabilities
 
@@ -32,7 +32,7 @@
 | :--- | :--- |
 | `InboxPort` | 统一事件缓冲与事实源（4 态生命周期 `pending` / `processing` / `done` / `failed`，重复幂等标 `dropped`）；支持 `claim_pending`、`fetch_processing`、`bind_session`、`requeue_processing`、`mark_done`、`mark_failed`；`has_open_event(inbox_id, source, external_id)` 判断同一去重键是否还有 `pending` / `processing` 事件（轮询方据此跳过，不写 `dropped` 行）；控制面重放 `replay(event_id, *, executor_id_override, force, replay_of_run_id)` 见 §11 |
 | `TimerPort` | 持久化定时器存储（单次 `follow_up` 与周期 `schedule`） |
-| `MemoryPort` | 跨 Run 目录记忆（必载基线 `instructions.md` / `index.md` / `reported.md` + 按需 `notes/*` / `progress/*`） |
+| `MemoryPort` | 跨 Run 目录记忆（必载基线 `instructions.md` / `index.md` / `reported.md` + 按需 `notes/*` / `progress/*`）；daemon 的实现委托 Memory Hub，按项目分区（§14） |
 | `PermissionPort` | 每次工具调用前置三态门禁（`allow` / `block` / `defer`） |
 | `OutboxPort` | 待发消息持久队列，解耦推理与外部通道投递；`fetch_pending(limit, *, now_iso)` 只返回 `next_retry_at` 为空或已到期的 `pending` 消息，`schedule_retry()` 记一次失败并排期，`mark_failed()` 为终态 |
 | `LockPort` | 以 `inbox_id` 为主键的单活租约锁（`acquire` / `renew` / `release`），支持进程崩溃后租约到期自动接管 |
@@ -66,7 +66,7 @@
   - **没有终端就挂起**：项目 `terminal_backend` 不是 `orca`、Orca 打不开终端，或运行中终端没了而本轮还没转投过，本次 Run 挂起（checkpoint `stage = "retry"`）并写明原因：批准后按同一提示词重试（期间的新事件并入），拒绝则结束，不退回子进程。重试的批准不代替 `steward.launch` 的批准；已批准的启动遇到没有终端时，批准留在 checkpoint 里。已转投过的一轮按失败处理：挂起的 Run 会把转投发出去，重试就重复了。
   - **工作目录与分支**：`[agents.<id>] workdir`（`~` 可用，相对路径以配置文件目录为准），未写时用项目 `checkout`；`checkout` 也没写时，加载配置时按项目 `repo` 在 `orca repo list --json` 的 `gitRemoteIdentity` 里找主检出（`registered_checkout()`），整个项目都用它，找不到、多于一个、目录不在本机或 Orca 没应答都报错。`branch` 写了时每次启动前用 `git symbolic-ref` 核对该目录当前分支，不一致（含不在任何分支上）按上条挂起；只读，不切换。
   - **只读边界**：`cwd` 是工作目录，从不创建 worktree。`--permission-mode dontAsk`、`--tools ""`（没有任何内置工具）、`--allowedTools` 只列本 Run 的 MCP 工具，`--disallowedTools` 另列 Read / Grep / Glob / Edit / Write / MultiEdit / NotebookEdit / Bash / Agent / Task 等，`--strict-mcp-config` 不加载别的 MCP 服务。每次起进程（含续接失败后的重试）都按当时的参数过 `steward.launch` 门禁：`block` 总是生效；批准只放行与申请时一致的 `defer`（检出、启动器及其命令、模型、计费与环境变量摘要，存在 checkpoint 里），有变就重新申请。提示词里的 `@` 一律写成 `\u0040`：Claude Code 会把 `@路径` 直接换成文件内容，不经任何工具，检出外的也读。
-  - **MCP 工具**（`steward_tools.py`，在 hb 进程里执行；`steward_mcp.py` 是 `python -I` 起的无状态 stdio 中继，经 0700 临时目录里的 Unix socket 转发，Run 结束即关）：`forward_to_inbox`、`read_file`、`search_files`、`list_files`、`read_memory`、`write_memory`、`list_sessions`、`list_events`、`git`，除转投外各以自己的名字（`git` 为 `git_read`）逐次过 `PermissionPort`。读文件只限 Git 跟踪或会跟踪的文件（`.git` 与被忽略的文件不可读），门禁收到的 `path` 是解开符号链接后的检出内路径；`search_files` 会显示文件内容，命中的每个文件另按 `read_file` 判一次，不放行的不显示也不计数；Git 输出按字节、以 NUL 为界解析，文件名含换行也按完整路径判，解析不了就整条不给。会话与事件只限本项目的 Inbox，事件只给元数据、标题与至多 500 字符的正文。`git`（`steward_git.py`）只有 `status`、`diff`、`log`、`show`、`blame`、`rev-parse`、`merge-base`，选项按命令列白名单、只认全称，路径写在 `--` 之后，拒绝越界路径与以 `:` 开头的参数，以 `GIT_OPTIONAL_LOCKS=0`、`GIT_NO_LAZY_FETCH=1`、`--no-ext-diff --no-textconv`（`blame` 用 `--no-textconv`）运行，读检出的命令另以环境变量清空全部 `filter.*` 驱动，`status` 与 `diff` 加 `--ignore-submodules=dirty` 不进子模块，配置里的程序都不会执行。**会显示文件正文的 git 操作按同一条 `read_file` 判定**：只有 `show <commit>`、`show <rev>:<path>`、`diff`、`blame` 给正文，版本先解析成 commit ID，先以不识别改名的 `--name-only` 列出涉及的文件（合并提交取与各父提交的差异并集），逐个过 `read_file`，有一个不放行就整条拒绝，放行后也只输出列出的这些文件；`show <rev>:<path>` 先用 `ls-tree` 核对条目，只有普通文件（不含子模块、目录、符号链接）才用 `cat-file blob` 输出原始内容；`--stat`、`--name-only` 等只给名称与计数的不需要。`log` 只给元数据，`-p`、`-S`、`-G`、`-L` 与按 blob 读内容一律没有。
+  - **MCP 工具**（`steward_tools.py`，在 hb 进程里执行；`steward_mcp.py` 是 `python -I` 起的无状态 stdio 中继，经 0700 临时目录里的 Unix socket 转发，Run 结束即关）：`forward_to_inbox`、`read_file`、`search_files`、`list_files`、`read_memory`、`write_memory`、`memory_search`、`memory_read`、`memory_propose_write`（§14，没有批准工具）、`list_sessions`、`list_events`、`git`，除转投外各以自己的名字（`git` 为 `git_read`）逐次过 `PermissionPort`。读文件只限 Git 跟踪或会跟踪的文件（`.git` 与被忽略的文件不可读），门禁收到的 `path` 是解开符号链接后的检出内路径；`search_files` 会显示文件内容，命中的每个文件另按 `read_file` 判一次，不放行的不显示也不计数；Git 输出按字节、以 NUL 为界解析，文件名含换行也按完整路径判，解析不了就整条不给。会话与事件只限本项目的 Inbox，事件只给元数据、标题与至多 500 字符的正文。`git`（`steward_git.py`）只有 `status`、`diff`、`log`、`show`、`blame`、`rev-parse`、`merge-base`，选项按命令列白名单、只认全称，路径写在 `--` 之后，拒绝越界路径与以 `:` 开头的参数，以 `GIT_OPTIONAL_LOCKS=0`、`GIT_NO_LAZY_FETCH=1`、`--no-ext-diff --no-textconv`（`blame` 用 `--no-textconv`）运行，读检出的命令另以环境变量清空全部 `filter.*` 驱动，`status` 与 `diff` 加 `--ignore-submodules=dirty` 不进子模块，配置里的程序都不会执行。**会显示文件正文的 git 操作按同一条 `read_file` 判定**：只有 `show <commit>`、`show <rev>:<path>`、`diff`、`blame` 给正文，版本先解析成 commit ID，先以不识别改名的 `--name-only` 列出涉及的文件（合并提交取与各父提交的差异并集），逐个过 `read_file`，有一个不放行就整条拒绝，放行后也只输出列出的这些文件；`show <rev>:<path>` 先用 `ls-tree` 核对条目，只有普通文件（不含子模块、目录、符号链接）才用 `cat-file blob` 输出原始内容；`--stat`、`--name-only` 等只给名称与计数的不需要。`log` 只给元数据，`-p`、`-S`、`-G`、`-L` 与按 blob 读内容一律没有。
   - **路由清单**：`app/projects.build_routing_manifest(project)` 每次唤醒由当前配置现拼（Agent 及其角色、执行器、模型、说明，各 Inbox 的默认 Agent、白名单与规则），进系统提示；续接的对话可能沿用旧系统提示，所以同时写进本轮消息。Skill 与代码里不写死任何 Inbox 或 Agent。
   - **结果与审批**：`--json-schema` 要求 `{action: reply|silent, message}`，对应 `Emit` / `Silent`。转投被 `defer` 时挂起，审批提示列出目标与全文；批准后由 Hibernaut 带 `approved_request_id` 补发并送出扣住的答复，不再调用模型（期间有新事件、或补发被拒时才再跑一轮）；拒绝则告诉 Steward 再答一轮。批准号只来自审批事件，agent 传不进来。
 - **5 级选路与原生会话续接闭环**：
@@ -178,7 +178,7 @@
 
 ## 5. 多 `inbox_id` Actor 分区并发与 `NewEventPolicy`
 
-- **多 `inbox_id` 并发**：`AsyncWorkerPool` 跨 `inbox_id` 并行、同 `inbox_id` 单活互斥（`worker_leases` 主键即 `inbox_id`）、`Suspend` 立即放锁；`WorkspacePartitionRegistry` 强制禁止不同 `inbox_id` 挂载同一本地代码目录，全局 `global/instructions.md` 只读共享。
+- **多 `inbox_id` 并发**：`AsyncWorkerPool` 跨 `inbox_id` 并行、同 `inbox_id` 单活互斥（`worker_leases` 主键即 `inbox_id`）、`Suspend` 立即放锁；`WorkspacePartitionRegistry` 强制禁止不同 `inbox_id` 挂载同一本地代码目录，全局 `global/instructions.md` 只读共享。队列、会话、租约和工作区按 `inbox_id` 分，项目记忆按 `project_key` 分，同一项目的 Inbox 共用（§14）。
 - **分级并发上限**（`app/concurrency.py` + `AsyncWorkerPool`）：计量单位是同时在跑的 Inbox（一次派发占一个名额）。全局 `[runtime] max_concurrency` 之外，`[projects.<name>]` 与 `[executors.<id>]`（CLI、角色执行器，以及只供 `[agents.*]` 引用的 Claude Code 执行器）可各写可选的 `max_concurrency`（`[agents.<id>]` 不能写：要单独限制某个 agent，就给它单独的 executor）：正整数，`0`、负数、布尔、字符串在加载时拒绝并指明配置路径；大于全局值时照常加载，记一条 `WARNING`，实际受全局值封顶。
   - **准入**：`ConcurrencyLimiter.try_acquire(inbox_id, project_key=…, executor_key=…)` 三个维度都有余量才一起扣减，否则什么都不扣、立即返回 `False`；`release(inbox_id)` 按实际占用归还，幂等。只在池的事件循环上调用，检查与扣减之间没有 await，因此是原子的。
   - **调度（无队头阻塞）**：待调度队列是 FIFO 的 `deque`。Worker 协程从队头扫描，取第一条各维度都有余量的 Inbox；满额的留在原位，不占 Worker 协程。没有可派发的就等 `_changed` 事件，它在唤醒、归还名额、退役与停机时置位，没有轮询。归还后从队头重扫，等得最久的先得到名额。排队 Inbox 的限流键缓存到它下次被唤醒，只用来跳过仍然满额的 Inbox（重扫不读库）；放行前一律重新解析，因此别的线程刚写库、唤醒还没到事件循环的变更（如换执行器重放）不会按旧键派发，也不丢队列位置。
@@ -352,7 +352,7 @@
   最终失败时事件 `mark_failed`，worktree 与日志保留，并向 Outbox 写一条告警（`kind = "run_failed"`、`outcome_kind = "error"`，元数据带 `run_id`、`error_kind`、`error_category`，正文带错误摘要并提示用 `hibernaut_replay_event` 重放；欠上级回投的 Run 不写，见「混合回信」）。执行器自己返回的 `Emit(status="failed" | "refused")` 是已交付的结果：只按其 telemetry 分类记下 `error_kind` 与 `exit_code`（telemetry 带合法的 `error_kind` 时直接采用，否则按 stderr 与退出码推断），事件照常 `done`，不重试、不另发告警。
 - **接线 3：控制面重放 `InboxPort.replay()`**：归属 Hibernaut 控制面，不在 `src/ledger/` 里。`SQLiteInboxAdapter.replay(event_id, *, executor_id_override=None, force=False, replay_of_run_id=None)` 在一个事务里把 `failed`（`force=True` 时也可以是 `done`）事件置为 `pending`、`attempts = 0`、`last_error = NULL`，payload 写入可选的 `executor_id` 与 `_replay_of_run_id`；`processing`（Run 进行中）与 `dropped`（重复事件，重放会破坏入队幂等）一律拒绝（`ValueError`）。它不碰 `worker_leases`：重放的事件像新事件一样排队，Inbox 有 Run 在跑时等它结束。旧 `RunRecord` 原样保留，新 Run 的 `replay_of_run_id` 指向它。
 - **接线 4：MCP 与配置**：`MCPServerAdapter` 增加 4 个来自 `ledger.MCPReadToolHandlers` 的只读工具 `hibernaut_list_runs`、`hibernaut_get_run_log`（日志缺失时回落到存储的 `error_summary`）、`hibernaut_list_audits`、`hibernaut_executor_stats`（按执行器统计成功率、平均耗时、token、费用与错误分布；成功 = `silent`，或 `emit` 且 `emit_status = "done"`），以及控制面写工具 `hibernaut_replay_event(event_id, executor_id?, force?)`：从账本取该事件最近一次失败的 `run_id`，调 `InboxPort.replay()`，经 `EventHandler.wake()` 唤醒该 Inbox，并写审计 `AuditRecord(service="hibernaut", stage="inbox.replay", outcome="queued")`。不可重放时返回 JSON-RPC `-32602`。未开账本时只读工具返回 `-32602`，重放照常（不带 `_replay_of_run_id`）。`--mcp-stdio` 伴随进程打开同一个 `ledger.db` 查询。
-- **复盘与 Memory 闸门**（`memory_gate.py`，本次未接线）：瞬时故障禁止进入 Memory；复盘结论先写 `notes/postmortem/<id>.md` 候选（带 `source_run_id` 与失效条件），复现 ≥ 2 次或人工批准后才幂等追加进 `instructions.md`。
+- **复盘与 Memory 闸门**：复盘结论经 MCP 工具 `memory_record_postmortem` 交给 Memory Hub 的两段式沉淀（§14）：瞬时故障不进 Memory；结论先写 `notes/postmortem/` 候选，复现 ≥ 2 次才生成 `instructions.md` 提案，由人批准后生效。账本包自带的 `memory_gate.py` 未接线。
 - **测试**：`tests/test_ledger_all.py`（包自身：AST 边界、Schema 双向契约、`ledger.db` 多对多与统计、Fail-Open、三级分类、日志防穿越与清理、双源计费、Memory 闸门、Switchboard 适配器脱敏与 MCP 只读处理器）；`tests/test_ledger_wiring.py`（4 处接线：审计端口新参数与同进程 Switchboard 审计入账、Worker 记账与日志 / usage、三路分流与告警、账本故障不影响 Run、`LocalCLIExecutor` telemetry、SQLite 与内存 Inbox 的 `replay` 契约、`ledger_db_path` 默认值、MCP 只读工具与失败事件重放端到端）。
 
 ## 12. Runner（执行面 / 执行节点）
@@ -370,3 +370,30 @@
 - **配置与零写侵入**（`dashboard/config.py`、`dashboard/snapshot.py`）：`resolve_config()` 从 `--config`（或 `$HIBERNAUT_CONFIG` / 当前目录 `hibernaut.toml`）解析本地 `hibernaut.db`、`ledger.db`、`runs/`、`outbox/` 与远端 Hub 根地址（取 `[switchboard].mcp_url` 或 `relay_url`，`--hub-url` 可覆盖），并从 `--hub-deploy-dir`（默认 `~/.config/hibernaut/hub-deploy`）读取 `switchboard.toml`、`taskboard.toml` 与 `taskboard.env`（优先 `$TASKBOARD_MCP_TOKEN`）。所有 SQLite 连接均使用只读 URI（`file:<path>?mode=ro`），绝不写库、不争抢 WAL 写锁；所有响应均不回传任何 token 或密钥。
 - **远端探针与防穿越**：并行探测 `/switchboard/healthz`、`/taskboard/healthz` 与 `/taskboard/mcp`（`initialize` + `tb_list_tasks`），带短 TTL 缓存（默认 4 秒，`?force=1` 强制刷新）；`/api/run/<session_id>` 与 `/api/outbox/<filename>` 强制白名单文件名正则与 `resolve().relative_to()` 边界校验，拒绝路径穿越。
 - **HTTP 服务与单页界面**（`dashboard/server.py`、`dashboard/static/`）：`python3 -m dashboard [--config hibernaut.toml] [--host 127.0.0.1] [--port 8877]` 默认仅监听回环地址，提供 `/`（总览）与 `/details`（7 个独立明细页签：事件队列、交付 PR & Worktrees、Taskboard、Switchboard、执行账本、`ccpeer`、Outbox 报告）前端无刷新切换，以及两页共用的可展开/收起拓扑状态条；事件队列与 Switchboard 中处于 `processing` 状态的事件行支持行内展开，展示关联的 Session 及其当前状态与活跃 Run 进度。静态资源随 `[tool.setuptools.package-data]` 一并打包。
+
+## 14. Memory Hub：分层预算的项目记忆（`src/memory_hub/`）
+
+`src/memory_hub/` 是只依赖标准库的独立包。`.importlinter` 的 `memory-hub-zero-business-deps` 禁止它导入 `agent_runtime`、`switchboard`、`taskboard`、`runner`、`ledger`；`business-packages-no-memory-hub` 禁止 `switchboard`、`runner`、`taskboard` 导入它；`tests/test_memory_hub.py` 另用 AST 检查。数据契约是 `schemas/v1/memory_{baseline,proposal,search,postmortem}.schema.json`（Draft 2020-12）。包按 v1.0 交付件原样合入，Hibernaut 侧的约束都写在接线层。
+
+- **分区**：`inbox_id` 先归到 `project_key`：`[memory_hub.inbox_projects]` 的显式映射 → `proj:<key>` 或 `proj:<key>:<子队列>` → `<key>:<任务>`（`user:` 除外）→ 整个 `inbox_id` 规范化。同一 `project_key` 的 Inbox 共用 `<memory_root>/projects/<project_key>/`。
+- **旧目录迁移**（`memory_fs/legacy.py`）：以前每个 `inbox_id` 一个目录。首次访问某 Inbox 的记忆时，把旧目录的文件复制进项目目录，旧目录不动、留标记 `.memory_hub_adopted`，只做一次。主 Inbox（`proj__<key>`）先复制；同名而内容不同的文件放 `notes/legacy/<旧目录>/`，不覆盖。
+- **写入策略**（`memory_hub/governance.py`）：
+
+  | 目标 | 运行中写入 |
+  | :--- | :--- |
+  | `global://`、`kb://` | 拒绝 |
+  | `proj://<key>/instructions.md`、`shared://`、项目里的其他文件 | 生成提案，人批准后生效 |
+  | `notes/*`、`index.md` | 去重与预算检查后写入 |
+  | `progress/*` | 直接写入 |
+  | `reported.md` | 追加，超出预算的旧条目滚动归档 |
+
+  `MemoryPort.write("instructions.md", …)` 因此不再立即生效；`write_memory` 工具的返回文字会说明已排队待批。去重只判 `memory_propose_write`，`MemoryPort.write` 是整文件替换。
+- **端口委托**（`memory_fs/partitioned.py`）：`PartitionedMemoryAdapter` 委托 `LegacyMemoryPortAdapter`，保持 `MemoryPort` 的方法与返回值，另有 `load_baseline_bundle()`。URI 可以写任意项目，适配器只许本项目，越界抛 `PermissionError`。
+- **单写者**（`memory_fs/hub.py` 的 `GovernedMemoryHub`）：包内读改写不加锁，所以每个进程一个 hub，读写与审批持线程锁加 `<memory_root>/.memory_hub.lock` 文件锁，daemon、HTTP 服务与 `--mcp-stdio` 伴随进程不会互相覆盖。提案号校验格式，已决定的提案不能再改判。热加载各代共用同一个 hub，改 `[memory_hub]` 需要重启。
+- **Prompt Cache 分段**（`memory_fs/segments.py`）：`stable_prefix`（全局与项目 `instructions.md`、`index.md`）在缓存断点前，`volatile_tail`（`reported.md`）在断点后。白盒执行器把前者放系统前缀，后者放每次请求的第一条消息，不进断点与压缩；CLI 与 Steward 的提示词里 `reported.md` 排在稳定部分之后；SDE 照旧只用稳定部分。预算由 `[memory_hub.budget]` 定（单位为估算 token，默认 1500 / 2500 / 1500 / 1000，总上限 6500），超出截断并记 `memory.budget_exceeded` 审计。
+- **工具与权限**：Run 里 `memory_search`、`memory_read`、`memory_propose_write` 默认放行，`memory_approve_proposal` 默认 `defer`：白盒执行器挂起，审批消息里带提案正文。Steward 没有批准工具。Hibernaut 的 MCP 控制面（`memory_bridge.py`）另给运营者 `memory_list_proposals`、`memory_reject_proposal` 与 `memory_record_postmortem`，可跨项目。
+- **复盘**：`memory_record_postmortem` 只收 `run_id`、根因和规则；项目、错误类别、复现次数都从执行账本取。复现指同项目、同错误类别、错误摘要去掉数字与哈希后相同的其他失败 Run；没有摘要的不计。成功的 Run 与不存在的 Run 被拒绝。
+- **机械 GC**（`MemoryGarbageCollector`）：启动时一轮，之后每 `gc_interval_seconds`（默认 86400，0 关闭）一轮，逐项目滚动 `reported.md`、归档已结束会话的旧 `progress/*`、校准 `index.md`、让过期提案失效。只归档会话已关闭且没有其他会话在用的 `progress` 文件，对不上会话的一律保留。
+- **HTTP / MCP 服务**（可选，`[memory_hub.http]`）：`ScopedMemoryHTTPServer` 默认只听回环地址，明文 HTTP，跨主机要在前面加 TLS。每个 token 有角色 `readonly` / `propose` / `admin` 与项目范围，取自环境变量并在启动时删除，agent 子进程拿不到。提案列表按 token 的项目过滤，提案作者取 token 的 subject。`admin` 可批准任意项目的提案，所以不许限定项目。
+- **审计**：hub 的审计事件写入执行账本 `audit_events`，`scope` 为 `project_key`。
+- **测试**：`tests/test_memory_hub.py`（包自身）；`tests/test_memory_hub_wiring.py`（依赖契约、配置、分区与迁移、越权、并发写、分段、工具与审批、复盘、GC、HTTP、热加载）。

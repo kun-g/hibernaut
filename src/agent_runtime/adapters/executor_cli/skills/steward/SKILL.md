@@ -31,3 +31,5 @@ Work can pass between agents only a few times. When a forward is refused for tha
 # Memory
 
 Write down what the next turn needs and the checkout does not already say: decisions, preferences a person stated, work in progress. Keep `index.md` short and pointing at the notes. Correct a note that turns out wrong.
+
+The memory belongs to the project: its other inboxes read and write the same files, so read a file before replacing it. Use `memory_search` before writing a new note, and `memory_propose_write` (append or replace one section) for a small change. `instructions.md` changes only after a person approves the proposal; when a tool says a write is queued, do not act as if it were in effect.

@@ -32,6 +32,7 @@ from agent_runtime.adapters.executor_cli.sde import SDE_OPTION_KEYS, SDE_ROLE, S
 from agent_runtime.adapters.executor_cli.steward import STEWARD_ROLE
 from agent_runtime.adapters.executor_cli.reclaim_sweep import DEFAULT_SWEEP_INTERVAL_SECONDS
 from agent_runtime.adapters.executor_cli.worktree import WorktreeBackend
+from agent_runtime.adapters.memory_bridge import DEFAULT_GC_INTERVAL_SECONDS
 from agent_runtime.adapters.permissions.security import proxy_service_url
 from agent_runtime.app.projects import (
     AgentConfig,
@@ -43,6 +44,9 @@ from agent_runtime.app.projects import (
     validate_project_rules,
 )
 from agent_runtime.core.models import InboxRoute, NewEventPolicy
+from memory_hub import BaselineBudgetConfig, KnowledgeMountConfig, MemoryHubConfig
+from memory_hub.models import AccessRole
+from memory_hub.partition import sanitize_segment
 from runner.cli_drivers import TemplateCLIDriver, ToolHookStyle
 
 _log = logging.getLogger(__name__)
@@ -390,6 +394,55 @@ _RUNNER_KEYS = frozenset(f.name for f in dataclasses.fields(RunnerLinkConfig))
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryHTTPToken:
+    subject: str
+    # The environment variable holding the token; the process takes it out of its environment.
+    token_env: str
+    role: AccessRole = "readonly"
+    allowed_projects: tuple[str, ...] = ("*",)
+    allow_kb: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryHTTPConfig:
+    enabled: bool = False
+    listen_host: str = "127.0.0.1"
+    listen_port: int = 8795
+    tokens: tuple[MemoryHTTPToken, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryHubLinkConfig:
+    default_budget: BaselineBudgetConfig = field(default_factory=BaselineBudgetConfig)
+    project_budgets: dict[str, BaselineBudgetConfig] = field(default_factory=dict[str, BaselineBudgetConfig])
+    mounts: tuple[KnowledgeMountConfig, ...] = ()
+    # inbox_id -> project_key, for inboxes whose id does not name their project.
+    inbox_projects: dict[str, str] = field(default_factory=dict[str, str])
+    index_dir: str = ""
+    max_note_bytes: int = 16_384
+    proposal_ttl_days: int = 14
+    progress_archive_days: int = 7
+    auto_git_commit: bool = False
+    # Mechanical GC of every project's memory; 0 turns it off.
+    gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
+    http: MemoryHTTPConfig = field(default_factory=MemoryHTTPConfig)
+
+    def hub_config(self, memory_root: str | Path) -> MemoryHubConfig:
+        return MemoryHubConfig(
+            memory_root=str(memory_root),
+            default_budget=self.default_budget,
+            project_budgets=self.project_budgets,
+            inbox_project_map=self.inbox_projects,
+            mounts=self.mounts,
+            index_dir=self.index_dir or None,
+            max_note_bytes=self.max_note_bytes,
+            proposal_ttl_days=self.proposal_ttl_days,
+            progress_archive_days=self.progress_archive_days,
+            auto_git_commit=self.auto_git_commit,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class HibernautConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
@@ -406,6 +459,7 @@ class HibernautConfig:
     switchboard: SwitchboardLinkConfig = field(default_factory=SwitchboardLinkConfig)
     peer: PeerHandoffConfig = field(default_factory=PeerHandoffConfig)
     runner: RunnerLinkConfig = field(default_factory=RunnerLinkConfig)
+    memory_hub: MemoryHubLinkConfig = field(default_factory=MemoryHubLinkConfig)
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
 
@@ -642,6 +696,146 @@ def _warn_obsolete(section: dict[str, Any], scope: str, service: str, *keys: str
                 UserWarning,
                 stacklevel=3,
             )
+
+
+_BUDGET_KEYS = frozenset(f.name for f in dataclasses.fields(BaselineBudgetConfig))
+_MOUNT_KEYS = frozenset(f.name for f in dataclasses.fields(KnowledgeMountConfig)) - {"name"}
+_MEMORY_HUB_KEYS = frozenset({
+    "budget", "projects", "mounts", "inbox_projects", "index_dir", "max_note_bytes", "proposal_ttl_days",
+    "progress_archive_days", "auto_git_commit", "gc_interval_seconds", "http",
+})
+_MEMORY_ROLES: tuple[AccessRole, ...] = ("readonly", "propose", "admin")
+
+
+class _Table:
+    # One table of the [memory_hub] section: typed reads that name the offending key.
+    def __init__(self, raw: Any, where: str, keys: frozenset[str] | None = None) -> None:
+        if not isinstance(raw, dict):
+            raise ValueError(f"[{where}] must be a table")
+        self.raw = cast(dict[str, Any], raw)
+        self.where = where
+        unknown = sorted(set(self.raw) - keys) if keys is not None else []
+        if unknown:
+            raise ValueError(f"[{where}] has unknown keys: {', '.join(unknown)}")
+
+    def table(self, key: str, keys: frozenset[str] | None = None) -> _Table:
+        return _Table(self.raw.get(key, {}), f"{self.where}.{key}", keys)
+
+    def tables(self, keys: frozenset[str] | None = None) -> dict[str, _Table]:
+        return {str(name): self.table(name, keys) for name in self.raw}
+
+    def text(self, key: str, default: str | None = None) -> str:
+        value = self.raw.get(key, default)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{self.where}.{key} must be a non-empty string")
+        return value.strip()
+
+    def path(self, key: str, base_dir: Path | None) -> str:
+        return _resolve_path(self.text(key), base_dir)
+
+    def flag(self, key: str, default: bool) -> bool:
+        value = self.raw.get(key, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"{self.where}.{key} must be true or false")
+        return value
+
+    def count(self, key: str, default: int, *, least: int = 1) -> int:
+        value = self.raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < least:
+            raise ValueError(f"{self.where}.{key} must be an integer of at least {least}")
+        return value
+
+    def names(self, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+        value = self.raw.get(key, list(default))
+        if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in cast(list[object], value)):
+            raise ValueError(f"{self.where}.{key} must be a list of strings")
+        return tuple(str(v).strip() for v in cast(list[object], value))
+
+
+def _segment(value: str, where: str) -> str:
+    # Project keys and mount names are path and URI segments.
+    if sanitize_segment(value, field_name=where) != value:
+        raise ValueError(f"{where}: '{value}' may only hold letters, digits, '.', '_' and '-'")
+    return value
+
+
+def _memory_budget(table: _Table, base: BaselineBudgetConfig) -> BaselineBudgetConfig:
+    return dataclasses.replace(base, **{key: table.count(key, getattr(base, key)) for key in _BUDGET_KEYS})
+
+
+def _memory_mount(name: str, table: _Table, base_dir: Path | None) -> KnowledgeMountConfig:
+    defaults = KnowledgeMountConfig(name=name, root="")
+    if table.text("mode", defaults.mode) != "readonly":
+        raise ValueError(f'{table.where}.mode must be "readonly"')
+    return KnowledgeMountConfig(
+        name=_segment(name, table.where),
+        root=table.path("root", base_dir),
+        include_globs=table.names("include_globs", defaults.include_globs),
+        exclude_globs=table.names("exclude_globs", defaults.exclude_globs),
+        max_file_bytes=table.count("max_file_bytes", defaults.max_file_bytes),
+    )
+
+
+def _memory_http(table: _Table) -> MemoryHTTPConfig:
+    defaults = MemoryHTTPConfig()
+    tokens: list[MemoryHTTPToken] = []
+    entries = table.table("tokens").tables(frozenset({"token_env", "role", "allowed_projects", "allow_kb"}))
+    for subject, entry in entries.items():
+        role = next((r for r in _MEMORY_ROLES if r == entry.raw.get("role", "readonly")), None)
+        if role is None:
+            raise ValueError(f"{entry.where}.role must be one of {', '.join(_MEMORY_ROLES)}")
+        projects = entry.names("allowed_projects", ("*",))
+        if role == "admin" and "*" not in projects:
+            # The service lets an admin approve any proposal and collect any project.
+            raise ValueError(f"{entry.where}: role \"admin\" reaches every project; leave allowed_projects out")
+        tokens.append(MemoryHTTPToken(
+            subject=subject, token_env=entry.text("token_env"), role=role, allowed_projects=projects,
+            allow_kb=entry.flag("allow_kb", False),
+        ))
+    enabled = table.flag("enabled", False)
+    if enabled and not tokens:
+        raise ValueError(f"{table.where}.enabled needs at least one [{table.where}.tokens.<subject>]")
+    port = table.count("listen_port", defaults.listen_port, least=0)
+    if port > 65535:
+        raise ValueError(f"{table.where}.listen_port must be a port number (0 picks a free one)")
+    return MemoryHTTPConfig(
+        enabled=enabled, listen_host=table.text("listen_host", defaults.listen_host), listen_port=port,
+        tokens=tuple(tokens),
+    )
+
+
+def parse_memory_hub(raw: Any, *, base_dir: Path | None = None) -> MemoryHubLinkConfig:
+    if raw is None:
+        return MemoryHubLinkConfig()
+    defaults = MemoryHubLinkConfig()
+    section = _Table(raw, "memory_hub", _MEMORY_HUB_KEYS)
+    budget = _memory_budget(section.table("budget", _BUDGET_KEYS), defaults.default_budget)
+    interval = section.raw.get("gc_interval_seconds", defaults.gc_interval_seconds)
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not math.isfinite(interval) or interval < 0:
+        raise ValueError("memory_hub.gc_interval_seconds must be finite and not negative (0 turns it off)")
+    inbox_projects = section.table("inbox_projects")
+    return MemoryHubLinkConfig(
+        default_budget=budget,
+        project_budgets={
+            _segment(key, table.where): _memory_budget(table.table("budget", _BUDGET_KEYS), budget)
+            for key, table in section.table("projects").tables(frozenset({"budget"})).items()
+        },
+        mounts=tuple(
+            _memory_mount(name, table, base_dir)
+            for name, table in section.table("mounts").tables(_MOUNT_KEYS).items()
+        ),
+        inbox_projects={
+            str(inbox): _segment(inbox_projects.text(inbox), f"memory_hub.inbox_projects.{inbox}")
+            for inbox in inbox_projects.raw
+        },
+        index_dir=section.path("index_dir", base_dir) if "index_dir" in section.raw else "",
+        max_note_bytes=section.count("max_note_bytes", defaults.max_note_bytes),
+        proposal_ttl_days=section.count("proposal_ttl_days", defaults.proposal_ttl_days),
+        progress_archive_days=section.count("progress_archive_days", defaults.progress_archive_days),
+        auto_git_commit=section.flag("auto_git_commit", defaults.auto_git_commit),
+        gc_interval_seconds=float(interval),
+        http=_memory_http(section.table("http", frozenset({"enabled", "listen_host", "listen_port", "tokens"}))),
+    )
 
 
 def load_config(path: str | Path) -> HibernautConfig:
@@ -959,5 +1153,6 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         switchboard=parse_switchboard_link(raw.get("switchboard"), base_dir=base_dir),
         peer=parse_peer(raw.get("peer"), base_dir=base_dir),
         runner=parse_runner_link(raw.get("runner"), agents=agents, templates=executors, base_dir=base_dir),
+        memory_hub=parse_memory_hub(raw.get("memory_hub"), base_dir=base_dir),
         config_dir=str(base_dir) if base_dir is not None else "",
     )

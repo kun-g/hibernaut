@@ -13,6 +13,7 @@
 - **`src/switchboard/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`taskboard`、`runner`、`memory_hub`（`.importlinter` 契约 `switchboard-zero-business-deps`）。
 - **`src/ccpeer/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`switchboard`、`taskboard`、`runner`、`memory_hub`（`.importlinter` 契约 `ccpeer-zero-business-deps`）。
 - **`src/runner/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`taskboard`、`switchboard`、`workshop`、`memory_hub`、`ledger`（`.importlinter` 契约 `runner-zero-business-deps`）。控制面经 `agent_runtime/adapters/runner_bridge.py` 单向依赖它。
+- **`src/memory_hub/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`switchboard`、`taskboard`、`runner`、`ledger`（`.importlinter` 契约 `memory-hub-zero-business-deps`），`switchboard`、`runner`、`taskboard` 也禁止导入它（`business-packages-no-memory-hub`）。控制面经 `agent_runtime/adapters/memory_fs/` 与 `memory_bridge.py` 单向依赖它。
 
 ## 2. 核心词汇表与并发红线
 

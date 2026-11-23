@@ -6,6 +6,15 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from agent_runtime.adapters.memory_fs import (
+    APPROVE_TOOL,
+    MEMORY_TOOLS,
+    BaselineSegments,
+    baseline_segments,
+    call_memory_tool,
+    describe_proposal,
+    write_memory,
+)
 from agent_runtime.core.models import (
     Emit,
     Event,
@@ -92,8 +101,10 @@ class WhiteboxExecutor:
         caps: RunCapabilities,
     ) -> RunOutcome:
         session_id = session.session_id if session is not None else new_id("sess")
-        baseline = caps.memory.load_baseline()
+        baseline = baseline_segments(caps.memory)
         system_prefix = self._build_cacheable_prefix(baseline)
+        # Goes with every request but never into messages, so neither compaction nor a checkpoint holds a copy.
+        volatile_tail = self._build_volatile_tail(baseline)
 
         messages: list[LLMMessage] = []
         pending_deferred: dict[str, Any] | None = None
@@ -116,7 +127,7 @@ class WhiteboxExecutor:
             tool_name = str(pending_deferred["tool_name"])
             tool_args = dict(pending_deferred["args"])
             if approved:
-                result_text = self._invoke_tool(tool_name, tool_args, caps)
+                result_text = await self._run_tool(tool_name, tool_args, caps, actor="human approval")
                 messages.append(
                     LLMMessage(
                         role="tool",
@@ -132,7 +143,7 @@ class WhiteboxExecutor:
                 )
 
         available_tools = sorted(
-            {"read_memory", "write_memory", "schedule_timer", *self._custom_tools.keys()}
+            {"read_memory", "write_memory", "schedule_timer", *MEMORY_TOOLS, *self._custom_tools.keys()}
         )
         emitted: list[str] = []
 
@@ -148,7 +159,7 @@ class WhiteboxExecutor:
             messages = self._compact_if_needed(messages)
             reply = await self._llm.complete(
                 system_prefix=system_prefix,
-                messages=messages,
+                messages=[*volatile_tail, *messages],
                 available_tools=available_tools,
             )
 
@@ -200,6 +211,8 @@ class WhiteboxExecutor:
                         f"参数={json.dumps(call.args, ensure_ascii=False)}。"
                         f"原因：{decision.reason}"
                     )
+                    if call.tool_name == APPROVE_TOOL:
+                        prompt = f"{prompt}\n\n{describe_proposal(caps.memory, call.args)}"
                     return Suspend(
                         request_id=request_id,
                         prompt=prompt,
@@ -207,7 +220,7 @@ class WhiteboxExecutor:
                         session_id=session_id,
                     )
 
-                result_text = self._invoke_tool(call.tool_name, call.args, caps)
+                result_text = await self._run_tool(call.tool_name, call.args, caps, actor=self._executor_id)
                 messages.append(
                     LLMMessage(
                         role="tool",
@@ -219,12 +232,16 @@ class WhiteboxExecutor:
             return Emit(messages=tuple(emitted), session_id=session_id)
         return Silent()
 
-    def _build_cacheable_prefix(self, baseline: dict[str, str]) -> str:
+    def _build_cacheable_prefix(self, baseline: BaselineSegments) -> str:
         sections = [self._system_prompt]
-        for name in ("instructions.md", "index.md", "reported.md"):
-            content = baseline.get(name, "").strip()
-            sections.append(f"## {name}\n{content or '(empty)'}")
+        sections.extend(f"## {name}\n{text or '(empty)'}" for name, text in baseline.stable)
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _build_volatile_tail(baseline: BaselineSegments) -> list[LLMMessage]:
+        return [
+            LLMMessage(role="system", content=f"## {name}\n{text}") for name, text in baseline.volatile if text
+        ]
 
     def _compact_if_needed(self, messages: list[LLMMessage]) -> list[LLMMessage]:
         if len(messages) <= self._max_messages_before_compact:
@@ -235,6 +252,18 @@ class WhiteboxExecutor:
         )
         return [head_summary, *messages[-8:]]
 
+    async def _run_tool(self, tool_name: str, args: dict[str, Any], caps: RunCapabilities, *, actor: str) -> str:
+        try:
+            if tool_name in MEMORY_TOOLS and tool_name not in self._custom_tools:
+                # A search may have to index a whole knowledge mount first.
+                return await asyncio.to_thread(call_memory_tool, caps.memory, tool_name, args, actor=actor)
+            if tool_name == "write_memory":
+                return write_memory(caps.memory, str(args["path"]), str(args["content"]))
+        except (OSError, ValueError) as exc:
+            # Memory Hub refused (budget, scope, no such document): for the agent to handle, not a failed Run.
+            return f"[ERROR] {exc}"
+        return self._invoke_tool(tool_name, args, caps)
+
     def _invoke_tool(
         self,
         tool_name: str,
@@ -243,9 +272,6 @@ class WhiteboxExecutor:
     ) -> str:
         if tool_name == "read_memory":
             return caps.memory.read_on_demand(str(args["path"]))
-        if tool_name == "write_memory":
-            caps.memory.write(str(args["path"]), str(args["content"]))
-            return f"wrote {args['path']}"
         if tool_name == "schedule_timer":
             timer_id = caps.timers.schedule(
                 kind=args.get("kind", "follow_up"),

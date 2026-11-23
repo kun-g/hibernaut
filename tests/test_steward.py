@@ -267,8 +267,9 @@ class ToolTests(StewardCase):
     async def test_tools_are_listed(self) -> None:
         await self.run_steward()
         self.assertEqual(self.calls()[-1]["tools"], [
-            "forward_to_inbox", "git", "list_events", "list_files", "list_sessions", "read_file", "read_memory",
-            "search_files", "write_memory",
+            "forward_to_inbox", "git", "list_events", "list_files", "list_sessions",
+            "memory_propose_write", "memory_read", "memory_search", "read_file", "read_memory", "search_files",
+            "write_memory",
         ])
 
     async def test_forward(self) -> None:
@@ -322,13 +323,15 @@ class ToolTests(StewardCase):
             ("read_memory", {"path": "index.md"}), ("write_memory", {"path": "index.md", "content": "x"}),
             ("list_sessions", {}), ("list_events", {}), ("git", {"args": ["status"]}),
             ("read_file", {"path": "calc.py"}), ("search_files", {"pattern": "x"}), ("list_files", {}),
+            ("memory_search", {"query": "x"}), ("memory_read", {"uri": "index.md"}),
+            ("memory_propose_write", {"target_uri": "index.md", "op": "append", "content": "x", "rationale": "r"}),
         ):
             failed, text = await self.tool(name, **arguments)
             self.assertTrue(failed, name)
             self.assertIn("no", text)
         self.assertEqual([s for s in seen if s != "steward.launch"],
                          ["read_memory", "write_memory", "list_sessions", "list_events", "git_read", "read_file",
-                          "search_files", "list_files"])
+                          "search_files", "list_files", "memory_search", "memory_read", "memory_propose_write"])
         self.assertEqual(self.caps.memory.read_on_demand("index.md"), "")
 
     async def test_default_policy_allows_the_stewards_tools(self) -> None:

@@ -77,6 +77,7 @@ from agent_runtime.adapters.executor_cli.reviewer import (
 )
 from agent_runtime.adapters.executor_cli.run_state import TurnSlot, read_state, write_state
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
+from agent_runtime.adapters.memory_fs import baseline_segments
 from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
 from agent_runtime.core.models import Emit, Event, RunDetached, RunOutcome, SessionRef, Silent, Suspend, new_id
 from agent_runtime.core.ports import RunCapabilities, RunContext
@@ -623,12 +624,7 @@ class SDEExecutor:
             raise ReviewAborted(str(exc)) from exc
 
     async def _first_prompt(self, state: _State, caps: RunCapabilities) -> str:
-        parts: list[str] = []
-        baseline = caps.memory.load_baseline()
-        for name in ("instructions.md", "index.md"):
-            text = baseline.get(name, "").strip()
-            if text:
-                parts.append(f"## {name}\n{text}")
+        parts = [f"## {name}\n{text}" for name, text in baseline_segments(caps.memory).stable if text]
         parts.append(f"## Task requirements\n{state.requirements}")
         if self._terminal is not None and state.work_key:
             parts.append(_reviewer_channel(self._peer_reviewer, state.work_key))

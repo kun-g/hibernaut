@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import cast, get_args
+from typing import Any, cast, get_args
 
 from agent_runtime.core.models import Event, FailureRoute, RunLedgerEntry, RunTelemetry
 from ledger import (
@@ -13,6 +13,7 @@ from ledger import (
     MCPReadToolHandlers,
     RunRecord,
     RunStorePort,
+    Severity,
     SQLiteLedgerStore,
     SwitchboardLedgerAuditAdapter,
     classify_error,
@@ -25,6 +26,7 @@ from ledger import (
 )
 
 _ERROR_KINDS: frozenset[str] = frozenset(get_args(ErrorKind))
+_SEVERITIES: frozenset[str] = frozenset(get_args(Severity))
 
 
 def _log_text(telemetry: RunTelemetry) -> str:
@@ -111,6 +113,28 @@ class LedgerRunRecorder:
         )
 
 
+class MemoryLedgerAudit:
+    # Memory Hub's AuditHookPort on the ledger.
+    def __init__(self, store: SQLiteLedgerStore) -> None:
+        self._store = store
+
+    def emit(self, stage: str, outcome: str, detail: dict[str, Any], *, severity: str = "info") -> None:
+        project_key = detail.get("project_key")
+        safe_emit_audit(
+            self._store,
+            AuditRecord(
+                audit_id=new_ledger_id("aud"),
+                occurred_at=utc_now_iso(),
+                service="hibernaut",
+                stage=stage,
+                outcome=outcome,
+                severity=cast(Severity, severity) if severity in _SEVERITIES else "info",
+                scope=str(project_key) if project_key is not None else None,
+                detail=detail,
+            ),
+        )
+
+
 class RunLedger:
     # The process's run ledger: ledger.db (its own SQLite file, so it never contends with the runtime database's
     # write lock), run logs under <ledger dir>/logs/runs, and the adapters the composition root hands out.
@@ -128,6 +152,9 @@ class RunLedger:
 
     def switchboard_audit(self) -> SwitchboardLedgerAuditAdapter:
         return SwitchboardLedgerAuditAdapter(self.store)
+
+    def memory_audit(self) -> MemoryLedgerAudit:
+        return MemoryLedgerAudit(self.store)
 
     def latest_failed_run_id(self, event_id: str) -> str | None:
         for run in self.store.list_runs(event_id=event_id):

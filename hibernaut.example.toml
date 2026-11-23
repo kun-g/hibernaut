@@ -302,3 +302,36 @@ gh_command = "gh"
 # listen_port = 8790
 # token_env = "HIBERNAUT_RUNNER_TOKEN"   # 节点共享 token 所在的环境变量，启动时取出并从环境里删除
 # affinity_db_path = "runner/affinity.db"   # 不填 = runtime.db_path 所在目录下的 runner/affinity.db
+
+# 项目记忆（Memory Hub）。不写这一段用下列默认值；改动要重启。同一项目的 Inbox 共用 <memory_root>/projects/<project_key>/。
+# 设计与写入策略见 docs/architecture.md §14。
+# [memory_hub]
+# gc_interval_seconds = 86400            # 机械清理周期；0 = 关闭
+# max_note_bytes = 16384
+# proposal_ttl_days = 14                 # 未批的提案过期天数
+# progress_archive_days = 7              # 会话已结束的 progress 文件多少天后归档
+# auto_git_commit = false                # 清理有改动时提交（memory_root 须是 Git 仓库）
+# index_dir = "./memory_index"           # 检索索引目录；不填 = memory_root 下的 .index
+# [memory_hub.budget]                    # 每轮必载基线的预算，单位为估算 token
+# global_instructions = 1500
+# project_instructions = 2500
+# project_index = 1500
+# project_reported = 1000
+# total_max_tokens = 6500
+# [memory_hub.projects.hibernaut.budget] # 按项目覆盖，没写的项沿用上面
+# project_index = 2000
+# [memory_hub.inbox_projects]            # inbox_id 归哪个项目；proj:<key> 与 <key>:<任务> 不用写
+# "user:main" = "hibernaut"
+# [memory_hub.mounts.vault]              # 只读知识库，用 kb://vault/ 引用
+# root = "./vault"                       # 相对本文件
+# include_globs = ["**/*.md"]
+# exclude_globs = ["**/.git/**"]
+# [memory_hub.http]                      # 可选的 HTTP 与 MCP 服务；明文，跨主机时前面要有 TLS
+# enabled = true
+# listen_host = "127.0.0.1"
+# listen_port = 8795
+# [memory_hub.http.tokens.laptop]
+# token_env = "HIBERNAUT_MEMORY_TOKEN_LAPTOP"   # 启动时取出并从环境里删除
+# role = "propose"                       # readonly | propose | admin（admin 不能限定项目）
+# allowed_projects = ["hibernaut"]
+# allow_kb = false                       # 能否读知识库挂载
