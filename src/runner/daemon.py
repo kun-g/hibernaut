@@ -31,7 +31,7 @@ from runner.protocol import (
     run_identity,
     utc_now_iso,
 )
-from runner.supervisor import ProcessSupervisor, build_child_env
+from runner.supervisor import ChildEnvError, ProcessSupervisor, build_child_env
 from runner.worktree import (
     GitWorktreeBackend,
     OrcaWorktreeBackend,
@@ -386,7 +386,7 @@ class RunnerDaemon:
                     work_key=req.work_key,
                     workdir=resolved.workdir,
                 )
-        except WorkspaceIsolationError as exc:
+        except (WorkspaceIsolationError, ChildEnvError) as exc:
             return self._refused(req, started_at, start_mono, "permission_denied", str(exc))
 
         pre_fp = await asyncio.to_thread(worktree_fingerprint, resolved.workdir) if req.readonly else None
@@ -397,7 +397,7 @@ class RunnerDaemon:
                 extra_env=spec.env,
                 credential_lease=req.credential_lease,
             )
-        except PermissionError as exc:
+        except ChildEnvError as exc:
             return self._refused(req, started_at, start_mono, "permission_denied", str(exc))
 
         def _on_line(line: str) -> None:

@@ -14,6 +14,7 @@ from typing import Any, Callable, Final, Literal, Protocol, Sequence, cast
 
 from runner.config import NamespacePolicy, ProjectCheckout
 from runner.protocol import ReclaimResult, WorktreeRef, utc_now_iso
+from runner.supervisor import ChildEnvError, build_child_env
 
 _SAFE_HINT_RE: Final = re.compile(r"[^a-z0-9_-]+")
 # Under the worktree base dir; write directories always start with a namespace prefix, never a dot.
@@ -69,12 +70,12 @@ CommandRunner = Callable[[Sequence[str], Path], CommandOutput]
 
 
 def _run_cmd(cmd: Sequence[str], cwd: Path) -> CommandOutput:
-    env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    # The same allowlist the CLI subprocesses get; hooks, filters and helpers that git starts inherit it too. Raises
+    # ChildEnvError before anything runs.
     proc = subprocess.run(
         list(cmd),
         cwd=str(cwd),
-        env=env,
+        env=build_child_env(os.environ),
         capture_output=True,
         text=True,
         check=False,
@@ -235,6 +236,12 @@ def _git_is_dirty(workdir: Path) -> bool:
 def _head_is_on_remote(workdir: Path, head_sha: str) -> bool:
     res = _run_cmd(["git", "branch", "-r", "--contains", head_sha], cwd=workdir)
     return res.returncode == 0 and bool(res.stdout.strip())
+
+
+def _env_refused(exc: ChildEnvError, *, branch_kept: str | None = None) -> ReclaimResult:
+    return ReclaimResult(
+        reclaimed=False, status="blocked", reason=str(exc), blockers=("child_env_refused",), branch_kept=branch_kept
+    )
 
 
 class WorktreeManager:
@@ -563,6 +570,8 @@ class WorktreeManager:
             return ReclaimResult(reclaimed=False, status="error", reason=str(exc), blockers=("remove_failed",))
         except WorkspaceIsolationError as exc:
             return ReclaimResult(reclaimed=False, status="blocked", reason=str(exc), blockers=("readonly_not_owned",))
+        except ChildEnvError as exc:
+            return _env_refused(exc)
         with self._lock:
             rec = self.get_record(
                 namespace=policy.namespace,
@@ -605,7 +614,11 @@ class WorktreeManager:
                     branch_kept=rec.branch,
                 )
 
-        blockers = self._local_git_blockers(rec.workdir, merged_head_sha=merged_head_sha)
+        try:
+            blockers = self._local_git_blockers(rec.workdir, merged_head_sha=merged_head_sha)
+        except ChildEnvError as exc:
+            self._release_reclaim(rec, claim_token)
+            return _env_refused(exc, branch_kept=rec.branch)
         if blockers:
             self._release_reclaim(rec, claim_token)
             return ReclaimResult(
@@ -619,6 +632,9 @@ class WorktreeManager:
         try:
             if rec.workdir.exists():
                 self._backend.remove(primary_checkout=primary, workdir=rec.workdir)
+        except ChildEnvError as exc:
+            self._release_reclaim(rec, claim_token)
+            return _env_refused(exc, branch_kept=rec.branch)
         except Exception as exc:
             self._release_reclaim(rec, claim_token)
             return ReclaimResult(
