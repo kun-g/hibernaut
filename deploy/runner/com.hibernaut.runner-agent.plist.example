@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Read-only remote agent node as a per-user LaunchAgent, on the node. Replace /Users/YOU and the repository path, then
+  see REMOTE.md. PATH must hold the agent CLI's own runtime. It reads its Relay token from the owner-only file named in
+  agent-runner.toml: put no credential in EnvironmentVariables.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hibernaut.runner-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>-m</string>
+    <string>runner.agent_service</string>
+    <string>--config</string>
+    <string>/Users/YOU/runner-agent/agent-runner.toml</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>/Users/YOU/runner-agent/src-checkout/src</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/Users/YOU/runner-agent</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <!-- Longer than the grace a stopped run's process group gets before SIGKILL. -->
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/YOU/Library/Logs/hibernaut-runner-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOU/Library/Logs/hibernaut-runner-agent.log</string>
+</dict>
+</plist>

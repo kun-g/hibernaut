@@ -36,7 +36,13 @@ class RunnerRelayAgent:
         hub_url: str,
         token: str,
         reconnect_delays: tuple[float, ...] = (0.2, 0.5, 1.0, 2.0, 5.0),
+        handshake_timeout_seconds: float = 10.0,
+        min_silence_seconds: float = 60.0,
     ) -> None:
+        # A forwarded connection may stay open while nothing answers behind it: without these the node would wait on it
+        # for good. The silence allowed is three of the hub's heartbeats, and never less than min_silence_seconds.
+        self._handshake_timeout = handshake_timeout_seconds
+        self._min_silence = min_silence_seconds
         self._daemon = daemon
         self._hub_url = hub_url
         self._token = token
@@ -143,7 +149,9 @@ class RunnerRelayAgent:
 
         bg_tasks: set[asyncio.Task[None]] = set()
         try:
-            await client_handshake(reader, writer, host=f"{host}:{port}", path=path)
+            await asyncio.wait_for(
+                client_handshake(reader, writer, host=f"{host}:{port}", path=path), timeout=self._handshake_timeout
+            )
             await _send(
                 {
                     "type": "hello",
@@ -159,12 +167,15 @@ class RunnerRelayAgent:
             )
             if welcome.get("type") != "welcome":
                 raise WSProtocolError("expected welcome frame")
+            silence = max(self._min_silence, 3 * float(welcome.get("heartbeat_sec", 0)))
             self._conn_epoch = int(welcome["conn_epoch"])
             self._connected_event.set()
             _log.info("relay connected (conn_epoch %s)", self._conn_epoch)
 
             while not self._stop_event.is_set():
-                frame = await recv_json(reader, writer, expect_masked=False, send_masked=True)
+                frame = await asyncio.wait_for(
+                    recv_json(reader, writer, expect_masked=False, send_masked=True), timeout=silence
+                )
                 if frame.get("conn_epoch") != self._conn_epoch:
                     continue
                 ftype = frame.get("type")

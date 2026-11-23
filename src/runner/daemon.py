@@ -6,7 +6,9 @@ import logging
 import os
 import time
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Mapping, ParamSpec, TypeVar, cast
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, Mapping, ParamSpec, TypeAlias, TypeVar, cast
 
 from runner.cli_drivers import (
     CLIDriver,
@@ -44,6 +46,9 @@ from runner.worktree import (
     worktree_fingerprint,
 )
 
+
+# (workdir, tool name, arguments) -> why this node does not run the call, or None to leave it to the authorizer.
+ToolGuard: TypeAlias = Callable[[Path, str, Mapping[str, Any]], str | None]
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
@@ -103,8 +108,10 @@ class RunnerDaemon:
         supervisor: ProcessSupervisor | None = None,
         stream_pipe: StreamPipe | None = None,
         hook_arm_timeout_seconds: float = 60.0,
+        tool_guard: ToolGuard | None = None,
     ) -> None:
         self._config = config
+        self._tool_guard = tool_guard
         self._drivers: dict[str, CLIDriver] = dict(drivers) if drivers is not None else default_cli_drivers()
         backend = OrcaWorktreeBackend() if config.worktree_backend == "orca" else GitWorktreeBackend()
         self._worktrees = worktree_manager or WorktreeManager(
@@ -448,11 +455,13 @@ class RunnerDaemon:
         try:
             binding: ToolGateBinding | None = None
             if entry.authorizer is not None:
+                guard = self._tool_guard
                 gate = ToolGate(
                     run_id=req.run_id,
                     authorizer=entry.authorizer,
                     stopped=entry.cancel_event.is_set,
                     on_defer=entry.cancel_event.set,
+                    guard=partial(guard, resolved.workdir) if guard is not None else None,
                 )
                 binding = await gate.open()
             spec = driver.build_command(req, resolved.workdir, tool_gate=binding)

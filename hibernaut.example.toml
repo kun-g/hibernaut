@@ -314,6 +314,7 @@ gh_command = "gh"
 #                                        # in_process 下其 args / resume_args 不得带 --settings、--permission-mode 等会改掉钩子的参数
 # allow_tools = ["Read", "Grep", "Glob", "Edit", "Write"]   # 工具名按各 CLI 的叫法；不在这里也不在内置名单里的工具一律挂起问人
 # block_tools = ["WebFetch"]             # 优先于 allow_tools；参数含 rm -rf 等危险内容的调用始终拒绝
+# readonly_only = false                  # true = 这些 agent 的每个 Run 都只读，不论事件怎么写
 # timeout_seconds = 1800                 # 单次 Run 的硬上限
 # node_wait_seconds = 60                 # 没有空槽（relay：或没有节点在线）时最多等多久，超时按执行失败处理
 # in_process：
@@ -325,7 +326,9 @@ gh_command = "gh"
 # listen_host = "127.0.0.1"              # 只说明文 ws；跨网络时前面要有 TLS
 # listen_port = 8790
 # token_env = "HIBERNAUT_RUNNER_TOKEN"   # 节点共享 token 所在的环境变量，启动时取出并从环境里删除
+# token_file = "~/.config/hibernaut/runner-agent.token"   # 与 token_env 二选一：本用户所有、0600、至少 32 个字符；不能与试点共用
 # affinity_db_path = "runner/affinity.db"   # 不填 = runtime.db_path 所在目录下的 runner/affinity.db
+# 远端只读 Agent 节点（专用执行器 + 加密隧道）的完整配置、验证与回退见 deploy/runner/REMOTE.md。
 
 # 项目记忆（Memory Hub）。不写这一段用下列默认值；改动要重启。同一项目的 Inbox 共用 <memory_root>/projects/<project_key>/。
 # 设计与写入策略见 docs/architecture.md §14。

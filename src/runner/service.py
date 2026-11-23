@@ -10,15 +10,15 @@ import os
 import signal
 import sys
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Mapping, cast
+from typing import Any, Callable, Final, Mapping, cast
 from urllib.parse import urlsplit
 
 from runner.check_driver import ProtocolCheckDriver
-from runner.cli_drivers import CLIDriver
+from runner.cli_drivers import CLIDriver, TemplateCLIDriver
 from runner.config import RunnerConfig, parse_runner_config
-from runner.daemon import RunnerDaemon
+from runner.daemon import RunnerDaemon, ToolGuard
 from runner.transport.auth import read_relay_token
 from runner.transport.relay_client import RunnerRelayAgent
 
@@ -37,18 +37,23 @@ _TABLES: Final[Mapping[str, frozenset[str]]] = {
 }
 
 
+def service_drivers() -> dict[str, CLIDriver]:
+    # The only program this service can start. No configuration adds another: an agent CLI has its own service
+    # (runner.agent_service), and the pilot's relay does not admit it.
+    driver = ProtocolCheckDriver()
+    return {driver.executor_id: driver}
+
+
 @dataclass(frozen=True, slots=True)
 class RunnerServiceConfig:
     runner: RunnerConfig
     relay_url: str
     token_file: Path
+    drivers: Mapping[str, CLIDriver] = field(default_factory=service_drivers)
+    tool_guard: ToolGuard | None = None
 
-
-def service_drivers() -> dict[str, CLIDriver]:
-    # The only program this service can start. No configuration adds another: an agent CLI here would call tools
-    # without Hibernaut's per-call authorization.
-    driver = ProtocolCheckDriver()
-    return {driver.executor_id: driver}
+    def open_daemon(self) -> RunnerDaemon:
+        return RunnerDaemon(self.runner, drivers=self.drivers, tool_guard=self.tool_guard)
 
 
 def parse_service_config(raw: Mapping[str, Any], *, base_dir: Path) -> RunnerServiceConfig:
@@ -95,10 +100,15 @@ def load_service_config(path: Path) -> RunnerServiceConfig:
     return parse_service_config(tomllib.loads(resolved.read_text(encoding="utf-8")), base_dir=resolved.parent)
 
 
-def _check_checkouts(config: RunnerConfig) -> None:
-    for project in config.projects.values():
+def _check_paths(config: RunnerServiceConfig) -> None:
+    for project in config.runner.projects.values():
         if not (project.checkout_path / ".git").exists():
             raise ValueError(f"projects.{project.project_key}.checkout_path {project.checkout_path} is not a git checkout")
+    for driver in config.drivers.values():
+        if isinstance(driver, TemplateCLIDriver) and not (
+            Path(driver.command).is_file() and os.access(driver.command, os.X_OK)
+        ):
+            raise ValueError(f"executors.{driver.executor_id}.command {driver.command} is not an executable file")
 
 
 def _lock_state_dir(state_dir: Path) -> int:
@@ -114,7 +124,7 @@ def _lock_state_dir(state_dir: Path) -> int:
 
 
 async def serve(config: RunnerServiceConfig, token: str, stop: asyncio.Event) -> int:
-    daemon = RunnerDaemon(config.runner, drivers=service_drivers())
+    daemon = config.open_daemon()
     agent = RunnerRelayAgent(daemon=daemon, hub_url=config.relay_url, token=token)
     stopping = asyncio.ensure_future(stop.wait())
     try:
@@ -140,15 +150,17 @@ async def _main(config: RunnerServiceConfig, token: str) -> int:
     return await serve(config, token, stop)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m runner.service", description="Standalone read-only Runner")
+def run_service(
+    argv: list[str] | None, *, prog: str, description: str, load: Callable[[Path], RunnerServiceConfig]
+) -> int:
+    parser = argparse.ArgumentParser(prog=prog, description=description)
     parser.add_argument("--config", required=True, type=Path, help="Path to runner.toml")
     parser.add_argument("--check", action="store_true", help="Validate the configuration, print the capabilities, exit")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stderr)
     try:
-        config = load_service_config(args.config)
-        _check_checkouts(config.runner)
+        config = load(args.config)
+        _check_paths(config)
         token = read_relay_token(config.token_file)
         lock = _lock_state_dir(config.runner.state_dir)
     except (OSError, ValueError, KeyError) as exc:
@@ -156,13 +168,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         if args.check:
-            daemon = RunnerDaemon(config.runner, drivers=service_drivers())
+            daemon = config.open_daemon()
             print(json.dumps(daemon.capabilities_sync().to_dict(), ensure_ascii=False, indent=2))
             daemon.close()
             return 0
         return asyncio.run(_main(config, token))
     finally:
         os.close(lock)
+
+
+def main(argv: list[str] | None = None) -> int:
+    return run_service(
+        argv, prog="python -m runner.service", description="Standalone read-only Runner", load=load_service_config
+    )
 
 
 if __name__ == "__main__":

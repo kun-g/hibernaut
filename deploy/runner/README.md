@@ -1,5 +1,7 @@
 # 只读试点 Runner 部署（macOS launchd）
 
+（另一台机器上的只读 Agent 节点见 [`REMOTE.md`](REMOTE.md)，可与本试点并行。）
+
 一条任务级 Inbox 的协议文件校验由这台独立 Runner 执行，设计与边界见 [`docs/runner.md`](../../docs/runner.md) §9。**默认关闭**；下面每一步都由人在部署机上做，代码合入不会改线上配置，也不会启动服务。
 
 ## 启用

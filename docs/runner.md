@@ -46,6 +46,7 @@
 - **工作区命令同一份受限环境**：`worktree.py` 的每条 git / orca 命令（创建、解析、指纹、只读还原、校验、回收）都以 `build_child_env` 的结果启动，git 拉起的 hook 与 filter 随之继承；Runner 自身的 `GH_TOKEN`、`SSH_AUTH_SOCK`、`GIT_ASKPASS`、`GIT_CONFIG_*`、`ORCA_*` 等不传入。环境带凭据（同上）时以 `ChildEnvError` 在启动任何命令前拒绝：Run 为 `refused`（`permission_denied`），回收为 `blocked`（`child_env_refused`，工作区记录退回 `ready`，配置改好后可再回收），文案只含变量名。
 - **输入写入不挡看门狗**：经 stdin 传 prompt 的驱动，写入在独立任务里进行，与输出读取、硬超时、静默看门狗和 `interrupt` 检查并发；子进程不读输入时超时与中断照常生效，结束时先取消写入再回收进程组。
 - **交互 Run 不降级**：内置 `TemplateCLIDriver` 只会起后台子进程，能力里的 `interactive_surface` 恒为 `none`；`interactive=True` 的请求在节点上以 `refused`（`config_error`）结束，Hub 路由也要求执行器本身声明 `orca`。在 Orca 可见终端里启动并监管 CLI 的驱动尚未实现。
+- **静默连接不会一直等**：握手 10 秒没有完成，或 `welcome` 之后超过 `max(60 秒, 3 × heartbeat_sec)` 没有收到 Hub 的任何帧，Agent 就结束这个连接（按断线处理）并重连；经隧道转发的连接在另一端断网后可能一直不关闭。
 - **断线后先收尾再重连**：Agent 的连接断开时，取消该连接上的全部 Run 并等它们结束（含 worktree 线程与进程组回收），之后才重连并读取 `ready_work_keys`；仍在创建的写工作区因此不会从 `hello` 里漏掉，Hub 不会删掉它的亲和绑定。
 - **日志先于进程、输出按块读取**：`ProcessSupervisor` 先打开运行日志再启动子进程，打不开日志就不启动；启动后的每条退出路径都经进程组回收。输出按 64 KiB 块持续排空并写日志，逐行回调另有 4 MiB 的行缓冲上限（`MAX_STREAM_LINE_BYTES`），超长行不会中断读取；读取失败时 Run 记为 `failed`，`stderr` 以 `runner output read failed` 开头。
 - **回复只认发出请求的连接**：`run.accepted` / `run.completed` 只在来自该 `run_id` 提交时的 `runner_id` 与 `conn_epoch` 时生效，`rpc.reply` 只在来自请求发往的连接时生效；别的节点或旧连接发来的同名回复被忽略。
@@ -57,6 +58,7 @@
   - **批准后恢复**：`approval_request_id` 的决定到达后，Bridge 用原 prompt 加审批结果续跑（CLI 支持原生续接时续同一会话）。批准只放行一次参数完全相同的调用（`Bash` / `Shell` / `run_terminal_command` 的 `description` 说明文字不计），参数变了重新问人，没用上的批准随下一个检查点保留；拒绝则本次 Run 内拦下该调用并附审批意见；策略已改为 `block` 时批准无效。执行器出错重试时，用过的批准不再生效（记在进程内存里，进程重启后重放同一批事件会再次生效）。只读 Run 恢复后仍是只读。
   - **各 CLI 的钩子**：`claude` 用 `--settings`（`PreToolUse` 匹配全部工具，`SessionStart` 报到，`disableAllHooks=false`）加 `--permission-mode dontAsk`（钩子没放行的一律拒绝）；`cursor-agent` 用 `--plugin-dir`（`preToolUse` `failClosed`）加 `--force --trust`；`grok` 用 `--agent` 定义文件（`PreToolUse` `failClosed`）加 `--permission-mode bypassPermissions --no-subagents --disallowed-tools workflow`（子代理与 workflow 不走本 agent 的钩子）。会替换或关掉这些设置的参数（如 `--settings`、`--permission-mode`、`--bare`）不得出现在驱动的 `args` / `resume_args` 里，构造驱动时即报错。`dsh` 没有可用钩子。
   - **fail-closed**：声明会调工具（`calls_tools=True`）的驱动没有 `ToolAuthorizer` 时，`RunnerDaemon` 以 `refused`（`permission_denied`）拒绝启动；要求授权（`authorize_tools`）但驱动没有钩子时同样拒绝，Hub 路由跳过没有声明 `tool_authorization` 的节点（旧节点视为没有）；Bridge 对工具能力未知或会调工具的执行器，未设 `authorize_tools` 时在提交前就返回 `Emit(status="refused")`。钩子 60 秒内没有报到则中断该 Run，跑完都没报到则结果作废（`failed` / `permission_denied`）。钩子读不懂载荷、参数被截断或超过 512 KiB、连不上 `ToolGate`、回调报错或 60 秒无回答，都按拒绝处理（退出码 2）。
+  - **节点自己的限制**：`RunnerDaemon(tool_guard=…)` 在问控制面之前先判一次，不许的调用由节点直接拒绝（不发 `tool.authorize`），只收窄、不放宽。§10 的节点用它把 CLI 限在只读工具和工作区内；其余组装不挂。
   - **不在覆盖范围**：仓库或用户自己给 CLI 配的其他钩子由 CLI 直接执行，不经 `PermissionPort`；被放行的 `Bash` 命令内部做什么由策略对参数的判定负责。
 - **回复文本**：驱动解析到 `type = "result"` 的 JSON 行时，其 `result` 文本记为 `RunResult.final_text`（上限 65536 字符），Bridge 优先用它作回信；`stdout_excerpt` 只保留输出开头 256 KiB，流更长时仍能取到最后的结果行。
 - **Orca 后端**：`orca worktree create` 带 `--repo path:<主检出>`、`--base-branch <解析后的提交>`、`--no-parent`、`--setup skip`、`--json`，以回执里的绝对路径与分支（须为请求的分支或其 `-N` 后缀）为准登记，回收时按该路径 `orca worktree rm`。
@@ -67,10 +69,11 @@
 
 - **`executors`**：不填时是所有命令名或执行器名为 `claude` / `grok` / `cursor-agent` 的 CLI agent。`in_process` 模式按 `[executors.<id>]` 的 `command` / `args` / `resume_args` / `env` 构造驱动，参数与钩子冲突、没有钩子的执行器在解析配置时报错；`relay` 模式的命令由各节点自己的驱动决定。
 - **权限策略**：`allow_tools` / `block_tools` 并入该进程 Worker 的 `AutoModePermissionAdapter`（优先级不变：block、危险参数、defer、allow）。两者和内置名单都没有的工具一律 `defer`，所以只读工具（如 `Read`、`Grep`、`Glob`）要显式列出，否则第一次调用就会挂起问人。
+- **`readonly_only`**：默认 `false`；`true` 时这些 agent 的每个 Run 都按只读派发，不论事件带不带 `readonly`。
 - **`mode = "in_process"`**：进程内 `RunnerDaemon` + `InProcessRunnerClient(caller_id="hibernaut", bound_namespace="hb")`；项目取自 `[projects.*]`（基线分支为 `origin/<delivery.base_branch>`，缺省 `origin/main`），状态库与日志在 `state_dir`（缺省 `db_path` 同目录的 `runner/`）。
-- **`mode = "relay"`**：进程内 `RunnerRelayHub` 监听 `listen_host:listen_port`，亲和库为 `WorkspaceAffinityStore`（缺省 `runner/affinity.db`），共享 token 从 `token_env` 指定的环境变量取出后即从 `os.environ` 删除，执行器子进程看不到。Hub 只说明文 ws，跨网络时前面要有 TLS。节点掉线、未连上或没有空槽（含 `workspace_busy`）时，Run 最多等 `node_wait_seconds`，期间可被新事件中断；超时后按执行失败处理（不是无限期保 `pending`）。
+- **`mode = "relay"`**：进程内 `RunnerRelayHub` 监听 `listen_host:listen_port`，亲和库为 `WorkspaceAffinityStore`（缺省 `runner/affinity.db`），共享 token 从 `token_env` 指定的环境变量取出后即从 `os.environ` 删除，执行器子进程看不到；也可用 `token_file`（本用户所有、0600、至少 32 个字符，与 `token_env` 二选一，不能与 `[runner_pilot]` 的是同一份）。Hub 只说明文 ws，跨网络时前面要有 TLS 或加密隧道。节点掉线、未连上或没有空槽（含 `workspace_busy`）时，Run 最多等 `node_wait_seconds`，期间可被新事件中断；超时后按执行失败处理（不是无限期保 `pending`）。
 - **生命周期**：`RunnerHandle`（`app/bootstrap.py`）每进程一个，`AlwaysOnDaemon.run()` / `serve_configured()` 在第一个 Run 之前 `start()`、最后一个 Run 结束并回收进程组之后 `stop()`。热加载各代共用同一个 handle：项目与执行器的变化对之后的 Run 生效，`[runner]` 本身的变化要重启（`executors` 除外）。`--mcp-stdio` 伴随进程不打开 Runner。
-- **尚未包含**：会话结案时自动 `reclaim_workspace`（Runner 的 worktree 目前由人回收）；常驻 Relay 节点的启动入口（`RunnerRelayAgent` 需自行装配，`python -m runner.service` 只接受 §9 的试点形状）；Orca 可见终端驱动；Bridge 的 prompt 只含事件正文，不含 Inbox Memory 的 `instructions.md` 等。
+- **尚未包含**：会话结案时自动 `reclaim_workspace`（Runner 的 worktree 目前由人回收）；可写或多槽位的常驻 Relay 节点的启动入口（`python -m runner.service` 只接受 §9 的试点形状，`python -m runner.agent_service` 只接受 §10 的只读形状，其余须自行装配 `RunnerRelayAgent`）；Orca 可见终端驱动；Bridge 的 prompt 只含事件正文，不含 Inbox Memory 的 `instructions.md` 等。
 
 ## 8. 架构门禁
 
@@ -78,6 +81,7 @@
 - `pyrightconfig.json` 将 `src/runner` 纳入 strict 类型检查；
 - `tests/test_runner_stage1.py` 与 `tests/test_runner_stage2.py` 覆盖协议、AST 隔离、Worktree 三道保险、看门狗、跨网反向 WS 调度与 `conn_epoch` 防脑裂；`tests/test_runner_safety.py` 覆盖第 6 节的不变量：取消后进程组（含忽略 `SIGTERM` 的孙进程）被回收、`workspace_busy`、Bridge 被取消时中断并等待、只读 Run 的独立 worktree 与还原、顶替连接时在途 Run 失败并释放槽位、Orca 回执路径与非法回执、槽位满时重复提交同一 `run_id` 仍被接受且只执行一次、ack 迟到仍返回结果、同一 `run_id` 的重叠等待只提交一次、worktree 创建不阻塞事件循环、并发解析同名提示得到不同目录；`tests/test_runner_stage1.py` 另覆盖 Bridge 在 `block` 与 `defer` 策略下对可调工具或工具能力未知的执行器不调用 `runner.run()`；`tests/test_runner_hardening.py` 覆盖子进程环境不带凭据（含驱动附加变量）、输入背压下超时与中断仍生效、交互请求被拒且不启动 CLI、握手后静默的节点被断开且在途 Run 失败、未绑定工作区在首个 ACK 前已认领（延迟 ACK 的双节点）且被拒后释放、多槽节点拒绝首单时次单不会派到别的节点、带凭据的代理 URL（继承与驱动两条路径）被拒且错误信息不含密码、重试已结束的 `run_id` 返回缓存结果不再执行、Hub 与 Daemon 拒绝把 `run_id` 复用于别的调用方或工作区、别的连接发来的回复被忽略、回收与被取消的 Run 在 worktree 线程跑完前不放开工作区、只读 Run 结束后删除其 detached worktree；名称撞上只读目录的写工作区与被指向写目录的只读 Run 都不受影响（后者被拒）、断线时仍在创建工作区的节点重连后亲和不变、改了 prompt / `interactive` / 原生会话 ID 的同一 `run_id` 在 Hub 与 Daemon 都被拒、`workspace_busy` 后同一 `run_id` 重试会执行、其他调用方不能中断或查询别人的 Run（同进程与 Relay）、日志打不开时不留进程、超过流读取上限的单行完整读出、输出读取失败时 Run 失败。`tests/test_runner_tool_gate.py` 覆盖逐次工具授权：三态经 Bridge、Daemon 与 CLI 钩子（同进程与 Relay）、批准 / 拒绝 / 改参 / 重试后的恢复、未挂授权与钩子未加载时拒绝、`ToolGate` 与钩子脚本的异常路径、三种 CLI 的启动参数；`tests/test_runner_composition.py` 覆盖组装根：缺省关闭时不变、两种模式经 `AgentWorker` 端到端、审批恢复、停机与热加载、配置校验。`tests/test_runner_workspace_env.py` 以记录环境的 git / orca 垫片与合成凭据覆盖工作区命令：白名单、hook、正常的创建 / 校验 / 回收、带凭据代理的拒绝与恢复。`tests/test_runner_ledger.py` 经 Bridge、`AgentWorker` 与真实 `RunLedger` 端到端校验：真实 `slots_full` 拒绝记为 `rate_limit` 且仍按已交付结果处理，`RunRecord.runner_id` 是执行节点，新事件中断的 Run 也记在执行节点上、原批次与新事件合并重跑且被中断的 Run 不产生交付消息。
 - `tests/test_runner_service.py` 覆盖第 9 节的 Runner 侧：校验程序的结果可用 git 与 SHA-256 独立复算、异常提交与请求一律失败、服务配置与令牌文件的限制、单实例锁、Relay 重启后重连、`SIGTERM` 退出、握手中断不终止重连、节点接纳与错误令牌；`tests/test_runner_pilot.py` 覆盖 Hibernaut 侧，并以 Hibernaut 与 Runner 两个真实进程端到端验证：账本追溯、受控中断、强制停止、Runner 停止、热加载关闭与恢复、遗留事件、Relay 不可用时的原路径。
+- `tests/test_runner_remote.py` 覆盖第 10 节：工作区守卫的放行与拒绝（越界、符号链接、`~`、首尾空白、未知参数与工具）、节点先于 Hibernaut 拒绝、服务配置只收固定形状且与试点服务互不通用、CLI 启动参数、静默连接重连、`token_file` / `readonly_only`、部署样例互相吻合；并以 Hibernaut、试点 Runner、远端 Runner 三个真实进程端到端验证并行、账本与节点日志对账、断线重跑、节点缺席与关闭后的原路由。
 
 ## 9. 只读试点（默认关闭）
 
@@ -96,3 +100,17 @@
 - **失败不会卡住**：节点 30 秒内不可用、连接中断、校验不通过、结果不符都以 `Emit(status="failed")` 结束并关闭会话；不自动重试，由人重放。
 - **关闭与回退**：热加载改 `enabled = false` 后，在途 Run 用完 Relay 再关，新事件回到原路由；会话已随每个结果关闭，同一 `correlation_key` 的后续事件走原执行器。遗留的试点事件由占位执行器了结。Relay 打不开（令牌、端口）时只影响试点 Inbox：冷启动保持 `pending`，热加载开启则拒绝本次配置。
 - **不做**：写工作区、会调工具的 CLI、多节点、非回环地址、自动 fetch 候选提交。
+
+## 10. 远端只读 Agent 节点（默认关闭）
+
+Hibernaut 指名一个专用 CLI agent 时，由另一台 macOS 上的 Runner 执行只读仓库查询。复用 §7 的 `relay` 模式、`RunnerRelayAgent`、§6 的逐次工具授权与只读 worktree；新增的是节点的启动入口与节点侧的限制。部署、验证、回退见 [`deploy/runner/REMOTE.md`](../deploy/runner/REMOTE.md)，均由人执行。与 §9 的试点可并行，端口、令牌、节点服务、配置文件各自独立。
+
+- **路由**：`[runner] executors` 只列专用 agent（如 `remote-claude`），只有指名它的事件（`agent_id`、绑定或会话续接）经 Relay 派发，其余 agent 仍是本机执行器。该 agent 的 `[executors]` `command` 写 `/usr/bin/false`：不属任何项目的 Inbox、`[runner]` 关闭、或别的 agent 的事件用 `payload.executor` 指到它时，本机只会得到一次失败，不会退回本机执行。节点不可用时等 `node_wait_seconds` 后失败。
+- **节点服务**：`python -m runner.agent_service --config agent-runner.toml`，由 launchd 监管。配置只接受固定形状：§9 服务的全部限制（一个槽位、`readonly_only`、git 后端、无交互、只认 `hibernaut`、恰好一个项目、Relay 地址固定为 `127.0.0.1`），外加恰好一个 `[executors.<id>]`，只有 `cli = "claude"`、`command`（绝对路径）、可选 `model` 三个键。启动参数、环境变量不可配置。试点服务不接受 `[executors]`，试点 Relay 不接纳这种节点。
+- **连接**：节点与 Hub 都只用 `127.0.0.1`，中间是 Hibernaut 主机发起的 SSH 反向转发（加密，两端分别以主机密钥与受限公钥鉴权），其上再用共享令牌鉴权。私钥在 Hibernaut 主机，节点不持有能连回去的凭据。
+- **工具**：CLI 只带 `Read` / `Grep` / `Glob`（`--tools`），加 `--restricted`（不载入用户与仓库的设置、钩子，文件工具限在工作目录）、`--strict-mcp-config`、`--disable-slash-commands`。节点的 `runner/workspace_guard.py` 独立于 CLI 再判一次：其他工具、未知参数、解析符号链接后不在本次只读 worktree 内的路径、以 `/` `~` 开头或含 `..` 的 glob、首尾带空白或不可打印字符的路径一律拒绝；通过的调用再交 Hibernaut 的 `PermissionPort`，三态语义不变。
+- **凭据**：CLI 进程环境按 §6 白名单，没有服务凭据与 Relay 令牌；令牌文件与 CLI 同属一个系统账号，靠上一条的两层限制读不到。提示词里的 `@<路径>` 会让 Claude Code 不经工具调用就附上该文件，`CLAUDE_CODE_DISABLE_ATTACHMENTS=1` 与 `--restricted` 关掉它。CLI 用自己保存的账号登录，节点用只放这两样东西的专用账号。
+- **只读**：Hibernaut 侧 `readonly_only = true`、节点侧 `readonly_only` 各拦一次；Run 用 §6 的独立 detached worktree，跑完即删，指纹变化则作废结果。只读 Run 不产生亲和绑定。查询看到的是节点克隆里 `default_base_ref` 的提交，由人 fetch。
+- **对账**：账本 `runner_id` 是节点，`log_ref` 日志里的 `=== runner log ===` 一行给出节点日志的相对路径、Runner `run_id`、SHA-256 与字节数；节点服务日志按同一 `run_id` 记接单与结束。没有节点回报的 Run（没派出去，或重试用尽仍断线）记 `outcome_kind = error`，`runner_id` 为默认的 `local`，不表示在本机执行过。
+- **中断与断线**：新事件、停机按 §6 中断节点上的 Run。执行中断线按瞬时故障退避重试，节点回来后重跑同一批事件。
+- **不做**：写工作区、`Bash` 与 git 历史查询、`claude` 以外的 CLI、多槽位、多项目、节点自动 fetch 与自动更新、非回环监听。
