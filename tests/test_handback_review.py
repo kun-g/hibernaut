@@ -263,13 +263,12 @@ class TestHandBackReview(SDEDeliveryCase):
 
     async def test_commits_nobody_reviewed_before_the_hand_back_are_reviewed(self):
         # Something was committed between the passed review and the delivery: it is not Hibernaut's, so it is shown.
-        for sneaky in ("sneaky.py", VERSION_FILE):
-            with self.subTest(sneaky):
-                await self.sneaky_commit(sneaky)
+        await self.sneaky_commit("sneaky.py")
+
+    async def test_the_version_file_hides_no_other_change_made_before_the_hand_back(self):
+        await self.sneaky_commit(VERSION_FILE)
 
     async def sneaky_commit(self, rel):
-        self.doCleanups()
-        self.setUp()
         self.conflict()
         delivery = self.delivery()
         original, done = delivery.deliver, []
