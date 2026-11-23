@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import socket
+import sys
 import threading
 import urllib.request
+from collections.abc import MutableMapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -63,6 +65,87 @@ class WebhookHTTPServer(ThreadingHTTPServer):
         # as it did with the single-threaded server (drain before stopping workers or reloading).
         super().shutdown()
         self.wait_idle()
+
+    @classmethod
+    def adopt(cls, listener: socket.socket, handler_class: type[BaseHTTPRequestHandler]) -> WebhookHTTPServer:
+        host, port = listener.getsockname()[:2]
+        server = cls((host, port), handler_class, bind_and_activate=False)
+        server.socket.close()
+        server.socket = listener
+        server.server_name = socket.getfqdn(host)
+        server.server_port = port
+        return server
+
+
+# Set by scripts/run_updating.py. LISTEN_FD names a listening socket a previous daemon generation served on;
+# HANDOVER_FD names a Unix socket on which this daemon sends its listener back when it stops. As long as one of the
+# processes holds the listener, connections made between two generations wait in its backlog instead of being refused.
+LISTEN_FD_ENV = "HIBERNAUT_LISTEN_FD"
+HANDOVER_FD_ENV = "HIBERNAUT_HANDOVER_FD"
+
+
+def _bound_to(sock: socket.socket, host: str, port: int) -> bool:
+    try:
+        wanted = socket.getaddrinfo(host or None, port, sock.family, socket.SOCK_STREAM, 0, socket.AI_PASSIVE)
+    except OSError:
+        return False
+    return port != 0 and sock.getsockname()[:2] in {info[4][:2] for info in wanted}
+
+
+def _adopt_fd(value: str | None) -> socket.socket | None:
+    if value is None:
+        return None
+    try:
+        sock = socket.socket(fileno=int(value))
+    except (ValueError, OSError):
+        return None
+    # Executor subprocesses must not keep the listener (or the channel) open after this process lets it go.
+    sock.set_inheritable(False)
+    return sock
+
+
+class ListenerHandover:
+    def __init__(self, inherited: socket.socket | None = None, channel: socket.socket | None = None) -> None:
+        self._inherited = inherited
+        self._channel = channel
+
+    @classmethod
+    def from_environ(cls, environ: MutableMapping[str, str]) -> ListenerHandover:
+        return cls(_adopt_fd(environ.pop(LISTEN_FD_ENV, None)), _adopt_fd(environ.pop(HANDOVER_FD_ENV, None)))
+
+    def server(self, address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler]) -> WebhookHTTPServer:
+        # The inherited listener is used at most once, and only for the configured address; a listener left over
+        # from before a port change is closed so its port refuses connections again.
+        inherited, self._inherited = self._inherited, None
+        if inherited is not None:
+            if inherited.type == socket.SOCK_STREAM and _bound_to(inherited, *address):
+                print(f"[hibernaut] Serving HTTP on the listener inherited from the previous daemon "
+                      f"({address[0]}:{address[1]}).", file=sys.stderr, flush=True)
+                return WebhookHTTPServer.adopt(inherited, handler_class)
+            inherited.close()
+        return WebhookHTTPServer(address, handler_class)
+
+    def release(self, server: WebhookHTTPServer, ack_timeout: float = 10.0) -> None:
+        # Called once serve_forever() has stopped. Our copy stays open until the supervisor acks: on macOS a socket
+        # that is only in flight is closed, queued connections and all, when the sender closes its last copy.
+        channel, self._channel = self._channel, None
+        if channel is None:
+            return
+        with channel:
+            try:
+                socket.send_fds(channel, [b"listener"], [server.socket.fileno()])
+                channel.settimeout(ack_timeout)
+                if not channel.recv(1):
+                    raise ConnectionError("the supervisor closed the channel")
+            except OSError as exc:
+                print(f"[hibernaut] Could not hand the HTTP listener to the supervisor: {exc!r}",
+                      file=sys.stderr, flush=True)
+
+    def close(self) -> None:
+        for sock in (self._inherited, self._channel):
+            if sock is not None:
+                sock.close()
+        self._inherited = self._channel = None
 
 
 class ConsoleChannelAdapter:

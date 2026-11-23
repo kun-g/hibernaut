@@ -1,6 +1,8 @@
 import argparse
 import os
+import select
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -43,6 +45,72 @@ def candidate() -> tuple[str, str] | None:
 
 TICK = 0.25
 
+# Same names as agent_runtime.adapters.channels.channels; this script imports nothing from the daemon it updates.
+LISTEN_FD_ENV = "HIBERNAUT_LISTEN_FD"
+HANDOVER_FD_ENV = "HIBERNAUT_HANDOVER_FD"
+
+
+def inherited_listener() -> int | None:
+    # Set by keep_across_exec() in the previous supervisor generation.
+    value = os.environ.pop(LISTEN_FD_ENV, None)
+    if value is None:
+        return None
+    try:
+        fd = int(value)
+        os.set_inheritable(fd, False)
+    except (ValueError, OSError) as exc:
+        log(f"Ignoring {LISTEN_FD_ENV}={value!r}: {exc}")
+        return None
+    return fd
+
+
+def reclaim_listener(channel: socket.socket) -> int | None:
+    # The daemon sends its HTTP listener right after it stops accepting and keeps its own copy open until this ack:
+    # on macOS a socket that is only in flight is closed, queued connections and all, with the sender's last copy.
+    try:
+        _, fds, _, _ = socket.recv_fds(channel, 64, 4)
+    except OSError:
+        return None
+    for extra in fds[1:]:
+        os.close(extra)
+    if not fds:
+        return None
+    try:
+        channel.sendall(b"k")
+    except OSError:
+        # The daemon gave up waiting and exited, closing the listener; what arrived is unusable.
+        os.close(fds[0])
+        return None
+    return fds[0]
+
+
+class Handback:
+    def __init__(self, channel: socket.socket) -> None:
+        self.channel = channel
+        self.listener: int | None = None
+        self.pending = True
+
+    def wait(self, child: subprocess.Popen[bytes], timeout: float) -> bool:
+        # Bounded like child.wait(timeout), but wakes as soon as the daemon sends its listener (or closes the
+        # channel by exiting), so the daemon is not held up waiting for the ack. True once the daemon has exited.
+        if not self.pending:
+            try:
+                child.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return False
+            return True
+        readable, _, _ = select.select([self.channel], [], [], timeout)
+        if readable:
+            self.pending = False
+            self.listener = reclaim_listener(self.channel)
+        return child.poll() is not None
+
+
+def keep_across_exec(listener: int | None) -> None:
+    if listener is not None:
+        os.set_inheritable(listener, True)
+        os.environ[LISTEN_FD_ENV] = str(listener)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the daemon and fast-forward from origin/main. Extra flags go to the daemon.", allow_abbrev=False)
@@ -69,7 +137,7 @@ def main() -> int:
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, on_signal)
 
-    def stop(child: subprocess.Popen[bytes]) -> None:
+    def stop(child: subprocess.Popen[bytes], handback: Handback) -> None:
         # The first stop signal (or an update) lets the daemon drain its Runs in progress while it keeps serving
         # ingress; a second signal is passed on so the daemon exits without waiting for them. No upper bound: a
         # stalled daemon is reported, not killed.
@@ -79,11 +147,8 @@ def main() -> int:
         next_report = started + args.wait_log_interval
         forwarded = False
         while True:
-            try:
-                child.wait(timeout=TICK)
+            if handback.wait(child, TICK):
                 return
-            except subprocess.TimeoutExpired:
-                pass
             if signals > 1 and not forwarded:
                 forwarded = True
                 log("Second stop signal: asking the daemon to exit without waiting for runs in progress.")
@@ -96,10 +161,28 @@ def main() -> int:
                 log(f"Supervisor {os.getpid()} still waiting for daemon {child.pid} to exit "
                     f"({time.monotonic() - started:.0f}s).")
 
+    # The HTTP listener passes from each daemon to the next: the daemon sends it back over a socketpair when it stops,
+    # this process keeps it while it updates the checkout and across execv(), and the next daemon serves on it. Only
+    # one process holds it at a time apart from the hand-over, so a daemon that moves to another port on a config
+    # reload closes the old one for good. The first daemon binds its own.
+    listener = inherited_listener()
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")}
     errors = (OSError, subprocess.SubprocessError)
     while not signals:
-        child = subprocess.Popen([sys.executable, "-m", "agent_runtime.app.main", *daemon_args], env=env, start_new_session=True)
+        channel, daemon_end = socket.socketpair()
+        child_env = {**env, HANDOVER_FD_ENV: str(daemon_end.fileno())}
+        pass_fds = [daemon_end.fileno()]
+        if listener is not None:
+            child_env[LISTEN_FD_ENV] = str(listener)
+            pass_fds.append(listener)
+        try:
+            child = subprocess.Popen([sys.executable, "-m", "agent_runtime.app.main", *daemon_args], env=child_env,
+                                     pass_fds=pass_fds, start_new_session=True)
+        finally:
+            daemon_end.close()
+            if listener is not None:
+                os.close(listener)
+                listener = None
         update = None
         try:
             next_check = time.monotonic() + args.interval
@@ -120,7 +203,12 @@ def main() -> int:
                     break
                 next_check = time.monotonic() + args.interval
         finally:
-            stop(child)
+            handback = Handback(channel)
+            try:
+                stop(child, handback)
+            finally:
+                channel.close()
+            listener = handback.listener
 
         if signals or update is None:
             break
@@ -136,6 +224,7 @@ def main() -> int:
             continue
         if not signals:
             log(f"Starting {new[:12]}.")
+            keep_across_exec(listener)
             os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
     return 0
 
