@@ -47,14 +47,17 @@ class ConcurrencyLimiter:
     def limits_executor(self, executor_key: str) -> bool:
         return executor_key in self._limits.executors
 
-    def try_acquire(self, inbox_id: str, *, project_key: str | None, executor_key: str | None) -> bool:
+    def available(self, inbox_id: str, *, project_key: str | None, executor_key: str | None) -> bool:
         if inbox_id in self._held or self.saturated():
             return False
         if project_key is not None and self._projects[project_key] >= self._limits.projects.get(
                 project_key, self._max_concurrency):
             return False
-        if executor_key is not None and self._executors[executor_key] >= self._limits.executors.get(
-                executor_key, self._max_concurrency):
+        return executor_key is None or self._executors[executor_key] < self._limits.executors.get(
+            executor_key, self._max_concurrency)
+
+    def try_acquire(self, inbox_id: str, *, project_key: str | None, executor_key: str | None) -> bool:
+        if not self.available(inbox_id, project_key=project_key, executor_key=executor_key):
             return False
         self._held[inbox_id] = LimitKeys(project_key, executor_key)
         if project_key is not None:

@@ -150,7 +150,8 @@ class AsyncWorkerPool:
         # Inboxes waiting to run, oldest first; one whose quota is full stays in place while later ones pass it.
         self._queue: deque[str] = deque()
         self._queued: set[str] = set()
-        # Limit keys of queued inboxes, resolved once per wake so a rescan costs no database reads.
+        # Limit keys a queued inbox was last refused with, dropped by its next wake, so a rescan that refuses it again
+        # costs no database reads.
         self._queued_keys: dict[str, LimitKeys] = {}
         # Set on every change that can make a queued inbox runnable or end a worker loop.
         self._changed = asyncio.Event()
@@ -209,10 +210,14 @@ class AsyncWorkerPool:
         # The first queued inbox with quota in every dimension. Never waits, so a full quota holds up only its own
         # inboxes and occupies no worker.
         for inbox_id in () if self._limiter.saturated() else tuple(self._queue):
-            keys = self._queued_keys.get(inbox_id)
-            if keys is None:
-                keys = self._limit_keys(inbox_id) if self._limit_keys is not None else LimitKeys()
-                self._queued_keys[inbox_id] = keys
+            cached = self._queued_keys.get(inbox_id)
+            if cached is not None and not self._limiter.available(
+                    inbox_id, project_key=cached.project, executor_key=cached.executor):
+                continue
+            # Cached keys only rule an inbox out; it is admitted on fresh ones. Another thread may have stored a
+            # change (an event replayed for another executor) whose wake has not reached the loop yet.
+            keys = self._limit_keys(inbox_id) if self._limit_keys is not None else LimitKeys()
+            self._queued_keys[inbox_id] = keys
             if self._limiter.try_acquire(inbox_id, project_key=keys.project, executor_key=keys.executor):
                 self._queue.remove(inbox_id)
                 self._queued.discard(inbox_id)

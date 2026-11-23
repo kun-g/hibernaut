@@ -471,6 +471,68 @@ class TestReplay(PoolCase):
         self.assertEqual(self.probe.finished, ["block-sde", "bad"])
         self.assertEqual(self.probe.peak("executor", "sde"), 1)
 
+    LIMITS = {"executors": {"claude": {"max_concurrency": 1}, "sde": {"max_concurrency": 1}}, "projects": {"a": TASKS}}
+
+    async def queued_for_claude(self, daemon):
+        # proj:a:x has run "first" on claude and now waits for the claude slot, its limit keys cached; sde is full too.
+        first = self.post(daemon, "proj:a:x", "first", executor="claude")
+        await self.idle(daemon)
+        self.post(daemon, "proj:a:c", "block-claude", executor="claude")
+        self.post(daemon, "proj:a:s", "block-sde", executor="sde")
+        await self.until(lambda: self.probe.active_texts() == ["block-claude", "block-sde"])
+        self.post(daemon, "proj:a:x", "second", executor="claude")
+        await self.settle()
+        self.assertEqual(daemon.pool._queued_keys["proj:a:x"].executor, "claude")
+        return first
+
+    async def test_a_replay_re_keys_an_inbox_that_is_already_queued(self):
+        for threaded in (False, True):
+            with self.subTest(threaded=threaded):
+                self.probe.__init__()
+                self.probe._inboxes = []
+                async with self.daemon(**self.LIMITS) as daemon:
+                    first = await self.queued_for_claude(daemon)
+                    if threaded:
+                        # As from the HTTP server: the wake reaches the pool through call_soon_threadsafe.
+                        await asyncio.to_thread(self.replay, daemon, first.event_id, executor_id="sde", force=True)
+                    else:
+                        self.replay(daemon, first.event_id, executor_id="sde", force=True)
+                    self.probe.release("block-claude")
+                    await self.until(lambda: "block-claude" in self.probe.finished)
+                    await self.settle()
+                    self.assertEqual(self.probe.active_texts(), ["block-sde"])
+                    self.assertEqual(daemon.pool.limiter.active, 1)
+                    self.probe.release("block-sde")
+                    await self.idle(daemon)
+                    self.assertEqual(self.probe.peak("executor", "sde"), 1)
+                    self.assertEqual(self.probe.started[-2:], ["first", "second"])
+                for path in self.root.glob("hb.db*"):
+                    path.unlink()
+
+    async def test_a_replay_stored_before_its_wake_arrives_is_not_dispatched_under_the_old_key(self):
+        async with self.daemon(**self.LIMITS) as daemon:
+            first = await self.queued_for_claude(daemon)
+            self.post(daemon, "proj:a:y", "later-sde", executor="sde")
+            await self.settle()
+            # An HTTP thread stores the replay before its wake runs on the loop; a scan can come in between.
+            daemon.inbox.replay(first.event_id, executor_id_override="sde", force=True)
+            admitted = []
+            with patch.object(daemon.pool.limiter, "try_acquire", wraps=daemon.pool.limiter.try_acquire) as acquire:
+                self.probe.release("block-claude")
+                await self.until(lambda: "block-claude" in self.probe.finished)
+                await self.settle()
+                admitted = [c.kwargs["executor_key"] for c in acquire.call_args_list if c.args == ("proj:a:x",)]
+            self.assertEqual(self.probe.peak("executor", "sde"), 1)
+            self.assertEqual(list(daemon.pool._queue), ["proj:a:x", "proj:a:y"])
+            self.assertNotIn("claude", admitted)
+            self.probe.release("block-sde")
+            await self.idle(daemon)
+            # It kept its place in the queue, ahead of the inbox that asked for sde after it.
+            replayed = len(self.probe.started) - 1 - self.probe.started[::-1].index("first")
+            self.assertLess(replayed, self.probe.started.index("later-sde"))
+            self.assertEqual(self.probe.started.count("first"), 2)
+            self.assertEqual(self.probe.peak("executor", "sde"), 1)
+
 
 class TestInterruptPolicy(PoolCase):
     policy = "interrupt"
