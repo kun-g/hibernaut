@@ -8,6 +8,10 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tests.fake_counter import next_count  # noqa: E402
+
 argv = sys.argv[1:]
 interactive = "-p" not in argv
 probe = not interactive and "--tools" in argv and argv[argv.index("--tools") + 1] == "" and "--mcp-config" not in argv
@@ -71,9 +75,7 @@ def next_step(name):
     steps = json.loads(Path(plan_path).read_text(encoding="utf-8")).get(name) or []
     if not steps:
         return None
-    counter = Path(f"{plan_path}.{name}.n")
-    n = int(counter.read_text()) if counter.exists() else 0
-    counter.write_text(str(n + 1))
+    n = next_count(Path(f"{plan_path}.{name}.n"))
     return steps[min(n, len(steps) - 1)]
 
 
@@ -163,8 +165,7 @@ def run_interactive():
     permitted = [t for t in HANDOFF_TOOLS if t in allowed.split(",")]
     instruction = argv[-1]
     while instruction:
-        turns = (int(transcript.read_text()) if transcript.exists() else 0) + 1
-        transcript.write_text(str(turns))
+        turns = next_count(transcript) + 1
         turn = re.search(r'turn "([^"]+)"', instruction).group(1)
         global prompt
         if HANDOFF_TOOLS[0] not in permitted:

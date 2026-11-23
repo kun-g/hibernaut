@@ -13,6 +13,7 @@ from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner
 from agent_runtime.adapters.executor_cli.process import (
     ProcessTimeout,
     last_text,
+    names_path,
     relayed_work_key,
     supervise,
     target_events,
@@ -97,7 +98,12 @@ class LocalCLIExecutor:
         orca_workspace: bool = False,
         terminal_bindings: SQLiteTerminalBindingStore | None = None,
         visible_runner: OrcaVisibleRunner | None = None,
+        # Set for an inbox of no project: every run starts here, without a worktree.
+        bound_workdir: str | Path | None = None,
+        readonly: bool = False,
     ) -> None:
+        self._bound_workdir = Path(bound_workdir).resolve() if bound_workdir is not None else None
+        self._readonly = readonly
         self._orca_workspace = orca_workspace
         self._visible = visible_runner or OrcaVisibleRunner(bindings=terminal_bindings)
         self._worktree_manager = worktree_manager
@@ -128,13 +134,17 @@ class LocalCLIExecutor:
 
         targets = target_events(events)
         explicit_workdir = self._extract_explicit_workdir(targets)
+        if self._bound_workdir is not None:
+            refusal = self._bound_refusal(explicit_workdir)
+            if refusal is not None:
+                return Emit(messages=(f"[LocalCLIExecutor] refused: {refusal}",), session_id=session_id, status="refused")
         work_key = (
             relayed_work_key(targets, session)
             or events[0].correlation_key
             or (session.correlation_key if session is not None else None)
             or f"task:{inbox_id}:{events[0].event_id}"
         )
-        configured = self._inbox_checkout_map.get(inbox_id)
+        configured = self._bound_workdir or self._inbox_checkout_map.get(inbox_id)
         primary_checkout = Path(configured).resolve() if configured is not None else None
         if explicit_workdir is None and primary_checkout is None:
             return Emit(
@@ -144,7 +154,7 @@ class LocalCLIExecutor:
             )
 
         try:
-            workdir = await asyncio.to_thread(
+            workdir = self._bound_workdir or await asyncio.to_thread(
                 self._worktree_manager.resolve_workdir,
                 work_key=work_key,
                 primary_checkout=primary_checkout or Path(str(explicit_workdir)),
@@ -214,6 +224,12 @@ class LocalCLIExecutor:
 
         return replace(self._parse_outcome(stdout, session_id=session_id), telemetry=telemetry)
 
+    def _bound_refusal(self, explicit_workdir: str | None) -> str | None:
+        assert self._bound_workdir is not None
+        if explicit_workdir is not None and not names_path(explicit_workdir, self._bound_workdir):
+            return f"explicit_workdir {explicit_workdir} is not this inbox's workdir {self._bound_workdir}"
+        return None if self._bound_workdir.is_dir() else f"workdir {self._bound_workdir} is not a directory"
+
     def _render_cli_args(
         self,
         template: CLITemplate,
@@ -267,7 +283,10 @@ class LocalCLIExecutor:
     ) -> str:
         # The CLI caches the prompt's unchanged start, so what varies between Runs comes after the stable memory.
         baseline = baseline_segments(caps.memory)
-        parts = [f"## {name}\n{text}" for name, text in (*baseline.stable, *baseline.volatile) if text]
+        parts = [f"## {name}\n{text}" for name, text in baseline.stable if text]
+        if self._bound_workdir is not None and self._readonly:
+            parts.append(f"## workdir\n{self._bound_workdir} is shared and read-only: change no file in it.")
+        parts.extend(f"## {name}\n{text}" for name, text in baseline.volatile if text)
         if session is not None and session.checkpoint:
             parts.append(f"## session_checkpoint\n{session.checkpoint}")
         serialized_events = [

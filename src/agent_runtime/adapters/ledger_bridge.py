@@ -31,7 +31,8 @@ _SEVERITIES: frozenset[str] = frozenset(get_args(Severity))
 
 def _log_text(telemetry: RunTelemetry) -> str:
     exit_line = f"=== exit code: {telemetry.exit_code} ===\n" if telemetry.exit_code is not None else ""
-    return f"=== stdout ===\n{telemetry.stdout}\n=== stderr ===\n{telemetry.stderr}\n{exit_line}"
+    runner_line = f"=== runner log ===\n{telemetry.runner_log}\n" if telemetry.runner_log is not None else ""
+    return f"=== stdout ===\n{telemetry.stdout}\n=== stderr ===\n{telemetry.stderr}\n{exit_line}{runner_line}"
 
 
 class LedgerRunRecorder:
@@ -75,7 +76,9 @@ class LedgerRunRecorder:
     def record_run(self, entry: RunLedgerEntry) -> None:
         log_ref: str | None = None
         telemetry = entry.telemetry
-        if telemetry is not None and self._logs is not None and (telemetry.stdout or telemetry.stderr):
+        if telemetry is not None and self._logs is not None and (
+            telemetry.stdout or telemetry.stderr or telemetry.runner_log
+        ):
             try:
                 log_ref = self._logs.write_log(entry.run_id, _log_text(telemetry))
             except (OSError, ValueError):

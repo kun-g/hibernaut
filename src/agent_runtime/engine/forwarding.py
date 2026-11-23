@@ -382,7 +382,8 @@ def return_payload(
     payload: dict[str, Any] = {
         "text": text,
         "status": status,
-        "hop_count": spec.hop_count + 1,
+        # Carried back unchanged, so whatever the result leads to goes on from here.
+        "hop_count": spec.hop_count,
         "forwarded_from": inbox_id,
         "forwarded_by": agent_id,
         **_lineage_fields(spec),
@@ -461,7 +462,8 @@ def closing_event(session: SessionRef, sessions: SessionStorePort) -> Event | No
 
 
 def out_of_hops(spec: ForwardSpec) -> bool:
-    return spec.hop_count >= MAX_FORWARD_HOPS
+    # Past the limit, not at it: the last forward still gets its result back, and none can go further than that.
+    return spec.hop_count > MAX_FORWARD_HOPS
 
 
 def return_refusal(
@@ -481,7 +483,7 @@ def return_refusal(
             return ForwardRefused(f"return_to '{spec.return_to}' is not an inbox of this project", "block")
     if out_of_hops(spec):
         return ForwardRefused(
-            f"this work already made {spec.hop_count} hop(s) between agents (limit {MAX_FORWARD_HOPS})", "block"
+            f"this work was forwarded {spec.hop_count} hop(s) (limit {MAX_FORWARD_HOPS})", "block"
         )
     decision = permissions.check(FORWARD_TOOL, {
         "inbox_id": inbox_id,
@@ -489,7 +491,7 @@ def return_refusal(
         "target_inbox": spec.return_to,
         "target_agent": None,
         "return_to": None,
-        "hop_count": spec.hop_count + 1,
+        "hop_count": spec.hop_count,
         "text": payload["text"],
         "status": payload["status"],
     })
@@ -545,7 +547,7 @@ class ForwardStage:
         hops = spec.hop_count if spec is not None else 0
         if hops >= MAX_FORWARD_HOPS:
             raise ForwardRefused(
-                f"this work already made {hops} hop(s) between agents (limit {MAX_FORWARD_HOPS}); answer it here instead"
+                f"this work was already forwarded {hops} hop(s) (limit {MAX_FORWARD_HOPS}); answer it here instead"
             )
         binding_route = self._check_inbox("target_inbox", target)
         relayed = target == self.inbox_id

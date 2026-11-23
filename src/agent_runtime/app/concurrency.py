@@ -17,12 +17,15 @@ _log = logging.getLogger(__name__)
 class ConcurrencyLimits:
     projects: Mapping[str, int] = field(default_factory=dict[str, int])
     executors: Mapping[str, int] = field(default_factory=dict[str, int])
+    agents: Mapping[str, int] = field(default_factory=dict[str, int])
 
 
 @dataclass(frozen=True, slots=True)
 class LimitKeys:
     project: str | None = None
+    # The driver the agent runs on; a legacy executor is its own agent and driver.
     executor: str | None = None
+    agent: str | None = None
 
 
 class ConcurrencyLimiter:
@@ -32,8 +35,12 @@ class ConcurrencyLimiter:
         self._max_concurrency = max_concurrency
         self._limits = limits or ConcurrencyLimits()
         self._held: dict[str, LimitKeys] = {}
+        # Every driver and agent counted for an inbox until its dispatch ends: the keys it was admitted with and those
+        # of later batches, which have no limit then but may be given one by a reload.
+        self._counted: dict[str, tuple[set[str], set[str]]] = {}
         self._projects: Counter[str] = Counter()
         self._executors: Counter[str] = Counter()
+        self._agents: Counter[str] = Counter()
         self._listeners: list[Callable[[], None]] = []
 
     def subscribe(self, listener: Callable[[], None]) -> Callable[[], None]:
@@ -68,27 +75,52 @@ class ConcurrencyLimiter:
     def held(self, inbox_id: str) -> LimitKeys | None:
         return self._held.get(inbox_id)
 
-    def limits_executor(self, executor_key: str) -> bool:
-        return executor_key in self._limits.executors
+    def covers(self, held: LimitKeys, needed: LimitKeys) -> bool:
+        # Whether work of the needed agent may run in the slot held for another event of the inbox.
+        return (
+            (needed.executor is None or needed.executor == held.executor
+             or needed.executor not in self._limits.executors)
+            and (needed.agent is None or needed.agent == held.agent or needed.agent not in self._limits.agents)
+        )
 
-    def available(self, inbox_id: str, *, project_key: str | None, executor_key: str | None) -> bool:
+    def available(
+        self, inbox_id: str, *, project_key: str | None, executor_key: str | None, agent_key: str | None = None,
+    ) -> bool:
         if inbox_id in self._held or self.saturated():
             return False
-        if project_key is not None and self._projects[project_key] >= self._limits.projects.get(
-                project_key, self._max_concurrency):
-            return False
-        return executor_key is None or self._executors[executor_key] < self._limits.executors.get(
-            executor_key, self._max_concurrency)
+        return all(
+            key is None or used[key] < limits.get(key, self._max_concurrency)
+            for key, used, limits in (
+                (project_key, self._projects, self._limits.projects),
+                (executor_key, self._executors, self._limits.executors),
+                (agent_key, self._agents, self._limits.agents),
+            )
+        )
 
-    def try_acquire(self, inbox_id: str, *, project_key: str | None, executor_key: str | None) -> bool:
-        if not self.available(inbox_id, project_key=project_key, executor_key=executor_key):
+    def try_acquire(
+        self, inbox_id: str, *, project_key: str | None, executor_key: str | None, agent_key: str | None = None,
+    ) -> bool:
+        if not self.available(inbox_id, project_key=project_key, executor_key=executor_key, agent_key=agent_key):
             return False
-        self._held[inbox_id] = LimitKeys(project_key, executor_key)
+        self._held[inbox_id] = LimitKeys(project_key, executor_key, agent_key)
+        self._counted[inbox_id] = (set(), set())
         if project_key is not None:
             self._projects[project_key] += 1
-        if executor_key is not None:
-            self._executors[executor_key] += 1
+        self.count(inbox_id, executor_key=executor_key, agent_key=agent_key)
         return True
+
+    def count(self, inbox_id: str, *, executor_key: str | None, agent_key: str | None) -> None:
+        counted = self._counted.get(inbox_id)
+        if counted is None:
+            # A worker used outside the pool has no slot.
+            return
+        for key, mine, used in (
+            (executor_key, counted[0], self._executors),
+            (agent_key, counted[1], self._agents),
+        ):
+            if key is not None and key not in mine:
+                mine.add(key)
+                used[key] += 1
 
     def release(self, inbox_id: str) -> None:
         keys = self._held.pop(inbox_id, None)
@@ -98,10 +130,11 @@ class ConcurrencyLimiter:
             self._projects[keys.project] -= 1
             if self._projects[keys.project] <= 0:
                 del self._projects[keys.project]
-        if keys.executor is not None:
-            self._executors[keys.executor] -= 1
-            if self._executors[keys.executor] <= 0:
-                del self._executors[keys.executor]
+        for mine, used in zip(self._counted.pop(inbox_id), (self._executors, self._agents), strict=True):
+            for key in mine:
+                used[key] -= 1
+                if used[key] <= 0:
+                    del used[key]
         self._notify()
 
 
@@ -118,16 +151,14 @@ class LimitKeyResolver:
     def __init__(
         self,
         *,
-        limits: ConcurrencyLimits,
         inbox: InboxPort,
         sessions: SessionStorePort,
         open_runs: OpenRunPort | None,
         route: Callable[[str], LimitRoute],
         global_default_executor: str | None,
-        # Agent id -> the [executors.<id>] it runs on, whose limit counts it; an id not listed is its own executor.
+        # Agent id -> the [executors.<id>] it runs on; an id not listed is its own executor.
         drivers: Mapping[str, str] | None = None,
     ) -> None:
-        self._limits = limits
         self._inbox = inbox
         self._sessions = sessions
         self._open_runs = open_runs
@@ -141,56 +172,60 @@ class LimitKeyResolver:
         except AmbiguousProjectMatch:
             # The worker factory raises it again and the pool reports it there.
             return LimitKeys()
-        if not self._limits.executors:
-            return LimitKeys(route.project)
+        # Resolved without any limit too: a reload may bring the first one while this Run is in progress.
         try:
-            return LimitKeys(route.project, self._next_executor(inbox_id, route))
+            return self._next_keys(inbox_id, route)
         except Exception:  # noqa: BLE001
             _log.warning("Next executor of inbox %s cannot be determined; its executor limit is not applied",
                          inbox_id, exc_info=True)
             return LimitKeys(route.project)
 
-    def event_executor(self, event: Event, route: LimitRoute) -> str | None:
+    def event_keys(self, event: Event, route: LimitRoute) -> LimitKeys:
         try:
-            return self._driver(AgentWorker.expected_executor_id(
+            return self._agent_keys(route, AgentWorker.expected_executor_id(
                 event, self._sessions, binding=route.binding, project_default=route.default_executor,
                 global_default=self._global_default,
             ))
         except Exception:  # noqa: BLE001
             _log.warning("Executor of event %s in inbox %s cannot be determined; its executor limit is not applied",
                          event.event_id, event.inbox_id, exc_info=True)
-            return None
+            return LimitKeys(route.project)
 
-    def _driver(self, agent_id: str | None) -> str | None:
-        return self._drivers.get(agent_id, agent_id) if agent_id is not None else None
+    def _agent_keys(self, route: LimitRoute, agent_id: str | None) -> LimitKeys:
+        if agent_id is None:
+            return LimitKeys(route.project)
+        return LimitKeys(route.project, self.driver(agent_id), agent_id)
 
-    def _next_executor(self, inbox_id: str, route: LimitRoute) -> str | None:
+    def driver(self, agent_id: str) -> str:
+        return self._drivers.get(agent_id, agent_id)
+
+    def _next_keys(self, inbox_id: str, route: LimitRoute) -> LimitKeys:
         # What the worker runs first: a Run a stopped process detached, else the first event it may claim.
         for run in self._open_runs.list_open(inbox_id) if self._open_runs is not None else ():
-            return self._driver(run.executor_id)
+            return self._agent_keys(route, run.executor_id)
         for event in self._inbox.fetch_pending(inbox_id):
             if route.hold is None or route.hold(event) is None:
-                return self.event_executor(event, route)
-        return None
+                return self.event_keys(event, route)
+        return LimitKeys(route.project)
 
 
 class ExecutorQuotaHold:
-    # One per worker. An inbox holds one executor's slot per dispatch but may have batches for several executors, some
-    # arriving mid-run. From the first event that needs another limited executor's slot on, nothing more is claimed in
-    # this dispatch, so inbox order is kept; on_defer makes the pool queue the inbox again under that event's executor.
+    # One per worker. An inbox holds one agent's and driver's slot per dispatch but may have batches for several, some
+    # arriving mid-run. From the first event that needs another limited slot on, nothing more is claimed in this
+    # dispatch, so inbox order is kept; on_defer makes the pool queue the inbox again under that event's keys.
     # Only that first event is checked again: later ones would overtake it.
     def __init__(
         self,
         inbox_id: str,
         *,
         limiter: ConcurrencyLimiter,
-        executor_of: Callable[[Event], str | None],
+        keys_of: Callable[[Event], LimitKeys],
         on_defer: Callable[[str], None],
         inner: Callable[[Event], str | None] | None = None,
     ) -> None:
         self._inbox_id = inbox_id
         self._limiter = limiter
-        self._executor_of = executor_of
+        self._keys_of = keys_of
         self._on_defer = on_defer
         self._inner = inner
         self._admitted: set[str] = set()
@@ -216,5 +251,4 @@ class ExecutorQuotaHold:
         if held is None:
             # A worker used outside the pool has no slot to compare with.
             return True
-        needed = self._executor_of(event)
-        return needed is None or needed == held.executor or not self._limiter.limits_executor(needed)
+        return self._limiter.covers(held, self._keys_of(event))

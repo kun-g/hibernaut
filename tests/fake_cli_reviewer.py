@@ -8,10 +8,12 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tests.fake_counter import next_count  # noqa: E402
+
 plan_path = Path(os.environ["FAKE_CLI_PLAN"])
-counter = Path(f"{plan_path}.n")
-n = int(counter.read_text()) if counter.exists() else 0
-counter.write_text(str(n + 1))
+n = next_count(Path(f"{plan_path}.n"))
 steps = json.loads(plan_path.read_text(encoding="utf-8"))
 step = steps[min(n, len(steps) - 1)]
 

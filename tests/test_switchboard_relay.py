@@ -55,7 +55,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FAST_BACKOFF = (0.05, 0.1, 0.2)
 
 
-def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+def wait_until(predicate: Callable[[], bool], timeout: float = 45.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():

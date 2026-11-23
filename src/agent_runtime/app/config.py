@@ -38,16 +38,20 @@ from agent_runtime.app.projects import (
     AgentConfig,
     InboxRule,
     ProjectBinding,
+    WorkdirBinding,
     parse_inbox_bindings,
     parse_inbox_rules,
+    parse_workdir_bindings,
     validate_project_bindings,
     validate_project_rules,
+    validate_workdir_bindings,
 )
 from agent_runtime.core.models import InboxRoute, NewEventPolicy
 from memory_hub import BaselineBudgetConfig, KnowledgeMountConfig, MemoryHubConfig
 from memory_hub.models import AccessRole
 from memory_hub.partition import sanitize_segment
 from runner.cli_drivers import TemplateCLIDriver, ToolHookStyle
+from runner.protocol_check import PROTOCOL_CHECK_EXECUTOR_ID
 
 _log = logging.getLogger(__name__)
 
@@ -65,6 +69,11 @@ class RuntimeConfig:
     default_executor: str = "claude"
     # Background reclaim of merged task worktrees a delivery-time reclaim had to skip; 0 turns it off.
     worktree_sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS
+    # Inboxes of no project, each with the directory its agents start in; the first that matches applies.
+    inbox_bindings: tuple[WorkdirBinding, ...] = ()
+
+    def workdir_binding(self, inbox_id: str) -> WorkdirBinding | None:
+        return next((b for b in self.inbox_bindings if b.rule.matches(inbox_id)), None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +144,7 @@ ROLES = (CODE_REVIEWER_ROLE, SDE_ROLE, STEWARD_ROLE)
 _LEGACY_REVIEWER = "coder-reviewer"
 # Deployment mode shared by every role, as an executor or an agent; visible is the old name of interactive.
 ROLE_DEPLOYMENT_KEYS = frozenset({"interactive", "visible"})
-# A limit belongs to the [executors.<id>] table, whichever agents run on it; an [agents.<id>] cannot set one.
+# On [executors.<id>] it caps all agents running on that driver together, on [agents.<id>] just that agent.
 EXECUTOR_LIMIT_KEYS = frozenset({"max_concurrency"})
 READONLY_CHECKOUT = "readonly"
 
@@ -210,7 +219,7 @@ def _parse_role(
                       max_concurrency=_max_concurrency(f"executors.{name}", item))
 
 
-_AGENT_KEYS = frozenset({"role", "executor", "description"})
+_AGENT_KEYS = frozenset({"role", "executor", "description"}) | EXECUTOR_LIMIT_KEYS
 
 
 def _parse_agent(
@@ -246,7 +255,8 @@ def _parse_agent(
         if unknown:
             raise ValueError(f"executors.{name}: {', '.join(unknown)} not supported for role '{role}'; "
                              "the driver's own settings belong in [executors]")
-    merged = {**bases[driver], **{k: v for k, v in item.items() if k not in ("executor", "description")}}
+    own = {k: v for k, v in item.items() if k not in _AGENT_KEYS or k == "role"}
+    merged = {**bases[driver], **own}
     return _parse_role(name, merged, launchers=launchers, anthropic_url=anthropic_url, base_dir=base_dir)
 
 
@@ -443,6 +453,19 @@ class MemoryHubLinkConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RunnerPilotConfig:
+    # One task inbox checked by one standalone Runner (docs/runner.md §8); off unless a deployment turns it on.
+    enabled: bool = False
+    inbox_id: str = ""
+    runner_id: str = ""
+    project_key: str = ""
+    # The Relay listens on 127.0.0.1 only; the address is not configurable.
+    port: int = 8791
+    token_file: str = ""
+    timeout_seconds: float = 120.0
+
+
+@dataclass(frozen=True, slots=True)
 class HibernautConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
@@ -460,6 +483,7 @@ class HibernautConfig:
     peer: PeerHandoffConfig = field(default_factory=PeerHandoffConfig)
     runner: RunnerLinkConfig = field(default_factory=RunnerLinkConfig)
     memory_hub: MemoryHubLinkConfig = field(default_factory=MemoryHubLinkConfig)
+    runner_pilot: RunnerPilotConfig = field(default_factory=RunnerPilotConfig)
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
 
@@ -579,6 +603,68 @@ def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> Switchb
         mcp_url=mcp_url,
         ca_file=ca_file,
     )
+
+
+_PILOT_KEYS = frozenset({"enabled", "inbox_id", "runner_id", "project_key", "port", "token_file", "timeout_seconds"})
+# <project>:<task>: a user's or a project's main inbox would put ordinary work on the pilot route.
+_TASK_INBOX_RE = re.compile(r"(?!user:|proj:)[^\s:]+:[^\s:]+")
+
+
+def parse_runner_pilot(raw: Any, *, base_dir: Path | None = None) -> RunnerPilotConfig:
+    defaults = RunnerPilotConfig()
+    if raw is None:
+        return defaults
+    if not isinstance(raw, dict):
+        raise ValueError("[runner_pilot] must be a table")
+    section = cast(dict[str, Any], raw)
+    unknown = sorted(set(section) - _PILOT_KEYS)
+    if unknown:
+        raise ValueError(f"[runner_pilot] has unknown keys: {', '.join(unknown)}")
+    enabled = section.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("runner_pilot.enabled must be true or false")
+    texts: dict[str, str] = {}
+    for key in ("inbox_id", "runner_id", "project_key", "token_file"):
+        value = section.get(key, "")
+        if not isinstance(value, str) or value != value.strip() or (enabled and not value):
+            raise ValueError(f"runner_pilot.{key} must be a non-empty string when the route is enabled")
+        texts[key] = value
+    port = section.get("port", defaults.port)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("runner_pilot.port must be a port number")
+    timeout = section.get("timeout_seconds", defaults.timeout_seconds)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 600:
+        raise ValueError("runner_pilot.timeout_seconds must be a number above 0 and at most 600")
+    if enabled and _TASK_INBOX_RE.fullmatch(texts["inbox_id"]) is None:
+        raise ValueError('runner_pilot.inbox_id must be one task inbox ("<project>:<task>", not "proj:" or "user:")')
+    return RunnerPilotConfig(
+        enabled=enabled,
+        inbox_id=texts["inbox_id"],
+        runner_id=texts["runner_id"],
+        project_key=texts["project_key"],
+        port=port,
+        token_file=_resolve_path(texts["token_file"], base_dir) if texts["token_file"] else "",
+        timeout_seconds=float(timeout),
+    )
+
+
+def _validate_runner_pilot(config: HibernautConfig) -> None:
+    pilot = config.runner_pilot
+    if not pilot.enabled:
+        return
+    if pilot.inbox_id == config.gdrive.default_inbox_id:
+        raise ValueError("runner_pilot.inbox_id is gdrive.default_inbox_id; use a task inbox of its own")
+    for project in config.projects.values():
+        if project.inbox_id == pilot.inbox_id:
+            raise ValueError(
+                f"runner_pilot.inbox_id is the primary inbox of projects.{project.name}; use a task inbox of its own"
+            )
+    if config.runtime.default_agent not in config.agents:
+        raise ValueError("runner_pilot.enabled needs runtime.default_agent to be a declared agent (no run starts without it)")
+    if pilot.port == config.channels.port:
+        raise ValueError("runner_pilot.port is channels.port")
+    if config.runner.enabled and config.runner.mode == "relay" and pilot.port == config.runner.listen_port:
+        raise ValueError("runner_pilot.port is runner.listen_port; each relay needs its own port")
 
 
 def tool_hook_style(agent: AgentConfig, template: CLITemplate) -> ToolHookStyle | None:
@@ -943,6 +1029,10 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
     # Launchers come only from this trusted deployment file; events cannot name a command.
     launchers = parse_launchers(raw.get("launchers", {}))
 
+    for table in ("executors", "agents"):
+        if PROTOCOL_CHECK_EXECUTOR_ID in raw.get(table, {}):
+            raise ValueError(f"{table}.{PROTOCOL_CHECK_EXECUTOR_ID}: the name is reserved for [runner_pilot]")
+
     executors: dict[str, CLITemplate] = {}
     roles: dict[str, RoleConfig] = {}
     # Pure drivers: no role and no command, so nothing to run until an agent picks them.
@@ -1013,14 +1103,17 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         except ValueError as exc:
             raise _as_agent_error(agent_id, exc) from exc
         description = str(entry.get("description", "")).strip()
+        agent_limit = _max_concurrency(f"agents.{agent_id}", entry)
         if isinstance(built, CLITemplate):
             executors[agent_id] = built
-            agents[agent_id] = AgentConfig(name=agent_id, executor=str(entry["executor"]), description=description)
+            agents[agent_id] = AgentConfig(name=agent_id, executor=str(entry["executor"]), description=description,
+                                           max_concurrency=agent_limit)
         else:
             roles[agent_id] = built
             agents[agent_id] = AgentConfig(
                 name=agent_id, executor=str(entry["executor"]), role=built.role, model=built.profile.model,
                 effort=built.profile.effort, checkout_access=built.checkout_access, description=description,
+                max_concurrency=agent_limit,
             )
     if "default_agent" in rt_raw and runtime.default_agent not in agents:
         raise ValueError(f"runtime.default_agent '{runtime.default_agent}' is not declared in [agents]")
@@ -1080,10 +1173,16 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         )
     validate_project_rules(projects.values())
     validate_project_bindings(projects.values())
+    runtime = dataclasses.replace(runtime, inbox_bindings=parse_workdir_bindings(
+        rt_raw.get("inbox_bindings"), declared=agents, resolve=lambda path: _resolve_path(path, base_dir),
+    ))
+    validate_workdir_bindings(runtime.inbox_bindings, projects.values(),
+                              {name: role.workdir for name, role in roles.items() if role.workdir})
 
     for where, limit in (
         *((f"executors.{n}", e.max_concurrency) for n, e in {**executors, **roles}.items()),
         *((f"executors.{n}", value) for n, value in base_limits.items()),
+        *((f"agents.{n}", a.max_concurrency) for n, a in agents.items()),
         *((f"projects.{n}", p.max_concurrency) for n, p in projects.items()),
     ):
         if limit is not None and limit > runtime.max_concurrency:
@@ -1139,7 +1238,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         default_inbox_id=str(gd_raw.get("default_inbox_id", "default")).strip() or "default",
     )
 
-    return HibernautConfig(
+    config = HibernautConfig(
         runtime=runtime,
         channels=channels,
         executors=executors,
@@ -1154,5 +1253,8 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         peer=parse_peer(raw.get("peer"), base_dir=base_dir),
         runner=parse_runner_link(raw.get("runner"), agents=agents, templates=executors, base_dir=base_dir),
         memory_hub=parse_memory_hub(raw.get("memory_hub"), base_dir=base_dir),
+        runner_pilot=parse_runner_pilot(raw.get("runner_pilot"), base_dir=base_dir),
         config_dir=str(base_dir) if base_dir is not None else "",
     )
+    _validate_runner_pilot(config)
+    return config

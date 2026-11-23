@@ -52,7 +52,7 @@ class TestConfigReload(unittest.TestCase):
             event = {'inbox_id':'reload','external_id':'stable','payload':{'text':'hello'}}
 
             def wait_for(check):
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + 45
                 while time.monotonic() < deadline:
                     self.assertIsNone(proc.poll(), log.read_text())
                     try:
@@ -122,7 +122,7 @@ class TestConfigReload(unittest.TestCase):
                     conn.close()
 
             def wait_for(check):
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + 45
                 while time.monotonic() < deadline:
                     self.assertIsNone(proc.poll(), log.read_text())
                     try:

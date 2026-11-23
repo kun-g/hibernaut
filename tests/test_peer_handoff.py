@@ -461,7 +461,7 @@ class TestResultSurvivesRestart(PeerCase):
         self.assertEqual(restarted.replies(target, since=0), [])
 
     def wait_for_task(self) -> FakeClaude:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             if self.orca.terminals and self.orca.session().received:
                 return self.orca.session()
@@ -470,7 +470,7 @@ class TestResultSurvivesRestart(PeerCase):
 
     def wait_inbox(self, count: int) -> None:
         log = JsonlLog(self.state / RECEIVER / "inbox.jsonl")
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 45
         while len(log.read().records) < count:
             if time.monotonic() > deadline:
                 raise AssertionError(f"inbox has {log.read().records}")

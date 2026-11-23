@@ -590,7 +590,7 @@ class TestVisibleRolesThroughEvents(unittest.TestCase):
             server = asyncio.create_task(serve_configured(path, config, daemon, stop, reload_interval=0.02))
 
             async def wait_for(check):
-                deadline = time.monotonic() + 30
+                deadline = time.monotonic() + 45
                 while time.monotonic() < deadline:
                     self.assertFalse(server.done(), stderr.getvalue())
                     try:

@@ -29,7 +29,8 @@ TASK_SYNC_KIND = "task_sync"
 # Outbox metadata key of the Run's trace. Not the top-level "trace_id", which is the Taskboard task's trace that
 # channels report back.
 TRACE_METADATA_KEY = "_trace_id"
-# Hops one external event may take between agents (forwards and returns alike) before it must be answered.
+# forward_to_inbox hops one external event may take between agents before it must be answered. A return only answers a
+# forward, so it uses none.
 MAX_FORWARD_HOPS = 3
 # The PermissionPort tool name every forward_to_inbox passes through.
 FORWARD_TOOL = "inbox.forward"
@@ -147,7 +148,7 @@ class ForwardSpec:
     target_agent: str | None = None
     # Inbox that gets the result back as an agent:return event; None answers outside through the reply channel.
     return_to: str | None = None
-    # Hops made so far, this one included: 0 for work that came from outside.
+    # Forwards made so far, this one included: 0 for work that came from outside.
     hop_count: int = 0
     forwarded_from: str | None = None
     parent_session_id: str | None = None
@@ -322,6 +323,8 @@ class RunTelemetry:
     error_kind: str | None = None
     # The execution node that ran the process; None means this process (the ledger records "local").
     runner_id: str | None = None
+    # That node's own log of the run (location, digest), kept in the ledger's log; None when there is none.
+    runner_log: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

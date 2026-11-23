@@ -78,6 +78,7 @@ from agent_runtime.adapters.memory_bridge import (
 )
 from agent_runtime.adapters.memory_fs import GovernedMemoryHub, WorkspacePartitionRegistry, check_inbox_id
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter, CredentialProxyClient, read_private_token
+from agent_runtime.adapters.runner_pilot import ClosedRouteExecutor, ProtocolCheckExecutor, RunnerPilotRelay
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.adapters.storage_sqlite.open_runs import SQLiteOpenRunStore
 from agent_runtime.adapters.storage_sqlite import (
@@ -107,6 +108,7 @@ from agent_runtime.app.config import (
     ProjectConfig,
     RoleConfig,
     RunnerLinkConfig,
+    RunnerPilotConfig,
     SwitchboardLinkConfig,
     config_changes,
     load_config,
@@ -114,10 +116,12 @@ from agent_runtime.app.config import (
 from agent_runtime.app.projects import (
     AmbiguousProjectMatch,
     ProjectRouter,
+    InboxRefused,
+    MissingWorkdirHold,
     UnmatchedProjectHold,
     build_routing_manifest,
 )
-from agent_runtime.core.models import Event, InboxRoute, NewEventPolicy
+from agent_runtime.core.models import Event, InboxBinding, InboxRoute, NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, OutboxPort, RunCapabilities
 from agent_runtime.engine import (
     AgentWorker,
@@ -129,6 +133,7 @@ from agent_runtime.engine import (
 from agent_runtime.engine.worker import ExecutorFailed
 from agent_runtime.adapters.ledger_bridge import RunLedger
 from memory_hub import MemoryHubConfig
+from runner.protocol_check import PROTOCOL_CHECK_EXECUTOR_ID
 from switchboard.ports import AuditSinkPort
 from switchboard.app import EnvCredentialBroker, Switchboard, build_switchboard
 from switchboard.config import load_config as load_switchboard_config
@@ -232,13 +237,14 @@ class AsyncWorkerPool:
         for inbox_id in () if self._limiter.saturated() else tuple(self._queue):
             cached = self._queued_keys.get(inbox_id)
             if cached is not None and not self._limiter.available(
-                    inbox_id, project_key=cached.project, executor_key=cached.executor):
+                    inbox_id, project_key=cached.project, executor_key=cached.executor, agent_key=cached.agent):
                 continue
             # Cached keys only rule an inbox out; it is admitted on fresh ones. Another thread may have stored a
             # change (an event replayed for another executor) whose wake has not reached the loop yet.
             keys = self._limit_keys(inbox_id) if self._limit_keys is not None else LimitKeys()
             self._queued_keys[inbox_id] = keys
-            if self._limiter.try_acquire(inbox_id, project_key=keys.project, executor_key=keys.executor):
+            if self._limiter.try_acquire(inbox_id, project_key=keys.project, executor_key=keys.executor,
+                                         agent_key=keys.agent):
                 self._queue.remove(inbox_id)
                 self._queued.discard(inbox_id)
                 del self._queued_keys[inbox_id]
@@ -272,6 +278,13 @@ class AsyncWorkerPool:
         for worker in self._active.values():
             worker.detach()
 
+    def _make_worker(self, inbox_id: str, worker_id: str) -> AgentWorker:
+        # Anyone who can post an event chooses its inbox_id: one that has no memory directory must not end the loop.
+        try:
+            return self._worker_factory(inbox_id, worker_id)
+        except (ValueError, OSError) as exc:
+            raise InboxRefused(inbox_id, exc) from exc
+
     async def _worker_loop(self, worker_idx: int, stop_event: asyncio.Event) -> None:
         worker_id = f"{self._pool_id}-worker-{worker_idx}"
         while self._handoff is None and (not stop_event.is_set() or self._queue):
@@ -285,7 +298,7 @@ class AsyncWorkerPool:
             settled = False
             try:
                 # Inside the try: a factory that refuses the inbox (AmbiguousProjectMatch) leaves its events pending.
-                worker = self._worker_factory(inbox_id, worker_id)
+                worker = self._make_worker(inbox_id, worker_id)
                 self._active[inbox_id] = worker
                 batch_reports = await worker.process_inbox(inbox_id)
                 settled = True
@@ -298,6 +311,8 @@ class AsyncWorkerPool:
                             "Post-run callback failed for inbox %s",
                             inbox_id,
                         )
+            except InboxRefused as exc:
+                logging.getLogger(__name__).warning("%s; its events stay pending", exc)
             except ExecutorFailed as exc:
                 settled = exc.batch_settled
                 logging.getLogger(__name__).exception(
@@ -636,6 +651,7 @@ def concurrency_limits(config: HibernautConfig) -> ConcurrencyLimits:
             **config.driver_limits,
             **{n: e.max_concurrency for n, e in executors.items() if e.max_concurrency is not None},
         },
+        agents={n: a.max_concurrency for n, a in config.agents.items() if a.max_concurrency is not None},
     )
 
 
@@ -647,10 +663,15 @@ def executor_quota_hold(
     keys: LimitKeyResolver,
     route: LimitRoute,
 ) -> Callable[[Event], str | None] | None:
-    if not limits.executors:
+    if not limits.executors and not limits.agents:
         return route.hold
     return ExecutorQuotaHold(inbox_id, limiter=pool.limiter, on_defer=pool.defer, inner=route.hold,
-                             executor_of=lambda event: keys.event_executor(event, route))
+                             keys_of=lambda event: keys.event_keys(event, route))
+
+
+def batch_counter(pool: AsyncWorkerPool, keys: LimitKeyResolver) -> Callable[[str, str], None]:
+    return lambda inbox_id, agent_id: pool.limiter.count(
+        inbox_id, executor_key=keys.driver(agent_id), agent_key=agent_id)
 
 
 def build_daemon(
@@ -759,6 +780,7 @@ def build_daemon(
                     wk, notify_outbox=outbox, inbox_id=_iid
                 ),
                 hold=_quota_hold(inbox_id),
+                on_batch_start=batch_counter(pool, limit_keys),
                 lock=lock,
                 sessions=sessions,
                 run_start_listener=gdrive_writer,
@@ -782,6 +804,7 @@ def build_daemon(
                 wk, notify_outbox=outbox, inbox_id=_iid
             ),
             hold=_quota_hold(inbox_id),
+            on_batch_start=batch_counter(pool, limit_keys),
             lock=lock,
             sessions=sessions,
             run_start_listener=gdrive_writer,
@@ -835,7 +858,7 @@ def build_daemon(
 
     resolved_limits = limits or ConcurrencyLimits()
     limit_keys = LimitKeyResolver(
-        limits=resolved_limits, inbox=inbox, sessions=sessions, open_runs=open_runs, route=_route,
+        inbox=inbox, sessions=sessions, open_runs=open_runs, route=_route,
         global_default_executor=global_default_executor or (
             default_executor.executor_id if executors_factory is None and executor_factory is None else None
         ),
@@ -912,6 +935,70 @@ def build_daemon(
     )
 
 
+def open_runner_pilot(pilot: RunnerPilotConfig) -> RunnerPilotRelay | None:
+    # Reads the Relay token (ValueError when it cannot be used) and listens on nothing yet.
+    if not pilot.enabled:
+        return None
+    return RunnerPilotRelay(
+        runner_id=pilot.runner_id,
+        project_key=pilot.project_key,
+        port=pilot.port,
+        token_file=Path(pilot.token_file),
+    )
+
+
+async def start_runner_pilot(relay: RunnerPilotRelay | None) -> bool:
+    if relay is None or relay.listening:
+        return relay is not None
+    try:
+        await relay.start()
+    except OSError as exc:
+        print(f"[runner_pilot] Relay cannot listen: {exc.strerror}; the pilot inbox stays held.",
+              file=sys.stderr, flush=True)
+        return False
+    return True
+
+
+async def next_runner_pilot(
+    current: RunnerPilotRelay | None, before: RunnerPilotConfig, after: RunnerPilotConfig
+) -> RunnerPilotRelay | None:
+    # The Relay after a reload. A route being turned on has to open, or the reload is refused; one that was on already
+    # but could not open is tried again without holding up the other settings.
+    if not after.enabled:
+        return None
+    try:
+        relay = current if current is not None else open_runner_pilot(after)
+    except ValueError as exc:
+        print(f"[runner_pilot] {exc}; the pilot inbox stays held.", file=sys.stderr, flush=True)
+        if not before.enabled:
+            raise
+        return None
+    if not await start_runner_pilot(relay) and not before.enabled:
+        raise OSError("the pilot relay cannot listen")
+    return relay
+
+
+def pilot_inbox(project: str) -> InboxRoute:
+    return InboxRoute(project=project, has_bindings=True, binding=InboxBinding(
+        inbox="[runner_pilot]", default_agent=PROTOCOL_CHECK_EXECUTOR_ID, agents=(PROTOCOL_CHECK_EXECUTOR_ID,),
+    ))
+
+
+def pilot_hold(
+    relay: RunnerPilotRelay | None, executor_of: Callable[[Event], str | None]
+) -> Callable[[Event], str | None]:
+    # The pilot inbox never runs on another executor, so whatever cannot run on the route waits for a person.
+    def hold(event: Event) -> str | None:
+        executor = executor_of(event)
+        if executor is None:
+            return None
+        if executor != PROTOCOL_CHECK_EXECUTOR_ID:
+            return f"the pilot inbox only runs {PROTOCOL_CHECK_EXECUTOR_ID}"
+        return None if relay is not None and relay.listening else "the pilot relay is not listening"
+
+    return hold
+
+
 def _permissions(link: RunnerLinkConfig) -> AutoModePermissionAdapter:
     if not link.enabled:
         return AutoModePermissionAdapter()
@@ -930,10 +1017,13 @@ def build_daemon_from_config(
     gdrive_client: DriveClientProtocol | None = None,
     switchboard: SwitchboardHandle | None = None,
     ledger: RunLedger | None = None,
+    runner_pilot: RunnerPilotRelay | None = None,
     runner: RunnerHandle | None = None,
     limiter: ConcurrencyLimiter | None = None,
     memory_hub: GovernedMemoryHub | None = None,
 ) -> AlwaysOnDaemon:
+    if demo and config.runner_pilot.enabled:
+        raise ValueError("runner_pilot.enabled cannot be used with --demo")
     # Every inbox -> project lookup goes through the router, so pattern-matched inboxes get their project's settings
     # and an inbox matching two projects raises AmbiguousProjectMatch instead of picking one.
     router = ProjectRouter(config.projects.values())
@@ -1189,6 +1279,26 @@ def build_daemon_from_config(
             for exec_name in config.executors
         }
         fallback_executors.update(_role_executors(default_mgr, "the inbox matches no [projects] entry"))
+        # Only the agents that can work outside a project are registered for an inbox bound to a workdir.
+        bound_executors: dict[str, dict[str, ExecutorPort]] = {
+            bound.rule.pattern: {
+                exec_name: LocalCLIExecutor(
+                    worktree_manager=default_mgr,
+                    inbox_checkout_map=inbox_checkout_map,
+                    templates=config.executors,
+                    default_executor=exec_name,
+                    bound_workdir=bound.workdir,
+                    readonly=bound.readonly,
+                )
+                for exec_name in config.executors
+            }
+            for bound in config.runtime.inbox_bindings
+        }
+        for bound in config.runtime.inbox_bindings:
+            if not bound.readonly and bound.rule.literal is not None:
+                daemon.partitions.register(bound.rule.literal, bound.workdir)
+        for registry in (*executors_by_project.values(), *bound_executors.values(), fallback_executors):
+            registry[PROTOCOL_CHECK_EXECUTOR_ID] = ClosedRouteExecutor()
 
         def _manager_for(inbox_id: str | None, work_key: str) -> OrcaWorktreeManager:
             if inbox_id is not None:
@@ -1214,6 +1324,11 @@ def build_daemon_from_config(
             )
             daemon.worktree_sweep_interval_seconds = config.runtime.worktree_sweep_interval_seconds
 
+        pilot = config.runner_pilot
+
+        def _on_pilot_route(inbox_id: str) -> bool:
+            return pilot.enabled and inbox_id == pilot.inbox_id
+
         def _route(inbox_id: str) -> InboxRoute | None:
             # None means nothing may be forwarded there: no project, two projects, or no memory partition of that name.
             try:
@@ -1221,27 +1336,100 @@ def build_daemon_from_config(
                 project = router.resolve(inbox_id)
             except (ValueError, AmbiguousProjectMatch):
                 return None
-            return project.route(inbox_id) if project is not None else None
+            # The pilot inbox offers its own executor and no other, whatever binding covers it when the route is off.
+            if project is not None:
+                route = project.route(inbox_id)
+            else:
+                bound = config.runtime.workdir_binding(inbox_id)
+                route = bound.route() if bound is not None else None
+            return pilot_inbox(route.project) if route is not None and _on_pilot_route(inbox_id) else route
 
         # One per config generation, so a held event is logged once each time it enters the wait.
         unmatched_hold = UnmatchedProjectHold(daemon.sessions)
+        workdir_holds = {b.rule.pattern: MissingWorkdirHold(daemon.sessions, b.workdir)
+                         for b in config.runtime.inbox_bindings}
+
+        def _pilot_executor(event: Event) -> str | None:
+            return AgentWorker.expected_executor_id(
+                event, daemon.sessions, project_default=PROTOCOL_CHECK_EXECUTOR_ID, global_default=None,
+            )
+
+        pilot_route = LimitRoute(
+            default_executor=PROTOCOL_CHECK_EXECUTOR_ID, hold=pilot_hold(runner_pilot, _pilot_executor)
+        )
 
         def _cli_route(inbox_id: str) -> LimitRoute:
+            if _on_pilot_route(inbox_id):
+                return pilot_route
             project = router.resolve(inbox_id)
             if project is None:
-                return LimitRoute(hold=unmatched_hold)
+                bound = config.runtime.workdir_binding(inbox_id)
+                if bound is None:
+                    return LimitRoute(hold=unmatched_hold)
+                return LimitRoute(binding=bound.binding, hold=workdir_holds[bound.rule.pattern])
             return LimitRoute(project=project.name, default_executor=project.default_agent,
                               binding=project.route(inbox_id).binding)
 
         limit_keys = LimitKeyResolver(
-            limits=limits, inbox=daemon.inbox, sessions=daemon.sessions, open_runs=daemon.open_runs, route=_cli_route,
+            inbox=daemon.inbox, sessions=daemon.sessions, open_runs=daemon.open_runs, route=_cli_route,
             global_default_executor=config.runtime.default_agent,
             drivers={name: agent.executor for name, agent in config.agents.items()},
         )
 
+        def _pilot_worker(inbox_id: str, worker_id: str) -> AgentWorker:
+            # Detached Runs of another executor belong to the worker that can resume them, so nothing runs meanwhile.
+            detached = daemon.open_runs.list_open(inbox_id) if daemon.open_runs is not None else []
+            if detached:
+                raise ExecutorFailed(
+                    f"Inbox {inbox_id} still has detached Runs of "
+                    f"{', '.join(sorted({run.executor_id for run in detached}))}; "
+                    "turn runner_pilot off to let them finish first"
+                )
+            executor: ExecutorPort = (
+                ProtocolCheckExecutor(
+                    runner=runner_pilot, inbox_id=pilot.inbox_id, project_key=pilot.project_key,
+                    timeout_seconds=pilot.timeout_seconds,
+                )
+                if runner_pilot is not None
+                else ClosedRouteExecutor()
+            )
+            return AgentWorker(
+                worker_id=worker_id,
+                inbox=daemon.inbox,
+                timers=daemon.timers,
+                memory=daemon.partitions.memory_for(inbox_id),
+                permissions=_permissions(config.runner),
+                outbox=daemon.outbox,
+                executors={PROTOCOL_CHECK_EXECUTOR_ID: executor},
+                project_default_executor=PROTOCOL_CHECK_EXECUTOR_ID,
+                routes=_route,
+                on_forward=daemon.pool.wake,
+                # The runner reclaims its own read-only worktrees; no worktree of this process is involved.
+                on_worktree_reclaim=None,
+                hold=executor_quota_hold(inbox_id, pool=daemon.pool, limits=limits, keys=limit_keys, route=pilot_route),
+                on_batch_start=batch_counter(daemon.pool, limit_keys),
+                run_start_listener=daemon.gdrive_result_writer,
+                open_runs=daemon.open_runs,
+                run_ledger=daemon.ledger.recorder if daemon.ledger is not None else None,
+                code_version=__version__,
+                lock=daemon.lock,
+                sessions=daemon.sessions,
+                # A check has no side effects to protect, and a new event is the controlled way to interrupt it.
+                new_event_policy="interrupt",
+            )
+
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
-            # Raises AmbiguousProjectMatch before any lease, executor or workspace exists for the inbox.
+            # Both raise (InboxRefused by way of the pool, AmbiguousProjectMatch) before any lease, executor or
+            # workspace exists for the inbox.
+            check_inbox_id(inbox_id)
+            if _on_pilot_route(inbox_id):
+                return _pilot_worker(inbox_id, worker_id)
             project = router.resolve(inbox_id)
+            bound = config.runtime.workdir_binding(inbox_id) if project is None else None
+            if project is not None:
+                executors = executors_by_project[project.name]
+            else:
+                executors = bound_executors[bound.rule.pattern] if bound is not None else fallback_executors
             wt_mgr = wt_mgr_by_project[project.name] if project is not None else default_mgr
             reclaim = worktree_reclaimer(wt_mgr, outbox=daemon.outbox, inbox_id=inbox_id,
                                          delivery=project.delivery if project is not None else None,
@@ -1253,7 +1441,7 @@ def build_daemon_from_config(
                 memory=daemon.partitions.memory_for(inbox_id),
                 permissions=_permissions(config.runner),
                 outbox=daemon.outbox,
-                executors=executors_by_project[project.name] if project is not None else fallback_executors,
+                executors=executors,
                 project_default_executor=project.default_agent if project is not None else None,
                 global_default_executor=config.runtime.default_agent,
                 routes=_route,
@@ -1261,6 +1449,7 @@ def build_daemon_from_config(
                 on_worktree_reclaim=reclaim,
                 hold=executor_quota_hold(inbox_id, pool=daemon.pool, limits=limits, keys=limit_keys,
                                          route=_cli_route(inbox_id)),
+                on_batch_start=batch_counter(daemon.pool, limit_keys),
                 run_start_listener=daemon.gdrive_result_writer,
                 open_runs=daemon.open_runs,
                 run_ledger=daemon.ledger.recorder if daemon.ledger is not None else None,
@@ -1416,6 +1605,7 @@ async def serve_configured(
     reload_interval: float = 1.0,
     outbox_interval_seconds: float = 1.0,
     listeners: ListenerHandover | None = None,
+    runner_pilot: RunnerPilotRelay | None = None,
 ) -> None:
     # A reload never waits for Runs in progress: the listener stays up and takes the new handler, services restart
     # within one tick, and the old worker pool is retired (no new claims) while its last Runs finish in the
@@ -1428,6 +1618,8 @@ async def serve_configured(
         else WebhookHTTPServer(address, daemon.http_handler())
     )
     changes = config_changes(path, stop, interval=reload_interval)
+    # Before the first pool scans its inbox: held events are not looked at again until the next wake.
+    await start_runner_pilot(runner_pilot)
 
     # The runner outlives the task group, which ends with the last Run of every generation.
     async with _running_runner(daemon.runner), asyncio.TaskGroup() as tasks:
@@ -1436,10 +1628,18 @@ async def serve_configured(
         generation = _Generation.start(daemon, tasks, outbox_interval_seconds=outbox_interval_seconds, halt=stop)
         # Every generation whose pool may still hold Runs: the current one and those retired by reloads.
         generations = [generation]
+        # Relays a reload took out of service, each stopping once the Runs that were using it have ended.
+        closing: list[asyncio.Task[None]] = []
         server_thread = _serve_in_thread(server)
 
         def wake_current(inbox_id: str) -> None:
             generation.daemon.pool.wake(inbox_id)
+
+        async def close_relay(relay: RunnerPilotRelay, users: list[asyncio.Task[None]]) -> None:
+            if users:
+                await asyncio.wait(users)
+            await relay.stop()
+            print("[runner_pilot] Relay closed.", file=sys.stderr, flush=True)
 
         try:
             async for candidate in changes:
@@ -1463,6 +1663,15 @@ async def serve_configured(
                         flush=True,
                     )
                     continue
+                if config.runner_pilot.enabled and candidate.runner_pilot.enabled and (
+                    candidate.runner_pilot != config.runner_pilot
+                ):
+                    print(
+                        "[config] [runner_pilot] changes need enabled = false first; keeping current settings.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
                 if replace(candidate.runner, executors=()) != replace(config.runner, executors=()):
                     print(
                         "[config] [runner] changes require a restart.",
@@ -1479,13 +1688,16 @@ async def serve_configured(
                     continue
                 address = (candidate.channels.host, candidate.channels.port)
                 next_server: WebhookHTTPServer | None = None
+                next_pilot: RunnerPilotRelay | None = None
                 try:
+                    next_pilot = await next_runner_pilot(runner_pilot, config.runner_pilot, candidate.runner_pilot)
                     replacement = build_daemon_from_config(
                         candidate,
                         database=daemon.db,
                         demo=demo,
                         switchboard=switchboard,
                         ledger=daemon.ledger,
+                        runner_pilot=next_pilot,
                         runner=daemon.runner,
                         limiter=shared_limiter,
                         memory_hub=daemon.memory_hub,
@@ -1500,6 +1712,8 @@ async def serve_configured(
                         file=sys.stderr,
                         flush=True,
                     )
+                    if next_pilot is not None and next_pilot is not runner_pilot:
+                        await next_pilot.stop()
                     continue
 
                 if replacement.runner is not None:
@@ -1515,6 +1729,12 @@ async def serve_configured(
                 # From here every wake reaching the old pool, from its in-flight requests or released leases,
                 # is forwarded to the new one.
                 previous.retire_pool(wake_current)
+                if runner_pilot is not None and next_pilot is not runner_pilot:
+                    closing.append(tasks.create_task(close_relay(
+                        runner_pilot,
+                        [g.runs for g in generations if g is not generation and g.runs is not None],
+                    )))
+                runner_pilot = next_pilot
                 if next_server is None:
                     server.RequestHandlerClass = handler
                 else:
@@ -1535,6 +1755,10 @@ async def serve_configured(
             )
             for g in generations:
                 g.pool_stop.set()
+            # Every Run has ended, and an interrupted one was stopped on the node first.
+            await asyncio.gather(*closing)
+            if runner_pilot is not None:
+                await runner_pilot.stop()
             await _close_server(server, server_thread, release=listeners.release if listeners is not None else None)
             await generation.stop_services()
 
@@ -1635,13 +1859,22 @@ def main() -> None:
             if args.mcp_stdio
             else start_switchboard(cfg.switchboard, audit=ledger.switchboard_audit() if ledger is not None else None)
         )
+        runner_pilot: RunnerPilotRelay | None = None
+        if not args.mcp_stdio:
+            try:
+                runner_pilot = open_runner_pilot(cfg.runner_pilot)
+            except ValueError as exc:
+                # The rest of the daemon runs; the pilot inbox is held, never run on another executor.
+                print(f"[runner_pilot] {exc}; the pilot inbox stays held.", file=sys.stderr, flush=True)
         # Nor does it run any agent, so it opens no runner; the memory HTTP service belongs to the daemon too.
         companion = (
             replace(cfg, runner=RunnerLinkConfig(), memory_hub=replace(cfg.memory_hub, http=MemoryHTTPConfig()))
             if args.mcp_stdio
             else cfg
         )
-        daemon = build_daemon_from_config(companion, demo=args.demo, switchboard=board, ledger=ledger)
+        daemon = build_daemon_from_config(
+            companion, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot
+        )
         host = cfg.channels.host
         port = cfg.channels.port
     else:
@@ -1698,6 +1931,7 @@ def main() -> None:
                     reload_interval=args.config_poll_interval,
                     outbox_interval_seconds=args.outbox_interval,
                     listeners=listeners,
+                    runner_pilot=runner_pilot,
                 )
             else:
                 server = listeners.server((host, port), daemon.http_handler())

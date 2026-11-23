@@ -48,7 +48,14 @@ def alive(pid: int) -> bool:
     return True
 
 
-async def until(condition, seconds: float = 8.0) -> bool:
+def running(pid: int) -> bool:
+    # A killed orphan stays a zombie until init reaps it, and a zombie no longer runs anything.
+    stat = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(stat) and not stat.startswith("Z")
+
+
+async def until(condition, seconds: float = 30.0) -> bool:
+    # Less than the 60s the processes under test sleep, so one left behind cannot end by itself in time.
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         if condition():
@@ -76,7 +83,8 @@ class Case(unittest.IsolatedAsyncioTestCase):
         return [int(p) for p in self.pids.read_text().split()] if self.pids.exists() else []
 
     async def started(self, count: int) -> list[int]:
-        self.assertTrue(await until(lambda: len(self.recorded()) == count), "the CLI did not start")
+        # The processes can be up before `terminal create` has returned to the runner.
+        self.assertTrue(await until(lambda: self.orca.terminals and len(self.recorded()) == count), "the CLI did not start")
         return self.recorded()
 
     async def all_gone(self, pids):
@@ -174,13 +182,14 @@ class TestCLITerminalScript(unittest.IsolatedAsyncioTestCase):
         self.root = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
         self.pids = self.root / "pids"
 
-    def start(self, timeout_seconds=30.0):
+    def start(self, timeout_seconds=60.0, script=None, stdout=subprocess.DEVNULL):
+        script = script or f'echo $$ > "{self.pids}"; sleep 60 & echo $! >> "{self.pids}"; wait'
         spec = {"title": "t", "cwd": str(self.root), "env": {}, "timeout_seconds": timeout_seconds,
-                "argv": ["/bin/sh", "-c", f'echo $$ > "{self.pids}"; sleep 60 & echo $! >> "{self.pids}"; wait'],
+                "argv": ["/bin/sh", "-c", script],
                 **{name: str(self.root / name) for name in ("stdout", "stderr", "exit.json")}}
         (self.root / "spec.json").write_text(json.dumps(spec))
         proc = subprocess.Popen([sys.executable, "-I", str(CLI_TERMINAL_SCRIPT), str(self.root / "spec.json")],
-                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                stdin=subprocess.PIPE, stdout=stdout, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         return proc
 
@@ -207,7 +216,27 @@ class TestCLITerminalScript(unittest.IsolatedAsyncioTestCase):
                 proc.send_signal(sig)
                 self.assertTrue(await until(lambda: proc.poll() is not None))
                 self.assertEqual(proc.returncode, 128 + sig)
-                self.assertTrue(await until(lambda: not any(alive(p) for p in pids)))
+                # The wrapper waits for the whole group to end before it exits.
+                self.assertEqual([p for p in pids if running(p)], [])
+
+    async def test_the_exit_code_names_the_signal_when_the_terminal_is_already_gone(self):
+        # Output the dead terminal refused must not turn the exit code into Python's own at shutdown.
+        go = self.root / "go"
+        os.mkfifo(go)
+        proc = self.start(script=f'echo up; cat < "{go}"; sleep 60', stdout=subprocess.PIPE)
+        assert proc.stdout is not None
+        self.assertEqual(os.read(proc.stdout.fileno(), 5), b"[hibe")
+        copy = self.root / "stdout"
+        self.assertTrue(await until(lambda: copy.exists() and copy.read_bytes() == b"up\n"))
+        proc.stdout.close()
+        with go.open("wb", buffering=0) as cli:
+            for line in (b"one\n", b"two\n"):
+                # A second chunk in the copy means that the first one was offered to the screen.
+                cli.write(line)
+                self.assertTrue(await until(lambda line=line: copy.read_bytes().endswith(line)))
+        proc.send_signal(signal.SIGHUP)
+        self.assertTrue(await until(lambda: proc.poll() is not None))
+        self.assertEqual(proc.returncode, 128 + signal.SIGHUP)
 
 
 class TestSessionCheckBeforeACommand(Case):
@@ -266,55 +295,155 @@ class TestSessionCheckBeforeACommand(Case):
         self.assertEqual((run.exit_code, run.stdout, run.stderr), (5, b"out\n", b"err\n"))
 
 
-# Runs one start of a wrapper script with a SIGTERM delivered after the CLI is running but before Popen returns.
-STOPPED_WHILE_STARTING = """
-import os, signal, subprocess, sys, time
+# Runs one wrapper script with stop signals delivered at one exact point. The CLI reports its pids through a FIFO, which
+# the script reads at that point, so it goes on only once the CLI and its child really run.
+SIGNALLED_WRAPPER = """
+import os, signal, subprocess, sys, threading
 from pathlib import Path
 from agent_runtime.adapters.executor_cli import claude_gate, cli_terminal
 
-start, root = sys.argv[1], Path(sys.argv[2])
-pids = root / "pids"
-argv = ["/bin/sh", "-c", f'echo $$ > "{pids}"; sleep 60 & echo $! >> "{pids}"; wait']
-real = subprocess.Popen
+start, window, root = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+argv = ["/bin/sh", "-c", f'sleep 60 & echo "$$ $!" > "{root / "started"}"; wait']
+if start == "once":
+    # cli_terminal.py kills a one-off gate after its own grace, so the gate must spend none on a probe that ignores TERM.
+    argv[2] = "trap '' TERM; " + argv[2]
+    cli_terminal.GRACE_SECONDS = 3600
+lease = root / "lease"
+lease.touch()
+pids = []
+
+def cli_started():
+    pids.append((root / "started").read_text())
+    (root / "pids").write_text(pids[0])
+
+def stop(*signals):
+    # All pending at once for the main thread, so the wrapper takes them one right after the other.
+    signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+    for sig in signals:
+        signal.pthread_kill(threading.main_thread().ident, sig)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)
+
+real_popen, real_read, real_exited = subprocess.Popen, os.read, cli_terminal.exited
+
+def read(fd, size):
+    # Popen reads the pipe on which the forked child reports a failed exec.
+    os.read = real_read
+    cli_started()
+    stop(signal.SIGHUP)
+    return real_read(fd, size)
 
 def popen(*args, **kwargs):
-    proc = real(*args, **kwargs)
-    while not pids.exists() or len(pids.read_text().split()) < 2:
-        time.sleep(0.02)
-    os.kill(os.getpid(), signal.SIGTERM)
-    time.sleep(0.1)
+    if window == "before the fork":
+        stop(signal.SIGHUP)
+    if window == "inside Popen":
+        os.read = read
+    proc = real_popen(*args, **kwargs)
+    if not pids:
+        cli_started()
+    if window == "before Popen returns":
+        stop(signal.SIGHUP)
+    if window == "as the cleanup starts":
+        lease.unlink()
+        sys.setprofile(after_the_body)
     return proc
 
+body = {"cli": "_run", "probe": "_probe", "once": "_probe", "agent": "_supervise"}[start]
+ended = False
+
+def after_the_body(frame, event, arg):
+    # The first function called once the body has ended for another reason (deadline, lease).
+    global ended
+    if event == "return" and frame.f_code.co_name == body:
+        ended = True
+    elif event == "call" and ended:
+        sys.setprofile(None)
+        stop(signal.SIGHUP)
+
+class Lost:
+    # Python drops an exception raised in a finalizer, so this stop never reaches the code it interrupted.
+    def __del__(self):
+        stop(signal.SIGHUP)
+
+watched = False
+
+def exited(pid, seconds):
+    global watched
+    if not watched:
+        watched = True
+        if window == "two signals at once":
+            stop(signal.SIGHUP, signal.SIGTERM)
+        if window == "in a finalizer":
+            Lost()
+    return real_exited(pid, seconds)
+
 subprocess.Popen = popen
-(root / "lease").touch()
-if start == "cli":
-    sys.exit(cli_terminal.main(str(root / "spec.json")))
-run = {"probe": lambda spec, running: claude_gate._probe(argv, dict(os.environ), 30.0, root / "lease", running),
-       "agent": lambda spec, running: claude_gate._supervise(argv, dict(os.environ), root / "lease", running)}[start]
-claude_gate._main = run
-sys.exit(claude_gate.main(str(root / "spec.json")))
+cli_terminal.exited = claude_gate.exited = exited
+real_run = cli_terminal._run
+
+def run(spec, running):
+    if window == "before the start":
+        stop(signal.SIGHUP)
+    if start == "cli":
+        return real_run(spec, running)
+    if start in ("probe", "once"):
+        return claude_gate._probe(argv, dict(os.environ), 30.0, lease, running)
+    return claude_gate._supervise(argv, dict(os.environ), lease, running)
+
+cli_terminal._run = claude_gate._main = run
+os._exit((cli_terminal if start == "cli" else claude_gate).main(str(root / "spec.json")))
 """
 
 
-class TestStopWhileStarting(Case):
-    async def test_a_signal_that_arrives_while_the_process_starts_still_ends_it(self):
-        spec = {"title": "t", "cwd": str(self.root), "env": {}, "timeout_seconds": 30.0, "argv": self.busy_cli(),
-                **{name: str(self.root / name) for name in ("stdout", "stderr", "exit.json")}}
+class TestStopAtEveryStage(Case):
+    def setUp(self):
+        super().setUp()
+        os.mkfifo(self.root / "started")
+
+    async def stopped(self, start: str, window: str) -> list[int]:
+        self.pids.unlink(missing_ok=True)
+        # The CLI reaches its deadline at once where the wrapper is to end it by itself.
+        spec = {"title": "t", "cwd": str(self.root), "env": {}, "timeout_seconds": 0 if "cleanup" in window else 30.0,
+                "argv": ["/bin/sh", "-c", f'sleep 60 & echo "$$ $!" > "{self.root / "started"}"; wait'],
+                "once": start == "once", **{name: str(self.root / name) for name in ("stdout", "stderr", "exit.json")}}
         (self.root / "spec.json").write_text(json.dumps(spec))
-        for start in ("cli", "probe", "agent"):
-            with self.subTest(start):
-                self.pids.unlink(missing_ok=True)
-                proc = await asyncio.create_subprocess_exec(
-                    sys.executable, "-c", STOPPED_WHILE_STARTING, start, str(self.root),
-                    env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, sys.path))},
-                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL)
-                self.addCleanup(lambda proc=proc: proc.returncode is None and proc.kill())
-                self.assertEqual(await asyncio.wait_for(proc.wait(), 30), 128 + signal.SIGTERM)
-                pids = self.recorded()
-                self.addCleanup(lambda pids=pids: [os.kill(p, signal.SIGKILL) for p in pids if alive(p)])
-                self.assertEqual(len(pids), 2)
-                await self.all_gone(pids)
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", SIGNALLED_WRAPPER, start, window, str(self.root),
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, sys.path))},
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL)
+        self.addCleanup(lambda: proc.returncode is None and proc.kill())
+        code = await asyncio.wait_for(proc.wait(), 60)
+        pids = self.recorded()
+        self.addCleanup(lambda: [os.kill(p, signal.SIGKILL) for p in pids if alive(p)])
+        self.assertEqual([p for p in pids if running(p)], [], "left running")
+        self.assertEqual(code, 128 + signal.SIGHUP)
         self.assertFalse((self.root / "exit.json").exists())
+        return pids
+
+    async def each_start(self, window: str, started: int = 2):
+        for start in ("cli", "probe", "once", "agent"):
+            with self.subTest(start):
+                self.assertEqual(len(await self.stopped(start, window)), started)
+
+    async def test_a_signal_before_the_start_starts_nothing(self):
+        await self.each_start("before the start", started=0)
+
+    async def test_a_signal_before_the_fork_ends_the_process_it_starts(self):
+        await self.each_start("before the fork")
+
+    async def test_a_signal_while_the_started_process_is_not_known_yet_ends_it(self):
+        await self.each_start("inside Popen")
+
+    async def test_a_signal_before_the_process_is_recorded_ends_it(self):
+        await self.each_start("before Popen returns")
+
+    async def test_a_second_signal_does_not_cut_the_cleanup_short(self):
+        await self.each_start("two signals at once")
+
+    async def test_a_signal_as_another_way_out_starts_its_cleanup_does_not_skip_it(self):
+        await self.each_start("as the cleanup starts")
+
+    async def test_a_stop_lost_in_a_finalizer_still_stops_the_wrapper(self):
+        await self.each_start("in a finalizer")
 
 
 class TestCLIGroupSignals(unittest.TestCase):
@@ -323,6 +452,8 @@ class TestCLIGroupSignals(unittest.TestCase):
     def setUp(self):
         self.root = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
         self.sent: list[tuple[int, int, bool]] = []
+        # SIGKILLs to lose, as when a member forks while its group is being signalled.
+        self.missed: list[bool] = []
         real = os.killpg
 
         def record(pgid, sig):
@@ -332,14 +463,21 @@ class TestCLIGroupSignals(unittest.TestCase):
             except ChildProcessError:
                 reaped = True
             self.sent.append((pgid, sig, reaped))
-            return real(pgid, sig)
+            return None if self.missed and sig == signal.SIGKILL and self.missed.pop() else real(pgid, sig)
 
         self.enterContext(patch("os.killpg", new=record))
 
     def popen(self, script):
-        proc = subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True)
+        # Returns once the script has written a line to $READY, with that line.
+        ready = self.root / "ready"
+        os.mkfifo(ready)
+        proc = subprocess.Popen(["/bin/sh", "-c", script], start_new_session=True,
+                                env={**os.environ, "READY": str(ready)})
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
-        return proc
+        return proc, ready.read_text().strip()
+
+    def sent_signals(self):
+        return [s[1] for s in self.sent if s[1] != 0]
 
     def assert_never_after_reaping(self):
         self.assertTrue(self.sent)
@@ -356,20 +494,61 @@ class TestCLIGroupSignals(unittest.TestCase):
         self.assert_never_after_reaping()
 
     def test_a_stopped_cli_that_ends_within_the_grace_is_not_signalled_after_it_is_reaped(self):
-        proc = self.popen("sleep 60")
-        time.sleep(0.2)
+        proc, _ = self.popen('echo > "$READY"; exec sleep 60')
         cli_terminal.end_group(proc)
         self.assertEqual(proc.returncode, -signal.SIGTERM)
         # SIGKILL still goes out for anything left in the group, but while the leader is an unreaped zombie.
-        self.assertEqual([s[1] for s in self.sent], [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(self.sent_signals(), [signal.SIGTERM, signal.SIGKILL])
         self.assert_never_after_reaping()
 
     def test_a_cli_that_ignores_sigterm_is_killed_while_it_is_still_running(self):
-        proc = self.popen("trap '' TERM; sleep 60 & wait; sleep 60")
-        time.sleep(0.2)
+        proc, _ = self.popen("trap '' TERM; sleep 60 & echo > \"$READY\"; wait; sleep 60")
         cli_terminal.end_group(proc, grace=0.3)
         self.assertEqual(proc.returncode, -signal.SIGKILL)
-        self.assertEqual([s[1] for s in self.sent], [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(self.sent_signals()[0], signal.SIGTERM)
+        self.assertEqual(set(self.sent_signals()[1:]), {signal.SIGKILL})
+        self.assert_never_after_reaping()
+
+    def test_a_member_that_outlives_the_leader_and_the_first_sigkill_is_killed_too(self):
+        proc, child = self.popen("sh -c 'trap \"\" TERM; echo $$ > \"$READY\"; exec sleep 60' & wait")
+        self.addCleanup(lambda: alive(int(child)) and os.kill(int(child), signal.SIGKILL))
+        self.missed = [True]
+        cli_terminal.end_group(proc, grace=0)
+        self.assertFalse(running(int(child)))
+        self.assert_never_after_reaping()
+
+    def test_a_group_of_only_zombies_has_ended_where_the_system_still_accepts_signals_to_it(self):
+        # Linux accepts them, so the wrapper reads /proc, here one made up for group 70.
+        def member(pid, state, pgrp, threads=1):
+            (self.root / str(pid)).mkdir()
+            (self.root / str(pid) / "stat").write_text(
+                f"{pid} (a) name)) {state} 1 {pgrp} 70 {' '.join(['0'] * 13)} {threads} 0 0 0 0\n")
+
+        def is_running():
+            with patch("os.killpg"), patch.object(cli_terminal, "PROC", self.root):
+                return cli_terminal._group_running(70)  # pyright: ignore[reportPrivateUsage]
+
+        self.assertTrue(is_running())  # nothing known about the group: the signal decides
+        member(70, "Z", 70)
+        member(71, "Z", 70)
+        member(80, "S", 80)
+        self.assertFalse(is_running())
+        member(72, "Z", 70, threads=2)
+        self.assertTrue(is_running())
+        (self.root / "72" / "stat").unlink()
+        member(73, "S", 70)
+        self.assertTrue(is_running())
+
+    def test_the_rest_of_the_group_has_the_grace_to_end_after_its_leader_ended(self):
+        # The leader is gone with the first SIGTERM; its child ends by itself, only later.
+        done = self.root / "done"
+        proc, child = self.popen(
+            f"sh -c 'trap \"sleep 0.2; echo cleaned > {done}; exit\" TERM; echo $$ > \"$READY\"; "
+            "while :; do sleep 60 & wait; done' & wait")
+        self.addCleanup(lambda: alive(int(child)) and os.kill(int(child), signal.SIGKILL))
+        cli_terminal.end_group(proc, grace=30)
+        self.assertEqual(proc.returncode, -signal.SIGTERM)
+        self.assertEqual(done.read_text() if done.exists() else "killed", "cleaned\n")
         self.assert_never_after_reaping()
 
 

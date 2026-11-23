@@ -34,7 +34,7 @@ from runner.protocol import (
     run_identity,
     utc_now_iso,
 )
-from runner.supervisor import ProcessSupervisor, build_child_env
+from runner.supervisor import ChildEnvError, ProcessSupervisor, build_child_env
 from runner.tool_gate import ToolGate, ToolGateBinding
 from runner.worktree import (
     GitWorktreeBackend,
@@ -197,6 +197,11 @@ class RunnerDaemon:
             return done
         if (in_flight := self._active_runs.get(req.run_id)) is not None:
             return await asyncio.shield(in_flight.future)
+
+        if self._config.readonly_only and not req.readonly:
+            return self._refused(
+                req, started_at, start_mono, "permission_denied", f"runner {self._config.runner_id!r} only takes readonly runs"
+            )
 
         project = self._config.projects.get(req.project_key)
         if project is None:
@@ -416,7 +421,7 @@ class RunnerDaemon:
                     work_key=req.work_key,
                     workdir=resolved.workdir,
                 )
-        except WorkspaceIsolationError as exc:
+        except (WorkspaceIsolationError, ChildEnvError) as exc:
             return self._refused(req, started_at, start_mono, "permission_denied", str(exc))
 
         pre_fp = await asyncio.to_thread(worktree_fingerprint, resolved.workdir) if req.readonly else None
@@ -457,7 +462,7 @@ class RunnerDaemon:
                     extra_env=spec.env,
                     credential_lease=req.credential_lease,
                 )
-            except PermissionError as exc:
+            except ChildEnvError as exc:
                 return self._refused(req, started_at, start_mono, "permission_denied", str(exc))
             if gate is not None:
                 arm_watch = asyncio.create_task(self._stop_unless_armed(gate, entry))

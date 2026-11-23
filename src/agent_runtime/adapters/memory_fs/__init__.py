@@ -5,6 +5,7 @@ from agent_runtime.adapters.memory_fs.partitioned import (
     PartitionedMemoryAdapter,
     WorkspacePartitionRegistry,
     check_inbox_id,
+    directory_key,
 )
 from agent_runtime.adapters.memory_fs.segments import BaselineSegments, baseline_segments
 from agent_runtime.adapters.memory_fs.tools import (
@@ -28,5 +29,6 @@ __all__ = [
     "call_memory_tool",
     "check_inbox_id",
     "describe_proposal",
+    "directory_key",
     "write_memory",
 ]

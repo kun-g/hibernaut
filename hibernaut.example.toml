@@ -4,7 +4,7 @@
 [runtime]
 db_path = "./hibernaut.db"
 memory_root = "./agent_memory"
-# 分级并发上限，单位是同时在跑的 Inbox 数，三级同时满足才派发：这里是全局上限；[executors.<id>]（按执行器合计引用它的各 agent）与 [projects.<name>] 各可再写
+# 分级并发上限，单位是同时在跑的 Inbox 数，各级同时满足才派发：这里是全局上限；[agents.<id>]（只限这个 agent）、[executors.<id>]（合计引用它的各 agent）与 [projects.<name>] 各可再写
 # 可选的 max_concurrency（整数，>= 1；不写 = 只受上层限制；大于全局值时以全局为准并记一条 WARNING）。
 # 某一级满额只让受它限制的 Inbox 排队（先到先跑），后面配额有余的 Inbox 照常派发。
 max_concurrency = 4
@@ -66,7 +66,7 @@ harness = "claude-code"         # 目前仅支持 claude-code
 launcher = "claude"             # [launchers.<name>] 之一
 billing = "subscription"        # subscription（用启动器自己的登录，剥离继承来的付费凭据，发现 env 没写明的付费来源即中止）| api（经 [credential_proxy]）
 timeout_seconds = 1800.0        # 交互模式下含等人回答的时间
-# max_concurrency = 2           # 可选：同时跑这个执行器的 Inbox 上限，跨项目、跨引用它的 agent 合计；普通 CLI 执行器同样可写。SDE 内置评审算在 SDE 那次 Run 的名额里
+# max_concurrency = 2           # 可选：同时跑这个执行器的 Inbox 上限，跨项目、跨引用它的 agent 合计；只想限某个 agent 就写在 [agents.<id>]。普通 CLI 执行器同样可写。SDE 内置评审算在 SDE 那次 Run 的名额里
 # model / effort 也可写在这里作默认值，agent 里写的优先
 
 # 独立评审 agent：派单时设 payload.agent_id = "code-reviewer"（旧键 executor_id 仍可用）。只读评审，返回 pass / changes_requested。
@@ -102,6 +102,7 @@ model = "codex/gpt-6.2-astra"
 role = "sde"
 executor = "claude-code"
 description = "在任务 worktree 里测试先行开发，送评审后交付"
+max_concurrency = 2             # 可选：同时跑这个 agent 的 Inbox 上限；满额时共用 claude-code 的 steward 仍可立即运行
 model = "claude-opus-5-5"
 effort = "high"
 review = true                   # true：送 reviewer 评审，changes_requested 时修复后复审，pass 才交付；false：测试与检查完成后直接交付
@@ -118,7 +119,7 @@ interactive = true              # 开发对话在交互终端里续接（存活�
 
 # Steward agent：项目的前台，读事件后自己答复或转投给别的 agent。每轮在工作目录的 Orca 终端里一次性跑 claude -p，跑完即关，不作
 # daemon 子进程；项目 terminal_backend 不是 orca 或 Orca 打不开终端时挂起并说明原因，批准后重试。只读，不建 worktree：没有 Edit / Write / Bash，
-# 只有 Read / Grep / Glob、只读 git、读写项目 Memory、查本项目的会话与事件、forward_to_inbox（每次都过 PermissionPort，最多 3 跳）。
+# 只有 Read / Grep / Glob、只读 git、读写项目 Memory、查本项目的会话与事件、forward_to_inbox（每次都过 PermissionPort，最多转投 3 次，回投不计）。
 # 它能路由到哪些 inbox 和 agent，每次唤醒由本配置现拼进提示，不写在 Skill 里。
 [agents.steward]
 role = "steward"
@@ -164,6 +165,17 @@ timeout_seconds = 300.0
 [agents.ops]
 executor = "grok"
 description = "巡检与例行检查"
+
+# 可选：不属于任何项目的 Inbox（sys:* / user:*）。没有项目检出，启动目录 workdir 必填（支持 ~，相对路径以本文件所在目录为准，不自动创建，
+# 不存在则事件保持 pending）。键同 [[projects.<name>.inbox_bindings]]，第一个整串匹配的生效；不能与项目的 inbox_id 重叠。
+# 可写目录只给一个 Inbox：pattern 须是精确 ID，两条绑定不能指向同一可写目录，也不能在项目检出或 steward 的 workdir 里。
+# 只能用不带 role 的 CLI agent。没有绑定也不匹配项目的 Inbox，事件保持 pending。规范见 docs/inbox-conventions.md。
+[[runtime.inbox_bindings]]
+pattern = "sys:hb-ops"
+default_agent = "ops"
+agents = ["ops"]
+workdir = "/absolute/path/to/your/ops-workdir"
+checkout_access = "readwrite"   # readwrite（默认）| readonly：可共享目录、可用正则；CLI 的只读由它自己的参数保证
 
 [projects.hibernaut]
 # 字符串：一个精确 inbox_id（原有写法，不当正则）。数组：每项直接是正则，须整串匹配（fullmatch），不用加 "re:"（旧写法仍可用）；
@@ -212,7 +224,7 @@ remote = "origin"
 version_file = "src/agent_runtime/__init__.py"   # 版本唯一来源；breaking→major，feature→minor，fix→patch，test_docs→不变
 version_pattern = '__version__\s*=\s*"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)"'
 title_template = "Hibernaut {version}: {title}"  # 版本未变时只用 title
-checks = [["lint-imports"], ["pytest", "-v"], ["pyright"]]   # 仓库门禁，按序在任务 worktree 运行，任一失败则不推送
+checks = [["lint-imports"], ["pytest", "-n", "auto", "--dist", "worksteal", "-v"], ["pyright"]]   # 仓库门禁，按序在任务 worktree 运行，任一失败则不推送
 check_timeout_seconds = 1800.0
 require_review = true           # 合并前要求独立评审 pass
 require_ci = true               # 合并前要求 PR 的 CI 全部通过（gh pr checks）
@@ -302,6 +314,19 @@ gh_command = "gh"
 # listen_port = 8790
 # token_env = "HIBERNAUT_RUNNER_TOKEN"   # 节点共享 token 所在的环境变量，启动时取出并从环境里删除
 # affinity_db_path = "runner/affinity.db"   # 不填 = runtime.db_path 所在目录下的 runner/affinity.db
+
+# Runner 只读试点（默认关闭，docs/runner.md §9；启用、验证与回退步骤见 deploy/runner/README.md）。打开后只有 inbox_id 这一个
+# 任务级 Inbox 改由独立 Runner 上的固定校验程序执行，任务须带 payload.candidate_commit；其他 Inbox 不受影响。
+# Relay 只监听 127.0.0.1。令牌文件须为本用户所有、权限 0600。运行中只能改 enabled，改其他项先关闭。
+# 与上面的 [runner] 互不依赖，可只开其一；[runner] 为 relay 时两者的端口不能相同。
+# [runner_pilot]
+# enabled = false
+# inbox_id = "hibernaut:runner-pilot"
+# runner_id = "mac-pilot"
+# project_key = "hibernaut"
+# port = 8791
+# token_file = "~/.config/hibernaut/runner-relay.token"
+# timeout_seconds = 120              # 单次校验上限，最多 600
 
 # 项目记忆（Memory Hub）。不写这一段用下列默认值；改动要重启。同一项目的 Inbox 共用 <memory_root>/projects/<project_key>/。
 # 设计与写入策略见 docs/architecture.md §14。

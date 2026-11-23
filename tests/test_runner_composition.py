@@ -73,7 +73,7 @@ def entries(tmp_path: Path, kind: str) -> list[dict[str, Any]]:
     return [e for e in map(json.loads, log.read_text(encoding="utf-8").splitlines()) if e["kind"] == kind]
 
 
-async def until(condition: Callable[[], Any], timeout: float = 20.0) -> Any:
+async def until(condition: Callable[[], Any], timeout: float = 45.0) -> Any:
     async with asyncio.timeout(timeout):
         while not (value := condition()):
             await asyncio.sleep(0.02)

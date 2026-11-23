@@ -519,7 +519,7 @@ class ConfigSwitchTests(unittest.TestCase):
             self.assertIsInstance(daemon_sb.channel, SwitchboardChannelAdapter)
             self.assertIsNotNone(daemon_sb.switchboard_bridge)
             board.bus.publish(message_event(scope="user:main"))
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 45
             while not daemon_sb.inbox.fetch_pending("user:main") and time.monotonic() < deadline:
                 board.worker.run_once()
                 time.sleep(0.02)

@@ -50,12 +50,12 @@
 
 ```bash
 lint-imports
-pytest -v
+pytest -n auto --dist worksteal -v
 pyright
 ```
 
 - `lint-imports`：验证 `.importlinter` 全部架构分层与反向依赖契约（0 broken）。
-- `pytest -v`：验证 AST 静态边界测试、Port 契约测试、多 `inbox_id` 并发隔离及 `NewEventPolicy`（`defer`/`fold`/`interrupt`）端到端测试。
+- `pytest -n auto --dist worksteal -v`：并行跑全量，验证 AST 静态边界测试、Port 契约测试、多 `inbox_id` 并发隔离及 `NewEventPolicy`（`defer`/`fold`/`interrupt`）端到端测试。串行 `pytest -v` 只在排查并行相关的失败时用。
 - `pyright`：对 `src/agent_runtime/core`、`src/agent_runtime/engine`、`src/switchboard`、`src/ccpeer`、`src/taskboard`、`src/runner` 与 `src/ledger` 执行 strict 静态类型检查（0 errors, 0 warnings）。
 
 ## 6. 文档增量协作闭环规范
