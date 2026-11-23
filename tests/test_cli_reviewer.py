@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from agent_runtime.adapters.delivery import MERGE_TOOL
+from agent_runtime.adapters.delivery import MERGE_TOOL, DeliveryRecord
 from agent_runtime.adapters.executor_cli import CLIReviewer, CLITemplate, CoderReviewerExecutor, OrcaWorktreeManager
 from agent_runtime.adapters.executor_cli import orca as orca_module
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
@@ -854,53 +854,64 @@ class TestSDEClosesReviewTerminals(TestSDEWithCLIReviewer):
         for handle in (first, second):
             self.assertIsNotNone(self.orca.terminals[handle]["proc"].returncode)
 
+
+class TestReviewTerminalDelivery(ReviewFlowCase):
+    def setUp(self):
+        super().setUp()
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        terminal = OrcaCommandTerminal(root=root)
+        self.executor._reviewer = CLIReviewer(template=CLITemplate(name="grok", command="review-cli", terminal="orca"),
+                                              terminal=terminal)
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.cli_reviewer.review_inputs", return_value=("diff", "")))
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.cli_reviewer.worktree_fingerprint", return_value="head:tree"))
+        self.create = self.enterContext(patch.object(orca_module, "_create_terminal"))
+        self.wait = self.enterContext(patch.object(terminal, "_wait"))
+        self.orca = self.enterContext(patch.object(orca_module, "_orca"))
+        self.operations = Mock()
+        self.operations.attach_mock(self.create, "create")
+        self.operations.attach_mock(self.orca, "orca")
+
+    async def finish(self, *reviews, close=False, record=DONE):
+        handles = [f"term-{i}" for i in range(1, len(reviews) + 1)]
+        self.create.side_effect = [(handle, None) for handle in handles]
+        self.wait.side_effect = [orca_module.TerminalRun(handle, json.dumps(review).encode(), b"", 0)
+                                 for handle, review in zip(handles, reviews, strict=True)]
+        self.delivery.config.close_terminal = close
+        outcome = await self.run_flow(snapshots=handles, reviews=reviews, deliveries=[record],
+                                      diffs={("term-1", "term-2"): ("fix", ["calc.py"])})
+        self.assertIsInstance(outcome, Emit)
+        return outcome.messages[0]
+
+    def closed(self):
+        return [c.args[3] for c in self.orca.await_args_list if c.args[:2] == ("terminal", "close")]
+
     async def test_a_review_terminal_is_closed_before_the_next_round_starts(self):
-        self.set_dev(({"calc.py": "x = 1\n"}, "first try"), ({"calc.py": "x = 2\n"}, "zero divisor rejected"))
-        self.cli.set(json.dumps({"result": json.dumps(CHANGES_REQUESTED), "session_id": "chat-1"}),
-                     json.dumps({"result": json.dumps(PASS), "session_id": "chat-2"}))
-        outcome = await self.executor(self.delivery()).execute([self.event()], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
-        first, second = self.orca.terminals
+        text = await self.finish({"result": json.dumps(CHANGES_REQUESTED), "session_id": "chat-1"},
+                                 {"result": json.dumps(PASS), "session_id": "chat-2"})
+        first, second = "term-1", "term-2"
         # With close_terminal off nothing is left for the delivery, and every round's terminal and session stay known.
-        verbs = [(v, c[3]) if (v := " ".join(c[:2])) == "terminal close" else v for c in self.orca.calls]
-        self.assertLess(verbs.index(("terminal close", first)), len(verbs) - 1 - verbs[::-1].index("terminal create"))
+        self.assertEqual([name for name, _, _ in self.operations.mock_calls], ["create", "orca", "create", "orca"])
         self.assertEqual(self.closed(), [first, second])
-        self.assertNotIn("Review terminals:", outcome.messages[0])
-        self.assertIn(f"Review runs: round 1 {first} (CLI session chat-1); round 2 {second} (CLI session chat-2)\n",
-                      outcome.messages[0])
+        self.assertNotIn("Review terminals:", text)
+        self.assertIn(f"Review runs: round 1 {first} (CLI session chat-1); round 2 {second} (CLI session chat-2)\n", text)
 
     async def test_a_failed_close_does_not_change_the_delivery(self):
-        self.set_dev(({"calc.py": "x = 1\n"}, "divide fixed"))
-        self.cli.set(json.dumps(PASS))
-        failing = OrcaFailingToClose(self.orca, RuntimeError("Orca is not running"))
-        with patch(f"{ORCA_LOG}._orca", new=failing), self.assertLogs(ORCA_LOG, "WARNING"):
-            outcome = await self.executor(self.delivery(close_terminal=True)).execute([self.event()], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
-        (handle,) = self.orca.terminals
-        # The delivery tries again.
-        self.assertEqual(failing.closes, [handle, handle])
-        self.assertIn("delivered (review=pass", outcome.messages[0])
+        self.orca.side_effect = RuntimeError("Orca is not running")
+        with self.assertLogs(ORCA_LOG, "WARNING"):
+            text = await self.finish(PASS, close=True)
+        self.assertEqual(self.closed(), ["term-1", "term-1"])
+        self.assertIn("delivered (review=pass", text)
 
     async def test_review_terminals_close_even_when_the_delivery_evidence_is_incomplete(self):
         # A review terminal is closed after its review and holds nothing to read, so missing delivery evidence does
         # not keep it; the second close only confirms that nothing of it is left.
-        self.set_dev(({"calc.py": "x = 1\n"}, "divide fixed"))
-        self.cli.set(json.dumps(PASS))
-        outcome = await self.executor(self.delivery(close_terminal=True, open_pr=False)).execute(
-            [self.event()], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
-        (handle,) = self.orca.terminals
-        self.assertIn(f"Review terminals: closed {handle}", outcome.messages[0])
-        self.assertNotIn("Review terminals: kept", outcome.messages[0])
-        self.assertEqual(self.closed(), [handle, handle])
+        text = await self.finish(PASS, close=True, record=DeliveryRecord(state="local"))
+        self.assertIn("Review terminals: closed term-1", text)
+        self.assertNotIn("Review terminals: kept", text)
+        self.assertEqual(self.closed(), ["term-1", "term-1"])
 
     async def test_review_terminals_are_closed_once_when_closing_is_off(self):
-        self.set_dev(({"calc.py": "x = 1\n"}, "divide fixed"))
-        self.cli.set(json.dumps(PASS))
-        outcome = await self.executor(self.delivery()).execute([self.event()], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
-        (handle,) = self.orca.terminals
-        # close_terminal decides about the delivery's close only.
-        self.assertEqual(self.closed(), [handle])
-        self.assertNotIn("Review terminals:", outcome.messages[0])
-        self.assertIn(f"[grok] verdict=pass (cli={cli_command(self.root)} terminal=orca)", outcome.messages[0])
+        text = await self.finish(PASS)
+        self.assertEqual(self.closed(), ["term-1"])
+        self.assertNotIn("Review terminals:", text)
+        self.assertIn("[grok] verdict=pass (cli=review-cli terminal=orca)", text)
