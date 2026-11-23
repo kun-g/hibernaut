@@ -19,7 +19,7 @@ from agent_runtime.adapters.executor_cli.project_guidance import (
     matches,
     pin_head,
 )
-from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
+from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor, ReviewRequest, review_inputs, review_prompt
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteSessionStoreAdapter
 from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
@@ -279,29 +279,38 @@ class TestDevelopmentAndBuiltInReview(_Harness):
         self.assertEqual((record.guidance_commit, record.workdir, record.activities, record.tags),
                          (self.start, str(self.repo), ("versioning",), ("tests",)))
 
+    async def guidance_prompts(self, files, **extra):
+        executor = self.sde()
+        events = [event(self.payload(**extra))]
+        state = await executor._new_state(events, events, None)
+        developer = await executor._first_prompt(state, self.caps)
+        for rel, content in files.items():
+            path = self.repo / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        pin, selection = executor._guidance_inputs(state)
+        request = ReviewRequest(workdir=self.repo, requirements=state.requirements, test_evidence=EVIDENCE,
+                                base_ref=state.base_ref, pin=pin, selection=selection)
+        diff, guidance = await review_inputs(request)
+        return developer, review_prompt(request, guidance, diff)
+
     async def test_pure_test_task_selects_by_issue_label(self):
-        self.set_plan(sde=[dev(NEW_TEST)], reviewer=[PASS])
-        await self.run_sde(labels=[{"name": "tests"}, {"name": "good first issue"}])
-        dev_call, review_call = self.calls()
-        self.assertEqual(bodies(dev_call["prompt"]), {"TESTING-BODY"})
-        self.assertIn('Selected because: tag "tests"', dev_call["prompt"])
-        self.assertEqual(bodies(section(review_call["prompt"])), {"TESTING-BODY"})
+        developer, reviewer = await self.guidance_prompts(NEW_TEST, labels=[{"name": "tests"}, {"name": "good first issue"}])
+        self.assertEqual(bodies(developer), {"TESTING-BODY"})
+        self.assertEqual(bodies(section(reviewer)), {"TESTING-BODY"})
 
     async def test_diff_adds_guidance_the_developer_was_not_given(self):
-        self.set_plan(sde=[dev({**NEW_TEST, "VERSION": "2.0.0\n"})], reviewer=[PASS])
-        await self.run_sde(tags=["tests"])
-        dev_call, review_call = self.calls()
-        self.assertEqual(bodies(dev_call["prompt"]), {"TESTING-BODY"})
-        self.assertEqual(bodies(section(review_call["prompt"])), {"TESTING-BODY", "VERSIONING-BODY"})
-        self.assertIn("Selected because: diff touches VERSION", review_call["prompt"])
+        developer, reviewer = await self.guidance_prompts({**NEW_TEST, "VERSION": "2.0.0\n"}, tags=["tests"])
+        self.assertEqual(bodies(developer), {"TESTING-BODY"})
+        self.assertEqual(bodies(section(reviewer)), {"TESTING-BODY", "VERSIONING-BODY"})
+        self.assertIn("Selected because: diff touches VERSION", reviewer)
 
     async def test_unmatched_task_gets_general_rules_and_catalog_only(self):
-        self.set_plan(sde=[dev({"calc.py": "def divide(a, b):\n    return a / b\n"})], reviewer=[PASS])
-        await self.run_sde()
-        for call in self.calls():
-            self.assertIn("GENERAL-RULE", call["prompt"])
-            self.assertIn("- docs/testing.md: Writing tests", call["prompt"])
-            self.assertEqual(bodies(section(call["prompt"])), set())
+        prompts = await self.guidance_prompts({"calc.py": "def divide(a, b):\n    return a / b\n"})
+        for prompt in prompts:
+            self.assertIn("GENERAL-RULE", prompt)
+            self.assertIn("- docs/testing.md: Writing tests", prompt)
+            self.assertEqual(bodies(section(prompt)), set())
 
     async def test_committed_and_uncommitted_guidance_edits_never_change_the_pinned_version(self):
         # Uncommitted guidance in the worktree when the task starts is not part of the task's guidance.
@@ -451,8 +460,6 @@ class TestIndependentReview(_Harness):
 
 
 class TestNonAsciiDiffPaths(_Harness):
-    review_payload = TestIndependentReview.review_payload
-    review = TestIndependentReview.review
 
     # git quotes non-ASCII paths ("\\347\\211\\210...") unless asked for raw output; matching must see real names.
     CN_DOC = "docs/规范/版本.md"
@@ -486,31 +493,33 @@ class TestNonAsciiDiffPaths(_Harness):
         self.assertIn(f"Source: {self.base}:{self.CN_DOC}", guidance)
         self.assertIn(self.CN_BODY, guidance)
 
+    async def explicit_review(self):
+        evt = event({"executor_id": "coder-reviewer", "text": "the task", "base_ref": "main", "explicit_workdir": str(self.repo)})
+        request = self.reviewer()._review_input([evt], None)
+        evidence, guidance = await review_inputs(request)
+        return {"prompt": review_prompt(request, guidance, evidence)}
+
     async def test_tracked_chinese_paths_select_their_guidance(self):
         (self.repo / "版本/当前.txt").write_text("1.1.0\n", encoding="utf-8")
         git(self.repo, "commit", "-qam", "bump")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo)))
+        call = await self.explicit_review()
         self.assert_cn_selected(call, "版本/当前.txt")
 
     async def test_tracked_edit_of_the_chinese_guidance_document_selects_its_pinned_body(self):
         (self.repo / self.CN_DOC).write_text("RELAXED-CN\n", encoding="utf-8")
         git(self.repo, "commit", "-qam", "relax")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo)))
+        call = await self.explicit_review()
         self.assert_cn_selected(call, self.CN_DOC)
         self.assertNotIn("RELAXED-CN", section(call["prompt"]))
 
     async def test_uncommitted_chinese_edit_selects_its_guidance(self):
         (self.repo / "版本/当前.txt").write_text("2.0.0\n", encoding="utf-8")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo)))
+        call = await self.explicit_review()
         self.assert_cn_selected(call, "版本/当前.txt")
 
     async def test_untracked_chinese_file_selects_its_guidance(self):
         (self.repo / "版本/新增说明.txt").write_text("new\n", encoding="utf-8")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo)))
+        call = await self.explicit_review()
         self.assert_cn_selected(call, "版本/新增说明.txt")
 
     async def test_sde_built_in_review_matches_chinese_paths(self):

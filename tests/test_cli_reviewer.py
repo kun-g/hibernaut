@@ -14,7 +14,7 @@ from agent_runtime.adapters.executor_cli import CLIReviewer, CLITemplate, CoderR
 from agent_runtime.adapters.executor_cli import orca as orca_module
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.orca import OrcaCommandTerminal, TerminalUnavailable, terminal_title
-from agent_runtime.adapters.executor_cli.project_guidance import pin_head
+from agent_runtime.adapters.executor_cli.project_guidance import GuidancePin, pin_head
 from agent_runtime.adapters.executor_cli.cli_reviewer import extract_verdict
 from agent_runtime.adapters.executor_cli.executor import LocalCLIExecutor, render_cli_args
 from agent_runtime.adapters.executor_cli.reviewer import REVIEW_SCHEMA, ReviewAborted, ReviewRequest, validate_review
@@ -494,7 +494,10 @@ class TerminalCase(unittest.IsolatedAsyncioTestCase):
     # wrapper script and the fake CLI really run, and their output lands in the terminal's screen file.
     def setUp(self):
         self.root = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
-        self.repo = make_repo(self.root)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.cli_reviewer.review_inputs", return_value=("diff", "")))
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.cli_reviewer.worktree_fingerprint", return_value="head:tree"))
         self.cli = CLIPlan(self.root)
         self.enterContext(patch.dict(os.environ, self.cli.env()))
         self.orca = FakeOrcaTerminals(self.root)
@@ -513,7 +516,7 @@ class TerminalCase(unittest.IsolatedAsyncioTestCase):
 
     def request(self, label="review of task-1 round 1"):
         return ReviewRequest(workdir=self.repo, requirements="divide must reject a zero divisor",
-                             test_evidence=EVIDENCE, base_ref="main", pin=pin_head(self.repo, "test"), label=label)
+                             test_evidence=EVIDENCE, base_ref="main", pin=GuidancePin(str(self.repo), "head", "test"), label=label)
 
     def handles(self):
         return list(self.orca.terminals)

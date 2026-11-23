@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from agent_runtime.adapters.delivery import (
     MERGE_TOOL,
@@ -452,6 +452,63 @@ class TestOpenPullRequest(DeliveryCase):
         self.assertEqual(rec.handback, {})
 
 
+class TestMergePolicy(unittest.TestCase):
+    url = "https://github.example/o/r/pull/1"
+
+    def setUp(self):
+        self.config = DeliveryConfig(repo="o/r", open_pr=True, auto_merge=True)
+        self.delivery = PRDelivery(self.config, Mock(), env={})
+        self.request = DeliveryRequest(work_key="task:1", workdir=Path("repo"), title="t", summary="s", test_evidence="e",
+                                       change_kind="fix", rationale="r", review="pass")
+        self.record = DeliveryRecord(state="pr_open", head_sha="a" * 40, pr_number=1, pr_url=self.url)
+        self.gh = self.enterContext(patch.object(self.delivery, "_gh", side_effect=AssertionError("unexpected gh call")))
+
+    def merge(self, review="pass", permissions=None):
+        self.delivery._merge(dataclasses.replace(self.request, review=review), self.record,
+                             permissions or InMemoryPermission(), frozenset(), lambda: False)
+        return self.delivery.outcome(self.record)
+
+    def test_merge_needs_a_passing_independent_review(self):
+        for review in ("off", "pending"):
+            with self.subTest(review):
+                self.record.notes.clear()
+                self.merge(review)
+                self.assertEqual(self.record.state, "pr_open")
+                self.assertIn(f"needs a passing independent review (review={review})", self.record.notes[0])
+        self.gh.assert_not_called()
+
+    def failed_ci(self):
+        self.gh.side_effect = None
+        self.gh.return_value = subprocess.CompletedProcess([], 1, '[{"name":"gates","state":"FAILURE","bucket":"fail"}]', "")
+        outcome = self.merge()
+        self.assertEqual([call.args[1:3] for call in self.gh.call_args_list], [("pr", "checks")])
+        return outcome
+
+    def test_failed_ci_does_not_merge(self):
+        self.failed_ci()
+        self.assertEqual((self.record.state, self.record.problem), ("pr_open", ""))
+        self.assertIn("not merged: CI failed (gates)", self.record.notes)
+
+    def test_outcome_names_why_an_authorized_merge_did_not_happen(self):
+        self.assertEqual(self.merge("pending"), DeliveryOutcome(
+            state="pr_open", pr_url=self.url, auto_merge=True, hold="review",
+            hold_detail="merging needs a passing independent review (review=pending)"))
+        outcome = self.failed_ci()
+        self.assertEqual((outcome.state, outcome.auto_merge, outcome.hold, outcome.hold_detail, outcome.pr_url),
+                         ("pr_open", True, "ci", "CI failed (gates)", self.url))
+        self.record = dataclasses.replace(self.record, merge_hold="", merge_hold_detail="", notes=[])
+        block = InMemoryPermission({MERGE_TOOL: PermissionDecision("block", "no merges today")})
+        outcome = self.merge(permissions=block)
+        self.assertEqual((outcome.state, outcome.hold, outcome.hold_detail),
+                         ("pr_open", "other", "delivery.merge blocked: no merges today"))
+
+    def test_outcome_has_no_hold_when_merging_is_not_authorized_or_done(self):
+        manual = PRDelivery(dataclasses.replace(self.config, auto_merge=False), Mock(), env={})
+        self.assertEqual(manual.outcome(self.record), DeliveryOutcome(state="pr_open", pr_url=self.url, auto_merge=False))
+        merged = dataclasses.replace(self.record, state="merged")
+        self.assertEqual(self.delivery.outcome(merged), DeliveryOutcome(state="merged", pr_url=self.url, auto_merge=True))
+
+
 class TestMerge(DeliveryCase):
     def merging(self, **overrides):
         return self.delivery(auto_merge=True, **overrides)
@@ -491,55 +548,6 @@ class TestMerge(DeliveryCase):
         self.assertEqual(self.gh_calls("merge"), [])
         rec = self.merging().deliver(self.request(wt), permissions=defer, approved=frozenset({MERGE_TOOL}))
         self.assertEqual(rec.state, "merged")
-
-    def test_merge_needs_a_passing_independent_review(self):
-        for review in ("off", "pending"):
-            wt = self.task(f"task-{review}", {"calc.py": f"x = '{review}'\n"})
-            rec = self.merging().deliver(self.request(wt, review=review), permissions=InMemoryPermission())
-            with self.subTest(review):
-                self.assertEqual(rec.state, "pr_open")
-                self.assertIn(f"needs a passing independent review (review={review})", rec.notes[0])
-        self.assertEqual(self.gh_calls("merge"), [])
-
-    def test_failed_ci_does_not_merge(self):
-        wt = self.task("task-a", {"calc.py": "x = 1\n"})
-        self.set_gh(checks=[{"name": "gates", "state": "FAILURE", "bucket": "fail"}])
-        rec = self.merging().deliver(self.request(wt), permissions=InMemoryPermission())
-        self.assertEqual((rec.state, rec.problem), ("pr_open", ""))
-        self.assertIn("not merged: CI failed (gates)", rec.notes)
-        self.assertEqual(self.gh_calls("merge"), [])
-
-    def test_outcome_names_why_an_authorized_merge_did_not_happen(self):
-        url = "https://github.example/o/r/pull/1"
-        wt = self.task("task-r", {"calc.py": "x = 'r'\n"})
-        rec = self.merging().deliver(self.request(wt, review="pending"), permissions=InMemoryPermission())
-        self.assertEqual(self.merging().outcome(rec), DeliveryOutcome(
-            state="pr_open", pr_url=url, auto_merge=True, hold="review",
-            hold_detail="merging needs a passing independent review (review=pending)"))
-
-        wt = self.task("task-c", {"calc.py": "x = 'c'\n"})
-        self.set_gh(checks=[{"name": "gates", "state": "FAILURE", "bucket": "fail"}])
-        rec = self.merging().deliver(self.request(wt), permissions=InMemoryPermission())
-        outcome = self.merging().outcome(rec)
-        self.assertEqual((outcome.state, outcome.auto_merge, outcome.hold, outcome.hold_detail),
-                         ("pr_open", True, "ci", "CI failed (gates)"))
-        self.assertTrue(outcome.pr_url.startswith("https://github.example/o/r/pull/"))
-
-        wt = self.task("task-b", {"calc.py": "x = 'b'\n"})
-        self.set_gh(checks=[{"name": "gates", "state": "SUCCESS", "bucket": "pass"}])
-        block = InMemoryPermission({MERGE_TOOL: PermissionDecision("block", "no merges today")})
-        outcome = self.merging().outcome(self.merging().deliver(self.request(wt), permissions=block))
-        self.assertEqual((outcome.state, outcome.hold, outcome.hold_detail),
-                         ("pr_open", "other", "delivery.merge blocked: no merges today"))
-
-    def test_outcome_has_no_hold_when_merging_is_not_authorized_or_done(self):
-        wt = self.task("task-a", {"calc.py": "x = 1\n"})
-        rec = self.delivery(auto_merge=False).deliver(self.request(wt), permissions=InMemoryPermission())
-        self.assertEqual(self.delivery(auto_merge=False).outcome(rec), DeliveryOutcome(
-            state="pr_open", pr_url="https://github.example/o/r/pull/1", auto_merge=False))
-        rec = self.merging().deliver(self.request(wt), permissions=InMemoryPermission())
-        self.assertEqual(self.merging().outcome(rec), DeliveryOutcome(
-            state="merged", pr_url="https://github.example/o/r/pull/1", auto_merge=True))
 
     def test_ci_timeout_is_recoverable(self):
         wt = self.task("task-a", {"calc.py": "x = 1\n"})
