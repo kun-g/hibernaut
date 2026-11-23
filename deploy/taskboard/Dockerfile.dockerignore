@@ -1,0 +1,7 @@
+# BuildKit reads this for deploy/taskboard/Dockerfile. The context is the repo root, so send only what the
+# stdlib-only service runs (keeps src/agent_runtime, tests, docs, .env, *.db and .venv out of the build).
+*
+!src/taskboard/
+!src/switchboard/
+!schemas/taskboard/
+**/__pycache__
