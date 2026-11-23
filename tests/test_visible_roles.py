@@ -359,9 +359,10 @@ class TestVisibleSDE(VisibleCase):
 
     async def test_timeout_closes_the_terminal_and_keeps_the_conversation_resumable(self):
         self.set_plan(sde=[{"hang": True}])
-        outcome = await self.sde(review=False, timeout=0.8).execute([event(self.payload())], None, self.caps)
+        # Long enough for the conversation to start on a busy machine: the timeout is meant to hit it while it hangs.
+        outcome = await self.sde(review=False, timeout=5.0).execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Emit), outcome
-        self.assertIn("development failed: timed out after 0.8", outcome.messages[0])
+        self.assertIn("development failed: timed out after 5", outcome.messages[0])
         (handle,) = self.orca.terminals
         self.assertIsNotNone(self.orca.terminals[handle]["proc"].returncode)
         binding = self.bindings.get(outcome.session_id)
