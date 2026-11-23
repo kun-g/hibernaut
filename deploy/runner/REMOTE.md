@@ -110,7 +110,11 @@ Hibernaut 指名一个专用执行器（下文 `remote-claude`）时，这一单
    token_file = "~/.config/hibernaut/runner-relay.token"
    ```
 
-   派单的 Inbox 须属于节点上的那个项目（`[projects.<name>] inbox_id` 能匹配到，且 `<name>` 与节点 `[projects.<键>]` 相同）；`[projects.<name>.inbox_bindings]` 对它有 `agents` 白名单时，把 `remote-claude` 加进去。
+   **派单的 Inbox** 没有专门的路由（与试点不同），按项目自己的规则找：
+   - `[projects.<name>] inbox_id` 的某一项须整串匹配它，且 `<name>` 与节点 `[projects.<键>]` 相同；匹配不到时事件一直 `pending`。
+   - 第一个整串匹配它的 `[[projects.<name>.inbox_bindings]]` 若写了 `agents` 白名单，须含 `remote-claude`，否则事件被拒绝；没有绑定匹配它则不限。
+
+   下文用 `proj:hibernaut:runner-agent`：在 `hibernaut.example.toml` 的项目里由 `proj:hibernaut:.+` 匹配，且不落在任何绑定上。部署的规则不同就换一个符合上面两条的 Inbox（或补规则、把 `remote-claude` 加进白名单），后面各条命令里的 Inbox 一起换。
 
 10. **重启前先查**（`[runner]` 打不开会让整个 Hibernaut 起不来，影响所有路由）：
 
@@ -124,9 +128,17 @@ Hibernaut 指名一个专用执行器（下文 `remote-claude`）时，这一单
 
 ## 验证（首单）
 
+先按「启用」第 9 步的两条确认 Inbox 能派到 `remote-claude`。在 Hibernaut 主机上，应输出项目名和 `True`（`None` 是匹配不到项目，`False` 是白名单没放行）：
+
+```bash
+PYTHONPATH=src python -c 'import sys; from agent_runtime.app.config import load_config; from agent_runtime.app.projects import ProjectRouter; p = ProjectRouter(load_config(sys.argv[1]).projects.values()).resolve(sys.argv[2]); b = p and p.route(sys.argv[2]).binding; print(p and p.name, p and (b is None or b.allows("remote-claude")))' hibernaut.toml proj:hibernaut:runner-agent
+```
+
+然后发单：
+
 ```bash
 curl -sS http://127.0.0.1:8080/events -H 'Content-Type: application/json' -d '{
-  "inbox_id": "hibernaut:runner-agent", "external_id": "runner-agent-1", "correlation_key": "runner-agent:1",
+  "inbox_id": "proj:hibernaut:runner-agent", "external_id": "runner-agent-1", "correlation_key": "runner-agent:1",
   "payload": {"agent_id": "remote-claude", "title": "只读仓库查询", "body": "读 README.md，列出提交前要跑的检查命令，并写明依据的文件与行。"}}'
 ```
 
@@ -134,14 +146,14 @@ curl -sS http://127.0.0.1:8080/events -H 'Content-Type: application/json' -d '{
 
    ```bash
    sqlite3 ledger.db "SELECT run_id, executor_id, runner_id, outcome_kind, emit_status, log_ref FROM runs
-     WHERE inbox_id = 'hibernaut:runner-agent' ORDER BY started_at"
+     WHERE inbox_id = 'proj:hibernaut:runner-agent' ORDER BY started_at"
    ```
 
    应为 `remote-claude` / 节点的 `runner_id` / `emit` / `done`。`log_ref` 指向账本旁的 `logs/runs/<日期>/<run_id>.log`，其中 `=== runner log ===` 一行是 `runner://<节点>/<日期>/<Runner run_id>.log run_id=… sha256=… bytes=…`。
-2. **节点核对同一单**：节点服务日志有 `run <Runner run_id> accepted (executor remote-claude, owner hibernaut:runner-agent)` 和 `ended: succeeded`；`shasum -a 256 ~/runner-agent/logs/<日期>/<Runner run_id>.log` 与账本里的 `sha256` 相同，`wc -c` 与 `bytes` 相同。
+2. **节点核对同一单**：节点服务日志有 `run <Runner run_id> accepted (executor remote-claude, owner proj:hibernaut:runner-agent)` 和 `ended: succeeded`；`shasum -a 256 ~/runner-agent/logs/<日期>/<Runner run_id>.log` 与账本里的 `sha256` 相同，`wc -c` 与 `bytes` 相同。
 3. **只读与隔离**：该日志首行（`"subtype":"init"`）的 `tools` 只有三个，`cwd` 在节点的只读 worktree（路径含 `.readonly`）；结束后 `git -C ~/runner-agent/hibernaut worktree list` 只剩主检出，`git -C ~/runner-agent/hibernaut status --short` 为空。
 4. **越界被拒**：再发一条要求读 `~/.config/hibernaut/runner-agent.token` 的查询。节点日志应有 `Read call refused on this node`，回复里没有内容。
-5. **原路由**：给其他 Inbox 发不写 `agent_id` 的普通任务，账本 `runner_id` 为 `local`；给试点 Inbox 发一条协议校验，`runner_id` 为试点节点；给 `hibernaut:runner-agent` 换一个 `correlation_key`、不写 `agent_id`，仍由项目默认 Agent 执行（同一 `correlation_key` 的会话会继续用上次的 Agent）。
+5. **原路由**：给同一项目的其他 Inbox 发不写 `agent_id` 的普通任务，仍由原 Agent 执行，账本 `runner_id` 为 `local`；给试点 Inbox 发一条协议校验，`runner_id` 为试点节点；给 `proj:hibernaut:runner-agent` 换一个 `correlation_key`、不写 `agent_id`，仍由项目默认 Agent 执行（同一 `correlation_key` 的会话会继续用上次的 Agent）。
 6. **节点缺席**：停节点服务，再发一条查询：等 `node_wait_seconds` 后该事件失败，账本 `outcome_kind = error`、`error_summary` 写明没有在线节点；期间其他路由照常。
 
 ## 回退
@@ -160,6 +172,8 @@ curl -sS http://127.0.0.1:8080/events -H 'Content-Type: application/json' -d '{
 | 现象 | 处理 |
 | :--- | :--- |
 | Hibernaut 重启后起不来，报 `relay token file …` 或 8790 被占 | 修好令牌文件或端口；来不及时按「回退」第 3 步关闭 `[runner]` 再启动 |
+| 首单一直 `pending`，Hibernaut 日志 `matches no [projects] entry` | Inbox 不属于任何项目，换 Inbox 或补 `[projects.<name>] inbox_id` 规则 |
+| 首单没有执行，回复说 `remote-claude` 不在绑定允许的 agent 里 | 把它加进匹配该 Inbox 的绑定的 `agents` 白名单，或换 Inbox |
 | 账本 `outcome_kind = error`、`runner_id = local` | 没有节点完成这一单（`local` 是没有节点回报时的默认值，不表示在本机执行过）；`error_summary` 是 `no online runner matches…` 时看隧道与节点服务，`connection lost` / `disconnected` 时是执行中断线 |
 | 隧道日志 `remote port forwarding failed for listen port 8790` | 节点上还有旧的 sshd 会话占着端口（等它超时，或管理员结束它），或 `permitlisten` 不符 |
 | 节点日志反复 `relay connection lost` | 隧道没通、Hibernaut 没开 Relay，或令牌不符（Hibernaut 日志 `relay refused a connection: invalid token`） |

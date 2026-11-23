@@ -6,10 +6,12 @@ import hashlib
 import json
 import os
 import plistlib
+import shlex
 import signal
 import sqlite3
 import subprocess
 import sys
+import textwrap
 import time
 import tomllib
 from collections.abc import Iterator
@@ -24,6 +26,7 @@ from agent_runtime.adapters.runner_pilot import RunnerPilotRelay
 from agent_runtime.app.bootstrap import open_runner
 from agent_runtime.app.config import parse_config
 from agent_runtime.app.main import build_daemon_from_config
+from agent_runtime.app.projects import ProjectRouter
 from runner.agent_service import AGENT_TOOLS, agent_driver, load_agent_service_config
 from runner.daemon import RunnerDaemon
 from runner.protocol import RunnerCapabilities, ToolCall, ToolDecision
@@ -481,6 +484,62 @@ def test_remote_examples_fit_the_services_and_each_other(tmp_path: Path) -> None
     assert "-N" in argv and "-A" not in argv
 
 
+def _first_order() -> dict[str, Any]:
+    text = (ROOT / "deploy/runner/REMOTE.md").read_text(encoding="utf-8")
+    body = text.split("/events", 1)[1].split("-d '", 1)[1].split("'", 1)[0]
+    order: dict[str, Any] = json.loads(body)
+    return order
+
+
+def _first_order_query() -> str:
+    text = (ROOT / "deploy/runner/REMOTE.md").read_text(encoding="utf-8")
+    return text.split('sqlite3 ledger.db "', 1)[1].split('"', 1)[0]
+
+
+def test_the_documented_first_order_reaches_the_remote_executor_in_the_example_project() -> None:
+    document = (ROOT / "deploy/runner/REMOTE.md").read_text(encoding="utf-8")
+    added = document.split("<!-- hibernaut.toml -->", 1)[1].split("```toml", 1)[1].split("```", 1)[0]
+    cfg = parse_config(tomllib.loads((ROOT / "hibernaut.example.toml").read_text(encoding="utf-8") + textwrap.dedent(added)))
+    order = _first_order()
+    inbox = order["inbox_id"]
+    # The pilot takes its own inbox over; this one has to be the project's by the project's own rules.
+    assert inbox != cfg.runner_pilot.inbox_id
+    project = ProjectRouter(cfg.projects.values()).resolve(inbox)
+    assert project is not None and project.name == "hibernaut"
+    node = load_agent_service_config(ROOT / "deploy/runner/agent-runner.example.toml")
+    assert [project.name] == list(node.runner.projects)
+    binding = project.route(inbox).binding
+    assert binding is None or binding.allows(AGENT)
+    assert order["payload"]["agent_id"] == AGENT
+    # The two places where the order is looked up again name the same inbox.
+    assert f"inbox_id = '{inbox}'" in _first_order_query()
+    assert f"owner {inbox})" in document and "hibernaut:runner-agent" not in document.replace(inbox, "")
+
+
+@pytest.mark.parametrize(
+    ("inbox", "answer"),
+    [
+        (None, "hibernaut True"),
+        ("proj:hibernaut:sde:1", "hibernaut False"),
+        ("hibernaut:runner-agent", "None None"),
+    ],
+)
+def test_the_documented_check_tells_whether_an_inbox_can_be_ordered_from(tmp_path: Path, inbox: str | None, answer: str) -> None:
+    document = (ROOT / "deploy/runner/REMOTE.md").read_text(encoding="utf-8")
+    added = document.split("<!-- hibernaut.toml -->", 1)[1].split("```toml", 1)[1].split("```", 1)[0]
+    (tmp_path / "hibernaut.toml").write_text(
+        (ROOT / "hibernaut.example.toml").read_text(encoding="utf-8") + textwrap.dedent(added), encoding="utf-8"
+    )
+    check = document.split("## 验证（首单）", 1)[1].split("```bash\n", 1)[1].split("```", 1)[0].strip()
+    argv = shlex.split(check)
+    assert argv[:3] == ["PYTHONPATH=src", "python", "-c"] and argv[4:] == ["hibernaut.toml", _first_order()["inbox_id"]]
+    done = subprocess.run(
+        [sys.executable, "-c", argv[3], "hibernaut.toml", inbox or argv[5]],
+        cwd=tmp_path, env={**os.environ, "PYTHONPATH": str(ROOT / "src")}, capture_output=True, text=True, timeout=60,
+    )
+    assert (done.returncode, done.stdout.strip()) == (0, answer), done.stderr
+
+
 # --- end to end: Hibernaut, the pilot node and the remote node as separate processes
 
 
@@ -549,14 +608,14 @@ class RemoteDeployment(Deployment):
     def ask(self, *calls: tuple[str, dict[str, Any]], **payload: Any) -> str:
         return self.post(INBOX, agent_id=AGENT, **{"text": plan(*calls), **payload})
 
-    def node_run_log(self, run: sqlite3.Row) -> Path:
+    def node_run_log(self, run: sqlite3.Row, *, owner: str = INBOX) -> Path:
         line = next(x for x in self.ledger_log(run).splitlines() if x.startswith("runner://"))
         location, *pairs = line.split()
         facts = dict(p.split("=", 1) for p in pairs)
         path = self.node / "logs" / location.removeprefix(f"runner://{REMOTE_ID}/")
         assert path.name == f"{facts['run_id']}.log"
         assert hashlib.sha256(path.read_bytes()).hexdigest() == facts["sha256"]
-        assert f"run {facts['run_id']} accepted (executor {AGENT}, owner {INBOX})" in self.node_log.read_text()
+        assert f"run {facts['run_id']} accepted (executor {AGENT}, owner {owner})" in self.node_log.read_text()
         return path
 
 
@@ -608,6 +667,29 @@ def test_a_query_runs_on_the_remote_node_beside_the_pilot_and_the_original_path(
     remote.finished(remote.post(OTHER, executor=AGENT))
     assert remote.outbox(OTHER)[-1].startswith(f"[CLI:{AGENT} exit=1]")
     assert len(remote.cli("start")) == 2
+
+
+def test_the_documented_first_order_is_found_again_in_the_ledger_and_on_the_node(remote: RemoteDeployment) -> None:
+    remote.write()
+    example = tomllib.loads((ROOT / "hibernaut.example.toml").read_text(encoding="utf-8"))["projects"]["hibernaut"]
+    text = remote.config.read_text(encoding="utf-8")
+    rules = 'inbox_id = ["proj:hibernaut", "hibernaut:.*"]'
+    assert rules in text
+    # The example project's inboxes, and its bindings with this deployment's only other agent in their place.
+    bindings = "".join(
+        f"[[projects.hibernaut.inbox_bindings]]\npattern = {json.dumps(b['pattern'])}\ndefault_agent = \"cli\"\nagents = [\"cli\"]\n"
+        for b in example["inbox_bindings"]
+    )
+    remote.config.write_text(text.replace(rules, f"inbox_id = {json.dumps(example['inbox_id'])}\n{bindings}"), encoding="utf-8")
+    remote.start_hb()
+    remote.start_node()
+    order = _first_order()
+    data = remote._post(order)
+    assert data is not None
+    remote.finished(str(data["event_id"]))
+    (row,) = remote.rows(_first_order_query(), db="ledger.db")
+    assert (row["executor_id"], row["runner_id"], row["outcome_kind"], row["emit_status"]) == (AGENT, REMOTE_ID, "emit", "done")
+    assert remote.node_run_log(row, owner=order["inbox_id"]).is_file()
 
 
 def test_a_run_cut_off_with_its_node_is_run_again_once_the_node_is_back(remote: RemoteDeployment) -> None:
