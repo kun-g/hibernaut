@@ -76,6 +76,8 @@ class InboundPipeline:
                 source=event.source,
                 event_id=None if existing is None else existing.event_id,
                 external_id=event.external_id,
+                correlation_key=event.correlation_key,
+                scope=event.scope,
             )
             return IngestResult(
                 status="duplicate",
@@ -91,6 +93,8 @@ class InboundPipeline:
             event_id=event.event_id,
             external_id=event.external_id,
             detail={"consumers": list(consumers), "event_type": event.event_type},
+            correlation_key=event.correlation_key,
+            scope=event.scope,
         )
         for listener in self._listeners:
             listener()
@@ -298,7 +302,8 @@ class DeliveryWorker:
                 now=now,
             )
             safe_audit(
-                self._audit, "delivery", "acked", event_id=row.event_id, consumer_id=row.consumer_id
+                self._audit, "delivery", "acked", event_id=row.event_id, consumer_id=row.consumer_id,
+                correlation_key=item.event.correlation_key, scope=item.event.scope,
             )
             return
 
@@ -340,6 +345,8 @@ class DeliveryWorker:
                 event_id=row.event_id,
                 consumer_id=row.consumer_id,
                 detail={"attempts": attempts, "error": error},
+                correlation_key=item.event.correlation_key,
+                scope=item.event.scope,
             )
             self._alert_dead_letter(item.event, row.consumer_id, attempts, error, now)
             return
@@ -360,6 +367,8 @@ class DeliveryWorker:
             event_id=row.event_id,
             consumer_id=row.consumer_id,
             detail={"attempts": attempts, "error": error},
+            correlation_key=item.event.correlation_key,
+            scope=item.event.scope,
         )
 
     def _backoff(self, index: int) -> float:

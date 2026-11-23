@@ -26,6 +26,7 @@
 | **Permissions & Credential Proxy** | 工具调用前置三态门禁（`allow / block / defer`）与外置凭证代理（沙箱内零真实密钥） | 全局共享 1 套安全网关，按项目/工具维度路由策略与凭据 |
 | **Outbox & Dispatcher** | 待发消息持久队列与后台节流投递引擎，负责去噪、防刷屏与失败重试 | 全局共享 1 套表与投递服务，按 `inbox_id` 标记归属 |
 | **RunOutcome（Silent / Emit / Suspend）** | 单轮 Run 的强类型三选一终态：静默退出（`Silent`）、发消息入 Outbox（`Emit`）、保存断点并立刻放锁等待人工审批（`Suspend`） | L0 领域契约，强制耗尽匹配 |
+| **执行账本（Ledger）/ RunRecord / AuditRecord** | 独立包 `src/ledger/` 与独立 SQLite 文件 `ledger.db`：每个结束的 Run 追加一条 `RunRecord`（结局、执行器、耗时、错误类别、日志引用 `log_ref`、token 与费用），各服务的点状审计追加为 `AuditRecord`；只追加、只读查询，写失败不影响主路径 | 全局 1 套，与主库分开；`run_id` 即 Outbox 元数据里的 `run_id`，重放事件的新 Run 以 `replay_of_run_id` 指向被重放的失败 Run |
 | **文件 Outbox** | `[channels] outbox_dir` 下每条投递的 Outbox 消息一个 Markdown 文件，开头是任务上下文头（任务、来源、状态、需要人做什么等） | 本机给人看的副本，与现有通道并存，不替代它们 |
 
 ## 3. 生态分域与易混概念澄清

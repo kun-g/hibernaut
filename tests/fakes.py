@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agent_runtime.adapters.storage_sqlite import EventDiagnostics
+from agent_runtime.adapters.storage_sqlite.stores import check_replayable, replay_payload
 from agent_runtime.core.models import (
     Event,
     OutboxMessage,
@@ -112,6 +113,26 @@ class InMemoryInbox:
             replace(evt, status="failed") if evt.event_id in target else evt
             for evt in self._events
         ]
+
+    def replay(
+        self,
+        event_id: str,
+        *,
+        executor_id_override: str | None = None,
+        force: bool = False,
+        replay_of_run_id: str | None = None,
+    ) -> Event:
+        event = next((evt for evt in self._events if evt.event_id == event_id), None)
+        if event is None:
+            raise ValueError(f"Event not found: {event_id}")
+        check_replayable(event, force)
+        replayed = replace(
+            event, status="pending", payload=replay_payload(event.payload, executor_id_override, replay_of_run_id)
+        )
+        self._events = [replayed if evt.event_id == event_id else evt for evt in self._events]
+        self._attempts[event_id] = 0
+        self._errors.pop(event_id, None)
+        return replayed
 
     def diagnostics(self, event_ids: Sequence[str]) -> dict[str, EventDiagnostics]:
         known = {evt.event_id for evt in self._events}
