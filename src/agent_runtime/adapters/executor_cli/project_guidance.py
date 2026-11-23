@@ -13,7 +13,6 @@ from agent_runtime.core.models import Event
 
 # Short general rules and the entry point; always included when present.
 ENTRY_FILE = "AGENTS.md"
-DEFAULT_BASES = ("origin/HEAD", "main")
 # Catalog of detailed documents: path, summary, activities, tags and the file paths each one governs.
 CATALOG_FILE = "guidance.toml"
 _DOC_KEYS = frozenset({"path", "summary", "activities", "tags", "paths"})
@@ -152,7 +151,7 @@ def pin_head(workdir: str | Path, origin: str) -> GuidancePin:
 
 
 def merge_base(workdir: str | Path, base_ref: str) -> tuple[str, str]:
-    candidates = (base_ref,) if base_ref else DEFAULT_BASES
+    candidates = (base_ref,) if base_ref else ("origin/HEAD", "main")
     for ref in candidates:
         proc = _git(workdir, "merge-base", ref, "HEAD")
         if proc.returncode == 0 and _out(proc):

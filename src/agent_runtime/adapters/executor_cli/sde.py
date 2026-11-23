@@ -24,7 +24,7 @@ from agent_runtime.adapters.executor_cli.base_merge import (
     newest_base,
     only_conflicts_resolved,
     regular_file,
-    with_upstreams,
+    with_upstream,
     without_base,
 )
 from agent_runtime.adapters.executor_cli.claude_code import (
@@ -43,7 +43,6 @@ from agent_runtime.adapters.executor_cli.orca import (
 from agent_runtime.adapters.executor_cli.peer import PEER_TOOLS, SUBAGENT_TOOLS
 from agent_runtime.adapters.executor_cli.process import is_approval, join_text, last_text, target_events
 from agent_runtime.adapters.executor_cli.project_guidance import (
-    DEFAULT_BASES,
     ENTRY_FILE,
     GuidanceDoc,
     GuidancePin,
@@ -850,8 +849,7 @@ class SDEExecutor:
     def _since_review(self, state: _State, workdir: Path, snapshot: str) -> SinceReview:
         delivery = self._delivery
         if delivery is None or not delivery.config.open_pr:
-            refs = with_upstreams(workdir, [state.base_ref] if state.base_ref else DEFAULT_BASES)
-            base = newest_base(workdir, snapshot, [delivery.base_ref, *refs] if delivery is not None else refs)
+            base = self._unpublished_base(state, workdir, snapshot)
             if not base:
                 return SinceReview(state.reviewed_snapshot.split(":", 1)[1])
         elif state.recheck:
@@ -860,6 +858,17 @@ class SDEExecutor:
         else:
             base = delivery.base_ref
         return without_base(workdir, state.reviewed_snapshot, snapshot, base)
+
+    def _unpublished_base(self, state: _State, workdir: Path, snapshot: str) -> str:
+        # One branch is the base, the one the full diff starts from, whichever of its local and remote refs is ahead.
+        try:
+            refs = with_upstream(workdir, merge_base(workdir, state.base_ref)[1])
+        except ValueError:
+            refs = []
+        configured = self._delivery.base_ref if self._delivery is not None else ""
+        if configured and configured not in refs:
+            return newest_base(workdir, snapshot, [configured]) or newest_base(workdir, snapshot, refs)
+        return newest_base(workdir, snapshot, refs)
 
     async def _resolved(
         self, session_id: str, native: str | None, state: _State, caps: RunCapabilities, snapshot: str,

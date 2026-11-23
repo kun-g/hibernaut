@@ -71,18 +71,17 @@ def newest_base(workdir: Path, current: str, refs: Sequence[str]) -> str:
     return newest
 
 
-def with_upstreams(workdir: Path, refs: Sequence[str]) -> list[str]:
+def with_upstream(workdir: Path, ref: str) -> list[str]:
     # A local branch can be behind the remote one it follows: its upstream, else the branch of that name on origin.
-    current = _run(workdir, "symbolic-ref", "--quiet", "HEAD").stdout.decode().strip()
-    found: list[str] = []
-    for ref in refs:
-        found.append(ref)
-        full = _run(workdir, "rev-parse", "--symbolic-full-name", "--verify", "--quiet", ref).stdout.decode().strip()
-        if full.startswith("refs/heads/") and full != current:
-            branch = full.removeprefix("refs/heads/")
-            upstream = _run(workdir, "rev-parse", "--symbolic-full-name", "--verify", "--quiet", f"{branch}@{{upstream}}")
-            found.append(upstream.stdout.decode().strip() or f"refs/remotes/origin/{branch}")
-    return found
+    full = _full_name(workdir, ref)
+    if not full.startswith("refs/heads/") or full == _full_name(workdir, "HEAD"):
+        return [full or ref]
+    branch = full.removeprefix("refs/heads/")
+    return [full, _full_name(workdir, f"{branch}@{{upstream}}") or f"refs/remotes/origin/{branch}"]
+
+
+def _full_name(workdir: Path, ref: str) -> str:
+    return _run(workdir, "rev-parse", "--symbolic-full-name", "--verify", "--quiet", ref).stdout.decode().strip()
 
 
 def changed_paths(workdir: Path, before: str, after: str) -> list[str]:
@@ -177,10 +176,10 @@ def _between(fixed: list[list[bytes]], lines: list[bytes]) -> list[list[bytes]] 
 
 def _combines(resolved: list[bytes], ours: list[bytes], base: list[bytes], theirs: list[bytes]) -> bool:
     # One side as it is, or both sides' text in their own order: nothing more often than both together have it, all
-    # that both have, and not merely a piece of one side. Blank lines and trailing spaces do not count.
-    done, left, common, right = (_tokens(lines) for lines in (resolved, ours, base, theirs))
-    if done in (left, right):
+    # that both have, and not merely a piece of one side.
+    if resolved in (ours, theirs):
         return True
+    done, left, common, right = (_tokens(lines) for lines in (resolved, ours, base, theirs))
     if not _within(Counter(done), Counter(left), Counter(common), Counter(right), least=True):
         return False
     if not _within(_rows(resolved), _rows(ours), _rows(base), _rows(theirs), least=False):
@@ -236,13 +235,16 @@ def _rows(lines: list[bytes]) -> Counter[str]:
 
 
 def _tokens(lines: list[bytes]) -> list[str]:
-    # A line starts with its indentation, so moving code into or out of a block shows.
+    # Nothing is left out: the indentation starts a line, what follows its text ends it, a blank line is one token.
     found: list[str] = []
     for line in lines:
-        text = line.decode("utf-8", "surrogateescape").rstrip()
-        if text:
-            body = text.lstrip()
-            found += ["\n" + text[:len(text) - len(body)], *_TOKEN.findall(body)]
+        text = line.decode("utf-8", "surrogateescape")
+        body = text.strip()
+        if body:
+            at = text.index(body)
+            found += ["^" + text[:at], *_TOKEN.findall(body), "$" + text[at + len(body):]]
+        else:
+            found.append("^$" + text)
     return found
 
 

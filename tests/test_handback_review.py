@@ -128,6 +128,40 @@ class TestConflictResolution(unittest.TestCase):
             with self.subTest(name):
                 self.assertFalse(self.block(*args))
 
+    TEXT = (["T = \"\"\"", "head", "old", "\"\"\""], ["T = \"\"\"", "head", "ours", "\"\"\""],
+            ["T = \"\"\"", "head", "theirs", "\"\"\""])
+
+    def test_a_string_taken_from_one_side_as_it_is_needs_no_review(self):
+        _, ours, theirs = self.TEXT
+        for name, resolved in {"ours": ours, "theirs": theirs}.items():
+            with self.subTest(name):
+                self.assertTrue(self.block(*self.TEXT, resolved))
+
+    def test_blank_lines_and_trailing_spaces_are_part_of_a_string(self):
+        base, ours, theirs = self.TEXT
+        for name, resolved in {
+            "a blank line in one side": ["T = \"\"\"", "head", "", "ours", "\"\"\""],
+            "a trailing space in one side": ["T = \"\"\"", "head", "ours ", "\"\"\""],
+            "spaces on a blank line": ["T = \"\"\"", "head", "ours", "  ", "\"\"\""],
+        }.items():
+            with self.subTest(name):
+                self.assertFalse(self.block(base, ours, theirs, resolved))
+        sides = ["T = \"\"\"", "ours", "\"\"\""], ["U = \"\"\"", "theirs", "\"\"\""]
+        both = [*sides[0], *sides[1]]
+        self.assertTrue(self.block([], *sides, both))
+        for name, resolved in {
+            "a blank line in both combined": [both[0], "", *both[1:]],
+            "a trailing space in both combined": [both[0], "ours ", *both[2:]],
+        }.items():
+            with self.subTest(name):
+                self.assertFalse(self.block([], *sides, resolved))
+
+    def test_a_blank_line_is_not_made_of_another_line_that_was_dropped(self):
+        self.assertFalse(self.block([], ["f(a)", "f(b)"], ["g(a)", "g(b)"], ["f(a)", "", "f(b)", "g(b)"]))
+
+    def test_blank_lines_of_both_sides_may_be_combined(self):
+        self.assertTrue(self.block([], ["f()", "", "f()"], ["g()", "", "g()"], ["f()", "", "f()", "g()", "", "g()"]))
+
     def test_each_block_is_explained_by_its_own_sides(self):
         # new(y) belongs to the second block; using it in the first one is another change.
         swapped = self.MERGED.replace("new(x)", "new(y)")
@@ -399,6 +433,50 @@ class TestHandBackReview(SDEDeliveryCase):
         run_git(self.wt, "config", "remote.origin.followRemoteHEAD", "never")
         run_git(self.wt, "update-ref", "--no-deref", "-d", "refs/remotes/origin/HEAD")
         await self.merged_in_a_fix_round(None, "")
+
+    async def another_default(self, delivery=None):
+        # The repository's default branch is trunk; the developer merges main, which is ahead of it.
+        run_git(self.wt, "push", "-q", "origin", "origin/main:refs/heads/trunk")
+        run_git(self.wt, "fetch", "-q")
+        run_git(self.wt, "remote", "set-head", "origin", "trunk")
+        self.push_main(OTHER, message="main adds a module")
+        self.set_plan(sde=[dev({"calc.py": TASK_CALC}), {**dev(FIX), "run": [["git", "fetch", "-q"], *MERGE_MAIN]}],
+                      reviewer=[FIRST, PASS])
+        outcome = await self.executor(delivery=delivery).execute(
+            [event(self.payload(base_ref=""))], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertEqual(out(self.wt, "rev-parse", "--symbolic-full-name", "origin/HEAD"), "refs/remotes/origin/trunk")
+        return self.delta()
+
+    async def test_a_branch_that_is_not_the_tasks_base_is_shown_when_merged(self):
+        delta, prompt = await self.another_default()
+        self.assertIn("main_only.py", delta)
+        self.assertIn("- main_only.py", prompt.split("## Incremental review\n")[1])
+
+    async def test_the_delivery_base_counts_whatever_the_tasks_base_is(self):
+        delta, _ = await self.another_default(self.delivery(open_pr=False))
+        self.assertNotIn("main_only.py", delta)
+
+    async def ahead_locally(self, delivery):
+        # Commits only the local main has, merged from there.
+        before = out(self.wt, "rev-parse", "origin/main")
+        self.push_main(OTHER, message="main adds a module")
+        run_git(self.wt, "fetch", "-q")
+        run_git(self.wt, "branch", "-f", "main", "origin/main")
+        run_git(self.wt, "update-ref", "refs/remotes/origin/main", before)
+        self.set_plan(sde=[dev({"calc.py": TASK_CALC}), {**dev(FIX), "run": [["git", "merge", "--no-edit", "main"]]}],
+                      reviewer=[FIRST, PASS])
+        outcome = await self.executor(delivery=delivery).execute(
+            [event(self.payload(base_ref="main"))], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertTrue((self.wt / "main_only.py").exists())
+        self.assertNotIn("main_only.py", self.delta()[0])
+
+    async def test_a_local_base_ahead_of_its_upstream_is_left_out(self):
+        await self.ahead_locally(None)
+
+    async def test_a_local_base_ahead_of_the_delivery_base_is_left_out(self):
+        await self.ahead_locally(self.delivery(open_pr=False))
 
     async def test_an_unreviewed_change_is_not_skipped(self):
         # review=pending (a declined retry) never counts as passed.
