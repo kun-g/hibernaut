@@ -15,6 +15,7 @@ from runner.cli_drivers import (
     StreamEvent,
     StreamPipe,
     default_cli_drivers,
+    format_prefixed_session_id,
 )
 from runner.config import NamespacePolicy, ProjectCheckout, RunnerConfig
 from runner.protocol import (
@@ -511,6 +512,11 @@ class RunnerDaemon:
             # The excerpt keeps the start of a long stream; the line that ends it carries the reply.
             stdout = f"{stdout}\n{result_line}"
         parsed = driver.parse_output(stdout, sup_out.stderr_excerpt, sup_out.exit_code)
+        if parsed.executor_session_id is None and gate is not None:
+            # A run stopped by a deferred call may not have printed its session id yet.
+            parsed = replace(
+                parsed, executor_session_id=format_prefixed_session_id(req.executor_id, gate.native_session_id)
+            )
         status: RunStatus
         error_kind: ErrorKind | None = None
         error_summary: str | None = None

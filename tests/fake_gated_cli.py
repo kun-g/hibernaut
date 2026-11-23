@@ -32,7 +32,8 @@ def run_hooks(event, payload):
 session = argv[argv.index("--resume") + 1] if "--resume" in argv else "native-1"
 note("start", cwd=os.getcwd(), prompt=prompt, argv=argv, session=session)
 run_hooks("SessionStart", {"hook_event_name": "SessionStart", "session_id": session})
-out({"type": "system", "subtype": "init", "session_id": session})
+if not os.environ.get("FAKE_PRINTS_ONLY_A_RESULT"):
+    out({"type": "system", "subtype": "init", "session_id": session})
 plan = []
 for line in prompt.splitlines():
     if line.startswith("PLAN: "):

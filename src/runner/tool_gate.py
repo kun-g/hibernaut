@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -14,6 +15,7 @@ from runner.protocol import ToolAuthorizer, ToolCall, ToolDecision
 
 MAX_TOOL_CALL_BYTES: Final = 512 * 1024
 DECISION_TIMEOUT_SECONDS: Final = 60.0
+_SESSION_ID_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 # sun_path holds 104 bytes on macOS.
 _MAX_SOCKET_PATH_BYTES: Final = 100
 
@@ -45,6 +47,7 @@ class ToolGate:
         self._server: asyncio.AbstractServer | None = None
         self._dir: Path | None = None
         self.armed = asyncio.Event()
+        self.native_session_id: str | None = None
         self.deferred: tuple[ToolCall, ToolDecision] | None = None
 
     async def open(self) -> ToolGateBinding:
@@ -99,6 +102,10 @@ class ToolGate:
         frame = cast(dict[str, Any], raw)
         if frame.get("type") == "hook.armed":
             self.armed.set()
+            session = frame.get("session_id")
+            # The first report is the run's own session; a subagent's would come later.
+            if self.native_session_id is None and isinstance(session, str) and _SESSION_ID_RE.fullmatch(session):
+                self.native_session_id = session
             return ToolDecision(action="allow")
         if frame.get("type") != "tool.authorize":
             return _block("malformed tool call")

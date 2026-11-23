@@ -254,6 +254,14 @@ def test_approved_call_runs_once_in_the_resumed_native_session(tmp_path: Path) -
     assert resumed["session"] == "native-1" and "已批准" in resumed["prompt"] and "go ahead" in resumed["prompt"]
 
 
+def test_native_session_of_a_stopped_run_is_known_even_if_the_cli_printed_nothing(tmp_path: Path) -> None:
+    node, policy = Node(tmp_path, env={"FAKE_PRINTS_ONLY_A_RESULT": "1"}), Policy({"Bash": "defer"})
+    bridge, first = deferred_run(node, plan(("Bash", CLEANUP)), policy)
+    assert first.executor_session_id == "claude:native-1"
+    execute(bridge, [answer(first, True)], suspended(first), Caps(policy))
+    assert "--resume" in node.entries("start")[-1]["argv"]
+
+
 def test_approval_covers_one_call_with_the_same_arguments(tmp_path: Path) -> None:
     node, policy = Node(tmp_path), Policy({"Bash": "defer"})
     body = plan(("Bash", {**CLEANUP, "description": "first wording"}))
@@ -619,8 +627,17 @@ def test_hook_refuses_when_the_gate_is_gone(tmp_path: Path) -> None:
 def test_hook_arms_the_gate() -> None:
     async def use(gate: ToolGate, binding: ToolGateBinding) -> None:
         assert not gate.armed.is_set()
-        assert (await run_hook("claude", binding.socket_path, {}, "arm"))[0] == 0
-        assert gate.armed.is_set()
+        assert (await run_hook("claude", binding.socket_path, {"session_id": "n-1", "cwd": "/private"}, "arm"))[0] == 0
+        assert gate.armed.is_set() and gate.native_session_id == "n-1"
+
+    with_gate(use)
+
+
+@pytest.mark.parametrize("payload", [b"", b"not json", {}, {"session_id": ["x"]}, {"session_id": "x" * 5000}])
+def test_hook_arms_the_gate_without_a_usable_session_id(payload: Any) -> None:
+    async def use(gate: ToolGate, binding: ToolGateBinding) -> None:
+        assert (await run_hook("claude", binding.socket_path, payload, "arm"))[0] == 0
+        assert gate.armed.is_set() and gate.native_session_id is None
 
     with_gate(use)
 

@@ -31,6 +31,15 @@ def tool_call(payload: dict[str, Any]) -> dict[str, Any]:
     return {"type": "tool.authorize", "tool_name": name, "args": args}
 
 
+def native_session_id(raw: bytes) -> str | None:
+    try:
+        payload = json.loads(raw)
+        found = payload.get("session_id", payload.get("sessionId"))
+    except (ValueError, AttributeError):
+        return None
+    return found if isinstance(found, str) else None
+
+
 def render(style: str, action: str, reason: str) -> dict[str, Any]:
     if action == "defer":
         reason = f"waiting for human approval: {reason}"
@@ -55,7 +64,7 @@ def main(argv: list[str]) -> int:
         style, path, event = argv
         raw = sys.stdin.buffer.read()
         if event == "arm":
-            ask(path, {"type": "hook.armed"})
+            ask(path, {"type": "hook.armed", "session_id": native_session_id(raw)})
             print("{}")
             return 0
         decision = ask(path, tool_call(json.loads(raw)))
