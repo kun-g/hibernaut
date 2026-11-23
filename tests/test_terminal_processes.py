@@ -75,7 +75,8 @@ class Case(unittest.IsolatedAsyncioTestCase):
         return [int(p) for p in self.pids.read_text().split()] if self.pids.exists() else []
 
     async def started(self, count: int) -> list[int]:
-        self.assertTrue(await until(lambda: len(self.recorded()) == count), "the CLI did not start")
+        # The processes can be up before `terminal create` has returned to the runner.
+        self.assertTrue(await until(lambda: self.orca.terminals and len(self.recorded()) == count), "the CLI did not start")
         return self.recorded()
 
     async def all_gone(self, pids):
