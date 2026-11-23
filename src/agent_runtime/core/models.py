@@ -323,6 +323,8 @@ class RunTelemetry:
     error_kind: str | None = None
     # The execution node that ran the process; None means this process (the ledger records "local").
     runner_id: str | None = None
+    # That node's own log of the run (location, digest), kept in the ledger's log; None when there is none.
+    runner_log: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
