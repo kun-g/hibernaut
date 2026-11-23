@@ -1,7 +1,9 @@
 import asyncio
+import contextlib
 import http.client
 import json
 import os
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -96,7 +98,7 @@ class FakeOrcaTerminals:
     async def close(self, handle: str) -> None:
         proc = self.terminals[handle]["proc"]
         if proc.returncode is None:
-            proc.terminate()
+            self._signal(proc, signal.SIGTERM)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=self.CLOSE_GRACE_SECONDS)
             except TimeoutError:
@@ -105,8 +107,15 @@ class FakeOrcaTerminals:
     async def kill(self, handle: str) -> None:
         proc = self.terminals[handle]["proc"]
         if proc.returncode is None:
-            proc.kill()
+            self._signal(proc, signal.SIGKILL)
             await proc.wait()
+
+    @staticmethod
+    def _signal(proc: asyncio.subprocess.Process, signum: int) -> None:
+        # Not proc.terminate() or proc.kill(): before Python 3.13 they poll the process first, which reaps one that just
+        # exited, and asyncio, finding its status gone, reports 255 as the exit code.
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(proc.pid, signum)
 
     async def close_all(self) -> None:
         for handle in self.terminals:
