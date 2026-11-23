@@ -350,6 +350,19 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["base_url"], PROXY)
         self.assertNotEqual(call["api_key"], "sk-real-secret")
 
+    async def test_configured_gateway_and_model_reach_the_harness(self):
+        self.set_plan(sde=[dev(FIXED)])
+        env = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:3425", "ANTHROPIC_AUTH_TOKEN": "magpie"}
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-daemon", "ANTHROPIC_BASE_URL": "http://daemon-gw"}):
+            outcome = await self.executor(review=False, model="codex/gpt-6.2-astra", env=env).execute(
+                [event(self.payload())], None, self.caps
+            )
+        assert isinstance(outcome, Emit), outcome
+        call = self.calls("sde")[0]
+        self.assertEqual((call["base_url"], call["auth_token"]), ("http://127.0.0.1:3425", "magpie"))
+        self.assertEqual(call["paid_env"], ["ANTHROPIC_AUTH_TOKEN"])
+        self.assertEqual(call["argv"][call["argv"].index("--model") + 1], "codex/gpt-6.2-astra")
+
 
 class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
     # Suspend/Resume through the real AgentWorker, SQLite sessions, inbox and outbox.
