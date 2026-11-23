@@ -359,7 +359,12 @@ class WorkerTaskLifecycleTests(_WorkerCase):
             self.outbox.mark_sent(message.message_id)
         self.deliver(work_ready("tb_tsk_9", dispatch_seq=2, trace_id="trace-9", hop_count=3))
         await self.worker.process_inbox(SCOPE)
-        claim, done = self.queued()
+        release, claim, done = self.queued()
+        # The dropped task keeps its own trace fields.
+        self.assertEqual(
+            (release.metadata["task_action"], release.metadata["task_id"], release.metadata["trace_id"]),
+            ("release", "tb_tsk_1", "trace-1"),
+        )
         self.assertEqual((claim.metadata["task_id"], claim.metadata["trace_id"], claim.metadata["hop_count"]),
                          ("tb_tsk_9", "trace-9", 3))
         self.assertEqual(done.metadata["task_id"], "tb_tsk_9")
@@ -400,6 +405,128 @@ class WorkerWithoutTaskTests(_WorkerCase):
         await self.worker.process_inbox(SCOPE)
         [approval] = self.queued()
         self.assertEqual(self.task_fields(approval), {})
+
+
+class _SupersedeMixin(_WorkerCase):
+    async def suspend_task_a(self) -> SessionRef:
+        self.deliver(work_ready("tb_tsk_a"))
+        self.executor.outcomes.append(Suspend(request_id="apr_a", prompt="Deploy?", session_checkpoint="cp"))
+        await self.worker.process_inbox(SCOPE)
+        for message in self.queued():
+            self.outbox.mark_sent(message.message_id)
+        session = self.sessions.find_by_request_id("apr_a")
+        assert session is not None and session.task_link is not None
+        return session
+
+    def assert_superseded(self, messages: list[OutboxMessage], *, old: str, new: str) -> None:
+        release, claim, result = messages
+        self.assertEqual((release.metadata["kind"], release.metadata["task_id"]), ("task_sync", old))
+        self.assertEqual((release.metadata["task_action"], release.metadata["stage"]), ("release", "superseded"))
+        self.assertEqual((claim.metadata["task_action"], claim.metadata["task_id"]), ("claim", new))
+        self.assertEqual((result.metadata["task_action"], result.metadata["task_id"]), ("complete", new))
+        self.assertEqual(len({m.metadata["run_id"] for m in messages}), 1)
+
+
+class SupersededTaskTests(_SupersedeMixin):
+    async def test_a_new_task_in_a_suspended_session_releases_the_old_one(self) -> None:
+        session = await self.suspend_task_a()
+        self.deliver(work_ready("tb_tsk_b", dispatch_seq=1))
+        self.executor.outcomes.append(Emit(messages=("B done",)))
+        await self.worker.process_inbox(SCOPE)
+        self.assert_superseded(self.queued(), old="tb_tsk_a", new="tb_tsk_b")
+        after = self.sessions.get(session.session_id)
+        assert after is not None
+        self.assertIsNone(after.task_link)
+
+    async def test_a_new_task_in_a_waiting_pr_session_releases_the_old_one_on_silent(self) -> None:
+        self.deliver(work_ready("tb_tsk_a"))
+        self.executor.outcomes.append(Emit(messages=("PR",), delivery=DeliveryOutcome(state="pr_open")))
+        await self.worker.process_inbox(SCOPE)
+        for message in self.queued():
+            self.outbox.mark_sent(message.message_id)
+        self.deliver(work_ready("tb_tsk_b"))
+        self.executor.outcomes.append(Silent())
+        await self.worker.process_inbox(SCOPE)
+        release, claim, done = self.queued()
+        self.assertEqual((release.metadata["task_action"], release.metadata["task_id"]), ("release", "tb_tsk_a"))
+        self.assertEqual((claim.metadata["task_action"], claim.metadata["task_id"]), ("claim", "tb_tsk_b"))
+        self.assertEqual((done.metadata["task_action"], done.metadata["task_id"]), ("complete", "tb_tsk_b"))
+
+    async def test_an_approval_batch_that_also_carries_a_new_task_releases_the_old_one(self) -> None:
+        session = await self.suspend_task_a()
+        # The decision closes its batch, so the new dispatch comes first to share the Run.
+        self.deliver(work_ready("tb_tsk_b"))
+        self.deliver(CanonicalEvent(
+            source="feishu", event_type="approval.decided", external_id="card:apr_a", scope=SCOPE,
+            correlation_key=KEY, actor="kun", subject="approve",
+            metadata={"approval_request_id": "apr_a", "decision": "approve", "session_id": session.session_id},
+        ))
+        self.executor.outcomes.append(Emit(messages=("B done",)))
+        await self.worker.process_inbox(SCOPE)
+        self.assertEqual(len(self.executor.batches[-1]), 2)
+        self.assert_superseded(self.queued(), old="tb_tsk_a", new="tb_tsk_b")
+
+    async def test_the_same_task_redispatched_is_not_released(self) -> None:
+        await self.suspend_task_a()
+        self.deliver(work_ready("tb_tsk_a", dispatch_seq=2))
+        self.executor.outcomes.append(Emit(messages=("A done",)))
+        await self.worker.process_inbox(SCOPE)
+        claim, result = self.queued()
+        self.assertEqual((claim.metadata["task_action"], result.metadata["task_action"]), ("claim", "complete"))
+
+    async def test_a_failed_run_of_the_new_task_still_released_the_old_one(self) -> None:
+        session = await self.suspend_task_a()
+        self.deliver(work_ready("tb_tsk_b"))
+        self.executor.outcomes.append(RuntimeError("boom"))
+        with self.assertRaises(Exception):
+            await self.worker.process_inbox(SCOPE)
+        actions = [(m.metadata["task_action"], m.metadata["task_id"]) for m in self.queued()]
+        self.assertEqual(actions, [("release", "tb_tsk_a"), ("claim", "tb_tsk_b"), ("release", "tb_tsk_b")])
+        after = self.sessions.get(session.session_id)
+        assert after is not None
+        self.assertIsNone(after.task_link)
+
+
+class InterruptibleSupersedeTests(_SupersedeMixin):
+    policy: NewEventPolicy = "interrupt"
+
+    async def test_release_and_claim_are_written_with_the_result(self) -> None:
+        await self.suspend_task_a()
+        self.deliver(work_ready("tb_tsk_b"))
+        self.executor.outcomes.append(Emit(messages=("B done",)))
+        await self.worker.process_inbox(SCOPE)
+        self.assert_superseded(self.queued(), old="tb_tsk_a", new="tb_tsk_b")
+
+
+class FoldedTaskTests(_WorkerCase):
+    policy: NewEventPolicy = "fold"
+
+    async def test_a_task_folded_into_the_run_supersedes_the_claimed_one(self) -> None:
+        started = asyncio.Event()
+        resume = asyncio.Event()
+        folded: list[Event] = []
+
+        async def execute(events: Sequence[Event], session: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
+            _ = session
+            started.set()
+            await resume.wait()
+            folded.extend(caps.poll_folded_events())
+            return Emit(messages=("both",))
+
+        self.executor.execute = execute  # type: ignore[method-assign]
+        self.deliver(work_ready("tb_tsk_a"))
+        running = asyncio.create_task(self.worker.process_inbox(SCOPE))
+        await asyncio.wait_for(started.wait(), 5)
+        self.deliver(work_ready("tb_tsk_b"))
+        resume.set()
+        await asyncio.wait_for(running, 5)
+
+        self.assertEqual([e.payload["task_id"] for e in folded], ["tb_tsk_b"])
+        claim_a, release_a, claim_b, result = self.queued()
+        self.assertEqual((claim_a.metadata["task_action"], claim_a.metadata["task_id"]), ("claim", "tb_tsk_a"))
+        self.assertEqual((release_a.metadata["task_action"], release_a.metadata["task_id"]), ("release", "tb_tsk_a"))
+        self.assertEqual((claim_b.metadata["task_action"], claim_b.metadata["task_id"]), ("claim", "tb_tsk_b"))
+        self.assertEqual((result.metadata["task_action"], result.metadata["task_id"]), ("complete", "tb_tsk_b"))
 
 
 class InterruptTests(_WorkerCase):

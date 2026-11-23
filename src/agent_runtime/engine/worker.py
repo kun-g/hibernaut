@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncGenerator, Callable, Generator, Mapping
+from collections.abc import AsyncGenerator, Callable, Collection, Generator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Never, assert_never, cast
 
@@ -163,6 +163,20 @@ def _task_fields(link: TaskLink, action: str, stage: str | None = None) -> dict[
     if link.hop_count is not None:
         fields["hop_count"] = link.hop_count
     return fields
+
+
+def _superseded(
+    candidates: Sequence[TaskLink | None], kept: TaskLink | None, released: Collection[str]
+) -> list[TaskLink]:
+    # Linked tasks the session drops for `kept`, each once and not one already released.
+    dropped: list[TaskLink] = []
+    seen = set(released)
+    for link in candidates:
+        if link is None or (kept is not None and link.task_id == kept.task_id) or link.task_id in seen:
+            continue
+        seen.add(link.task_id)
+        dropped.append(link)
+    return dropped
 
 
 def _emit_task_fields(link: TaskLink, emit: Emit) -> dict[str, Any]:
@@ -758,19 +772,18 @@ class AgentWorker:
         handle = _RunHandle(registered.run_dir, self._is_detaching) if registered is not None else None
         batch_correlation_key = self._extract_correlation_key(batch, active_session)
         run_id = new_id("run")
-        task_link = _task_link(batch, active_session)
-        # An interruptible Run may be thrown away, and an interrupted Run writes nothing to the Outbox, so it claims
-        # together with its result. A resumed Run was claimed by the process that started it.
-        claim_with_result = task_link is not None and allow_interrupt
-        claimed = task_link is not None and not allow_interrupt
-        if claimed and not resuming:
-            assert task_link is not None
-            self._enqueue_task_sync(
-                inbox_id,
-                self._report_metadata(batch, batch_correlation_key, executor.executor_id, run_id),
-                active_session.session_id,
-                _task_fields(task_link, "claim", "running"),
-            )
+        previous_link = active_session.task_link
+        start_link = _task_link(batch, active_session)
+        # An interruptible Run may be thrown away, and an interrupted Run writes nothing to the Outbox, so it releases
+        # and claims together with its result. A resumed Run was claimed by the process that started it.
+        claimed_link = start_link if not allow_interrupt else None
+        released: set[str] = set()
+        if claimed_link is not None:
+            superseded = _superseded([previous_link], claimed_link, released)
+            released.update(link.task_id for link in superseded)
+            if not resuming:
+                extra = self._report_metadata(batch, batch_correlation_key, executor.executor_id, run_id)
+                self._sync_task_switch(inbox_id, extra, active_session.session_id, superseded, claimed_link)
 
         def _drop_registration() -> None:
             if registered is not None and registry is not None:
@@ -805,13 +818,12 @@ class AgentWorker:
             all_failed_ids = batch_ids + [e.event_id for e in folded_events]
             self._inbox.mark_failed(all_failed_ids, str(exc.__cause__ or exc))
             _drop_registration()
-            if claimed:
-                assert task_link is not None
+            if claimed_link is not None:
                 # Otherwise the task would stay in_progress on Taskboard with nothing working on it.
                 self._release_failed_task(
                     inbox_id,
                     active_session.session_id,
-                    task_link,
+                    claimed_link,
                     self._report_metadata(batch + folded_events, batch_correlation_key, executor.executor_id, run_id),
                 )
             raise
@@ -822,6 +834,9 @@ class AgentWorker:
             if handle is not None:
                 self._handles.discard(handle)
 
+        # Resolved once from what the Run actually consumed (a folded work.ready can name a new task); this link is
+        # both reported and saved on the session.
+        final_link = _task_link(batch + folded_events, active_session)
         final_corr = self._extract_correlation_key(batch + folded_events, active_session)
         final_work_key = self._extract_work_key(
             batch + folded_events,
@@ -837,8 +852,10 @@ class AgentWorker:
             final_work_key,
             executor,
             report_metadata=self._report_metadata(batch + folded_events, final_corr, executor.executor_id, run_id),
-            task_link=_task_link(batch + folded_events, active_session),
-            claim_with_result=claim_with_result,
+            task_link=final_link,
+            superseded=_superseded([previous_link, claimed_link], final_link, released),
+            claim_with_result=final_link is not None
+            and (claimed_link is None or claimed_link.task_id != final_link.task_id),
         )
         all_done_ids = batch_ids + [evt.event_id for evt in folded_events]
         if final_session_id is not None and final_session_id != active_session.session_id:
@@ -1228,6 +1245,21 @@ class AgentWorker:
             },
         )
 
+    def _sync_task_switch(
+        self,
+        inbox_id: str,
+        extra: Mapping[str, Any],
+        session_id: str,
+        superseded: Sequence[TaskLink],
+        claim: TaskLink | None,
+    ) -> None:
+        # A session tracks one task: the one it drops is released before the new one is claimed, so it does not
+        # stay in_progress on Taskboard with nothing working on it.
+        for link in superseded:
+            self._enqueue_task_sync(inbox_id, extra, session_id, _task_fields(link, "release", "superseded"))
+        if claim is not None:
+            self._enqueue_task_sync(inbox_id, extra, session_id, _task_fields(claim, "claim", "running"))
+
     def _release_failed_task(
         self, inbox_id: str, session_id: str, link: TaskLink, extra: Mapping[str, Any]
     ) -> None:
@@ -1247,13 +1279,13 @@ class AgentWorker:
         *,
         report_metadata: Mapping[str, Any] | None = None,
         task_link: TaskLink | None = None,
+        superseded: Sequence[TaskLink] = (),
         claim_with_result: bool = False,
     ) -> str | None:
         extra: dict[str, Any] = dict(report_metadata or {})
-        if task_link is not None and claim_with_result:
-            self._enqueue_task_sync(
-                inbox_id, extra, session_ref.session_id, _task_fields(task_link, "claim", "running")
-            )
+        self._sync_task_switch(
+            inbox_id, extra, session_ref.session_id, superseded, task_link if claim_with_result else None
+        )
         match outcome:
             case Silent(executor_session_id=exec_sid):
                 exec_id, bound_exec_sid = self._resolve_executor_binding(
