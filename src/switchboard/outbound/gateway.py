@@ -99,6 +99,8 @@ class OutboundGateway:
                 "no_target",
                 event_id=event.event_id,
                 detail={"correlation_key": event.correlation_key},
+                correlation_key=event.correlation_key,
+                scope=event.scope,
             )
             return None
         self.deliver(msg)
