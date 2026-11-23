@@ -23,6 +23,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 执行账本 | 同仓的独立包 `src/ledger/`：每个 Run 记一条档案（结局、执行器、耗时、错误类别、日志、token 与费用），同进程 Switchboard 的审计也记入，存在独立的 `ledger.db`；执行器失败按类别分流（瞬时故障 5/15/45 秒退避重试，配置或权限错误第 1 次即停，执行故障不重试），最终失败发告警；MCP 只读工具查询 Run、日志、审计与执行器统计，`hibernaut_replay_event` 重放失败事件。设计见 [`docs/observability-ledger-design.md`](docs/observability-ledger-design.md) |
 | Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard；`--check` 在发版前无副作用地校验配置，停机时先结清在途请求、投递和发送 |
 | Taskboard | 同仓的独立包：多来源任务归集（一个任务可挂多个来源）、5 态状态机、DAG 依赖与环检测、上游完成后自动解锁下游，经 Switchboard 发 `work.ready` 或给人发待办通知；SQLite 存储。独立常驻服务 `python -m taskboard.app` 经 Relay 消费 Switchboard 事件、经 Switchboard `/mcp` 上行，并以 HTTP `/mcp`（可挂同域子路径，如 `/taskboard/mcp`）或 `--mcp-stdio` 提供 7 个 `tb_*` MCP 工具；Hibernaut 接 `work.ready` 执行，并以 `execution.reported` 回报 `claim` / `update_stage` / `complete` / `release`（审批挂起后恢复仍回写同一任务）。设计见 [`docs/taskboard.md`](docs/taskboard.md) |
+| Dashboard | 同仓的独立包 `src/dashboard/`：只读本地 Web 看板，用于实时查看 Hibernaut、Taskboard 与 Switchboard 运转状态（拓扑与延迟、活跃 Run、挂起/异常告警、事件队列、PR 交付与 worktree、Taskboard 任务、Switchboard 路由与流量、执行账本、`ccpeer` 与 Outbox 报告）。运行 `PYTHONPATH=src python3 -m dashboard --config hibernaut.toml` 访问 `http://127.0.0.1:8877` |
 
 ## 工作方式
 
@@ -118,7 +119,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 
 | 文档 | 内容 |
 | :--- | :--- |
-| [`docs/architecture.md`](docs/architecture.md) | 完整设计：生命周期（§1）、分层（§2）、会话与路由及各入口（§3）、执行器、评审、SDE、PR 交付、worktree、多 inbox 项目、热加载（§4）、并发与新事件策略（§5）、Switchboard（§7）、ccpeer（§9）、Taskboard（§10）、执行账本（§11） |
+| [`docs/architecture.md`](docs/architecture.md) | 完整设计：生命周期（§1）、分层（§2）、会话与路由及各入口（§3）、执行器、评审、SDE、PR 交付、worktree、多 inbox 项目、热加载（§4）、并发与新事件策略（§5）、Switchboard（§7）、ccpeer（§9）、Taskboard（§10）、执行账本（§11）、Dashboard（§12） |
 | [`docs/taskboard.md`](docs/taskboard.md) | Taskboard 完整设计方案：职责边界、5 态状态机、DAG 解锁与异常传播、Flow 展开、与 Switchboard 的 Schema 契约、DDL 与门禁 |
 | [`docs/observability-ledger-design.md`](docs/observability-ledger-design.md) | 执行账本（Observability / Ledger）设计基线：定位与边界、双层数据契约、错误分类与分流、日志与计费、重放与 Memory 闸门；接线见架构文档 §11 |
 | [`docs/glossary.md`](docs/glossary.md) | 术语表（术语以它为准） |
@@ -145,6 +146,7 @@ src/switchboard/  # 独立包，不依赖 agent_runtime
 src/ccpeer/       # 独立包：与本机 Claude Code 会话收发消息（发送、会话发现、常驻接收端），只依赖标准库
 src/taskboard/    # 独立包：多源任务归集与 DAG 编排（core/ L0、ports.py L1、engine/ L2、adapters/ L3、app/ 配置与入口），只依赖标准库与 switchboard
 src/ledger/       # 独立包：执行账本与审计（独立 ledger.db、运行日志、错误分类、MCP 只读查询），只依赖标准库
+src/dashboard/    # 独立包：只读本地 Web 看板（HB / TB / SB 实时总览与详情页），只依赖标准库
 schemas/taskboard/  # Taskboard 与 Switchboard 之间事件 metadata 的 JSON Schema（Draft 2020-12）
 schemas/v1/         # 执行账本的 AuditRecord / RunRecord JSON Schema（ADR-0001，Draft 2020-12）
 ```
@@ -155,5 +157,5 @@ schemas/v1/         # 执行账本的 AuditRecord / RunRecord JSON Schema（ADR-
 pip install -e ".[dev]"
 lint-imports   # 分层与反向依赖检查
 pytest -v      # 契约、并发、端到端测试（本地快检可用 pytest -n auto $(python scripts/select_tests.py)）
-pyright        # core/、engine/、switchboard/、ccpeer/、taskboard/、ledger/ 的 strict 类型检查
+pyright        # core/、engine/、switchboard/、ccpeer/、taskboard/、ledger/、dashboard/ 的 strict 类型检查
 ```
