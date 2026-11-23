@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Final, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from runner.protocol import CredentialLease, LogRef, MAX_STDOUT_EXCERPT_BYTES
 
@@ -63,7 +64,24 @@ def is_credential_env_name(name: str) -> bool:
     return bool(_CREDENTIAL_NAME_RE.search(name))
 
 
-def _carries_url_credentials(value: str) -> bool:
+def _is_proxy_env_name(name: str) -> bool:
+    lowered = name.lower()
+    return lowered.endswith("_proxy") and lowered != "no_proxy"
+
+
+def _proxy_has_userinfo(value: str) -> bool:
+    # Proxy clients also take a bare "user:pass@host:port", so parse it as a URL whether or not a scheme is given.
+    raw = value.strip()
+    try:
+        netloc = urlsplit(raw if "://" in raw else f"http://{raw}").netloc
+    except ValueError:
+        return "@" in raw
+    return "@" in netloc
+
+
+def _carries_url_credentials(name: str, value: str) -> bool:
+    if _is_proxy_env_name(name) and _proxy_has_userinfo(value):
+        return True
     return bool(_URL_USERINFO_RE.search(value))
 
 
@@ -81,14 +99,14 @@ def build_child_env(
     # Refused rather than dropped, so a node configured with an authenticated proxy fails loudly instead of running
     # offline; messages name the variable only, never its value.
     for k, v in env.items():
-        if _carries_url_credentials(v):
+        if _carries_url_credentials(k, v):
             raise PermissionError(f"runner environment variable {k!r} carries URL credentials")
     env["GIT_TERMINAL_PROMPT"] = "0"
     if extra_env:
         for k, v in extra_env.items():
             if is_credential_env_name(k) or k in _LEASE_ENV_KEYS:
                 raise PermissionError(f"refusing to inject credential-like key {k!r} into child env")
-            if _carries_url_credentials(v):
+            if _carries_url_credentials(k, v):
                 raise PermissionError(f"driver environment variable {k!r} carries URL credentials")
             env[k] = v
     if credential_lease is not None:

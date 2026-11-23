@@ -217,12 +217,16 @@ def test_unbound_workspace_is_claimed_before_the_first_ack(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("source", ["inherited", "driver"])
+@pytest.mark.parametrize(
+    "proxy",
+    ["http://proxy-user:placeholder-pass@proxy.example:8080", "proxy-user:placeholder-pass@proxy.example:8080"],
+    ids=["with-scheme", "schemeless"],
+)
 def test_proxy_url_with_user_credentials_never_reaches_the_child(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, proxy: str
 ) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
-    proxy = "http://proxy-user:placeholder-pass@proxy.example:8080"
     if source == "inherited":
         monkeypatch.setenv("HTTPS_PROXY", proxy)
         drivers = _env_driver()
@@ -240,17 +244,20 @@ def test_proxy_url_with_user_credentials_never_reaches_the_child(
     assert "placeholder-pass" not in res.stdout_excerpt
 
 
-def test_proxy_url_without_credentials_still_reaches_the_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("proxy", ["http://proxy.example:8080", "proxy.example:8080"], ids=["with-scheme", "schemeless"])
+def test_proxy_url_without_credentials_still_reaches_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, proxy: str
+) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
-    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
+    monkeypatch.setenv("HTTPS_PROXY", proxy)
     daemon = RunnerDaemon(_config(tmp_path, repo), drivers=_env_driver())
     try:
         res = asyncio.run(daemon.run(_req("run_proxy_ok", executor_id="env"), caller_id="hibernaut"))
     finally:
         daemon.close()
     assert res.status == "succeeded", res.error_summary
-    assert json.loads(res.stdout_excerpt)["env"]["HTTPS_PROXY"] == "http://proxy.example:8080"
+    assert json.loads(res.stdout_excerpt)["env"]["HTTPS_PROXY"] == proxy
 
 
 def test_rejected_first_claim_on_a_multi_slot_node_does_not_split_the_workspace(tmp_path: Path) -> None:
