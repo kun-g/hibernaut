@@ -665,6 +665,8 @@ def _validate_runner_pilot(config: HibernautConfig) -> None:
         raise ValueError("runner_pilot.port is channels.port")
     if config.runner.enabled and config.runner.mode == "relay" and pilot.port == config.runner.listen_port:
         raise ValueError("runner_pilot.port is runner.listen_port; each relay needs its own port")
+    if config.memory_hub.http.enabled and pilot.port == config.memory_hub.http.listen_port:
+        raise ValueError("runner_pilot.port is memory_hub.http.listen_port")
 
 
 def tool_hook_style(agent: AgentConfig, template: CLITemplate) -> ToolHookStyle | None:

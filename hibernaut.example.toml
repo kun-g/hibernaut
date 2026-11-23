@@ -315,19 +315,6 @@ gh_command = "gh"
 # token_env = "HIBERNAUT_RUNNER_TOKEN"   # 节点共享 token 所在的环境变量，启动时取出并从环境里删除
 # affinity_db_path = "runner/affinity.db"   # 不填 = runtime.db_path 所在目录下的 runner/affinity.db
 
-# Runner 只读试点（默认关闭，docs/runner.md §9；启用、验证与回退步骤见 deploy/runner/README.md）。打开后只有 inbox_id 这一个
-# 任务级 Inbox 改由独立 Runner 上的固定校验程序执行，任务须带 payload.candidate_commit；其他 Inbox 不受影响。
-# Relay 只监听 127.0.0.1。令牌文件须为本用户所有、权限 0600。运行中只能改 enabled，改其他项先关闭。
-# 与上面的 [runner] 互不依赖，可只开其一；[runner] 为 relay 时两者的端口不能相同。
-# [runner_pilot]
-# enabled = false
-# inbox_id = "hibernaut:runner-pilot"
-# runner_id = "mac-pilot"
-# project_key = "hibernaut"
-# port = 8791
-# token_file = "~/.config/hibernaut/runner-relay.token"
-# timeout_seconds = 120              # 单次校验上限，最多 600
-
 # 项目记忆（Memory Hub）。不写这一段用下列默认值；改动要重启。同一项目的 Inbox 共用 <memory_root>/projects/<project_key>/。
 # 设计与写入策略见 docs/architecture.md §14。
 # [memory_hub]
@@ -360,3 +347,16 @@ gh_command = "gh"
 # role = "propose"                       # readonly | propose | admin（admin 不能限定项目）
 # allowed_projects = ["hibernaut"]
 # allow_kb = false                       # 能否读知识库挂载
+
+# Runner 只读试点（默认关闭，docs/runner.md §9；启用、验证与回退步骤见 deploy/runner/README.md）。打开后只有 inbox_id 这一个
+# 任务级 Inbox 改由独立 Runner 上的固定校验程序执行，任务须带 payload.candidate_commit；其他 Inbox 不受影响。
+# Relay 只监听 127.0.0.1。令牌文件须为本用户所有、权限 0600。运行中只能改 enabled，改其他项先关闭。
+# 与上面的 [runner] 互不依赖，可只开其一；[runner] 为 relay 时两者的端口不能相同。
+# [runner_pilot]
+# enabled = false
+# inbox_id = "hibernaut:runner-pilot"
+# runner_id = "mac-pilot"
+# project_key = "hibernaut"
+# port = 8791
+# token_file = "~/.config/hibernaut/runner-relay.token"
+# timeout_seconds = 120              # 单次校验上限，最多 600

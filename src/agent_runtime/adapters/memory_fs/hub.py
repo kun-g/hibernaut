@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import fcntl
+import os
 import re
 import threading
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from memory_hub import (
     WriteProposal,
     WriteResult,
 )
+from memory_hub.partition import sanitize_segment
 
 _PROPOSAL_ID_RE = re.compile(r"prop_[0-9a-f]+")
 
@@ -34,6 +36,8 @@ class GovernedMemoryHub(MemoryHub):
         root.mkdir(parents=True, exist_ok=True)
         self._thread_lock = threading.RLock()
         self._held = 0
+        # Whether the deployment binds this inbox to a workdir of no project; every config generation sets its own.
+        self.is_projectless: Callable[[str], bool] = lambda inbox_id: False
         self._lock_file = (root / ".memory_hub.lock").open("a")
         try:
             with self.exclusive():
@@ -61,13 +65,29 @@ class GovernedMemoryHub(MemoryHub):
                 super().close()
                 self._lock_file.close()
 
+    def resolve_project_key(self, inbox_id: str) -> str:
+        # MemoryHub reads <name>:<rest> as a queue of project <name>, which would give all sys:* inboxes, and a project
+        # that happens to be called so, one memory.
+        if inbox_id not in self.config.inbox_project_map and (
+            inbox_id.strip().startswith("sys:") or self.is_projectless(inbox_id)
+        ):
+            return sanitize_segment(inbox_id, field_name="inbox_id")
+        return super().resolve_project_key(inbox_id)
+
+    def lay_out(self, project_key: str) -> None:
+        # OSError when the key is no directory name.
+        with self.exclusive():
+            self._store.ensure_project(project_key)
+
+    def is_laid_out(self, folder: Path) -> bool:
+        # By Memory Hub itself, unlike the directories of the per-inbox_id layout before it.
+        return os.path.isdir(folder / "notes" / "reported_archive")
+
     def project_dir(self, project_key: str) -> Path:
         return self.root / "projects" / project_key
 
     def project_keys(self) -> list[str]:
-        # Only directories Memory Hub has laid out itself, not those of the per-inbox_id layout before it.
-        projects = self.root / "projects"
-        return sorted(p.name for p in projects.iterdir() if (p / "notes" / "reported_archive").is_dir())
+        return sorted(p.name for p in (self.root / "projects").iterdir() if self.is_laid_out(p))
 
     def set_global_instructions(self, content: str) -> None:
         with self.exclusive():

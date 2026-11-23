@@ -178,6 +178,8 @@ class WorkspacePartitionRegistry:
 
     def memory_for(self, inbox_id: str) -> PartitionedMemoryAdapter:
         binding = self.binding_for(inbox_id)
+        # Before any Run: an inbox whose memory has no usable directory is refused, not failed event by event.
+        self._hub.lay_out(binding.memory_dir.name)
         adopt_legacy_memory(self._hub, inbox_id)
         return PartitionedMemoryAdapter(inbox_id=inbox_id, hub=self._hub, workspace_dir=binding.workspace_dir)
 

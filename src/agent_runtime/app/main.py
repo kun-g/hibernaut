@@ -999,6 +999,10 @@ def pilot_hold(
     return hold
 
 
+def projectless_inboxes(config: HibernautConfig) -> Callable[[str], bool]:
+    return lambda inbox_id: config.runtime.workdir_binding(inbox_id) is not None
+
+
 def _permissions(link: RunnerLinkConfig) -> AutoModePermissionAdapter:
     if not link.enabled:
         return AutoModePermissionAdapter()
@@ -1088,6 +1092,7 @@ def build_daemon_from_config(
     opened_hub = memory_hub is None
     if memory_hub is None:
         memory_hub = open_memory_hub(config.memory_hub.hub_config(config.runtime.memory_root), ledger=ledger)
+    memory_hub.is_projectless = projectless_inboxes(config)
 
     daemon = build_daemon(
         db_path=config.runtime.db_path,
@@ -1712,6 +1717,8 @@ async def serve_configured(
                         file=sys.stderr,
                         flush=True,
                     )
+                    if daemon.memory_hub is not None:
+                        daemon.memory_hub.is_projectless = projectless_inboxes(config)
                     if next_pilot is not None and next_pilot is not runner_pilot:
                         await next_pilot.stop()
                     continue

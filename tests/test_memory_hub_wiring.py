@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import socket
 import sqlite3
 import threading
 import time
@@ -103,6 +104,95 @@ def test_inboxes_of_one_project_share_its_memory_and_projects_stay_apart(registr
         other.read_on_demand("progress/task.md")
     assert registry.binding_for(PROJ).memory_dir == registry.binding_for(ISSUE).memory_dir
     assert registry.binding_for("proj:web-app").memory_dir != registry.binding_for(PROJ).memory_dir
+
+
+def test_inboxes_of_no_project_have_memory_of_their_own(registry: WorkspacePartitionRegistry) -> None:
+    ids = ("sys:hb-ops", "sys:backup", "user:main", "proj:sys", "sys")
+    for inbox_id in ids:
+        registry.memory_for(inbox_id).write("notes/mine.md", inbox_id)
+    assert [registry.memory_for(i).read_on_demand("notes/mine.md") for i in ids[:4]] == [
+        "sys:hb-ops", "sys:backup", "user:main", "sys"]
+    assert registry.binding_for("sys:hb-ops").memory_dir.name == "sys__hb-ops"
+
+
+def _bound_config(tmp_path: Path, *patterns: str, **sections: Any) -> dict[str, Any]:
+    return {
+        "runtime": {
+            "db_path": str(tmp_path / "hb.db"), "memory_root": str(tmp_path / "memory"), "default_agent": "cli",
+            "inbox_bindings": [
+                {"pattern": p, "default_agent": "cli", "agents": ["cli"], "workdir": str(tmp_path / f"work{n}")}
+                for n, p in enumerate(patterns)
+            ],
+        },
+        "executors": {"cli": {"command": "true"}},
+        **sections,
+    }
+
+
+def test_a_workdir_binding_is_a_memory_scope_of_its_own_whatever_its_name(tmp_path: Path) -> None:
+    cfg = parse_config(_bound_config(tmp_path, "ops:a", "ops:b", "sys:mapped", memory_hub={
+        "inbox_projects": {"sys:mapped": "ops"}}))
+    daemon = build_daemon_from_config(cfg)
+    try:
+        keys = {i: daemon.partitions.memory_for(i).project_key for i in ("ops:a", "ops:b", "ops:c", "sys:mapped")}
+        assert keys == {"ops:a": "ops__a", "ops:b": "ops__b", "ops:c": "ops", "sys:mapped": "ops"}
+        assert daemon.partitions.binding_for("ops:a").memory_dir.name == "ops__a"
+        # A post-mortem and GC go by the same key.
+        assert daemon.memory_hub is not None and daemon.memory_hub.resolve_project_key("ops:a") == "ops__a"
+    finally:
+        daemon.close()
+
+
+def test_settings_that_cannot_be_activated_leave_the_memory_scopes_as_they_were(tmp_path: Path) -> None:
+    path = tmp_path / "hibernaut.toml"
+    taken = socket.socket()
+    taken.bind(("127.0.0.1", 0))
+    taken.listen()
+
+    def write(port: int, *patterns: str) -> None:
+        raw = _bound_config(tmp_path, *patterns)
+        runtime = {k: v for k, v in raw["runtime"].items() if k != "inbox_bindings"}
+        lines = ["[channels]", 'host = "127.0.0.1"', f"port = {port}", "[runtime]"]
+        lines += [f"{k} = {json.dumps(v)}" for k, v in runtime.items()]
+        for bound in raw["runtime"]["inbox_bindings"]:
+            lines += ["[[runtime.inbox_bindings]]", *(f"{k} = {json.dumps(v)}" for k, v in bound.items())]
+        path.write_text("\n".join([*lines, "[executors.cli]", 'command = "true"', ""]), encoding="utf-8")
+
+    async def scenario() -> None:
+        write(0, "ops:a")
+        config = load_config(path)
+        daemon = build_daemon_from_config(config)
+        hub = daemon.memory_hub
+        assert hub is not None
+        stop, stderr = asyncio.Event(), io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            task = asyncio.create_task(serve_configured(path, config, daemon, stop, reload_interval=0.02))
+            try:
+                for wanted, port, patterns in (("Cannot activate", taken.getsockname()[1], ("ops:b",)),
+                                               ("Reloaded", 0, ("ops:b",))):
+                    write(port, *patterns)
+                    async with asyncio.timeout(20):
+                        while wanted not in stderr.getvalue():
+                            await asyncio.sleep(0.02)
+                    keys = [hub.resolve_project_key(i) for i in ("ops:a", "ops:b")]
+                    assert keys == (["ops__a", "ops"] if wanted == "Cannot activate" else ["ops", "ops__b"])
+            finally:
+                stop.set()
+                await asyncio.wait_for(task, 20)
+                daemon.close()
+
+    with taken:
+        asyncio.run(scenario())
+
+
+def test_an_inbox_without_a_usable_memory_directory_is_refused_before_any_run(
+    registry: WorkspacePartitionRegistry,
+) -> None:
+    for inbox_id in ("sys:" + "x" * 300, "x" * 300, "user:" + "x" * 300, "x" * 300 + ":task"):
+        with pytest.raises(OSError):
+            registry.memory_for(inbox_id)
+    # The project's directory can be made, however long the name of one of its queues is.
+    assert registry.memory_for("proj:p:" + "x" * 300).project_key == "p"
 
 
 def test_adapter_exposes_the_bundle_and_keeps_the_legacy_dict(
@@ -376,6 +466,13 @@ def test_legacy_partitions_of_one_project_merge_without_losing_either(tmp_path: 
     assert memory.load_baseline()["instructions.md"] == "PROJECT RULE"
     assert memory.read_on_demand("progress/t.md") == "TASK PROGRESS"
     assert memory.read_on_demand("notes/legacy/hibernaut__issue-42/instructions.md") == "TASK RULE"
+
+
+def test_memory_in_use_by_another_scope_is_not_taken_for_old_memory(registry: WorkspacePartitionRegistry) -> None:
+    # proj__ops is where an inbox named so has its memory today, not where project ops had it before.
+    registry.memory_for("proj__ops").write("notes/private.md", "not for the project")
+    with pytest.raises(FileNotFoundError):
+        registry.memory_for("ops:task").read_on_demand("notes/private.md")
 
 
 def test_an_inbox_whose_directory_name_is_unchanged_is_left_alone(tmp_path: Path) -> None:

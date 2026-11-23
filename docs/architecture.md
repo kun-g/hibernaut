@@ -382,8 +382,8 @@
 
 `src/memory_hub/` 是只依赖标准库的独立包。`.importlinter` 的 `memory-hub-zero-business-deps` 禁止它导入 `agent_runtime`、`switchboard`、`taskboard`、`runner`、`ledger`；`business-packages-no-memory-hub` 禁止 `switchboard`、`runner`、`taskboard` 导入它；`tests/test_memory_hub.py` 另用 AST 检查。数据契约是 `schemas/v1/memory_{baseline,proposal,search,postmortem}.schema.json`（Draft 2020-12）。包按 v1.0 交付件合入，之后只改过 `index_fts5.py` 的索引同步（见下文「检索索引」），Hibernaut 侧的约束都写在接线层。
 
-- **分区**：`inbox_id` 先归到 `project_key`：`[memory_hub.inbox_projects]` 的显式映射 → `proj:<key>` 或 `proj:<key>:<子队列>` → `<key>:<任务>`（`user:` 除外）→ 整个 `inbox_id` 规范化。同一 `project_key` 的 Inbox 共用 `<memory_root>/projects/<project_key>/`。
-- **旧目录迁移**（`memory_fs/legacy.py`）：以前每个 `inbox_id` 一个目录。首次访问某 Inbox 的记忆时，把旧目录的文件复制进项目目录，旧目录不动、留标记 `.memory_hub_adopted`，只做一次。主 Inbox（`proj__<key>`）先复制；同名而内容不同的文件放 `notes/legacy/<旧目录>/`，不覆盖。
+- **分区**：`inbox_id` 先归到 `project_key`：`[memory_hub.inbox_projects]` 的显式映射 → 不属于项目的 Inbox（`sys:*`，以及 `[[runtime.inbox_bindings]]` 绑定了 `workdir` 的，不论叫什么）取整个 `inbox_id` 规范化，各有各的记忆 → `proj:<key>` 或 `proj:<key>:<子队列>` → `<key>:<任务>`（`user:` 除外）→ 整个 `inbox_id` 规范化。同一 `project_key` 的 Inbox 共用 `<memory_root>/projects/<project_key>/`。非项目绑定随配置热加载生效，加载失败则保持原样。目录在建 Worker 时就建好，建不出来的 Inbox 按 `InboxRefused` 处理（§4）。
+- **旧目录迁移**（`memory_fs/legacy.py`）：以前每个 `inbox_id` 一个目录。首次访问某 Inbox 的记忆时，把旧目录的文件复制进项目目录，旧目录不动、留标记 `.memory_hub_adopted`，只做一次；Memory Hub 正在使用的目录属于别的分区，不会被当作旧目录。主 Inbox（`proj__<key>`）先复制；同名而内容不同的文件放 `notes/legacy/<旧目录>/`，不覆盖。
 - **写入策略**（`memory_hub/governance.py`）：
 
   | 目标 | 运行中写入 |

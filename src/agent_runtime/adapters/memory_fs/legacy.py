@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from agent_runtime.adapters.memory_fs.hub import GovernedMemoryHub
@@ -14,19 +15,21 @@ def adopt_legacy_memory(hub: GovernedMemoryHub, inbox_id: str) -> None:
     # partitions hold the same file its version is the one in effect and the other is kept under notes/legacy/.
     key = hub.resolve_project_key(inbox_id)
     names = dict.fromkeys((f"proj__{key}", sanitize_segment(inbox_id, field_name="inbox_id")))
-    pending = [d for d in (hub.project_dir(n) for n in names if n != key) if _is_unadopted(d)]
+    pending = [d for d in (hub.project_dir(n) for n in names if n != key) if _is_unadopted(hub, d)]
     if not pending:
         return
     with hub.exclusive():
-        hub.load_baseline(key)
+        hub.lay_out(key)
         for source in pending:
-            if _is_unadopted(source):
+            if _is_unadopted(hub, source):
                 _copy(source, hub.project_dir(key))
                 (source / _ADOPTED_MARKER).write_text(f"{key}\n", encoding="utf-8")
 
 
-def _is_unadopted(folder: Path) -> bool:
-    return folder.is_dir() and not (folder / _ADOPTED_MARKER).exists()
+def _is_unadopted(hub: GovernedMemoryHub, folder: Path) -> bool:
+    # os.path, which answers False where a Path raises for a name too long to exist. A directory in use today belongs to
+    # another scope.
+    return os.path.isdir(folder) and not hub.is_laid_out(folder) and not (folder / _ADOPTED_MARKER).exists()
 
 
 def _copy(source: Path, target: Path) -> None:

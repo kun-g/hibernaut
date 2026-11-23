@@ -13,7 +13,7 @@ Inbox 是串行队列：同一个 `inbox_id` 一次只跑一件，不同 `inbox_
 
 - 项目 Inbox 须被该项目的 `inbox_id` 规则匹配；项目写了绑定的，还须被某条绑定覆盖，否则转投被拒。
 - `<slug>` 取任务的稳定短名（Issue 号、主题），同一件活的后续事件沿用同一个，不用随机值。
-- `inbox_id` 同时是 Memory 分区名，不能含 `/`、`\`、`..`。
+- Memory 分区名由 `inbox_id` 得出，所以它不能含 `/`、`\`、`..`。同一项目的 Inbox 共用项目记忆；`sys:*`、`user:*` 与其他绑定了 `workdir` 的 Inbox 各有各的记忆（[`architecture.md`](architecture.md) §14）。
 
 ## 串行复用还是并发分桶
 
