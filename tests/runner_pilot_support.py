@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
@@ -8,7 +9,9 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+from functools import cache
 from pathlib import Path
 
 from runner.protocol_check import PROTOCOL_FILES
@@ -24,16 +27,24 @@ def git(*args: str, cwd: Path) -> str:
     ).stdout.strip()
 
 
-def protocol_repo(repo: Path) -> str:
-    # A repository holding this checkout's five protocol files; returns the commit.
-    repo.mkdir(parents=True)
+@cache
+def _protocol_seed() -> tuple[Path, str]:
+    tmp = tempfile.TemporaryDirectory(prefix="runner_protocol_seed_")
+    atexit.register(tmp.cleanup)
+    repo = Path(tmp.name)
     git("init", "-q", "-b", "main", cwd=repo)
     git("config", "user.email", "test@example.com", cwd=repo)
     git("config", "user.name", "Test", cwd=repo)
     for path in PROTOCOL_FILES:
         (repo / path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / path, repo / path)
-    return commit(repo, "protocol files")
+    return repo, commit(repo, "protocol files")
+
+
+def protocol_repo(repo: Path) -> str:
+    seed, head = _protocol_seed()
+    shutil.copytree(seed, repo, symlinks=True)
+    return head
 
 
 def commit(repo: Path, message: str) -> str:
