@@ -318,41 +318,6 @@ class TestDeliveryHandBack(SDEDeliveryCase):
         self.assertIn("main.txt needs ok.txt", handback)
         self.assertEqual(git(self.bare, "show", "hb/task-1:ok.txt"), "ok")
 
-    async def test_hand_backs_stop_at_the_limit_and_wait_for_a_person(self):
-        self.set_plan(sde=[dev({"calc.py": TASK_CALC}), dev({"notes.txt": "tried\n"}, commit="no merge")],
-                      reviewer=[PASS])
-        self.push_main({"calc.py": MAIN_CALC})
-        executor = self.executor(delivery=self.delivery())
-        outcome = await executor.execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        self.assertEqual(len(self.calls("sde")), 3)
-        for part in ("[sde] delivery pending: merging origin/main into hb/task-1 conflicts in calc.py",
-                     "Handed back to the developer 2 time(s) already (limit 2); a person decides now.",
-                     "Delivery hand-back 1 of 2", "Delivery hand-back 2 of 2"):
-            self.assertIn(part, outcome.prompt)
-        self.assertEqual(self.gh_state().get("prs", []), [])
-
-    async def test_a_limit_of_zero_suspends_as_before(self):
-        self.set_plan(sde=[dev({"calc.py": TASK_CALC})], reviewer=[PASS])
-        self.push_main({"calc.py": MAIN_CALC})
-        outcome = await self.executor(delivery=self.delivery(max_handbacks=0)).execute(
-            [event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        self.assertIn("conflicts in calc.py", outcome.prompt)
-        self.assertEqual(len(self.calls("sde")), 1)
-
-    async def test_a_question_from_the_developer_during_a_hand_back_suspends(self):
-        question = {"status": "needs_input", "summary": "both sides change divide", "test_evidence": "",
-                    "question": "keep main's divide or ours?", "change_kind": "feature",
-                    "change_rationale": "feature so far"}
-        self.set_plan(sde=[dev({"calc.py": TASK_CALC}), {"output": question}], reviewer=[PASS])
-        self.push_main({"calc.py": MAIN_CALC})
-        outcome = await self.executor(delivery=self.delivery()).execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        self.assertIn("[sde] needs input: keep main's divide or ours?", outcome.prompt)
-        self.assertIn("Delivery hand-back 1 of 2: merging origin/main conflicts in calc.py", outcome.prompt)
-        self.assertEqual(self.gh_state().get("prs", []), [])
-
     async def test_a_conflict_only_in_the_version_file_is_still_resolved_by_delivery(self):
         self.set_plan(sde=[dev({VERSION_FILE: '"""pkg"""\n__version__ = "0.4.1"\n', "calc.py": "y = 2\n"},
                                kind="fix")], reviewer=[PASS])

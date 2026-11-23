@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_runtime.adapters.delivery import DeliveryRecord
 from agent_runtime.adapters.executor_cli import sde
 from agent_runtime.adapters.executor_cli.reviewer import ReviewAborted
 from agent_runtime.adapters.executor_cli.sde import _State
@@ -135,6 +136,45 @@ class TestHandBackReview(ReviewFlowCase):
                          (2, 2, 2))
         self.assertIn(f"```diff\n{diff}\n```", self.request().previous_round)
         return outcome
+
+    def persistent_conflict(self, limit):
+        record = DeliveryRecord(problem="merging origin/main into hb/task-1 conflicts in calc.py",
+                                handback=CONFLICT.handback)
+        self.delivery.config.max_handbacks = limit
+        self.delivery.record.return_value = record
+        return record
+
+    async def test_hand_backs_stop_at_the_limit_and_wait_for_a_person(self):
+        conflict = self.persistent_conflict(2)
+        outcome = await self.run_flow(snapshots=["first", "retry1", "retry2"],
+                                      diffs={("first", "retry1"): ("tried", ["notes.txt"]),
+                                             ("retry1", "retry2"): ("", [])},
+                                      reviews=[PASS] * 3, deliveries=[conflict] * 3)
+        self.assertIsInstance(outcome, Suspend)
+        self.assertEqual((self.develop.await_count, self.delivery.deliver.call_count), (3, 3))
+        for part in ("[sde] delivery pending: merging origin/main into hb/task-1 conflicts in calc.py",
+                     "Handed back to the developer 2 time(s) already (limit 2); a person decides now.",
+                     "Delivery hand-back 1 of 2", "Delivery hand-back 2 of 2"):
+            self.assertIn(part, outcome.prompt)
+        self.assertNotIn("PR created", outcome.prompt)
+
+    async def test_a_limit_of_zero_suspends_as_before(self):
+        conflict = self.persistent_conflict(0)
+        outcome = await self.run_flow(snapshots=["first"], diffs={}, reviews=[PASS], deliveries=[conflict])
+        self.assertIsInstance(outcome, Suspend)
+        self.assertIn("conflicts in calc.py", outcome.prompt)
+        self.assertEqual(self.develop.await_count, 1)
+
+    async def test_a_question_from_the_developer_during_a_hand_back_suspends(self):
+        conflict = self.persistent_conflict(2)
+        question = {"status": "needs_input", "question": "keep main's divide or ours?"}
+        outcome = await self.run_flow(snapshots=["first"], diffs={}, reviews=[PASS], deliveries=[conflict],
+                                      reports=[REPORT, question])
+        self.assertIsInstance(outcome, Suspend)
+        self.assertIn("[sde] needs input: keep main's divide or ours?", outcome.prompt)
+        self.assertIn("Delivery hand-back 1 of 2: merging origin/main conflicts in calc.py", outcome.prompt)
+        self.assertEqual(self.delivery.deliver.call_count, 1)
+        self.assertNotIn("PR created", outcome.prompt)
 
     async def test_a_plain_conflict_resolution_is_reviewed_before_delivery(self):
         outcome = await self.simple_conflict()

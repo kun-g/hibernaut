@@ -16,7 +16,9 @@ from unittest.mock import Mock, patch
 
 from agent_runtime.adapters.executor_cli import OrcaWorktreeManager
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
-from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
+from agent_runtime.adapters.executor_cli.base_merge import SinceReview
+from agent_runtime.adapters.executor_cli.project_guidance import ProjectGuidance
+from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor, ReviewAborted, render_review, review_prompt, validate_review
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
@@ -365,45 +367,59 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
-    # Suspend/Resume through the real AgentWorker, SQLite sessions, inbox and outbox.
+    # The worker owns the Inbox, cards and checkpoints. Script only role replies and their repository evidence.
     def setUp(self):
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.repo = make_base_repo(self.root)
-        git(self.repo, "checkout", "-qb", "hb/task-1")
-        self.log = self.root / "calls.jsonl"
-        self.plan = self.root / "plan.json"
-        self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan)}))
+        self.repo = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.db = SQLiteDatabase(":memory:")
         self.addCleanup(self.db.close)
         self.inbox = SQLiteInboxAdapter(self.db)
         self.outbox = SQLiteOutboxAdapter(self.db)
         self.sessions = SQLiteSessionStoreAdapter(self.db)
-        self.workspaces = SQLiteWorkspaceStore(self.db)
         self.handler = EventHandler(inbox=self.inbox)
         self.permissions = InMemoryPermission()
         self.n = 0
+        self.history = []
+        self.workspaces = SQLiteWorkspaceStore(self.db)
+        self.manager = OrcaWorktreeManager(workspace_store=self.workspaces, session_store=self.sessions, backend="git")
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.sde.load_guidance", side_effect=lambda pin: ProjectGuidance(pin, "", (), False)))
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.sde._review_delta", return_value=("fix", ["calc.py"])))
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.sde.worktree_fingerprint", return_value="head:tree"))
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.reviewer.repo_root", return_value=self.repo))
+
+    def pin(self, state, selection):
+        state.project = {"workdir": str(self.repo), "commit": "base", "origin": "test"}
 
     def set_plan(self, sde=(), reviewer=()):
-        self.plan.write_text(json.dumps({"sde": list(sde), "reviewer": list(reviewer)}))
+        self.reports, self.reviews = iter(sde), iter(reviewer)
+
+    async def develop(self, session_id, native, state, prompt, caps, progress):
+        self.history.append({"role": "sde", "prompt": prompt})
+        report = next(self.reports)["output"]
+        return {**report, "code_change": True}, native or "native"
+
+    async def review(self, request, caps, **kwargs):
+        self.history.append({"role": "reviewer", "prompt": review_prompt(request, "", "+++ b/calc.py")})
+        answer = next(self.reviews)
+        if "error" in answer:
+            raise ReviewAborted(answer["error"])
+        return validate_review(answer)
 
     def worker(self):
-        launcher = ClaudeCodeLauncher(name="fake", command=fake_command(self.root))
-        reviewer = CoderReviewerExecutor(profile=ClaudeCodeProfile(name="coder-reviewer", launcher=launcher),
-                                         workspaces=self.workspaces, tasks=SQLiteTaskMetadataStore(self.db))
-        sde = SDEExecutor(
-            profile=ClaudeCodeProfile(name="sde", launcher=launcher),
-            options=SDEOptions(),
-            reviewer=reviewer,
-            worktree_manager=OrcaWorktreeManager(workspace_store=self.workspaces, session_store=self.sessions,
-                                                 backend="git"),
-            inbox_checkout_map={},
-            tasks=SQLiteTaskMetadataStore(self.db),
-        )
+        reviewer = Mock()
+        reviewer.check_launch.return_value.action = "allow"
+        reviewer.review = self.review
+        reviewer.format_review.side_effect = lambda review: render_review(review, executor_id="coder-reviewer", settings="test")
+        executor = SDEExecutor(profile=ClaudeCodeProfile(name="sde"), options=SDEOptions(), reviewer=reviewer,
+                               worktree_manager=self.manager, inbox_checkout_map={}, tasks=SQLiteTaskMetadataStore(self.db))
+        executor._pin = self.pin
+        executor._develop = self.develop
+        executor._unfinished = lambda _: ("", None)
+        executor._since_review = lambda *_: SinceReview("previous")
         memory = Mock()
         memory.load_baseline.return_value = {}
         return AgentWorker(worker_id="w", inbox=self.inbox, timers=SQLiteTimerAdapter(self.db), memory=memory,
                            permissions=self.permissions, outbox=self.outbox, lock=SQLiteLeaseLockAdapter(self.db),
-                           sessions=self.sessions, executors={"sde": sde}, global_default_executor="sde")
+                           sessions=self.sessions, executors={"sde": executor}, global_default_executor="sde")
 
     async def send(self, payload):
         self.n += 1
@@ -426,8 +442,7 @@ class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
         return [m.content for m in self.outbox.fetch_pending(100) if m.metadata.get("kind") == "emit"]
 
     def calls(self, role=None):
-        rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
-        return [r for r in rows if role is None or r["role"] == role]
+        return [r for r in self.history if role is None or r["role"] == role]
 
     async def test_follow_up_while_suspended_reaches_developer_and_reviewer_without_a_new_card(self):
         self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?"), dev(FIXED)], reviewer=[PASS])
