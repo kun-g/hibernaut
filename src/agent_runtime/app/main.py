@@ -1296,11 +1296,12 @@ def build_daemon_from_config(
             except (ValueError, AmbiguousProjectMatch):
                 return None
             # The pilot inbox offers its own executor and no other, whatever binding covers it when the route is off.
-            on_pilot = _on_pilot_route(inbox_id)
             if project is not None:
-                return pilot_inbox(project.name) if on_pilot else project.route(inbox_id)
-            bound = config.runtime.workdir_binding(inbox_id) if not on_pilot else None
-            return bound.route() if bound is not None else None
+                route = project.route(inbox_id)
+            else:
+                bound = config.runtime.workdir_binding(inbox_id)
+                route = bound.route() if bound is not None else None
+            return pilot_inbox(route.project) if route is not None and _on_pilot_route(inbox_id) else route
 
         # One per config generation, so a held event is logged once each time it enters the wait.
         unmatched_hold = UnmatchedProjectHold(daemon.sessions)

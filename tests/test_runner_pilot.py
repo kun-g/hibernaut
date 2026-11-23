@@ -397,8 +397,8 @@ def test_the_general_runner_and_the_route_are_independent(tmp_path: Path) -> Non
         daemon.close()
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_a_workdir_binding_of_a_projectless_inbox_does_not_take_the_pilot_inbox_over(tmp_path: Path, enabled: bool) -> None:
+def _projectless_daemon(tmp_path: Path, relay: _FakeRelay, *, enabled: bool = True) -> AlwaysOnDaemon:
+    # One workdir binding covers every task inbox, the pilot's included; no project does.
     raw = _raw(enabled=enabled)
     (tmp_path / "ops").mkdir()
     raw["projects"]["hibernaut"] |= {"checkout": str(tmp_path), "inbox_id": "proj:hibernaut"}
@@ -408,10 +408,15 @@ def test_a_workdir_binding_of_a_projectless_inbox_does_not_take_the_pilot_inbox_
             {"pattern": "hibernaut:.*", "workdir": str(tmp_path / "ops"), "checkout_access": "readonly", "default_agent": "cli"}
         ],
     }
-    relay = _FakeRelay(_result)
-    daemon = build_daemon_from_config(
+    return build_daemon_from_config(
         parse_config(raw, base_dir=tmp_path), runner_pilot=relay if enabled else None, channel=RecordingChannel(),  # type: ignore[arg-type]
     )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_a_workdir_binding_of_a_projectless_inbox_does_not_take_the_pilot_inbox_over(tmp_path: Path, enabled: bool) -> None:
+    relay = _FakeRelay(_result)
+    daemon = _projectless_daemon(tmp_path, relay, enabled=enabled)
     try:
         pilot, other = (daemon.pool._worker_factory(inbox, "w") for inbox in (PILOT, OTHER))
         assert isinstance(other._executors[PROTOCOL_CHECK_EXECUTOR_ID], ClosedRouteExecutor)
@@ -453,6 +458,20 @@ class _Forwarder:
         return Silent()
 
 
+def test_an_uncovered_pilot_inbox_takes_no_forwards(tmp_path: Path) -> None:
+    raw = _raw()
+    raw["projects"]["hibernaut"] |= {"checkout": str(tmp_path), "inbox_id": ["proj:hibernaut", OTHER]}
+    raw["runtime"] |= {"db_path": str(tmp_path / "hb.db"), "memory_root": str(tmp_path / "mem")}
+    daemon = build_daemon_from_config(
+        parse_config(raw, base_dir=tmp_path), runner_pilot=_FakeRelay(_result), channel=RecordingChannel(),  # type: ignore[arg-type]
+    )
+    daemon.handler.ingest(inbox_id=OTHER, source="github", external_id="1", payload={"text": "go"}, correlation_key="c1")
+    asked = _Forwarder()
+    _process(daemon, OTHER, asked)
+    assert asked.refused is not None and "is not an inbox of this project" in asked.refused
+    daemon.close()
+
+
 @pytest.mark.parametrize("key", ["agent_id", "executor_id"])
 def test_inbox_bindings_neither_take_the_pilot_inbox_over_nor_refuse_its_executor(tmp_path: Path, key: str) -> None:
     relay = _FakeRelay(_result)
@@ -471,8 +490,11 @@ def test_inbox_bindings_neither_take_the_pilot_inbox_over_nor_refuse_its_executo
     daemon.close()
 
 
-def test_work_is_forwarded_to_the_pilot_inbox_only_for_its_own_executor(tmp_path: Path) -> None:
-    daemon = _daemon(tmp_path, _FakeRelay(_result))
+@pytest.mark.parametrize("build", [_daemon, _projectless_daemon])
+def test_work_is_forwarded_to_the_pilot_inbox_only_for_its_own_executor(
+    tmp_path: Path, build: Callable[[Path, _FakeRelay], AlwaysOnDaemon]
+) -> None:
+    daemon = build(tmp_path, _FakeRelay(_result))
     daemon.handler.ingest(inbox_id=OTHER, source="github", external_id="1", payload={"text": "go"}, correlation_key="c1")
     asked = _Forwarder(target_agent="cli")
     _process(daemon, OTHER, asked)
@@ -481,10 +503,13 @@ def test_work_is_forwarded_to_the_pilot_inbox_only_for_its_own_executor(tmp_path
     daemon.close()
 
 
-def test_the_pilot_hands_its_result_back_to_the_inbox_that_asked_for_it(tmp_path: Path) -> None:
+@pytest.mark.parametrize("build", [_daemon, _projectless_daemon])
+def test_the_pilot_hands_its_result_back_to_the_inbox_that_asked_for_it(
+    tmp_path: Path, build: Callable[[Path, _FakeRelay], AlwaysOnDaemon]
+) -> None:
     # A forward carries no candidate commit, so the result is a refusal to check; what counts is that it comes back.
     relay = _FakeRelay(_result)
-    daemon = _daemon(tmp_path, relay)
+    daemon = build(tmp_path, relay)
     daemon.handler.ingest(inbox_id=OTHER, source="github", external_id="1", payload={"text": "go"}, correlation_key="c1")
     asked = _Forwarder()
     _process(daemon, OTHER, asked)
