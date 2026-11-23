@@ -10,4 +10,4 @@ description: Hibernaut's default review method for the code-reviewer role — ju
 - When a blocking item rests on project guidance, cite the document in guidance_path and quote the clause in guidance_clause, so the developer receives that document in the fix round.
 - A blocking item is something that must change before merge: a bug, a missed requirement, a broken contract, a security problem, a violated project requirement, or a requirement the test evidence does not show to work.
 - Style preferences and optional improvements go to notes, never to blocking.
-- The developer fixes the blocking items and submits again for a fresh, independent review; on a re-review, check that each earlier blocking item is resolved and look for new problems in the changes since then.
+- The developer fixes the blocking items and submits again for a fresh, independent review; on a re-review, check that each earlier blocking item is resolved and look for new problems in the changes since then. When the task message has an "## Incremental review" section, only those two kinds block; put a problem you newly find in unchanged code in notes.

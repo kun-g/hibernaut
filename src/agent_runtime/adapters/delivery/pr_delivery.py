@@ -41,6 +41,13 @@ TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRI
 _SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 _MAX_MAIN_MOVES = 3
 _TAIL = 4000
+# GitHub rejects a longer PR body; the Outbox message always has every follow-up in full.
+_MAX_BODY = 65_536
+# A follow-up that does not fit is cut, unless so little would be left that it says nothing.
+_MIN_CUT = 80
+# The rest of a full body gives way until the follow-ups have this much room; what is cut first, and down to what.
+_MIN_FOLLOWUPS = 2_000
+_SHRINKABLE = (("evidence", 500), ("summary", 1_000), ("review", 1_000), ("rationale", 500))
 # No CI result for this long while the base has moved past the PR: GitHub may never run CI for it.
 _EMPTY_CHECKS_GRACE = 300.0
 CIResult = Literal["passed", "failed", "stale"]
@@ -266,6 +273,8 @@ class DeliveryRequest:
     review_detail: str = ""
     # "owner/repo#n" of the GitHub Issue the task came from (source_issue); "" for any other source.
     issue: str = ""
+    # Review notes that did not block, listed in the PR body.
+    followups: tuple[str, ...] = ()
 
 
 def _strs() -> list[str]:
@@ -395,6 +404,31 @@ def remote_env(base: Mapping[str, str]) -> dict[str, str]:
     env = {k: v for k, v in base.items() if k not in TOKEN_ENV}
     env.update({"GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"})
     return env
+
+
+def _followup_list(notes: Sequence[str], room: int) -> str:
+    # One line each, at most `room` characters; "" when not even the notice of a cut list fits.
+    # A zero-width space keeps a quoted decorator or number from pinging a person or closing an issue.
+    lines = ["- " + re.sub(r"([@#])(?=\w)", "\\1\u200b", " ".join(note.split())) for note in notes]
+    full = "\n".join(lines)
+    if len(full) <= room:
+        return full
+
+    def ending(missing: int) -> str:
+        return f"- 已截断，另有 {missing} 条未列；全文见 Hibernaut 完成消息"
+
+    shown: list[str] = []
+    left = room - len(ending(len(lines)))
+    if left < 0:
+        return ""
+    for line in lines:
+        if len(line) + 1 > left:
+            if left > _MIN_CUT:
+                shown.append(line[:left - 2] + "…")
+            break
+        shown.append(line)
+        left -= len(line) + 1
+    return "\n".join([*shown, ending(len(lines) - len(shown))])
 
 
 def _tail(text: str, limit: int = _TAIL) -> str:
@@ -638,6 +672,26 @@ class PRDelivery:
         self._git(cwd, "fetch", "--quiet", cfg.remote, f"+refs/heads/{cfg.base_branch}:{self._base_ref()}")
         return self._git(cwd, "rev-parse", "--verify", f"{self._base_ref()}^{{commit}}").stdout.strip()
 
+    @property
+    def base_ref(self) -> str:
+        return self._base_ref()
+
+    def same_but_version(self, before: str, after: str) -> bool:
+        # Whether a version file's two texts differ in the version alone, as the delivery step leaves it.
+        def rest(text: str) -> tuple[str, str] | None:
+            m = self._pattern.search(text)
+            return (text[:m.start("version")], text[m.end("version"):]) if m is not None else None
+
+        return rest(before) is not None and rest(before) == rest(after)
+
+    def base_tip(self, workdir: Path) -> str:
+        # The base branch as the remote has it now; "" when it cannot be fetched.
+        try:
+            with self._repo_lock(workdir):
+                return self._fetch_base(workdir)
+        except _Problem:
+            return ""
+
     def _prepare(self, req: DeliveryRequest, rec: DeliveryRecord, is_interrupted: Callable[[], bool]) -> None:
         cfg, cwd = self._config, req.workdir
         self._checkpoint(is_interrupted)
@@ -814,16 +868,33 @@ class PRDelivery:
                         "recomputes it before merging.")
         review = f"review={req.review}" + (f"\n\n{req.review_detail}" if req.review_detail else "")
         issue = self._issue_line(req.issue)
-        return "\n\n".join([
-            *([issue] if issue else []),
-            f"## Summary\n{req.summary or '(none)'}",
-            f"## Change\nKind: {req.change_kind}\n\nRationale: {req.rationale or '(none)'}",
-            f"## Version\n{version}",
-            f"## Checks (run by Hibernaut on {rec.head_sha[:12]})\n{checks}",
-            f"## Review\n{review}",
-            f"## Test evidence (from the developer)\n```text\n{_tail(req.test_evidence, 20000)}\n```",
-            f"Delivered by Hibernaut for task `{req.work_key}`.",
-        ])
+        text = {"summary": req.summary or "(none)", "rationale": req.rationale or "(none)", "review": review,
+                "evidence": _tail(req.test_evidence, 20000)}
+
+        def compose(followups: str | None) -> str:
+            return "\n\n".join([
+                *([issue] if issue else []),
+                f"## Summary\n{text['summary']}",
+                f"## Change\nKind: {req.change_kind}\n\nRationale: {text['rationale']}",
+                f"## Version\n{version}",
+                f"## Checks (run by Hibernaut on {rec.head_sha[:12]})\n{checks}",
+                f"## Review\n{text['review']}",
+                *([f"## 跟进\n{followups}"] if followups is not None else []),
+                f"## Test evidence (from the developer)\n```text\n{text['evidence']}\n```",
+                f"Delivered by Hibernaut for task `{req.work_key}`.",
+            ])
+
+        if not req.followups:
+            return compose(None)
+        wanted = min(len(_followup_list(req.followups, _MAX_BODY)), _MIN_FOLLOWUPS)
+        for part, floor in _SHRINKABLE:
+            short = wanted + len(compose("")) - _MAX_BODY
+            if short <= 0:
+                break
+            keep = max(floor, len(text[part]) - short - 3)
+            if keep + 3 < len(text[part]):
+                text[part] = _tail(text[part], keep) if part == "evidence" else text[part][:keep] + "..."
+        return compose(_followup_list(req.followups, _MAX_BODY - len(compose(""))) or None)
 
     def _list_prs(self, cwd: Path, branch: str) -> list[dict[str, Any]]:
         proc = self._gh(cwd, "pr", "list", "--head", branch, "--base", self._config.base_branch, "--state", "all",

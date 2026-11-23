@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, TypeAlias
@@ -135,6 +136,11 @@ class RunTelemetry:
     stdout: str = ""
     stderr: str = ""
     exit_code: int | None = None
+    # Set by executors that already classify their failures (the runner's error_kind); the ledger takes it as given
+    # instead of guessing from stderr and the exit code.
+    error_kind: str | None = None
+    # The execution node that ran the process; None means this process (the ledger records "local").
+    runner_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,3 +240,11 @@ class RunDetached(Exception):
     # Raised by a resumable executor that stopped at a resumable point because the process is stopping; the work
     # outside this process goes on and the next process resumes the Run from its run directory.
     pass
+
+
+class RunCancelled(asyncio.CancelledError):
+    # A cancellation that still knows how the Run ended (a remote runner's interrupted result): it cancels like any
+    # CancelledError, and the worker records its telemetry for the interrupted Run.
+    def __init__(self, msg: str = "", *, telemetry: RunTelemetry | None = None) -> None:
+        super().__init__(msg)
+        self.telemetry = telemetry
