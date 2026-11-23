@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hibernaut.local/schemas/runner/v1/runner.capabilities.schema.json",
+  "title": "RunnerCapabilities",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "runner_id",
+    "namespaces",
+    "projects",
+    "worktree_backend",
+    "interactive_surface",
+    "executors",
+    "slots",
+    "reported_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "runner.v1" },
+    "runner_id": { "type": "string", "minLength": 1 },
+    "namespaces": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,15}$" },
+      "minItems": 1
+    },
+    "projects": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "worktree_backend": { "enum": ["orca", "git"] },
+    "interactive_surface": { "enum": ["orca", "none"] },
+    "labels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "executors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["executor_id", "driver", "supports_resume", "supports_stream_json"],
+        "properties": {
+          "executor_id": { "type": "string", "minLength": 1 },
+          "driver": { "enum": ["claude", "grok", "cursor-agent", "dsh", "custom"] },
+          "supports_resume": { "type": "boolean" },
+          "supports_stream_json": { "type": "boolean" },
+          "interactive_surface": { "enum": ["none", "orca"] }
+        }
+      }
+    },
+    "slots": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_concurrent", "active_runs", "available"],
+      "properties": {
+        "max_concurrent": { "type": "integer", "minimum": 1 },
+        "active_runs": { "type": "integer", "minimum": 0 },
+        "available": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "reported_at": { "type": "string", "format": "date-time" }
+  }
+}

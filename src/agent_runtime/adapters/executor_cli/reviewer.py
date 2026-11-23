@@ -22,6 +22,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, terminal_title
 from agent_runtime.adapters.executor_cli.peer import PEER_TOOLS, DeveloperPeerResolver, PeerLookup
 from agent_runtime.adapters.executor_cli.process import join_text, last_text, relayed_work_key, target_events
+from agent_runtime.adapters.executor_cli.review_scope import BASES, INTRODUCED, UNFIXED, ReviewScope
 from agent_runtime.adapters.executor_cli.run_state import TurnSlot
 from agent_runtime.adapters.executor_cli.project_guidance import (
     GuidancePin,
@@ -77,6 +78,8 @@ REVIEW_SCHEMA: dict[str, Any] = {
                     "fix": {"type": "string"},
                     "guidance_path": {"type": "string"},
                     "guidance_clause": {"type": "string"},
+                    "basis": {"type": "string", "enum": list(BASES)},
+                    "previous_item": {"type": "integer"},
                 },
                 "required": ["location", "trigger", "impact"],
             },
@@ -109,11 +112,12 @@ def _peer_role_args() -> tuple[str, ...]:
 
 
 # Program-owned rules shared by every reviewer; the review method itself comes from the role skill.
-_REVIEW_RULES = """- Review only. Do not create, edit, stage, commit, stash or delete anything. Any change to the working tree voids this review.
+_REVIEW_RULES = f"""- Review only. Do not create, edit, stage, commit, stash or delete anything. Any change to the working tree voids this review.
 - verdict "pass" only when no blocking issue remains; otherwise "changes_requested" with at least one blocking item.
 - Every blocking item gives location (path:line), trigger (the inputs or state that make it go wrong), impact (what breaks for whom), and optionally fix.
 - A blocking item that rests on the project guidance also gives guidance_path (the document's path as listed in the project guidance, such as AGENTS.md or a catalog entry) and guidance_clause (the exact clause it breaks, quoted).
-- Non-blocking remarks go to notes."""
+- A task message with an "## Incremental review" section narrows what may block: an item of the previous round that is still not fixed (basis "{UNFIXED}" with previous_item, its number there), or a new problem caused by the changes since that review (basis "{INTRODUCED}", located in a file those changes touch). There every blocking item gives its basis, and a problem newly found in code unchanged since that review goes to notes. Without that section anything may block, and basis and previous_item are left out.
+- Non-blocking remarks go to notes, each understandable on its own (path:line where it applies): they are delivered as follow-ups."""
 _GUIDANCE_SOURCE = """"Project guidance" in the task message is the project's requirements: its AGENTS.md and the documents selected from its guidance.toml, read from the pinned commit it names. Judge against that version; edits to those files inside the change under review do not change the rules it is judged by."""
 _REVIEWER_INTRO = f"You are {CODE_REVIEWER_ROLE}, Hibernaut's independent code reviewer. Another agent wrote the change in the task message; judge it, do not fix it."
 
@@ -188,6 +192,8 @@ class ReviewRequest:
     selection: Selection = Selection()
     # Earlier findings plus the diff since that review; empty on a first review.
     previous_round: str = ""
+    # What an incremental re-review may block on; None reviews the whole change.
+    scope: ReviewScope | None = None
     # What the review is for, shown in the interactive terminal's title.
     label: str = ""
     # The developer task this review was dispatched for, and the verified channel to its conversation.
@@ -441,6 +447,8 @@ def review_prompt(request: ReviewRequest, guidance: str, evidence: str) -> str:
     parts += [f"## Test evidence\n{request.test_evidence}", f"## Code diff\n{evidence}"]
     if request.previous_round:
         parts.append(request.previous_round)
+    if request.scope is not None:
+        parts.append(request.scope.render())
     if request.peer is not None:
         parts.append(_peer_section(request.subject, request.peer))
     return "\n\n".join(parts)
@@ -467,6 +475,9 @@ def render_review(review: Mapping[str, Any], *, executor_id: str, settings: str)
         lines.append("Developer messages:")
         lines.extend(f"- {m}" for m in exchange)
     blocking: list[dict[str, str]] = review["blocking"]
+    if review.get("downgraded"):
+        lines.append(f"Downgraded to notes: {review['downgraded']} blocking item(s) outside the incremental scope "
+                     f"(reviewer verdict: {review['reviewer_verdict']})")
     if blocking:
         lines.append("Blocking:")
         lines.append(format_blocking(blocking))
@@ -486,6 +497,8 @@ def format_blocking(blocking: Sequence[Mapping[str, str]]) -> str:
         lines.append(f"   Impact: {item['impact']}")
         if item.get("fix"):
             lines.append(f"   Fix: {item['fix']}")
+        if item.get("basis") in BASES:
+            lines.append(f"   Basis: {item['basis']}")
         if item.get("guidance_path"):
             lines.append(f"   Guidance: {item['guidance_path']}")
             lines.append(f'   Clause: "{item.get("guidance_clause", "")}"')
@@ -515,6 +528,10 @@ def validate_review(raw: object) -> dict[str, Any]:
         if not isinstance(item, dict):
             raise ReviewAborted("a blocking item is not an object")
         entry = {str(k): str(v).strip() for k, v in item.items() if isinstance(v, str)}
+        number = _whole_number(cast(dict[str, object], item).get("previous_item"))
+        entry.pop("previous_item", None)
+        if number:
+            entry["previous_item"] = number
         if not all(entry.get(k) for k in ("location", "trigger", "impact")):
             raise ReviewAborted("a blocking item lacks location, trigger or impact")
         if bool(entry.get("guidance_path")) != bool(entry.get("guidance_clause")):
@@ -529,7 +546,15 @@ def validate_review(raw: object) -> dict[str, Any]:
             "developer_messages": exchange}
 
 
-def _git(workdir: Path, *args: str, env: Mapping[str, str] | None = None) -> str:
+def _whole_number(raw: object) -> str:
+    if isinstance(raw, str):
+        return raw.strip() if raw.strip().isdecimal() else ""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return ""
+    return str(int(raw)) if isinstance(raw, int) or raw.is_integer() else ""
+
+
+def git_output(workdir: Path, *args: str, env: Mapping[str, str] | None = None) -> str:
     proc = subprocess.run(
         ["git", *args], cwd=str(workdir), capture_output=True, text=True, check=False,
         env=dict(env) if env is not None else None,
@@ -539,7 +564,7 @@ def _git(workdir: Path, *args: str, env: Mapping[str, str] | None = None) -> str
     return proc.stdout
 
 
-def _git_paths(workdir: Path, *args: str) -> list[str]:
+def git_paths(workdir: Path, *args: str) -> list[str]:
     proc = subprocess.run(["git", *args], cwd=str(workdir), capture_output=True, check=False)
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", "replace").strip()[:500]
@@ -548,8 +573,8 @@ def _git_paths(workdir: Path, *args: str) -> list[str]:
 
 
 def worktree_fingerprint(workdir: Path) -> str:
-    head = _git(workdir, "rev-parse", "HEAD").strip()
-    index = Path(_git(workdir, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+    head = git_output(workdir, "rev-parse", "HEAD").strip()
+    index = Path(git_output(workdir, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
     # Snapshot tracked and untracked (non-ignored) files through a scratch index; the real index stays untouched.
     with tempfile.TemporaryDirectory(prefix="hibernaut-review-") as tmp:
         scratch = Path(tmp) / "index"
@@ -559,17 +584,24 @@ def worktree_fingerprint(workdir: Path) -> str:
             # data, which misses same-size edits within the same mtime second (0 would disable that check).
             os.utime(scratch, (1, 1))
         env = {**os.environ, "GIT_INDEX_FILE": str(scratch)}
-        _git(workdir, "add", "-A", env=env)
-        tree = _git(workdir, "write-tree", env=env).strip()
+        git_output(workdir, "add", "-A", env=env)
+        tree = git_output(workdir, "write-tree", env=env).strip()
     return f"{head}:{tree}"
 
 
 def snapshot_diff(workdir: Path, before: str, after: str) -> str:
     # Fingerprints are "<head>:<tree>"; their tree objects stay in the object store, so two snapshots diff directly.
-    diff = _git(workdir, "diff", before.split(":", 1)[1], after.split(":", 1)[1])
+    diff = git_output(workdir, "diff", before.split(":", 1)[1], after.split(":", 1)[1])
     if len(diff) > _MAX_DIFF_CHARS:
         diff = diff[:_MAX_DIFF_CHARS] + f"\n[diff truncated at {_MAX_DIFF_CHARS} characters]"
     return diff
+
+
+def review_scope(
+    workdir: Path, changed: Sequence[str], *, previous: Sequence[Mapping[str, str]], notes: Sequence[str]
+) -> ReviewScope:
+    return ReviewScope(root=repo_root(workdir), workdir=workdir, previous=tuple(previous), changed=tuple(changed),
+                       notes=tuple(notes))
 
 
 def _collect_diff(workdir: Path, base_ref: str) -> tuple[str, list[str]]:
@@ -578,13 +610,13 @@ def _collect_diff(workdir: Path, base_ref: str) -> tuple[str, list[str]]:
         base, base_ref = merge_base(workdir, base_ref)
     except ValueError as exc:
         raise ReviewAborted(str(exc)) from exc
-    commits = _git(workdir, "log", "--oneline", f"{base}..HEAD").strip()
-    stat = _git(workdir, "diff", "--stat", base).strip()
-    untracked = _git(workdir, "ls-files", "--others", "--exclude-standard").strip()
-    diff = _git(workdir, "diff", base)
+    commits = git_output(workdir, "log", "--oneline", f"{base}..HEAD").strip()
+    stat = git_output(workdir, "diff", "--stat", base).strip()
+    untracked = git_output(workdir, "ls-files", "--others", "--exclude-standard").strip()
+    diff = git_output(workdir, "diff", base)
     # -z: raw NUL-separated names; the default output quotes non-ASCII paths, which no glob would match.
-    changed = _git_paths(workdir, "diff", "--name-only", "--no-relative", "-z", base)
-    changed += _git_paths(workdir, "ls-files", "--others", "--exclude-standard", "--full-name", "-z")
+    changed = git_paths(workdir, "diff", "--name-only", "--no-relative", "-z", base)
+    changed += git_paths(workdir, "ls-files", "--others", "--exclude-standard", "--full-name", "-z")
     if not diff.strip() and not untracked:
         raise ReviewAborted(f"no changes between {base_ref} ({base[:12]}) and {workdir}")
     if len(diff) > _MAX_DIFF_CHARS:

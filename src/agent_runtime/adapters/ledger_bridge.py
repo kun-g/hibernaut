@@ -54,12 +54,16 @@ class LedgerRunRecorder:
         error: BaseException | None = None,
         telemetry: RunTelemetry | None = None,
     ) -> FailureRoute:
-        kind = classify_error(
-            exc=error,
-            executor_id=executor_id,
-            exit_code=telemetry.exit_code if telemetry is not None else None,
-            stderr_text=telemetry.stderr if telemetry is not None else None,
-        )
+        kind: ErrorKind
+        if error is None and telemetry is not None and telemetry.error_kind in _ERROR_KINDS:
+            kind = cast(ErrorKind, telemetry.error_kind)
+        else:
+            kind = classify_error(
+                exc=error,
+                executor_id=executor_id,
+                exit_code=telemetry.exit_code if telemetry is not None else None,
+                stderr_text=telemetry.stderr if telemetry is not None else None,
+            )
         policy = route_error(kind)
         delays: tuple[float, ...] = ()
         if policy.should_retry:
@@ -90,6 +94,7 @@ class LedgerRunRecorder:
                 ended_at=entry.ended_at,
                 duration_ms=entry.duration_ms,
                 outcome_kind=entry.outcome_kind,
+                runner_id=(telemetry.runner_id if telemetry is not None else None) or "local",
                 emit_status=entry.emit_status,
                 correlation_key=entry.correlation_key,
                 trace_id=entry.trace_id,

@@ -5,7 +5,9 @@
     "src/switchboard",
     "src/ccpeer",
     "src/taskboard",
-    "src/ledger"
+    "src/runner",
+    "src/ledger",
+    "src/dashboard"
   ],
   "extraPaths": [
     "src"

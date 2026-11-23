@@ -379,6 +379,38 @@ class TestSDEWithCLIReviewer(DeliveryCase, unittest.IsolatedAsyncioTestCase):
         self.assertIn("## Changes since the previous review", rereview_prompt)
         self.assertIn("+x = 2", rereview_prompt)
 
+    async def test_a_cli_review_in_round_two_is_held_to_the_same_scope(self):
+        old = {"location": "old.py:1", "trigger": "y is read", "impact": "wrong value"}
+        unfixed = {**CHANGES_REQUESTED["blocking"][0], "basis": "unfixed_previous", "previous_item": 1}
+        late = {**old, "basis": "introduced_since_previous"}
+        broke = {"location": "calc.py:1", "trigger": "import", "impact": "x is gone",
+                 "basis": "introduced_since_previous"}
+        self.set_dev(({"calc.py": "x = 1\n", "old.py": "y = 1\n"}, "try 1"), ({"calc.py": "x = 2\n"}, "try 2"),
+                     ({"calc.py": "x = 3\n"}, "try 3"), ({"other.txt": "z\n"}, "try 4"))
+        rounds = [CHANGES_REQUESTED, {**CHANGES_REQUESTED, "blocking": [unfixed, late], "notes": []},
+                  {**CHANGES_REQUESTED, "blocking": [broke, late], "notes": []},
+                  {**CHANGES_REQUESTED, "blocking": [late], "notes": []}]
+        self.cli.set(*(f"```json\n{json.dumps(r)}\n```" for r in rounds))
+        self.caps.permissions = InMemoryPermission({MERGE_TOOL: PermissionDecision("block", "not in this test")})
+        executor = self.executor(self.delivery())
+        executor._options = SDEOptions(review=True, reviewer="grok", max_review_rounds=4)  # pyright: ignore
+        outcome = await executor.execute([self.event()], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        text = outcome.messages[0]
+        for part in ("review=pass after 4 round", "round 2 changes_requested (1 blocking, 1 downgraded)",
+                     "round 3 changes_requested (1 blocking, 1 downgraded)", "round 4 pass (1 downgraded)", "已降级：",
+                     "[grok] verdict=pass (cli="):
+            self.assertIn(part, text)
+        self.assertIn("ZeroDivisionError crashes the caller", self.dev_calls()[2]["prompt"])
+        self.assertIn("x is gone", self.dev_calls()[3]["prompt"])
+        self.assertNotIn("old.py:1", "".join(c["prompt"] for c in self.dev_calls()))
+        self.assertIn("## Incremental review", self.cli.calls()[1]["argv"][1])
+        state = json.loads(self.state_file.read_text())
+        followups = state["prs"][0]["body"].split("## 跟进\n")[1].split("\n\n## ")[0]
+        self.assertEqual(followups.count("old.py:1"), 1)
+        self.assertIn("name the helper more clearly", followups)
+        self.assertEqual(text.split("跟进：\n")[1].count("old.py:1"), 1)
+
     def git_bare(self, *args):
         import subprocess
         return subprocess.run(["git", *args], cwd=self.bare, check=True, capture_output=True, text=True).stdout.strip()

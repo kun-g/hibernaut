@@ -27,6 +27,7 @@ from agent_runtime.core.models import (
     RunDetached,
     RunEndKind,
     RunLedgerEntry,
+    RunCancelled,
     RunOutcome,
     RunTelemetry,
     TASK_CONTEXT_KEY,
@@ -1377,6 +1378,7 @@ class AgentWorker:
         end_kind: RunEndKind | None = "error"
         ledger_outcome: RunOutcome | None = None
         ledger_error: BaseException | None = None
+        cancel_telemetry: list[RunTelemetry] = []
         if handle is not None:
             self._handles.add(handle)
         try:
@@ -1395,6 +1397,7 @@ class AgentWorker:
                     handle=handle,
                     resume=resuming,
                     on_attempt=forwards.reset,
+                    cancel_telemetry=cancel_telemetry,
                 )
             end_kind, ledger_outcome = _end_kind(outcome), outcome
         except _RunInterrupted:
@@ -1477,6 +1480,7 @@ class AgentWorker:
                     end_kind=end_kind,
                     outcome=ledger_outcome,
                     error=ledger_error,
+                    cancel_telemetry=cancel_telemetry[-1] if cancel_telemetry else None,
                 )
 
         # Resolved once from what the Run actually consumed (a folded work.ready can name a new task); this link is
@@ -1587,14 +1591,18 @@ class AgentWorker:
         handle: _RunHandle | None = None,
         resume: bool = False,
         on_attempt: Callable[[], None],
+        cancel_telemetry: list[RunTelemetry] | None = None,
     ) -> RunOutcome:
         if not allow_interrupt and handle is None:
-            return await self._execute_with_retry(executor, batch, session_ref, caps, on_attempt=on_attempt)
+            return await self._execute_with_retry(
+                executor, batch, session_ref, caps, on_attempt=on_attempt, cancel_telemetry=cancel_telemetry
+            )
 
         # A resumable Run gets its own task, so a stop can cancel it without cancelling this worker.
         exec_task = asyncio.create_task(
             self._execute_with_retry(
-                executor, batch, session_ref, caps, handle=handle, resume=resume, on_attempt=on_attempt
+                executor, batch, session_ref, caps, handle=handle, resume=resume, on_attempt=on_attempt,
+                cancel_telemetry=cancel_telemetry,
             )
         )
         if handle is not None:
@@ -1905,6 +1913,7 @@ class AgentWorker:
         handle: _RunHandle | None = None,
         resume: bool = False,
         on_attempt: Callable[[], None],
+        cancel_telemetry: list[RunTelemetry] | None = None,
     ) -> RunOutcome:
         resumable = self._resumable(executor) if handle is not None else None
         attempt = 0
@@ -1916,7 +1925,12 @@ class AgentWorker:
                         return await resumable.resume(batch, session_ref, caps, handle)
                     return await resumable.execute_resumable(batch, session_ref, caps, handle)
                 return await executor.execute(batch, session_ref, caps)
-            except (asyncio.CancelledError, RunDetached):
+            except asyncio.CancelledError as exc:
+                # Caught here, before the exec_task boundary, so the interrupted Run is recorded on the node that ran it.
+                if isinstance(exc, RunCancelled) and exc.telemetry is not None and cancel_telemetry is not None:
+                    cancel_telemetry.append(exc.telemetry)
+                raise
+            except RunDetached:
                 raise
             except Exception as exc:  # noqa: BLE001
                 # Each failed attempt is routed on its own: a transient error followed by a deterministic one stops.
@@ -1961,6 +1975,7 @@ class AgentWorker:
         end_kind: RunEndKind,
         outcome: RunOutcome | None,
         error: BaseException | None,
+        cancel_telemetry: RunTelemetry | None = None,
     ) -> None:
         ledger = self._run_ledger
         if ledger is None:
@@ -1968,7 +1983,7 @@ class AgentWorker:
         try:
             error_kind: str | None = None
             error_summary: str | None = None
-            telemetry = outcome.telemetry if outcome is not None else None
+            telemetry = outcome.telemetry if outcome is not None else cancel_telemetry
             emit_status = outcome.status if isinstance(outcome, Emit) else None
             if error is not None:
                 cause = error.__cause__ if isinstance(error, ExecutorFailed) and error.__cause__ else error

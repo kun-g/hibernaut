@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hibernaut.local/schemas/runner/v1/runner.run_request.schema.json",
+  "title": "RunRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "namespace",
+    "project_key",
+    "owner_scope",
+    "work_key",
+    "executor_id",
+    "readonly",
+    "prompt",
+    "timeout_seconds"
+  ],
+  "properties": {
+    "schema_version": { "const": "runner.v1" },
+    "run_id": { "type": "string", "pattern": "^run_[A-Za-z0-9_-]+$" },
+    "namespace": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,15}$" },
+    "project_key": { "type": "string", "minLength": 1 },
+    "owner_scope": { "type": "string", "minLength": 1 },
+    "work_key": { "type": "string", "minLength": 1 },
+    "name_hint": { "type": ["string", "null"] },
+    "executor_id": { "type": "string", "minLength": 1 },
+    "executor_session_id": { "type": ["string", "null"] },
+    "readonly": { "type": "boolean" },
+    "interactive": { "type": "boolean" },
+    "remote_readonly_ok": { "type": "boolean" },
+    "prompt": { "type": "string" },
+    "system_prompt_append": { "type": ["string", "null"] },
+    "output_schema": { "type": ["object", "null"] },
+    "timeout_seconds": { "type": "number", "exclusiveMinimum": 0 },
+    "idle_timeout_seconds": { "type": ["number", "null"], "exclusiveMinimum": 0 },
+    "credential_lease": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["broker_url", "lease_token", "expires_at"],
+      "properties": {
+        "broker_url": { "type": "string", "format": "uri" },
+        "lease_token": { "type": "string", "minLength": 1 },
+        "expires_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "metadata": { "type": "object" }
+  }
+}
