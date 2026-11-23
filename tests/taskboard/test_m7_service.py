@@ -439,6 +439,16 @@ def test_tool_errors_are_structured(running: _Running) -> None:
     assert err and any("source_ref" in p for p in missing_args["problems"])
     err, bad_flow = _call(url, "tb_instantiate_flow", {"title": "F", "scope": SCOPE, "steps": []})
     assert err and bad_flow["error_type"] == "SchemaValidationError"
+    # A misspelt step field must not fall back to a default (agent:default would dispatch agent work).
+    err, typo = _call(
+        url,
+        "tb_instantiate_flow",
+        {"title": "F", "scope": SCOPE, "steps": [{"id": "s1", "title": "Review", "asignnee": "human:kun"}]},
+    )
+    assert err and typo["error_type"] == "SchemaValidationError"
+    assert any("steps[0].asignnee" in p for p in typo["problems"]), typo["problems"]
+    _, everything = _call(url, "tb_list_tasks", {})
+    assert all(t["title"] != "Review" for t in everything["tasks"])
     err, unknown = _call(url, "tb_delete_everything", {})
     assert err and "unknown tool" in unknown["error"]
 

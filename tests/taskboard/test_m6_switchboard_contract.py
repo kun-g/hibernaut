@@ -25,9 +25,14 @@ SCOPE = "proj:hibernaut"
 @dataclass
 class _Bus:
     published: list[CanonicalEvent] = field(default_factory=lambda: [])
+    # The next N publishes fail, as when the hub's /mcp is unreachable.
+    failures: int = 0
 
     def publish(self, event: CanonicalEvent) -> IngestResult:
         validate_envelope(event)
+        if self.failures:
+            self.failures -= 1
+            raise ConnectionError("switchboard /mcp unreachable")
         self.published.append(event)
         return IngestResult(status="accepted", event_id=event.event_id)
 
@@ -194,13 +199,15 @@ def test_labeled_old_issue_work_updated_creates_the_task_once(make_stack: Callab
     [ready] = stack.bus.published
     assert (ready.event_type, ready.metadata["task_id"]) == ("work.ready", created.task_id)
 
-    # Redelivery and a later edit update the same task; nothing is created or dispatched again.
+    # Redelivery and a later edit update the same task; nothing is created or newly dispatched. Updates
+    # of a ready task replay the same work.ready id, which Switchboard dedupes on (source, external_id).
     assert stack.adapter.handle_canonical_event(labeled) == "acked"
     edited = github_event("edited", number=9, title="Renamed", updated_at="2026-11-22T05:00:00Z")
     assert stack.adapter.handle_canonical_event(edited) == "acked"
     tasks = stack.service.tb_list_tasks()
     assert [v.task.title for v in tasks] == ["Renamed"]
-    assert len(stack.bus.published) == 1
+    assert tasks[0].task.dispatch_seq == 1
+    assert {e.external_id for e in stack.bus.published} == {f"tb:{created.task_id}:d1"}
 
 
 def test_work_updated_for_unknown_task_without_auto_ready_source_still_fails(
@@ -218,8 +225,15 @@ def test_work_updated_for_unknown_task_without_auto_ready_source_still_fails(
     )
     with pytest.raises(TaskNotFoundError):
         stack.adapter.ingest_event(unknown)
+    assert stack.adapter.handle_canonical_event(unknown) == "nack"
     assert stack.service.tb_list_tasks() == []
 
+
+def test_updates_and_closes_of_untracked_closed_or_untitled_items_are_acked(
+    make_stack: Callable[..., _Stack],
+) -> None:
+    # Retrying these can never succeed (no work.opened will follow), so they are acked, not dead-lettered.
+    stack = make_stack(auto_ready_sources=["github"])
     no_subject = CanonicalEvent(
         source="github",
         event_type="work.updated",
@@ -229,12 +243,41 @@ def test_work_updated_for_unknown_task_without_auto_ready_source_still_fails(
         subject="",
         metadata={"work_kind": "issue", "state": "open"},
     )
-    with pytest.raises(TaskNotFoundError):
-        stack.adapter.ingest_event(no_subject)
-
-    # Labelling an already closed issue must not dispatch work for it.
-    closed = github_event("labeled", number=78, state="closed")
-    with pytest.raises(TaskNotFoundError):
-        stack.adapter.ingest_event(closed)
+    # Labelling an already closed issue, or editing a closed issue that carries the label.
+    closed_labeled = github_event("labeled", number=78, state="closed")
+    closed_edited = github_event("edited", number=79, state="closed")
+    closed_issue = github_event("closed", number=80, state="closed")
+    assert closed_issue.event_type == "work.closed"
+    for event in (no_subject, closed_labeled, closed_edited, closed_issue):
+        assert stack.adapter.ingest_event(event) is None, event.external_id
+        assert stack.adapter.handle_canonical_event(event) == "acked", event.external_id
     assert stack.service.tb_list_tasks() == []
     assert stack.bus.published == []
+    assert any(r["event_name"] == "untracked_work_ignored" for r in stack.audit.records)
+
+
+def test_labeled_issue_dispatch_lost_to_a_publish_failure_is_replayed_on_redelivery(
+    make_stack: Callable[..., _Stack],
+) -> None:
+    stack = make_stack(auto_ready_sources=["github"])
+    labeled = github_event("labeled", number=11)
+    stack.bus.failures = 1
+    # The task commits and claims dispatch_seq 1, then the publish fails: nack for a redelivery.
+    assert stack.adapter.handle_canonical_event(labeled) == "nack"
+    task = stack.store.find_by_source_ref("github:kun-g/hibernaut#11")
+    assert task is not None and task.status == "ready" and task.dispatch_seq == 1
+    assert stack.bus.published == []
+
+    # The redelivery finds the task and must still publish its work.ready, under the same external_id.
+    assert stack.adapter.handle_canonical_event(labeled) == "acked"
+    [ready] = stack.bus.published
+    assert (ready.event_type, ready.external_id) == ("work.ready", f"tb:{task.task_id}:d1")
+    after = stack.store.find_by_source_ref("github:kun-g/hibernaut#11")
+    assert after is not None and after.dispatch_seq == 1
+
+    # A later update republishes the same id (Switchboard dedupes it) and never claims a new dispatch.
+    edited = github_event("edited", number=11, title="Renamed", updated_at="2026-11-22T05:00:00Z")
+    assert stack.adapter.handle_canonical_event(edited) == "acked"
+    assert {e.external_id for e in stack.bus.published} == {f"tb:{task.task_id}:d1"}
+    final = stack.store.find_by_source_ref("github:kun-g/hibernaut#11")
+    assert final is not None and final.dispatch_seq == 1 and final.title == "Renamed"

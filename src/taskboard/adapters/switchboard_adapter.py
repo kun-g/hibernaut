@@ -248,7 +248,7 @@ class SwitchboardAdapter:
                 if key in event.metadata and event.metadata[key] is not None:
                     patch[key] = event.metadata[key]
             try:
-                return self._ingestion.handle_work_updated(
+                updated = self._ingestion.handle_work_updated(
                     source_ref=source_ref,
                     patch=patch,
                     occurred_at_ms=occurred_at_ms,
@@ -256,28 +256,39 @@ class SwitchboardAdapter:
                     hop_count=hop_count,
                 )
             except TaskNotFoundError:
+                if event.source not in self._auto_ready_sources:
+                    raise
+                # A closed or untitled item will never get a work.opened, so a retry cannot succeed: ack it.
+                if not event.subject or event.metadata.get("state") == "closed":
+                    self._ignore_untracked(event, source_ref)
+                    return None
                 # GitHub reports a trigger label added to an existing issue as work.updated, so the first
                 # event Taskboard sees for it is an update; handle_work_opened is idempotent on source_ref.
-                closed = event.metadata.get("state") == "closed"
-                if event.source not in self._auto_ready_sources or not event.subject or closed:
-                    raise
                 self._safe_audit(
                     "work_updated_opened_task",
                     detail={"event_id": event.event_id, "source_ref": source_ref},
                 )
                 return self._open_work(event, hop_count=hop_count)
+            return self._replay_ready_dispatch(updated, trace_id=trace_id, hop_count=hop_count)
 
         if event.event_type == "work.closed":
             raw_state = str(event.metadata.get("state") or "cancelled")
             state: Literal["closed", "cancelled"] = "closed" if raw_state == "closed" else "cancelled"
-            return self._ingestion.handle_work_closed(
-                source_ref=source_ref,
-                state=state,
-                reason=str(event.metadata.get("close_reason") or event.body or ""),
-                occurred_at_ms=occurred_at_ms,
-                trace_id=trace_id,
-                hop_count=hop_count,
-            )
+            try:
+                return self._ingestion.handle_work_closed(
+                    source_ref=source_ref,
+                    state=state,
+                    reason=str(event.metadata.get("close_reason") or event.body or ""),
+                    occurred_at_ms=occurred_at_ms,
+                    trace_id=trace_id,
+                    hop_count=hop_count,
+                )
+            except TaskNotFoundError:
+                # Closing an item Taskboard never tracked (e.g. older than the deployment) has nothing to do.
+                if event.source not in self._auto_ready_sources:
+                    raise
+                self._ignore_untracked(event, source_ref)
+                return None
 
         if event.event_type == "execution.reported":
             validate_against_schema(
@@ -300,6 +311,29 @@ class SwitchboardAdapter:
             )
 
         return None
+
+    # The first delivery may have committed the ready task and claimed its dispatch, then failed to
+    # publish; the redelivery lands here as an update. Replaying republishes the same external_id
+    # (tb:<task_id>:d<seq>), which Switchboard dedupes when the first publish did get through.
+    def _replay_ready_dispatch(self, result: MergeResult, *, trace_id: str, hop_count: int) -> MergeResult:
+        assert self._ingestion is not None
+        if result.task.status != "ready":
+            return result
+        dispatched = self._ingestion.dispatcher.dispatch_ready_task(
+            result.task, trace_id=trace_id, hop_count=hop_count
+        )
+        return result if dispatched is None else replace(result, task=dispatched)
+
+    def _ignore_untracked(self, event: CanonicalEvent, source_ref: str) -> None:
+        self._safe_audit(
+            "untracked_work_ignored",
+            detail={
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "source_ref": source_ref,
+                "state": event.metadata.get("state"),
+            },
+        )
 
     def _open_work(self, event: CanonicalEvent, *, hop_count: int) -> TaskItem:
         assert self._ingestion is not None
