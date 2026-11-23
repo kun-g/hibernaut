@@ -178,6 +178,10 @@ class DockerKitTests(unittest.TestCase):
         self.assertNotIn("TASKBOARD_CONFIG_SHA", sb)
         self.assertNotIn("SWITCHBOARD_CONFIG_SHA", tb)
 
+        # Longer than Switchboard's shutdown_timeout_seconds, here and in the raw compose of the README.
+        self.assertIn("stop_grace_period: 20s", sb)
+        self.assertIn("       stop_grace_period: 20s\n", (DEPLOY / "README.md").read_text(encoding="utf-8"))
+
         self.assertIn("/etc/taskboard/taskboard.toml", tb)
         self.assertIn("taskboard_data:/data", tb)
         for name in ("SWITCHBOARD_RELAY_TOKEN", "SWITCHBOARD_MCP_TOKEN", "TASKBOARD_MCP_TOKEN"):

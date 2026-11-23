@@ -42,6 +42,8 @@ from switchboard.relay_protocol import (
 RELAY_CREDENTIAL_CHANNEL: Final = "relay"
 # How long a closed connection may keep sending (its frames are dropped) before we cut it.
 CLOSE_GRACE_SEC: Final = 2.0
+# Enough to put close frames on the wire when a stop has no time left, and for cut connections to end.
+CLOSE_FLUSH_SEC: Final = 0.1
 _UNSENDABLE_CLOSE_CODES: Final = frozenset({1005, 1006, 1015})
 
 
@@ -87,6 +89,8 @@ class RelayHub:
         self._epochs: dict[str, int] = {}
         self._sockets: set[WebSocketConnection] = set()
         self._listeners: list[Callable[[str], object]] = []
+        # Set by drain(): no new connection or push, but acks of pushes in flight are still read.
+        self._draining = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.transport = WebSocketRelayTransport(self)
@@ -110,14 +114,20 @@ class RelayHub:
         if self._thread is not None:
             return
         self._stop.clear()
+        self._draining.clear()
         self._thread = threading.Thread(target=self._heartbeat_loop, name="switchboard-relay-heartbeat", daemon=True)
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def drain(self) -> None:
+        self._draining.set()
+        with self._cond:
+            self._cond.notify_all()
+
+    # Returns within about timeout: peers that answer the close frame leave on their own, the rest are cut (False).
+    def stop(self, timeout: float = CLOSE_GRACE_SEC) -> bool:
+        deadline = time.monotonic() + max(timeout, CLOSE_FLUSH_SEC)
+        self.drain()
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout)
-            self._thread = None
         with self._cond:
             connections = list(self._routes.values())
             self._routes.clear()
@@ -125,18 +135,29 @@ class RelayHub:
                 self._fail_in_flight(conn)
             sockets = list(self._sockets)
             self._cond.notify_all()
-        for conn in connections:
-            conn.ws.send_close(CLOSE_GOING_AWAY, "relay hub stopping")
+        for ws in sockets:
+            # A peer that stopped reading can block a send, so no close is sent on the calling thread.
+            threading.Thread(target=ws.send_close, args=(CLOSE_GOING_AWAY, "relay hub stopping"), daemon=True).start()
+        with self._cond:
+            left = self._cond.wait_for(lambda: not self._sockets, max(0.0, deadline - time.monotonic()))
         for ws in sockets:
             ws.abort()
+        with self._cond:
+            self._cond.wait_for(lambda: not self._sockets, CLOSE_FLUSH_SEC)
+        if self._thread is not None:
+            self._thread.join(CLOSE_FLUSH_SEC)
+            self._thread = None
+        return left
 
     # Runs on the HTTP handler thread for the whole life of one WebSocket connection.
     def serve(self, ws: WebSocketConnection, peer: str) -> None:
         with self._cond:
-            if self._stop.is_set():
-                ws.send_close(CLOSE_GOING_AWAY, "relay hub stopping")
-                return
-            self._sockets.add(ws)
+            stopping = self._draining.is_set()
+            if not stopping:
+                self._sockets.add(ws)
+        if stopping:
+            ws.send_close(CLOSE_GOING_AWAY, "relay hub stopping")
+            return
         try:
             hello = self._authenticate(ws, peer)
             if hello is None:
@@ -149,9 +170,10 @@ class RelayHub:
             finally:
                 self._evict(conn, "disconnected", close_code=None)
         finally:
+            ws.abort()
             with self._cond:
                 self._sockets.discard(ws)
-            ws.abort()
+                self._cond.notify_all()
 
     def push(self, consumer_id: str, event: CanonicalEvent) -> DeliverOutcome:
         ack_timeout = self._config.ack_timeout_sec
@@ -159,7 +181,7 @@ class RelayHub:
         with self._cond:
             while True:
                 conn = self._routes.get(consumer_id)
-                if conn is None or conn.closed:
+                if conn is None or conn.closed or self._draining.is_set():
                     return DeliverOutcome(status="offline")
                 # in_flight = 1 per (scope, consumer_id) keeps each queue head-of-line ordered.
                 if (
@@ -259,7 +281,7 @@ class RelayHub:
     def _install(self, ws: WebSocketConnection, consumer_id: str, peer: str) -> _RelayConnection | None:
         # Epoch bump and route swap are one step, so the newest handshake always owns the route.
         with self._cond:
-            if self._stop.is_set():
+            if self._draining.is_set():
                 ws.send_close(CLOSE_GOING_AWAY, "relay hub stopping")
                 return None
             epoch = self._epochs.get(consumer_id, 0) + 1

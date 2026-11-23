@@ -76,6 +76,7 @@ python3 scripts/prepare_taskboard_deploy.py render \
          dockerfile: deploy/switchboard/Dockerfile
        image: hibernaut-switchboard:${SWITCHBOARD_REF}
        restart: unless-stopped
+       stop_grace_period: 20s
        labels: ["switchboard.config-sha=${SWITCHBOARD_CONFIG_SHA}"]
        environment:
          SWITCHBOARD_RELAY_WEBHOOK_SECRET: ${SWITCHBOARD_RELAY_WEBHOOK_SECRET}

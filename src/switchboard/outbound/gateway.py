@@ -210,16 +210,28 @@ class OutboundGateway:
         self._thread = threading.Thread(target=self._loop, name="switchboard-outbound", daemon=True)
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    # From here on no message is claimed; a send in flight still records its result.
+    def request_stop(self) -> None:
         self._stop.set()
         self._wake.set()
+
+    def join(self, timeout: float) -> bool:
         if self._thread is not None:
             self._thread.join(timeout)
+            if self._thread.is_alive():
+                return False
             self._thread = None
+        return True
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        self.request_stop()
+        return self.join(timeout)
 
     def run_once(self) -> int:
         sent = 0
         for row in self._store.due_outbound(self._clock()):
+            if self._stop.is_set():
+                break
             if self._send(row):
                 sent += 1
         return sent
@@ -230,6 +242,9 @@ class OutboundGateway:
                 self.run_once()
             except Exception as exc:  # noqa: BLE001
                 print(f"[switchboard] outbound loop error: {exc!r}", file=sys.stderr)
+            # A forced shutdown has closed the store by now.
+            if self._stop.is_set():
+                return
             self._wake.wait(self._sleep_seconds())
             self._wake.clear()
 

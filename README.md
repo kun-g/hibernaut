@@ -21,7 +21,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 安全 | agent 进程不持有真实密钥（运营者在 `env` 里显式写的除外）：API key 由外置代理注入，Drive 密钥由独立系统用户保管，GitHub 走宿主机凭据 |
 | 运维 | 配置热加载、跟随 `origin/main` 自动更新；Outbox 上报失败按 5/15/45/135/405 秒持久化退避，重启不丢进度 |
 | 执行账本 | 同仓的独立包 `src/ledger/`：每个 Run 记一条档案（结局、执行器、耗时、错误类别、日志、token 与费用），同进程 Switchboard 的审计也记入，存在独立的 `ledger.db`；执行器失败按类别分流（瞬时故障 5/15/45 秒退避重试，配置或权限错误第 1 次即停，执行故障不重试），最终失败发告警；MCP 只读工具查询 Run、日志、审计与执行器统计，`hibernaut_replay_event` 重放失败事件。设计见 [`docs/observability-ledger-design.md`](docs/observability-ledger-design.md) |
-| Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard |
+| Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard；`--check` 在发版前无副作用地校验配置，停机时先结清在途请求、投递和发送 |
 | Taskboard | 同仓的独立包：多来源任务归集（一个任务可挂多个来源）、5 态状态机、DAG 依赖与环检测、上游完成后自动解锁下游，经 Switchboard 发 `work.ready` 或给人发待办通知；SQLite 存储。独立常驻服务 `python -m taskboard.app` 经 Relay 消费 Switchboard 事件、经 Switchboard `/mcp` 上行，并以 HTTP `/mcp`（可挂同域子路径，如 `/taskboard/mcp`）或 `--mcp-stdio` 提供 7 个 `tb_*` MCP 工具；Hibernaut 接 `work.ready` 执行，并以 `execution.reported` 回报 `claim` / `update_stage` / `complete` / `release`（审批挂起后恢复仍回写同一任务）。设计见 [`docs/taskboard.md`](docs/taskboard.md) |
 | Runner | 同仓的独立包，只依赖标准库：代码执行宿主，负责 worktree 隔离与安全回收、子进程监管（硬超时与静默看门狗）、多 CLI 驱动与会话续接；本机同进程直调，或经反向 WebSocket 由控制面按工作区亲和调度多个节点。`agent_runtime.adapters.runner_bridge.RunnerExecutorBridge` 把它适配为 `ExecutorPort`，目前未接入 `hibernaut.toml`，默认执行器不变。设计见 [`docs/runner.md`](docs/runner.md) |
 | Dashboard | 同仓的独立包 `src/dashboard/`：只读本地 Web 看板，用于实时查看 Hibernaut、Taskboard 与 Switchboard 运转状态（拓扑与延迟、活跃 Run、挂起/异常告警、事件队列、PR 交付与 worktree、Taskboard 任务、Switchboard 路由与流量、执行账本、`ccpeer` 与 Outbox 报告）。运行 `PYTHONPATH=src python3 -m dashboard --config hibernaut.toml` 访问 `http://127.0.0.1:8877` |
@@ -94,6 +94,8 @@ GitHub 入站只经 Switchboard。把 GitHub Webhook 指向 Switchboard 的 `/we
 
 `[gdrive] poll_interval_seconds` 继续控制 Drive 任务队列的轮询周期。
 
+Switchboard 自己的配置在 `switchboard.toml`（模板 [`switchboard.example.toml`](switchboard.example.toml)）。发版或重启前先校验：`PYTHONPATH=src python3 -m switchboard.app --config switchboard.toml --check`，不建目录和数据库、不监听端口、不访问网络；通过时退出码 0，否则在 stderr 给出配置路径和字段名并以 1 退出。顶层 `shutdown_timeout_seconds`（默认 10 秒，正数，写在第一个 `[表]` 之前）是停机等待在途工作的上限，`docker stop`、systemd 等的强杀时限要比它长。细节见 [`deploy/switchboard/`](deploy/switchboard/README.md)。
+
 ## 运行
 
 长期运行用自动更新监督进程（需在一个专用的、位于 `main` 的检出里）：
@@ -106,7 +108,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 
 停机（SIGINT / SIGTERM，自动更新也走这条路）分两步：先只停止认领新事件，进行中的 Run 照常跑完并写回结果（正在等 Orca 终端里 agent 结果的 Run 例外：旧进程不等它、不关终端，登记和 `runs/` 下的状态目录留给新进程接着等，agent 不会收到重复任务），期间 HTTP 入口（`/events`、`/mcp`）照常接收入库并返回 202、留给下一个进程处理，Outbox 投递、定时器和 Drive 轮询照常运行（worktree 回收清扫不再开始新一轮）；Run 全部结束后才关闭 HTTP（等已接收的请求写完）、停后台服务并退出。新进程启动后先接回这些 Run，再处理同一 Inbox 的新事件。
 
-经 `run_updating.py` 重启时 HTTP 入口不拒绝连接：旧 daemon 停止接收后把监听 socket 交还监督进程，监督进程带着它快进、`execv`，再交给新 daemon 直接使用；这段时间到达的连接在内核 backlog（128）里排队，新 daemon 开始监听后按序处理。实测排队最长约 0.3 秒（不跑 Run 的测试实例；生产上取决于新进程的导入与组装耗时），客户端超时须长于这段时间。Switchboard 中继（`mode = "relay"`）在旧 daemon 退出前主动断开，新 daemon 组装时立即重连（实测断开约 0.3 秒），断开期间的事件由 Switchboard 暂存，重连后立即重投。不经监督进程直接运行 daemon、或第一次启动时，daemon 照旧自己绑定端口；进程内 Switchboard（`mode = "in_process"`）自己的 HTTP 端口不在交接范围内，重启期间仍会拒绝连接。
+经 `run_updating.py` 重启时 HTTP 入口不拒绝连接：旧 daemon 停止接收后把监听 socket 交还监督进程，监督进程带着它快进、`execv`，再交给新 daemon 直接使用；这段时间到达的连接在内核 backlog（128）里排队，新 daemon 开始监听后按序处理。实测排队最长约 0.3 秒（不跑 Run 的测试实例；生产上取决于新进程的导入与组装耗时），客户端超时须长于这段时间。Switchboard 中继（`mode = "relay"`）在旧 daemon 退出前主动断开，新 daemon 组装时立即重连（实测断开约 0.3 秒），断开期间的事件由 Switchboard 暂存，重连后立即重投。不经监督进程直接运行 daemon、或第一次启动时，daemon 照旧自己绑定端口；进程内 Switchboard（`mode = "in_process"`）自己的 HTTP 端口不在交接范围内，重启期间仍会拒绝连接；它在 daemon 停机的最后排空在途工作（上限 `shutdown_timeout_seconds`）再关闭。
 
 再发一次 SIGINT / SIGTERM（直接发给 daemon，或发给 `run_updating.py`，它会转给 daemon）则不再等待：进行中的 Run 按中断处理，不写半成品，事件回到 `pending`，由下一个进程重跑。
 
