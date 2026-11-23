@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agent_runtime.adapters.executor_cli import (
     CLITemplate,
@@ -145,19 +145,20 @@ class StewardCase(unittest.IsolatedAsyncioTestCase):
     async def run_steward(self, *events: Event, session: SessionRef | None = None) -> Any:
         return await self.executor().execute(list(events) or [self.event()], session, self.caps)
 
-    async def tool(self, name: str, **arguments: Any) -> tuple[bool, str]:
-        self.set_plan({"calls": [{"tool": name, "arguments": arguments}]})
-        outcome = await self.run_steward()
-        self.assertIsInstance(outcome, Silent)
-        failed, text = self.answers()[-1]
-        return failed, text
-
 
 def arg(call: dict[str, Any], flag: str) -> str:
     return call["argv"][call["argv"].index(flag) + 1]
 
 
 class ReadOnlyBoundaryTests(StewardCase):
+    async def test_tools_are_listed(self) -> None:
+        await self.run_steward()
+        self.assertEqual(self.calls()[-1]["tools"], [
+            "forward_to_inbox", "git", "list_events", "list_files", "list_sessions",
+            "memory_propose_write", "memory_read", "memory_search", "read_file", "read_memory", "search_files",
+            "write_memory",
+        ])
+
     async def test_runs_in_the_main_checkout_with_read_only_tools(self) -> None:
         before = git_state(self.repo)
         self.set_plan({"output": {"action": "reply", "message": "on it"}})
@@ -177,6 +178,16 @@ class ReadOnlyBoundaryTests(StewardCase):
         self.assertEqual((arg(call, "--model"), arg(call, "--effort")), ("claude-sonnet-5-5", "medium"))
         self.assertEqual(git_state(self.repo), before)
         self.assertEqual(self.db.fetchall("SELECT * FROM workspaces"), [])
+
+    async def test_tool_refusal_reaches_the_steward_through_its_cli(self) -> None:
+        self.caps.permissions = Mock(wraps=InMemoryPermission({"git_read": PermissionDecision("block", "private history")}))
+        self.set_plan({"calls": [{"tool": "git", "arguments": {"args": ["status"]}}]})
+        outcome = await self.run_steward()
+        self.assertIsInstance(outcome, Silent)
+        [(failed, text)] = self.answers()
+        self.assertTrue(failed)
+        self.assertIn("private history", text)
+        self.assertEqual([c.args[0] for c in self.caps.permissions.check.call_args_list], ["steward.launch", "git_read"])
 
     async def test_system_prompt_carries_contract_skill_and_the_current_manifest(self) -> None:
         await self.run_steward()
@@ -263,14 +274,23 @@ def git_state(repo: Path) -> tuple[str, str, str]:
     return out("status", "--porcelain"), out("rev-parse", "HEAD"), out("worktree", "list")
 
 
-class ToolTests(StewardCase):
-    async def test_tools_are_listed(self) -> None:
-        await self.run_steward()
-        self.assertEqual(self.calls()[-1]["tools"], [
-            "forward_to_inbox", "git", "list_events", "list_files", "list_sessions",
-            "memory_propose_write", "memory_read", "memory_search", "read_file", "read_memory", "search_files",
-            "write_memory",
-        ])
+class ToolTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.repo = make_repo(self.root)
+        db = SQLiteDatabase(":memory:")
+        self.addCleanup(db.close)
+        self.sessions = SQLiteSessionStoreAdapter(db)
+        self.inbox = SQLiteInboxAdapter(db)
+        self.caps = Caps(self.root)
+        self.tools = steward_tools.StewardTools(
+            caps=self.caps, checkout=self.repo, inbox_id=MAIN, sessions=self.sessions,
+            events=self.inbox, in_project=lambda inbox_id: inbox_id.startswith("proj:x"),
+        )
+
+    async def tool(self, name: str, **arguments: Any) -> tuple[bool, str]:
+        text, failed = await self.tools.call(name, arguments)
+        return failed, text
 
     async def test_forward(self) -> None:
         failed, text = await self.tool(
@@ -438,7 +458,7 @@ class ToolTests(StewardCase):
             self.assertTrue(failed, path)
             self.assertIn("private", text)
             self.assertNotIn("needle", text)
-        self.assertIn(("steward.launch", "allow"), [(name, "allow") for name, _ in seen])
+        self.assertEqual(seen, [("read_file", {"path": "secrets/key.txt"})] * 3)
         self.assertEqual((await self.tool("read_file", path="open.txt"))[1], "1\tneedle in the open\n")
         # A search returns file content too, so each file it found is asked for as a read.
         _, text = await self.tool("search_files", pattern="needle")

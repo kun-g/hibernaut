@@ -557,15 +557,36 @@ class TestCLIGroupSignals(unittest.TestCase):
         self.assertTrue(is_running())
 
     def test_the_rest_of_the_group_has_the_grace_to_end_after_its_leader_ended(self):
-        # The leader is gone with the first SIGTERM; its child ends by itself, only later.
-        done = self.root / "done"
-        proc, child = self.popen(
-            f"sh -c 'trap \"sleep 0.2; echo cleaned > {done}; exit\" TERM; echo $$ > \"$READY\"; "
-            "while :; do sleep 60 & wait; done' & wait")
+        # The child may finish its cleanup once the supervisor sees it still running without its leader.
+        ready = self.root / "ready"
+        finish = ready.with_suffix(".finish")
+        os.mkfifo(finish)
+        writer = self.enterContext(os.fdopen(os.open(finish, os.O_RDWR), "w", buffering=1))
+        program = self.root / "child.py"
+        program.write_text(
+            "import os, signal\n"
+            "from pathlib import Path\n"
+            "ready = Path(os.environ['READY'])\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
+            "ready.write_text(str(os.getpid()))\n"
+            "signal.sigwait({signal.SIGTERM})\n"
+            "with ready.with_suffix('.finish').open() as gate: gate.readline()\n"
+            "ready.with_suffix('.done').write_text('cleaned')\n"
+        )
+        proc, child = self.popen(f'"{sys.executable}" -I "{program}" & wait')
         self.addCleanup(lambda: alive(int(child)) and os.kill(int(child), signal.SIGKILL))
-        cli_terminal.end_group(proc, grace=30)
+        group_running = cli_terminal._group_running
+
+        def observe(pgid):
+            live = group_running(pgid)
+            if live and cli_terminal.exited(pgid, 0):
+                writer.write("finish\n")
+            return live
+
+        with patch.object(cli_terminal, "_group_running", new=observe):
+            cli_terminal.end_group(proc, grace=5)
         self.assertEqual(proc.returncode, -signal.SIGTERM)
-        self.assertEqual(done.read_text() if done.exists() else "killed", "cleaned\n")
+        self.assertEqual(ready.with_suffix(".done").read_text(), "cleaned")
         self.assert_never_after_reaping()
 
 

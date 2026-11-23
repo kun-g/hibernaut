@@ -20,7 +20,6 @@ from runner.transport.relay_client import RunnerRelayAgent
 from runner.transport.relay_hub import RunnerRelayHub
 from tests.test_runner_safety import _config, _drivers, _git, _init_repo, _req
 
-REAL_GIT = shutil.which("git") or "/usr/bin/git"
 MARK = "synthetic-not-a-secret"
 SYNTHETIC = {
     name: f"{MARK}-{name}"
@@ -102,7 +101,10 @@ def ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Workspace:
     bin_dir.mkdir()
     orca_root = tmp_path / "orca-worktrees"
     orca_root.mkdir()
-    values = {"python": sys.executable, "log": str(log), "git": REAL_GIT, "root": str(orca_root)}
+    # Use the git selected for the test session before installing the recorder in front of it.
+    real_git = shutil.which("git")
+    assert real_git is not None
+    values = {"python": sys.executable, "log": str(log), "git": real_git, "root": str(orca_root)}
     _write_shim(bin_dir / "git", _GIT_SHIM.format(**values))
     _write_shim(bin_dir / "orca", _ORCA_SHIM.format(**values))
     # Hooks run inside "git worktree add" and inherit its environment.

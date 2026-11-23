@@ -5,6 +5,8 @@ import hashlib
 import http.client
 import json
 import os
+import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -913,15 +915,36 @@ def test_a_new_event_interrupts_the_check_and_leaves_no_partial_result(pilot: De
     pilot.assert_original_path(OTHER)
 
 
-def test_a_forced_stop_ends_the_worker_process_and_the_next_start_finishes_the_task(pilot: Deployment) -> None:
+def test_a_forced_stop_ends_the_worker_process_and_the_next_start_finishes_the_task(
+    pilot: Deployment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Gate the first protocol check's object read. On replay the same request can complete immediately.
+    gate = pilot.root / "hold-check"
+    os.mkfifo(gate)
+    reading = pilot.root / "reading-object"
+    real_git = shutil.which("git")
+    assert real_git is not None
+    bin_dir = pilot.root / "bin"
+    bin_dir.mkdir()
+    shim = bin_dir / "git"
+    shim.write_text(
+        f"#!/bin/sh\nfor arg do\n"
+        f'  if [ "$arg" = cat-file ] && [ -p {shlex.quote(str(gate))} ]; then\n'
+        f"    touch {shlex.quote(str(reading))}\n    read -r go < {shlex.quote(str(gate))}\n  fi\ndone\n"
+        f'exec {shlex.quote(real_git)} "$@"\n'
+    )
+    shim.chmod(0o755)
     pilot.write(enabled=True)
     pilot.start_hb()
-    pilot.start_runner()
-    held = pilot.check(key=KEY, hold_seconds=20)
+    with monkeypatch.context() as env:
+        env.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+        pilot.start_runner()
+    held = pilot.check(key=KEY)
+    pilot.until(reading.exists)
     worker = pilot.worker()
     assert pilot.hb is not None
     pilot.hb.send_signal(signal.SIGTERM)
-    time.sleep(0.5)
+    pilot.until(lambda: "Stopping: waiting for runs in progress" in pilot.hb_log.read_text())
     pilot.hb.send_signal(signal.SIGTERM)
     assert pilot.hb.wait(timeout=20) == 0, pilot.logs()
     assert not alive(worker)
@@ -930,6 +953,7 @@ def test_a_forced_stop_ends_the_worker_process_and_the_next_start_finishes_the_t
     assert (run["outcome_kind"], run["runner_id"]) == ("interrupted", RUNNER_ID)
     assert _runner_run(pilot, run).is_file()
     pilot.hb = None
+    gate.unlink()
     # Same port, same token; the Runner reconnects on its own.
     pilot.start_hb()
     pilot.until(lambda: pilot.status(held) == "done", timeout=60)
