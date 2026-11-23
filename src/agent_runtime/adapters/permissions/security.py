@@ -15,6 +15,10 @@ class AutoModePermissionAdapter:
         {
             "read_memory",
             "write_memory",
+            # Within the Run's own project; Memory Hub itself queues what needs a person (instructions.md, shared/).
+            "memory_search",
+            "memory_read",
+            "memory_propose_write",
             "schedule_timer",
             "send_message",
             "fetch_status",
@@ -45,6 +49,8 @@ class AutoModePermissionAdapter:
             "deploy_production",
             "transfer_funds",
             "delete_resource",
+            # Puts a queued memory proposal into effect; an agent approving its own would undo the queue.
+            "memory_approve_proposal",
         }
     )
     DEFAULT_BLOCK_TOOLS: frozenset[str] = frozenset(

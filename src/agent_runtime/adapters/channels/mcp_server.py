@@ -9,6 +9,7 @@ from agent_runtime import __version__
 from agent_runtime.adapters.channels.http_types import WebhookResponse
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
 from agent_runtime.adapters.ledger_bridge import RunLedger
+from agent_runtime.adapters.memory_bridge import MemoryControlPlane
 from agent_runtime.adapters.storage_sqlite.stores import (
     SQLiteInboxAdapter,
     SQLiteSessionStoreAdapter,
@@ -228,8 +229,10 @@ class MCPServerAdapter:
         bearer_token: str | None = None,
         worktree_manager_for: Callable[[str | None, str], OrcaWorktreeManager | None] | None = None,
         ledger: RunLedger | None = None,
+        memory: MemoryControlPlane | None = None,
     ) -> None:
         self._handler = handler
+        self._memory = memory
         self._ledger = ledger
         # (inbox_id or None, work_key) -> the manager of the project that owns that workspace, if any.
         self._worktree_manager_for = worktree_manager_for
@@ -317,7 +320,8 @@ class MCPServerAdapter:
         if method == "ping":
             return self._ok_response(req_id, {})
         if method == "tools/list":
-            return self._ok_response(req_id, {"tools": _TOOL_DEFINITIONS})
+            memory_tools = self._memory.definitions() if self._memory is not None else []
+            return self._ok_response(req_id, {"tools": [*_TOOL_DEFINITIONS, *memory_tools]})
         if method == "tools/call":
             return self._handle_tool_call(req_id, params)
 
@@ -347,6 +351,8 @@ class MCPServerAdapter:
         )
 
     def _dispatch_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._memory is not None and self._memory.handles(tool_name):
+            return self._memory.call(tool_name, args)
         if tool_name == "hibernaut_ingest_event":
             inbox_id = str(args["inbox_id"])
             source = str(args["source"])

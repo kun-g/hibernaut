@@ -336,10 +336,10 @@ class TestProjectDispatch(_DispatchCase):
             f"proj:hibernaut:drive/{KEY}": ("proj:hibernaut:drive", runs["proj_hibernaut_drive"]),
             f"proj:hibernaut:task-3/{KEY}": ("proj:hibernaut:task-3", runs["proj_hibernaut_task-3"]),
         })
-        # Queues, sessions and memory stay per inbox.
+        # Queues and sessions stay per inbox; memory is the project's.
         self.assertEqual(sorted(self.rows("SELECT inbox_id, correlation_key FROM sessions")),
                          sorted((i, KEY) for i in inboxes))
-        self.assertEqual(len({daemon.partitions.binding_for(i).memory_dir for i in inboxes}), 3)
+        self.assertEqual({daemon.partitions.binding_for(i).memory_dir.name for i in inboxes}, {"hibernaut"})
         self.assertEqual(self.rows("SELECT COUNT(*) FROM worker_leases"), [(0,)])
 
         # Reclaim through MCP goes to the closing inbox's own worktree.

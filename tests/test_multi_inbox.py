@@ -68,6 +68,9 @@ class TestPartitionedMemoryAndWorkspace(unittest.TestCase):
         mem_b = self.registry.memory_for("proj:web-app")
 
         mem_a.write("instructions.md", "LOCAL_A: python strict")
+        self.assertEqual(mem_a.load_baseline()["instructions.md"], "GLOBAL_RULE: quiet by default")
+        (pending,) = self.registry.hub.list_proposals()
+        self.registry.hub.approve_proposal(pending["proposal_id"], actor="human")
         mem_a.write("progress/task.md", "A progress")
         mem_b.write("progress/task.md", "B progress")
 

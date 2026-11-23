@@ -22,6 +22,7 @@ from agent_runtime.adapters.executor_cli.steward_git import (
     plan_git,
     run_git,
 )
+from agent_runtime.adapters.memory_fs import call_memory_tool, write_memory
 from agent_runtime.core.models import Event, ForwardRefused, SessionStatus
 from agent_runtime.core.ports import RunCapabilities, SessionStorePort
 
@@ -148,6 +149,7 @@ def _strings(arguments: dict[str, Any], key: str) -> list[str]:
 
 _TEXT = {"type": "string"}
 _TEXTS = {"type": "array", "items": _TEXT}
+_FLAG = {"type": "boolean"}
 
 
 def _schema(required: Sequence[str] = (), **properties: dict[str, Any]) -> dict[str, Any]:
@@ -201,8 +203,32 @@ class StewardTools:
             {"name": "list_files", "description": "List the checkout's files.", "inputSchema": _schema(glob=glob)},
             {"name": "read_memory", "description": "Read a file of the project memory, e.g. notes/release.md.",
              "inputSchema": _schema(("path",), path=_TEXT)},
-            {"name": "write_memory", "description": "Replace a file of the project memory.",
+            {"name": "write_memory",
+             "description": "Replace a file of the project memory. reported.md is appended to instead; instructions.md "
+                            "waits for a person's approval.",
              "inputSchema": _schema(("path", "content"), path=_TEXT, content=_TEXT)},
+            {"name": "memory_search",
+             "description": "Full-text search over the project's and the shared memory, and with include_kb the "
+                            "read-only knowledge mounts.",
+             "inputSchema": _schema(
+                 ("query",), query=_TEXT, top_k={"type": "integer"}, include_shared=_FLAG, include_kb=_FLAG,
+                 include_archived=_FLAG,
+             )},
+            {"name": "memory_read",
+             "description": "Read a memory document or one Markdown section of it. uri: a path of the project memory, "
+                            "or a proj://, shared://, global:// or kb:// URI from memory_search.",
+             "inputSchema": _schema(("uri",), uri=_TEXT, heading=_TEXT, max_bytes={"type": "integer"})},
+            {"name": "memory_propose_write",
+             "description": "Governed write to project memory: notes/ and progress/ apply at once (near-duplicates are "
+                            "refused unless supersedes or force_new is given), instructions.md and shared:// wait for "
+                            "a person's approval. base_sha256 from memory_read makes it a compare-and-set.",
+             "inputSchema": _schema(
+                 ("target_uri", "op", "content", "rationale"), target_uri=_TEXT,
+                 op={"type": "string", "enum": ["append", "replace_section", "upsert_file", "archive",
+                                                "append_reported"]},
+                 content=_TEXT, rationale=_TEXT, section_heading=_TEXT, base_sha256=_TEXT, evidence_ref=_TEXT,
+                 supersedes=_TEXTS, force_new=_FLAG,
+             )},
             {"name": "list_sessions", "description": "List this project's sessions, newest first.",
              "inputSchema": _schema(inbox_id=inbox, status={"type": "string", "enum": list(_STATUSES)})},
             {"name": "list_events", "description": "List this project's inbox events, newest first.",
@@ -223,6 +249,10 @@ class StewardTools:
             "list_files": self._list_files,
             "read_memory": self._read_memory,
             "write_memory": self._write_memory,
+            # No memory_approve_proposal: a Run cannot ask a person in the middle of a turn, and must not decide itself.
+            "memory_search": self._memory_tool("memory_search"),
+            "memory_read": self._memory_tool("memory_read"),
+            "memory_propose_write": self._memory_tool("memory_propose_write"),
             "list_sessions": self._list_sessions,
             "list_events": self._list_events,
             "git": self._run_git,
@@ -315,8 +345,14 @@ class StewardTools:
         if not isinstance(content, str):
             raise ToolError("content must be a string")
         self._allow("write_memory", {"path": path, "content": content})
-        self.caps.memory.write(path, content)
-        return f"Wrote {path}."
+        return write_memory(self.caps.memory, path, content)
+
+    def _memory_tool(self, name: str) -> Callable[[dict[str, Any]], Awaitable[str]]:
+        async def run(arguments: dict[str, Any]) -> str:
+            self._allow(name, arguments)
+            return await asyncio.to_thread(call_memory_tool, self.caps.memory, name, arguments, actor=self.inbox_id)
+
+        return run
 
     def _inbox(self, arguments: dict[str, Any]) -> str | None:
         inbox_id = _optional(arguments, "inbox_id")

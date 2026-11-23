@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from agent_runtime.adapters.memory_fs.fs_memory import FileSystemMemoryAdapter
-
-_SAFE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
+from agent_runtime.adapters.memory_fs.hub import GovernedMemoryHub
+from agent_runtime.adapters.memory_fs.legacy import adopt_legacy_memory
+from agent_runtime.adapters.memory_fs.tool_args import read_document, required, search_query, write_proposal
+from memory_hub import BaselineBundle, LegacyMemoryPortAdapter, MemoryHubConfig
+from memory_hub.governance import classify_write_policy
+from memory_hub.partition import ParsedUri, parse_memory_uri
 
 
 def check_inbox_id(inbox_id: str) -> None:
@@ -36,11 +40,6 @@ def _folded(text: str) -> str:
     return unicodedata.normalize("NFD", unicodedata.normalize("NFD", text).casefold())
 
 
-def _sanitize_inbox_id(inbox_id: str) -> str:
-    check_inbox_id(inbox_id)
-    return _SAFE_SEGMENT_RE.sub("__", inbox_id.strip())
-
-
 @dataclass(frozen=True, slots=True)
 class PartitionBinding:
     inbox_id: str
@@ -49,17 +48,17 @@ class PartitionBinding:
 
 
 class PartitionedMemoryAdapter:
+    # The MemoryPort of one inbox's Runs, on the memory of its project in Memory Hub.
     def __init__(
         self,
         *,
         inbox_id: str,
-        project_memory_dir: str | Path,
-        global_instructions_path: str | Path,
+        hub: GovernedMemoryHub,
         workspace_dir: str | Path | None = None,
     ) -> None:
         self._inbox_id = inbox_id
-        self._project_memory = FileSystemMemoryAdapter(project_memory_dir)
-        self._global_instructions_path = Path(global_instructions_path).resolve()
+        self._hub = hub
+        self._legacy = LegacyMemoryPortAdapter(hub, inbox_id)
         self._workspace_dir = Path(workspace_dir).resolve() if workspace_dir is not None else None
 
     @property
@@ -67,64 +66,87 @@ class PartitionedMemoryAdapter:
         return self._inbox_id
 
     @property
+    def project_key(self) -> str:
+        return self._legacy.project_key
+
+    @property
     def workspace_dir(self) -> Path | None:
         return self._workspace_dir
 
     def load_baseline(self) -> dict[str, str]:
-        baseline = self._project_memory.load_baseline()
-        global_text = (
-            self._global_instructions_path.read_text(encoding="utf-8").strip()
-            if self._global_instructions_path.is_file()
-            else ""
-        )
-        local_text = baseline["instructions.md"].strip()
-        if global_text and local_text:
-            baseline["instructions.md"] = f"{global_text}\n\n{local_text}"
-        elif global_text:
-            baseline["instructions.md"] = global_text
-        return baseline
+        return self._legacy.load_baseline()
+
+    def load_baseline_bundle(self) -> BaselineBundle:
+        return self._legacy.load_baseline_bundle()
 
     def read_on_demand(self, path: str) -> str:
-        return self._project_memory.read_on_demand(path)
+        self._parse(path)
+        return self._legacy.read_on_demand(path)
 
     def write(self, path: str, content: str) -> None:
-        normalized = path.lstrip("/")
-        # Global instructions.md is strictly read-only from partition runtime writes.
-        if normalized == "global/instructions.md":
-            raise PermissionError("Global instructions.md is read-only")
-        self._project_memory.write(path, content)
+        self._parse(path)
+        self._legacy.write(path, content)
+
+    # True when write() only queues a proposal: the port returns nothing, so a tool asks this to say what happened.
+    def needs_approval(self, path: str) -> bool:
+        return classify_write_policy(self._parse(path)) == "REQUIRE_APPROVAL"
+
+    # The memory_* tools: argument objects in, JSON objects out, always within this inbox's project.
+
+    def search(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        return self._hub.search(search_query(self.project_key, args)).to_dict()
+
+    def read_document(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        return read_document(self._hub, self._parse(required(args, "uri")).raw_uri, args)
+
+    def propose(self, args: Mapping[str, Any], *, actor: str = "") -> dict[str, Any]:
+        uri = self._parse(required(args, "target_uri")).raw_uri
+        return self._hub.propose_write(write_proposal(uri, args, author=actor or None)).to_dict()
+
+    def proposal(self, proposal_id: str) -> dict[str, Any]:
+        record = next((r for r in self._hub.list_proposals(status=None) if r.get("proposal_id") == proposal_id), None)
+        if record is None:
+            raise FileNotFoundError(f"Proposal not found: {proposal_id}")
+        self._parse(str(record["proposal"]["target_uri"]))
+        return record
+
+    def approve(self, proposal_id: str, *, actor: str) -> dict[str, Any]:
+        self.proposal(proposal_id)
+        return self._hub.approve_proposal(proposal_id, actor=actor).to_dict()
+
+    def _parse(self, path: str) -> ParsedUri:
+        # A URI may name any project; a Run stays in its own.
+        parsed = parse_memory_uri(path if "://" in path else f"proj://{self.project_key}/{path.lstrip('/')}")
+        if parsed.scheme == "proj" and parsed.scope != self.project_key:
+            raise PermissionError(f"{path} is outside the memory of project '{self.project_key}'")
+        return parsed
 
 
 class WorkspacePartitionRegistry:
-    def __init__(self, memory_root: str | Path) -> None:
-        self._root = Path(memory_root).resolve()
-        self._global_dir = self._root / "global"
-        self._projects_dir = self._root / "projects"
-        self._global_dir.mkdir(parents=True, exist_ok=True)
-        self._projects_dir.mkdir(parents=True, exist_ok=True)
-        self._global_instructions = self._global_dir / "instructions.md"
-        if not self._global_instructions.exists():
-            self._global_instructions.write_text("", encoding="utf-8")
-
+    def __init__(self, memory_root: str | Path, *, hub: GovernedMemoryHub | None = None) -> None:
+        self._hub = hub if hub is not None else GovernedMemoryHub(MemoryHubConfig(memory_root=str(memory_root)))
         self._bindings: dict[str, PartitionBinding] = {}
         self._workspaces: dict[str, Path] = {}
 
     @property
+    def hub(self) -> GovernedMemoryHub:
+        return self._hub
+
+    @property
     def global_instructions_path(self) -> Path:
-        return self._global_instructions
+        return self._hub.root / "global" / "instructions.md"
 
     def set_global_instructions(self, content: str) -> None:
-        tmp = self._global_instructions.with_suffix(".md.tmp")
-        tmp.write_text(content, encoding="utf-8")
-        tmp.replace(self._global_instructions)
+        self._hub.set_global_instructions(content)
 
     def register(
         self,
         inbox_id: str,
         workspace_dir: str | Path | None = None,
     ) -> PartitionBinding:
-        safe_name = _sanitize_inbox_id(inbox_id)
-        memory_dir = (self._projects_dir / safe_name).resolve()
+        check_inbox_id(inbox_id)
+        # Inboxes of one project share its memory; queues, sessions and workspaces stay per inbox_id.
+        memory_dir = self._hub.project_dir(self._hub.resolve_project_key(inbox_id))
         resolved_workspace = Path(workspace_dir).resolve() if workspace_dir is not None else None
 
         if resolved_workspace is not None:
@@ -156,12 +178,10 @@ class WorkspacePartitionRegistry:
 
     def memory_for(self, inbox_id: str) -> PartitionedMemoryAdapter:
         binding = self.binding_for(inbox_id)
-        return PartitionedMemoryAdapter(
-            inbox_id=inbox_id,
-            project_memory_dir=binding.memory_dir,
-            global_instructions_path=self._global_instructions,
-            workspace_dir=binding.workspace_dir,
-        )
+        # Before any Run: an inbox whose memory has no usable directory is refused, not failed event by event.
+        self._hub.lay_out(binding.memory_dir.name)
+        adopt_legacy_memory(self._hub, inbox_id)
+        return PartitionedMemoryAdapter(inbox_id=inbox_id, hub=self._hub, workspace_dir=binding.workspace_dir)
 
     def workspace_for(self, inbox_id: str) -> Path | None:
         return self.binding_for(inbox_id).workspace_dir

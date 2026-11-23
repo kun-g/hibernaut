@@ -161,6 +161,15 @@ def test_the_relay_port_must_not_be_the_one_of_the_general_runner() -> None:
         assert parse_config(other).runner_pilot.port == 8790
 
 
+def test_the_relay_port_must_not_be_the_one_of_the_memory_service() -> None:
+    http = {"enabled": True, "listen_port": 8790, "tokens": {"a": {"token_env": "T"}}}
+    raw = _raw(port=8790)
+    with pytest.raises(ValueError, match="runner_pilot.port is memory_hub.http.listen_port"):
+        parse_config({**raw, "memory_hub": {"http": http}})
+    for change in ({"enabled": False}, {"listen_port": 8795}):
+        assert parse_config({**raw, "memory_hub": {"http": http | change}}).runner_pilot.port == 8790
+
+
 def test_demo_mode_cannot_open_the_route(tmp_path: Path) -> None:
     raw = _raw()
     raw["runtime"] |= {"db_path": str(tmp_path / "hb.db"), "memory_root": str(tmp_path / "mem")}

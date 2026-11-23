@@ -70,7 +70,13 @@ from agent_runtime.adapters.executor_whitebox import (
     RuleBasedDemoLLM,
     WhiteboxExecutor,
 )
-from agent_runtime.adapters.memory_fs import WorkspacePartitionRegistry, check_inbox_id
+from agent_runtime.adapters.memory_bridge import (
+    DEFAULT_GC_INTERVAL_SECONDS,
+    MemoryControlPlane,
+    MemoryGarbageCollector,
+    ScopedMemoryHTTPServer,
+)
+from agent_runtime.adapters.memory_fs import GovernedMemoryHub, WorkspacePartitionRegistry, check_inbox_id
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter, CredentialProxyClient, read_private_token
 from agent_runtime.adapters.runner_pilot import ClosedRouteExecutor, ProtocolCheckExecutor, RunnerPilotRelay
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
@@ -87,7 +93,7 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteTaskMetadataStore,
     SQLiteWorkspaceStore,
 )
-from agent_runtime.app.bootstrap import RunnerHandle, open_runner
+from agent_runtime.app.bootstrap import RunnerHandle, open_memory_http, open_memory_hub, open_runner
 from agent_runtime.app.concurrency import (
     ConcurrencyLimiter,
     ConcurrencyLimits,
@@ -98,6 +104,7 @@ from agent_runtime.app.concurrency import (
 )
 from agent_runtime.app.config import (
     HibernautConfig,
+    MemoryHTTPConfig,
     ProjectConfig,
     RoleConfig,
     RunnerLinkConfig,
@@ -125,6 +132,7 @@ from agent_runtime.engine import (
 )
 from agent_runtime.engine.worker import ExecutorFailed
 from agent_runtime.adapters.ledger_bridge import RunLedger
+from memory_hub import MemoryHubConfig
 from runner.protocol_check import PROTOCOL_CHECK_EXECUTOR_ID
 from switchboard.ports import AuditSinkPort
 from switchboard.app import EnvCredentialBroker, Switchboard, build_switchboard
@@ -397,6 +405,11 @@ class AlwaysOnDaemon:
     ledger: RunLedger | None = None
     # Likewise shared; run() and serve_configured() start it before the first Run and stop it after the last.
     runner: RunnerHandle | None = None
+    # One per process, whatever the config generation; closed, with its HTTP service, by the generation that opened it.
+    memory_hub: GovernedMemoryHub | None = None
+    memory_http: ScopedMemoryHTTPServer | None = None
+    memory_gc: MemoryGarbageCollector | None = None
+    memory_gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def register_partition(
@@ -508,6 +521,12 @@ class AlwaysOnDaemon:
                         halt=halt,
                     )
                 )
+            if self.memory_gc is not None:
+                tasks.create_task(
+                    self.memory_gc.run_forever(
+                        interval_seconds=self.memory_gc_interval_seconds, stop_event=stop_event
+                    )
+                )
             if self.gdrive_poller is not None:
                 tasks.create_task(
                     self.gdrive_poller.run_forever(
@@ -517,6 +536,10 @@ class AlwaysOnDaemon:
                 )
 
     def close(self) -> None:
+        if self.memory_http is not None:
+            self.memory_http.shutdown()
+        if self.memory_hub is not None:
+            self.memory_hub.close()
         if self.ledger is not None:
             self.ledger.close()
         self.db.close()
@@ -688,6 +711,8 @@ def build_daemon(
     ledger: RunLedger | None = None,
     ledger_db_path: str | Path | None = None,
     limiter: ConcurrencyLimiter | None = None,
+    memory_hub: GovernedMemoryHub | None = None,
+    memory_gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS,
 ) -> AlwaysOnDaemon:
     db = database if database is not None else SQLiteDatabase(db_path)
     if ledger is None and (database is None or ledger_db_path):
@@ -706,7 +731,9 @@ def build_daemon(
     lock = SQLiteLeaseLockAdapter(db)
     sessions = SQLiteSessionStoreAdapter(db)
     workspaces = SQLiteWorkspaceStore(db)
-    partitions = WorkspacePartitionRegistry(memory_root)
+    if memory_hub is None:
+        memory_hub = open_memory_hub(MemoryHubConfig(memory_root=str(memory_root)), ledger=ledger)
+    partitions = WorkspacePartitionRegistry(memory_root, hub=memory_hub)
     permissions = AutoModePermissionAdapter()
     resolved_channel: ChannelPort = (
         channel if channel is not None else ConsoleChannelAdapter(echo=outbox_dir is None)
@@ -865,6 +892,7 @@ def build_daemon(
         outbox=outbox,
         bearer_token=mcp_bearer_token,
         ledger=ledger,
+        memory=MemoryControlPlane(memory_hub, ledger),
     )
 
     return AlwaysOnDaemon(
@@ -901,6 +929,9 @@ def build_daemon(
         ingest_only=ingest_only,
         open_runs=open_runs,
         ledger=ledger,
+        memory_hub=memory_hub,
+        memory_gc=MemoryGarbageCollector(memory_hub, sessions) if memory_gc_interval_seconds > 0 else None,
+        memory_gc_interval_seconds=memory_gc_interval_seconds,
     )
 
 
@@ -968,6 +999,10 @@ def pilot_hold(
     return hold
 
 
+def projectless_inboxes(config: HibernautConfig) -> Callable[[str], bool]:
+    return lambda inbox_id: config.runtime.workdir_binding(inbox_id) is not None
+
+
 def _permissions(link: RunnerLinkConfig) -> AutoModePermissionAdapter:
     if not link.enabled:
         return AutoModePermissionAdapter()
@@ -989,6 +1024,7 @@ def build_daemon_from_config(
     runner_pilot: RunnerPilotRelay | None = None,
     runner: RunnerHandle | None = None,
     limiter: ConcurrencyLimiter | None = None,
+    memory_hub: GovernedMemoryHub | None = None,
 ) -> AlwaysOnDaemon:
     if demo and config.runner_pilot.enabled:
         raise ValueError("runner_pilot.enabled cannot be used with --demo")
@@ -1050,9 +1086,19 @@ def build_daemon_from_config(
         project = router.resolve(inbox_id)
         return project.name if project is not None else None
 
+    if ledger is None and (database is None or config.runtime.ledger_db_path):
+        ledger_path = run_ledger_path(config.runtime.db_path, config.runtime.ledger_db_path)
+        ledger = RunLedger(ledger_path) if ledger_path is not None else None
+    opened_hub = memory_hub is None
+    if memory_hub is None:
+        memory_hub = open_memory_hub(config.memory_hub.hub_config(config.runtime.memory_root), ledger=ledger)
+    memory_hub.is_projectless = projectless_inboxes(config)
+
     daemon = build_daemon(
         db_path=config.runtime.db_path,
         database=database,
+        memory_hub=memory_hub,
+        memory_gc_interval_seconds=config.memory_hub.gc_interval_seconds,
         limits=limits,
         project_for=_project_name,
         memory_root=config.runtime.memory_root,
@@ -1456,6 +1502,7 @@ def build_daemon_from_config(
             bearer_token=mcp_token,
             worktree_manager_for=_manager_for,
             ledger=daemon.ledger,
+            memory=MemoryControlPlane(memory_hub, daemon.ledger),
         )
 
     if resolved_gdrive_client is not None:
@@ -1473,6 +1520,10 @@ def build_daemon_from_config(
     if switchboard is not None:
         attach_switchboard(daemon, switchboard, config.switchboard.consumer_id)
 
+    if opened_hub:
+        # Last, so settings refused above leave no listener behind. A reload passes the running hub, whose service goes
+        # on; its settings cannot change without a restart.
+        daemon.memory_http = open_memory_http(config.memory_hub.http, memory_hub)
     return daemon
 
 
@@ -1633,6 +1684,13 @@ async def serve_configured(
                         flush=True,
                     )
                     continue
+                if candidate.memory_hub != config.memory_hub:
+                    print(
+                        "[config] [memory_hub] changes require a restart.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
                 address = (candidate.channels.host, candidate.channels.port)
                 next_server: WebhookHTTPServer | None = None
                 next_pilot: RunnerPilotRelay | None = None
@@ -1647,6 +1705,7 @@ async def serve_configured(
                         runner_pilot=next_pilot,
                         runner=daemon.runner,
                         limiter=shared_limiter,
+                        memory_hub=daemon.memory_hub,
                     )
                     handler = replacement.http_handler()
                     if address != (config.channels.host, config.channels.port):
@@ -1658,6 +1717,8 @@ async def serve_configured(
                         file=sys.stderr,
                         flush=True,
                     )
+                    if daemon.memory_hub is not None:
+                        daemon.memory_hub.is_projectless = projectless_inboxes(config)
                     if next_pilot is not None and next_pilot is not runner_pilot:
                         await next_pilot.stop()
                     continue
@@ -1812,8 +1873,12 @@ def main() -> None:
             except ValueError as exc:
                 # The rest of the daemon runs; the pilot inbox is held, never run on another executor.
                 print(f"[runner_pilot] {exc}; the pilot inbox stays held.", file=sys.stderr, flush=True)
-        # Nor does it run any agent, so it opens no runner.
-        companion = replace(cfg, runner=RunnerLinkConfig()) if args.mcp_stdio else cfg
+        # Nor does it run any agent, so it opens no runner; the memory HTTP service belongs to the daemon too.
+        companion = (
+            replace(cfg, runner=RunnerLinkConfig(), memory_hub=replace(cfg.memory_hub, http=MemoryHTTPConfig()))
+            if args.mcp_stdio
+            else cfg
+        )
         daemon = build_daemon_from_config(
             companion, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot
         )

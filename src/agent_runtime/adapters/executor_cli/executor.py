@@ -19,6 +19,7 @@ from agent_runtime.adapters.executor_cli.process import (
     target_events,
 )
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager, WorkspaceIsolationError
+from agent_runtime.adapters.memory_fs import baseline_segments
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.core.models import (
     Emit,
@@ -280,14 +281,12 @@ class LocalCLIExecutor:
         session: SessionRef | None,
         caps: RunCapabilities,
     ) -> str:
-        baseline = caps.memory.load_baseline()
-        parts: list[str] = []
-        for name in ("instructions.md", "index.md", "reported.md"):
-            text = baseline.get(name, "").strip()
-            if text:
-                parts.append(f"## {name}\n{text}")
+        # The CLI caches the prompt's unchanged start, so what varies between Runs comes after the stable memory.
+        baseline = baseline_segments(caps.memory)
+        parts = [f"## {name}\n{text}" for name, text in baseline.stable if text]
         if self._bound_workdir is not None and self._readonly:
             parts.append(f"## workdir\n{self._bound_workdir} is shared and read-only: change no file in it.")
+        parts.extend(f"## {name}\n{text}" for name, text in baseline.volatile if text)
         if session is not None and session.checkpoint:
             parts.append(f"## session_checkpoint\n{session.checkpoint}")
         serialized_events = [

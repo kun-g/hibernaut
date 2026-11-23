@@ -13,7 +13,9 @@ from agent_runtime.adapters.executor_whitebox import (
     RuleBasedDemoLLM,
     WhiteboxExecutor,
 )
-from agent_runtime.adapters.memory_fs import FileSystemMemoryAdapter
+from agent_runtime.adapters.ledger_bridge import RunLedger
+from agent_runtime.adapters.memory_bridge import ScopedMemoryHTTPServer
+from agent_runtime.adapters.memory_fs import FileSystemMemoryAdapter, GovernedMemoryHub
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
@@ -24,7 +26,13 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteTimerAdapter,
 )
 from agent_runtime.adapters.runner_bridge import RunnerExecutorBridge
-from agent_runtime.app.config import HibernautConfig, ProjectConfig, RunnerLinkConfig, runner_driver
+from agent_runtime.app.config import (
+    HibernautConfig,
+    MemoryHTTPConfig,
+    ProjectConfig,
+    RunnerLinkConfig,
+    runner_driver,
+)
 from agent_runtime.core.ports import ChannelPort, RunCapabilities
 from agent_runtime.engine import (
     AgentWorker,
@@ -32,6 +40,7 @@ from agent_runtime.engine import (
     OutboxDispatcher,
     TimerScheduler,
 )
+from memory_hub import AuthPrincipal, MemoryHubConfig, StaticTokenAuth
 from runner.cli_drivers import CLIDriver
 from runner.config import NamespacePolicy, ProjectCheckout, RunnerConfig
 from runner.daemon import RunnerDaemon
@@ -249,6 +258,46 @@ def open_runner(
     if config.runner.mode == "relay":
         return RelayRunnerHandle(config, os.environ if environ is None else environ)
     return InProcessRunnerHandle(config)
+
+
+def open_memory_hub(config: MemoryHubConfig, *, ledger: RunLedger | None) -> GovernedMemoryHub:
+    return GovernedMemoryHub(config, audit=ledger.memory_audit() if ledger is not None else None)
+
+
+def open_memory_http(
+    config: MemoryHTTPConfig,
+    hub: GovernedMemoryHub,
+    *,
+    environ: MutableMapping[str, str] | None = None,
+) -> ScopedMemoryHTTPServer | None:
+    if not config.enabled:
+        return None
+    env = os.environ if environ is None else environ
+    missing = [t.token_env for t in config.tokens if not env.get(t.token_env, "").strip()]
+    if missing:
+        raise ValueError(f"memory_hub.http needs {', '.join(missing)} in the environment")
+    # Executor subprocesses inherit os.environ; moving the tokens out keeps them away from agents.
+    secrets = {t.subject: env.pop(t.token_env).strip() for t in config.tokens}
+    if len(set(secrets.values())) < len(secrets):
+        raise ValueError("memory_hub.http: two entries hold the same token")
+    auth = StaticTokenAuth({
+        secrets[t.subject]: AuthPrincipal(
+            subject=t.subject, role=t.role, allowed_projects=t.allowed_projects, allow_kb=t.allow_kb
+        )
+        for t in config.tokens
+    })
+    server = ScopedMemoryHTTPServer(hub, auth, host=config.listen_host, port=config.listen_port)
+    server.start_background()
+    host, port = server.address
+    print(f"[hibernaut] [memory_hub] HTTP and MCP service on http://{host}:{port}", file=sys.stderr, flush=True)
+    if host not in _LOOPBACK_ADDRESSES:
+        print(
+            "[hibernaut] [memory_hub] WARNING: the service speaks plain HTTP; put TLS in front of it before other "
+            "hosts use it.",
+            file=sys.stderr,
+            flush=True,
+        )
+    return server
 
 
 def _runner_dir(config: HibernautConfig, configured: str) -> Path:

@@ -22,6 +22,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 安全 | agent 进程不持有真实密钥（运营者在 `env` 里显式写的除外）：API key 由外置代理注入，Drive 密钥由独立系统用户保管，GitHub 走宿主机凭据 |
 | 运维 | 配置热加载、跟随 `origin/main` 自动更新；Outbox 上报失败按 5/15/45/135/405 秒持久化退避，重启不丢进度 |
 | 执行账本 | 同仓的独立包 `src/ledger/`：每个 Run 记一条档案（结局、执行器、耗时、错误类别、日志、token 与费用），同进程 Switchboard 的审计也记入，存在独立的 `ledger.db`；执行器失败按类别分流（瞬时故障 5/15/45 秒退避重试，配置或权限错误第 1 次即停，执行故障不重试），最终失败发告警；MCP 只读工具查询 Run、日志、审计与执行器统计，`hibernaut_replay_event` 重放失败事件。设计见 [`docs/observability-ledger-design.md`](docs/observability-ledger-design.md) |
+| Memory Hub | 同仓的独立包 `src/memory_hub/`：项目记忆，同一项目的 Inbox 共用；基线按 token 预算加载，稳定部分排在 Prompt Cache 断点前；改 `instructions.md` 要人批准；全文检索记忆与只读知识库挂载；失败复盘两段式沉淀，定期清理。旧的按 Inbox 记忆首次访问时自动并入项目目录。见 [`docs/architecture.md`](docs/architecture.md) §14 |
 | Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard；`--check` 在发版前无副作用地校验配置，停机时先结清在途请求、投递和发送 |
 | Taskboard | 同仓的独立包：多来源任务归集（一个任务可挂多个来源）、5 态状态机、DAG 依赖与环检测、上游完成后自动解锁下游，经 Switchboard 发 `work.ready` 或给人发待办通知；SQLite 存储。独立常驻服务 `python -m taskboard.app` 经 Relay 消费 Switchboard 事件、经 Switchboard `/mcp` 上行，并以 HTTP `/mcp`（可挂同域子路径，如 `/taskboard/mcp`）或 `--mcp-stdio` 提供 7 个 `tb_*` MCP 工具；Hibernaut 接 `work.ready` 执行，并以 `execution.reported` 回报 `claim` / `update_stage` / `complete` / `release`（审批挂起后恢复仍回写同一任务）。设计见 [`docs/taskboard.md`](docs/taskboard.md) |
 | Runner | 同仓的独立包，只依赖标准库：代码执行宿主，负责 worktree 隔离与安全回收、子进程监管（硬超时与静默看门狗）、多 CLI 驱动与会话续接；本机同进程直调，或经反向 WebSocket 由控制面按工作区亲和调度多个节点。`agent_runtime.adapters.runner_bridge.RunnerExecutorBridge` 把它适配为 `ExecutorPort`，CLI 里每次工具调用先经 `PermissionPort` 判定（放行、拒绝、挂起问人）。由 `hibernaut.toml` 的 `[runner]` 启用（`in_process` 或 `relay`），默认关闭，执行器不变。另有一条互不依赖、同样默认关闭的只读试点路由（`[runner_pilot]`），把一个任务级 Inbox 交给本机独立的 Runner 服务（`python -m runner.service`），启用与回退见 [`deploy/runner/README.md`](deploy/runner/README.md)。设计见 [`docs/runner.md`](docs/runner.md) |
@@ -69,7 +70,7 @@ curl -s localhost:8080/events -H 'Content-Type: application/json' -d @docs/dispa
 
 ## 配置
 
-Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.example.toml`](hibernaut.example.toml)。保存后自动热加载：入口、消息发送和 Drive 轮询继续运行，进行中的任务用旧配置跑完，新事件用新配置；非法配置保留当前设置；改存储路径或 `[switchboard]` 需要重启。
+Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.example.toml`](hibernaut.example.toml)。保存后自动热加载：入口、消息发送和 Drive 轮询继续运行，进行中的任务用旧配置跑完，新事件用新配置；非法配置保留当前设置；改存储路径、`[switchboard]` 或 `[memory_hub]` 需要重启。
 
 | 配置段 | 管什么 |
 | :--- | :--- |
@@ -83,6 +84,7 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 | `[[projects.<name>.inbox_bindings]]` | Inbox 与 Agent 的绑定：`pattern`（整串匹配的正则）、`default_agent`、`agents` 白名单、`rules`（按 `source` / `event_type` / `tags` 选 Agent；具名定时器的来源是 `timer:<timer_name>`）。写了绑定的项目，转投只能到有绑定覆盖的 Inbox |
 | `[projects.<name>.delivery]` | PR 交付：开 PR、自动合并、版本文件、检查命令、是否要求评审和 CI、冲突与检查失败交回开发的次数上限（`max_handbacks`）、合并后是否删除源分支（`delete_branch`）、来自 GitHub Issue 的任务在 PR 正文里怎么写这个 Issue（`issue_link`：`closes` 合并后关闭 / `refs` 只关联，默认 / `none` 不写） |
 | `[gdrive]` | Drive 任务队列，部署见 [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md)。任务可引用队列根下 `附件/` 里的文件（frontmatter `attachments` 写文件 ID 或原名，逗号分隔、`[a, b]` 或逐行 `- a` 均可，或正文里写该文件的 Drive ID），Run 开始时下载到 `attachments_dir`（默认数据库旁的 `attachments/`，在 worktree 之外），任务正文末尾附上路径、大小和 sha256，会话结案后删除。上传 `.md` 任务文件时关掉 Drive「将上传的文件转换为 Google 文档格式」 |
+| `[memory_hub]` | 项目记忆：`[memory_hub.budget]` 基线预算（`[memory_hub.projects.<project_key>.budget]` 按项目覆盖）、`[memory_hub.mounts.<name>]` 只读知识库、`[memory_hub.inbox_projects]` 指定 Inbox 归哪个项目、`gc_interval_seconds` 清理周期、`[memory_hub.http]` 可选的 HTTP 与 MCP 服务。不写用默认值 |
 | `[switchboard]` | 同进程运行 Switchboard 或经 Relay 连接远程 Switchboard；公网 VPS 容器部署见 [`deploy/switchboard/`](deploy/switchboard/README.md)，与 Taskboard 同域部署见 [`deploy/taskboard/`](deploy/taskboard/README.md) |
 
 并发上限分四级：全局、项目、执行器（驱动）、Agent，后三级不写就不单独限制，大于全局值时以全局为准。满额的一级只让受它限制的 Inbox 按到达顺序排队，其他 Inbox 照常运行。
@@ -127,7 +129,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 
 | 文档 | 内容 |
 | :--- | :--- |
-| [`docs/architecture.md`](docs/architecture.md) | 完整设计：生命周期（§1）、分层（§2）、会话与路由及各入口（§3）、执行器、评审、SDE、PR 交付、worktree、多 inbox 项目、热加载（§4）、并发与新事件策略（§5）、Switchboard（§7）、ccpeer（§9）、Taskboard（§10）、执行账本（§11）、Runner（§12）、Dashboard（§13） |
+| [`docs/architecture.md`](docs/architecture.md) | 完整设计：生命周期（§1）、分层（§2）、会话与路由及各入口（§3）、执行器、评审、SDE、PR 交付、worktree、多 inbox 项目、热加载（§4）、并发与新事件策略（§5）、Switchboard（§7）、ccpeer（§9）、Taskboard（§10）、执行账本（§11）、Runner（§12）、Dashboard（§13）、Memory Hub（§14） |
 | [`docs/inbox-conventions.md`](docs/inbox-conventions.md) | Inbox 使用规范：命名、串行复用与并发分桶、依赖、非项目 Inbox 的 `workdir`、代码硬约束 |
 | [`docs/taskboard.md`](docs/taskboard.md) | Taskboard 完整设计方案：职责边界、5 态状态机、DAG 解锁与异常传播、Flow 展开、与 Switchboard 的 Schema 契约、DDL 与门禁 |
 | [`docs/observability-ledger-design.md`](docs/observability-ledger-design.md) | 执行账本（Observability / Ledger）设计基线：定位与边界、双层数据契约、错误分类与分流、日志与计费、重放与 Memory 闸门；接线见架构文档 §11 |
