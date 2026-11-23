@@ -6,7 +6,9 @@ from pathlib import Path
 from agent_runtime.adapters.delivery.pr_delivery import _followup_list
 from agent_runtime.adapters.executor_cli.review_scope import ReviewScope, merge_notes
 from agent_runtime.adapters.executor_cli.reviewer import REVIEW_SCHEMA, plain_review_contract, validate_review
+from agent_runtime.adapters.executor_cli.reviewer import ReviewAborted, review_prompt
 from agent_runtime.adapters.executor_cli.sde import _State
+from tests.review_flow_support import CONFLICT, DONE, QUESTION, REPORT, ReviewFlowCase
 from agent_runtime.core.models import Emit, Suspend
 from tests.test_pr_delivery import rendered_body
 from tests.test_sde_delivery import MAIN_CALC, MERGE_MAIN, PASS, RESOLVED, TASK_CALC, SDEDeliveryCase, dev, event
@@ -190,17 +192,144 @@ class TestReviewContract(unittest.TestCase):
                 self.assertEqual(item.get("previous_item"), read)
 
 
-class TestRoleReviewRounds(SDEDeliveryCase):
+class TestRoleReviewRounds(ReviewFlowCase):
+    def prompt(self, index):
+        return review_prompt(self.request(index), "", "+++ b/calc.py\n+++ b/old.py")
+
+    def developer_prompt(self, index):
+        return self.develop.await_args_list[index].args[3]
+
+    def pr_body(self):
+        req = self.delivery.deliver.call_args.args[0]
+        return rendered_body(followups=req.followups, summary=req.summary, evidence=req.test_evidence)
+
+    async def rounds(self, *reviews, changes=()):
+        snapshots = [f"round-{i}" for i in range(len(reviews))]
+        diffs = {(before, after): (f"+++ b/{path}", [path]) for before, after, path in
+                 zip(snapshots[:-1], snapshots[1:], changes, strict=True)}
+        return await self.run_flow(snapshots=snapshots, diffs=diffs, deliveries=[DONE],
+                                   reviews=[validate_review(r) for r in reviews])
+
+    async def test_the_first_round_may_block_on_anything(self):
+        outcome = await self.rounds(verdict(OLD_CODE), PASS, changes=["calc.py"])
+        self.assertIsInstance(outcome, Emit)
+        self.assertEqual(self.develop.await_count, 2)
+        self.assertIn("old.py:2", self.developer_prompt(1))
+        self.assertNotIn("## Incremental review", self.prompt(0))
+
+    async def test_an_unfixed_previous_item_is_sent_back_again(self):
+        unfixed = block("calc.py:2", impact="still crashes", basis="unfixed_previous", previous_item=1)
+        outcome = await self.rounds(FIRST, verdict(unfixed, OLD_CODE), PASS, changes=["readme.txt", "calc.py"])
+        self.assertIsInstance(outcome, Emit)
+        self.assertIn("review=pass after 3 round", outcome.messages[0])
+        self.assertIn("still crashes", self.developer_prompt(2))
+        self.assertNotIn("old.py:2", self.developer_prompt(2))
+        self.assertIn("round 2 changes_requested (1 blocking, 1 downgraded)", outcome.messages[0])
+        self.assertIn("old.py:2", self.pr_body().split("## 跟进\n")[1])
+
+    async def test_a_problem_the_fix_introduced_is_sent_back(self):
+        introduced = block("calc.py:3", impact="wrong exception type", basis="introduced_since_previous")
+        outcome = await self.rounds(FIRST, verdict(introduced), PASS, changes=["calc.py", "calc.py"])
+        self.assertIsInstance(outcome, Emit)
+        self.assertIn("review=pass after 3 round", outcome.messages[0])
+        self.assertIn("wrong exception type", self.developer_prompt(2))
+
+    async def test_the_second_round_is_told_its_scope_and_still_gets_the_full_diff(self):
+        await self.rounds(FIRST, PASS, changes=["calc.py"])
+        prompt = self.prompt(1)
+        scope = prompt.split("## Incremental review\n")[1]
+        for part in ("unfixed_previous", "introduced_since_previous", "- calc.py\n", "1 blocking item",
+                     "rename divide to safe_divide"):
+            self.assertIn(part, scope)
+        self.assertNotIn("- old.py", scope)
+        self.assertIn("old.py", prompt.split("## Code diff")[1].split("## Previous review round")[0])
+
+    async def test_a_recheck_after_a_hand_back_blocks_only_on_changes_since_the_pass(self):
+        outcome = await self.run_flow(snapshots=["first", "resolved"], diffs={("first", "resolved"): ("delta", ["calc.py"])},
+                                      reviews=[PASS, validate_review(verdict({**OLD_CODE, "basis": "unfixed_previous",
+                                                                             "previous_item": 1}))])
+        self.assertIsInstance(outcome, Emit)
+        self.assertIn("round 2 pass (1 downgraded)", outcome.messages[0])
+        self.assertIn("## Incremental review", self.prompt(1))
+        self.assertIn("old.py:2", self.pr_body().split("## 跟进\n")[1])
+
+    async def test_a_recheck_still_blocks_on_the_conflict_resolution(self):
+        bad = block("calc.py:3", impact="lost main's change", basis="introduced_since_previous")
+        outcome = await self.run_flow(snapshots=["first", "merged", "fixed"],
+                                      diffs={("first", "merged"): ("resolution", ["calc.py"]),
+                                             ("merged", "fixed"): ("fix", ["calc.py"])},
+                                      reviews=[PASS, verdict(bad), PASS])
+        self.assertIsInstance(outcome, Emit)
+        self.assertIn("lost main's change", self.developer_prompt(2))
+
+    async def test_a_follow_up_is_developed_and_the_next_review_stays_incremental(self):
+        # Each subcase starts a new task and may resume it through a human decision.
+        for follow_up, recheck in (("carry on with the original requirements", False), ("keep main's divide", True)):
+            with self.subTest(follow_up):
+                await self.follow_up_round(follow_up, recheck)
+
+    async def follow_up_round(self, follow_up, recheck):
+        self.state = _State(stage="develop", workdir="/test/repo", base_ref="main", requirements="divide",
+                            project={"workdir": "/test/repo", "commit": "initial"})
+        self.develop.reset_mock()
+        self.reviewer.review.reset_mock()
+        late = verdict({**OLD_CODE, "basis": "introduced_since_previous"})
+        outcome = await self.run_flow(snapshots=["first", "fixed"], diffs={("first", "fixed"): ("fix", ["calc.py"])},
+                                      deliveries=[CONFLICT, DONE] if recheck else [DONE], reviews=[PASS if recheck else FIRST, late],
+                                      reports=[REPORT, QUESTION, REPORT])
+        self.assertIsInstance(outcome, Suspend)
+        batch = [event({"text": follow_up}), event({"approval_request_id": outcome.request_id, "approved": True})]
+        done = await self.executor.execute(batch, SDEDeliveryCase.resume(outcome), self.caps)
+        self.assertIsInstance(done, Emit)
+        self.assertIn("round 2 pass (1 downgraded)", done.messages[0])
+        self.assertIn(follow_up, self.developer_prompt(2))
+        prompt = self.prompt(1)
+        self.assertIn(follow_up, prompt)
+        scope = prompt.split("## Incremental review\n")[1]
+        self.assertIn("A requirement a person added since that review", scope)
+        self.assertIn("keep its real location and put it in notes", scope)
+        self.assertNotIn("closest", scope)
+        self.assertEqual("## Why this is reviewed again" in prompt, recheck)
+
+    async def test_a_follow_up_with_the_approval_of_a_spent_review_stays_incremental(self):
+        self.executor._options = type(self.executor._options)(max_review_rounds=1)
+        outcome = await self.rounds(FIRST, verdict(OLD_CODE), changes=["calc.py"])
+        self.assertIsInstance(outcome, Suspend)
+        batch = [event({"text": "fix it as originally required"}),
+                 event({"approval_request_id": outcome.request_id, "approved": True})]
+        done = await self.executor.execute(batch, SDEDeliveryCase.resume(outcome), self.caps)
+        self.assertIsInstance(done, Emit)
+        self.assertIn("fix it as originally required", self.developer_prompt(1))
+        self.assertIn("round 2 pass (1 downgraded)", done.messages[0])
+
+    async def test_rounds_still_run_out_and_wait_for_a_person(self):
+        unfixed = block("calc.py:2", basis="unfixed_previous", previous_item=1)
+        outcome = await self.rounds(FIRST, verdict(unfixed, OLD_CODE), verdict(unfixed, OLD_CODE), changes=["a.txt", "a.txt"])
+        self.assertIsInstance(outcome, Suspend)
+        self.assertIn("still changes_requested after 3 round(s)", outcome.prompt)
+        self.assertEqual(self.reviewer.review.await_count, 3)
+
+    async def test_notes_survive_a_declined_review_retry(self):
+        outcome = await self.run_flow(snapshots=["first", "fixed"], diffs={("first", "fixed"): ("fix", ["calc.py"])},
+                                      reviews=[FIRST, ReviewAborted("reviewer crashed")], deliveries=[DONE])
+        self.assertIsInstance(outcome, Suspend)
+        declined = await self.executor.execute([event({"approval_request_id": outcome.request_id, "approved": False})],
+                                               SDEDeliveryCase.resume(outcome), self.caps)
+        self.assertIsInstance(declined, Emit)
+        self.assertIn("跟进：\n- rename divide to safe_divide", declined.messages[0])
+        self.assertIn("## 跟进\n- rename divide to safe_divide", self.pr_body())
+
+    async def test_without_notes_there_is_no_follow_up_section(self):
+        outcome = await self.rounds(PASS)
+        self.assertIsInstance(outcome, Emit)
+        self.assertNotIn("跟进", outcome.messages[0])
+        self.assertNotIn("## 跟进", self.pr_body())
+
+
+class TestDeliveredReviewNotes(SDEDeliveryCase):
     async def run_task(self, *reviews, fixes=(FIX,), **delivery):
         self.set_plan(sde=[dev(BUGGY), *(dev(f) for f in fixes)], reviewer=reviews)
         return await self.executor(delivery=self.delivery(**delivery)).execute([event(self.payload())], None, self.caps)
-
-    async def test_the_first_round_may_block_on_anything(self):
-        outcome = await self.run_task(verdict(OLD_CODE), PASS)
-        assert isinstance(outcome, Emit), outcome
-        self.assertEqual(len(self.calls("sde")), 2)
-        self.assertIn("old.py:2", self.calls("sde")[1]["prompt"])
-        self.assertNotIn("## Incremental review", self.calls("reviewer")[0]["prompt"])
 
     async def test_an_old_code_finding_in_round_two_becomes_a_note_and_the_review_passes(self):
         late = {**OLD_CODE, "basis": "introduced_since_previous"}
@@ -219,113 +348,6 @@ class TestRoleReviewRounds(SDEDeliveryCase):
                 self.assertIn(part, where)
         self.assertEqual(section.count("safe_divide"), 1)
 
-    async def test_an_unfixed_previous_item_is_sent_back_again(self):
-        unfixed = block("calc.py:2", impact="still crashes", basis="unfixed_previous", previous_item=1)
-        outcome = await self.run_task(FIRST, verdict(unfixed, OLD_CODE), PASS, fixes=({"readme.txt": "x\n"}, FIX))
-        assert isinstance(outcome, Emit), outcome
-        self.assertIn("review=pass after 3 round", outcome.messages[0])
-        second_fix = self.calls("sde")[2]["prompt"]
-        self.assertIn("still crashes", second_fix)
-        # The downgraded item is not part of the fix round.
-        self.assertNotIn("old.py:2", second_fix)
-        self.assertIn("round 2 changes_requested (1 blocking, 1 downgraded)", outcome.messages[0])
-        self.assertIn("old.py:2", self.gh_state()["prs"][0]["body"].split("## 跟进\n")[1])
-
-    async def test_a_problem_the_fix_introduced_is_sent_back(self):
-        introduced = block("calc.py:3", impact="wrong exception type", basis="introduced_since_previous")
-        outcome = await self.run_task(FIRST, verdict(introduced), PASS, fixes=(FIX, {"calc.py": "x = 1\n"}))
-        assert isinstance(outcome, Emit), outcome
-        self.assertIn("review=pass after 3 round", outcome.messages[0])
-        self.assertIn("wrong exception type", self.calls("sde")[2]["prompt"])
-
-    async def test_the_second_round_is_told_its_scope_and_still_gets_the_full_diff(self):
-        await self.run_task(FIRST, PASS)
-        prompt = self.calls("reviewer")[1]["prompt"]
-        scope = prompt.split("## Incremental review\n")[1]
-        for part in ("unfixed_previous", "introduced_since_previous", "- calc.py\n", "1 blocking item",
-                     "rename divide to safe_divide"):
-            self.assertIn(part, scope)
-        self.assertNotIn("- old.py", scope)
-        self.assertIn("old.py", prompt.split("## Code diff")[1].split("## Previous review round")[0])
-
-    async def test_a_recheck_after_a_hand_back_blocks_only_on_changes_since_the_pass(self):
-        self.push_main({"calc.py": MAIN_CALC}, message="divide returns b")
-        self.set_plan(sde=[dev({"calc.py": TASK_CALC, "old.py": BUGGY["old.py"]}),
-                           {**dev({"calc.py": RESOLVED}, commit="merge origin/main"), "run": MERGE_MAIN}],
-                      reviewer=[PASS, verdict({**OLD_CODE, "basis": "unfixed_previous", "previous_item": 1})])
-        outcome = await self.executor(delivery=self.delivery()).execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
-        self.assertIn("round 2 pass (1 downgraded)", outcome.messages[0])
-        self.assertIn("## Incremental review", self.calls("reviewer")[1]["prompt"])
-        self.assertIn("old.py:2", self.gh_state()["prs"][0]["body"].split("## 跟进\n")[1])
-
-    async def test_a_recheck_still_blocks_on_the_conflict_resolution(self):
-        self.push_main({"calc.py": MAIN_CALC}, message="divide returns b")
-        bad = block("calc.py:3", impact="lost main's change", basis="introduced_since_previous")
-        self.set_plan(sde=[dev({"calc.py": TASK_CALC}),
-                           {**dev({"calc.py": RESOLVED}, commit="merge origin/main"), "run": MERGE_MAIN},
-                           dev({"calc.py": RESOLVED + "# both\n"})],
-                      reviewer=[PASS, verdict(bad), PASS])
-        outcome = await self.executor(delivery=self.delivery()).execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
-        self.assertIn("lost main's change", self.calls("sde")[2]["prompt"])
-
-    async def test_a_follow_up_is_developed_and_the_next_review_stays_incremental(self):
-        # A message added while the task waited does not reopen code the earlier round already covered.
-        for follow_up, recheck in (("carry on with the original requirements", False), ("keep main's divide", True)):
-            with self.subTest(follow_up):
-                await self.follow_up_round(follow_up, recheck)
-
-    async def follow_up_round(self, follow_up, recheck):
-        for name in ("sde", "reviewer"):
-            Path(f"{self.plan}.{name}.n").unlink(missing_ok=True)
-        self.log.unlink(missing_ok=True)
-        late = verdict({**OLD_CODE, "basis": "introduced_since_previous"})
-        question = {"output": {"status": "needs_input", "summary": "s", "test_evidence": "", "question": "which?",
-                               "change_kind": "fix", "change_rationale": "r"}}
-        if recheck:
-            self.push_main({"calc.py": MAIN_CALC}, message="divide returns b")
-            self.set_plan(sde=[dev({"calc.py": TASK_CALC}), question,
-                               {**dev({"calc.py": RESOLVED}, commit="merge"), "run": MERGE_MAIN}], reviewer=[PASS, late])
-        else:
-            self.set_plan(sde=[dev(BUGGY), question, dev(FIX)], reviewer=[FIRST, late])
-        executor = self.executor(delivery=self.delivery(open_pr=recheck))
-        outcome = await executor.execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        batch = [event({"text": follow_up}), event({"approval_request_id": outcome.request_id, "approved": True})]
-        done = await executor.execute(batch, self.resume(outcome), self.caps)
-        assert isinstance(done, Emit), done
-        self.assertIn("round 2 pass (1 downgraded)", done.messages[0])
-        self.assertIn(follow_up, self.calls("sde")[2]["prompt"])
-        prompt = self.calls("reviewer")[1]["prompt"]
-        self.assertIn(follow_up, prompt)
-        scope = prompt.split("## Incremental review\n")[1]
-        # An added requirement is context: it does not move a finding in unchanged code to a changed file.
-        self.assertIn("A requirement a person added since that review", scope)
-        self.assertIn("keep its real location and put it in notes", scope)
-        self.assertNotIn("closest", scope)
-        self.assertEqual("## Why this is reviewed again" in prompt, recheck)
-
-    async def test_a_follow_up_with_the_approval_of_a_spent_review_stays_incremental(self):
-        self.set_plan(sde=[dev(BUGGY), dev(FIX)], reviewer=[FIRST, verdict(OLD_CODE)])
-        executor = self.executor(delivery=self.delivery())
-        executor._options = type(executor._options)(max_review_rounds=1)
-        outcome = await executor.execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        batch = [event({"text": "fix it as originally required"}),
-                 event({"approval_request_id": outcome.request_id, "approved": True})]
-        done = await executor.execute(batch, self.resume(outcome), self.caps)
-        assert isinstance(done, Emit), done
-        self.assertIn("fix it as originally required", self.calls("sde")[1]["prompt"])
-        self.assertIn("round 2 pass (1 downgraded)", done.messages[0])
-
-    async def test_rounds_still_run_out_and_wait_for_a_person(self):
-        unfixed = block("calc.py:2", basis="unfixed_previous", previous_item=1)
-        outcome = await self.run_task(FIRST, verdict(unfixed, OLD_CODE), fixes=({"a.txt": "1\n"}, {"a.txt": "2\n"}))
-        assert isinstance(outcome, Suspend), outcome
-        self.assertIn("still changes_requested after 3 round(s)", outcome.prompt)
-        self.assertEqual(len(self.calls("reviewer")), 3)
-
     async def test_notes_reach_the_outbox_when_no_pr_is_opened(self):
         for name, delivery in (("no PR", self.delivery(open_pr=False)), ("no delivery step", None)):
             with self.subTest(name):
@@ -334,23 +356,6 @@ class TestRoleReviewRounds(SDEDeliveryCase):
                 assert isinstance(outcome, Emit), outcome
                 self.assertIn("跟进：\n- split calc.py", outcome.messages[0])
                 self.assertEqual(self.gh_state().get("prs", []), [])
-
-    async def test_notes_survive_a_declined_review_retry(self):
-        executor = self.executor(delivery=self.delivery())
-        self.set_plan(sde=[dev(BUGGY)], reviewer=[FIRST, {"error": "reviewer crashed"}])
-        outcome = await executor.execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        declined = await executor.execute([event({"approval_request_id": outcome.request_id, "approved": False})],
-                                          self.resume(outcome), self.caps)
-        assert isinstance(declined, Emit), declined
-        self.assertIn("跟进：\n- rename divide to safe_divide", declined.messages[0])
-        self.assertIn("## 跟进\n- rename divide to safe_divide", self.gh_state()["prs"][0]["body"])
-
-    async def test_without_notes_there_is_no_follow_up_section(self):
-        outcome = await self.run_task(PASS)
-        assert isinstance(outcome, Emit), outcome
-        self.assertNotIn("跟进", outcome.messages[0])
-        self.assertNotIn("## 跟进", self.gh_state()["prs"][0]["body"])
 
 
 class TestReviewCheckpoint(unittest.TestCase):

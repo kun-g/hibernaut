@@ -24,6 +24,7 @@ from agent_runtime.adapters.delivery import (
 )
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteDeliveryStore
 from agent_runtime.core.models import DeliveryOutcome, Event, PermissionDecision
+from tests import fake_gh
 from tests.fakes import InMemoryPermission
 
 FAKE_GH = Path(__file__).with_name("fake_gh.py")
@@ -174,6 +175,13 @@ def _repoint_origin(repo: Path, old_bare: Path, new_bare: Path) -> None:
     cfg.write_text(cfg.read_text(encoding="utf-8").replace(str(old_bare), str(new_bare)), encoding="utf-8")
 
 
+class FixtureDelivery(PRDelivery):
+    def _run(self, argv, cwd, *, timeout=300.0):
+        if argv[0] == self.config.gh_command:
+            return fake_gh.run(argv, cwd=cwd, env=self._env)
+        return super()._run(argv, cwd, timeout=timeout)
+
+
 class DeliveryCase(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -242,9 +250,9 @@ class DeliveryCase(unittest.TestCase):
         git(self.seed, "push", "-q", "origin", "main")
         self._main_moved = True
 
-    def delivery(self, sleep=None, **overrides):
-        return PRDelivery(dataclasses.replace(self.config, **overrides), self.store, env=self.env,
-                          sleep=sleep or self.sleeps.append)
+    def delivery(self, sleep=None, *, launch_gh=False, **overrides):
+        cls = PRDelivery if launch_gh else FixtureDelivery
+        return cls(dataclasses.replace(self.config, **overrides), self.store, env=self.env, sleep=sleep or self.sleeps.append)
 
     def request(self, workdir, kind="feature", review="pass", work_key=None, title="divide rejects zero", issue=""):
         return DeliveryRequest(work_key=work_key or f"task:{workdir.name}", workdir=workdir, title=title,
@@ -299,7 +307,7 @@ class TestOpenPullRequest(DeliveryCase):
     def test_merges_latest_main_sets_version_runs_checks_pushes_and_creates_the_pr(self):
         wt = self.task("task-a", {"calc.py": "def divide(a, b):\n    return a / b\n"})
         self.push_main({"README.md": "docs\n"})
-        rec = self.delivery().deliver(self.request(wt), permissions=InMemoryPermission())
+        rec = self.delivery(launch_gh=True).deliver(self.request(wt), permissions=InMemoryPermission())
         self.assertEqual(rec.problem, "")
         self.assertEqual(rec.state, "pr_open")
         self.assertEqual((rec.base_version, rec.bump, rec.version), ("0.4.0", "minor", "0.5.0"))
