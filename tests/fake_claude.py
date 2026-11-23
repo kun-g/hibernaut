@@ -244,6 +244,8 @@ elif role == "steward":
         sys.exit(step["exit"])
     if step.get("calls") and step.get("pidfile_after"):
         park(step["pidfile_after"])
+    while step.get("wait_for") and not Path(step["wait_for"]).exists():
+        time.sleep(0.02)
     output = step.get("output", {"action": "silent", "message": ""})
 else:
     step = step or {}

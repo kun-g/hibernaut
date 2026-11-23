@@ -169,7 +169,8 @@ description = "巡检与例行检查"
 # 可选：不属于任何项目的 Inbox（sys:* / user:*）。没有项目检出，启动目录 workdir 必填（支持 ~，相对路径以本文件所在目录为准，不自动创建，
 # 不存在则事件保持 pending）。键同 [[projects.<name>.inbox_bindings]]，第一个整串匹配的生效；不能与项目的 inbox_id 重叠。
 # 可写目录只给一个 Inbox：pattern 须是精确 ID，两条绑定不能指向同一可写目录，也不能在项目检出或 steward 的 workdir 里。
-# 只能用不带 role 的 CLI agent。没有绑定也不匹配项目的 Inbox，事件保持 pending。规范见 docs/inbox-conventions.md。
+# 可用不带 role 的 CLI agent；checkout_access = "readonly" 的绑定还可用 steward（sde、code-reviewer 拒绝）。
+# 没有绑定也不匹配项目的 Inbox，事件保持 pending。规范见 docs/inbox-conventions.md。
 [[runtime.inbox_bindings]]
 pattern = "sys:hb-ops"
 default_agent = "ops"
@@ -177,11 +178,22 @@ agents = ["ops"]
 workdir = "/absolute/path/to/your/ops-workdir"
 checkout_access = "readwrite"   # readwrite（默认）| readonly：可共享目录、可用正则；CLI 的只读由它自己的参数保证
 
+# 全局 Steward：接个人对话（如飞书单聊），能答的自己答，新活转投到 forward_to 列出的项目。目录以这里的 workdir 为准（Orca 已登记的 Git 检出），
+# agent 自己写了 workdir 须是同一个目录。同一个对话派出的每件活各有会话与 worktree。
+[[runtime.inbox_bindings]]
+pattern = "user:main"
+default_agent = "steward"
+agents = ["steward"]
+workdir = "/absolute/path/to/your/workspace"
+checkout_access = "readonly"
+forward_to = ["proj:hibernaut"]   # 可选：每项是某个项目的主 inbox（inbox_id 的第一个精确 ID），否则拒绝加载；省略则不能转投出本绑定
+
 [projects.hibernaut]
 # 字符串：一个精确 inbox_id（原有写法，不当正则）。数组：每项直接是正则，须整串匹配（fullmatch），不用加 "re:"（旧写法仍可用）；
 # 不含正则语法的项是精确 ID（字面的点写成 "\\."）。第一个精确 ID 是主 inbox，Switchboard 的群聊和仓库路由应指向本项目服务的 inbox。
 # 服务多个 inbox 的项目，每个写任务都在该 inbox 自己的 hb-* worktree 里运行。
 inbox_id = ["proj:hibernaut", "proj:hibernaut:.+"]
+# description = "Always-on Agent 运行时"   # 可选：写进全局 Steward 的路由清单
 repo = "kun-g/hibernaut"
 checkout = "/absolute/path/to/your/hibernaut"   # 可省略：按 repo 在 Orca 已登记的仓库（orca repo list）里找主检出，找不到或不止一个则加载报错
 worktree_backend = "orca"    # orca | git

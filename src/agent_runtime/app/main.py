@@ -54,6 +54,7 @@ from agent_runtime.adapters.executor_cli.orca import (
     TerminalUnavailable,
     default_transcript_roots,
 )
+from agent_runtime.adapters.executor_cli.steward import GlobalScope
 from agent_runtime.adapters.executor_cli.reclaim_sweep import (
     DEFAULT_SWEEP_INTERVAL_SECONDS,
     SweepTarget,
@@ -119,6 +120,8 @@ from agent_runtime.app.projects import (
     InboxRefused,
     MissingWorkdirHold,
     UnmatchedProjectHold,
+    WorkdirBinding,
+    build_global_manifest,
     build_routing_manifest,
 )
 from agent_runtime.core.models import Event, InboxBinding, InboxRoute, NewEventPolicy
@@ -377,6 +380,20 @@ class AsyncWorkerPool:
         await asyncio.wait_for(self._idle_event.wait(), timeout=timeout_seconds)
 
 
+class ForwardTargets:
+    # What the configuration in force lets each inbox outside a project forward to. Shared by every generation: one that
+    # a reload retired still runs what it started, but sends nothing to a project that was taken off the list since.
+    def __init__(self, config: HibernautConfig) -> None:
+        self._in_force = config.runtime.workdir_binding
+
+    def activate(self, config: HibernautConfig) -> None:
+        self._in_force = config.runtime.workdir_binding
+
+    def allowed(self, inbox_id: str, own: tuple[str, ...]) -> tuple[str, ...]:
+        bound = self._in_force(inbox_id)
+        return tuple(target for target in own if bound is not None and target in bound.forward_to)
+
+
 @dataclass
 class AlwaysOnDaemon:
     db: SQLiteDatabase
@@ -410,6 +427,8 @@ class AlwaysOnDaemon:
     memory_http: ScopedMemoryHTTPServer | None = None
     memory_gc: MemoryGarbageCollector | None = None
     memory_gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
+    # One per process too; a reload points it at the new configuration once that is in force.
+    forward_targets: ForwardTargets | None = None
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def register_partition(
@@ -1025,6 +1044,7 @@ def build_daemon_from_config(
     runner: RunnerHandle | None = None,
     limiter: ConcurrencyLimiter | None = None,
     memory_hub: GovernedMemoryHub | None = None,
+    forward_targets: ForwardTargets | None = None,
 ) -> AlwaysOnDaemon:
     if demo and config.runner_pilot.enabled:
         raise ValueError("runner_pilot.enabled cannot be used with --demo")
@@ -1129,6 +1149,9 @@ def build_daemon_from_config(
         limiter=limiter,
     )
 
+    targets = forward_targets if forward_targets is not None else ForwardTargets(config)
+    daemon.forward_targets = targets
+
     if config.runner.enabled and not demo:
         # A reload passes the running one, whose settings cannot change without a restart.
         daemon.runner = runner if runner is not None else open_runner(config)
@@ -1179,6 +1202,38 @@ def build_daemon_from_config(
                 terminal=cli_terminal if no_terminal is None else TerminalUnavailable(no_terminal),
                 workdir=role.workdir,
                 branch=role.branch,
+            )
+
+        def _bound_steward(role: RoleConfig, bound: WorkdirBinding) -> StewardExecutor:
+            def listed(inbox_id: str) -> tuple[ProjectConfig, ...]:
+                route = _route(inbox_id)
+                allowed = route.forward_to if route is not None else ()
+                return tuple(p for target in allowed for p in config.projects.values() if p.inbox_id == target)
+
+            def readable(inbox_id: str, asked: str) -> bool:
+                try:
+                    project = router.resolve(asked)
+                except AmbiguousProjectMatch:
+                    return False
+                return project is not None and project in listed(inbox_id)
+
+            return StewardExecutor(
+                profile=role.profile,
+                checkouts=inbox_checkout_map,
+                sessions=daemon.sessions,
+                events=daemon.inbox,
+                manifest=lambda: "",
+                in_project=lambda _inbox_id: False,
+                terminal=cli_terminal,
+                workdir=bound.workdir,
+                branch=role.branch,
+                scope=GlobalScope(
+                    manifest=lambda inbox_id: build_global_manifest(
+                        inbox_id, bound.binding, tuple(config.agents.values()), listed(inbox_id),
+                        config.runtime.default_agent,
+                    ),
+                    readable=readable,
+                ),
             )
 
         def _role_executors(
@@ -1300,6 +1355,9 @@ def build_daemon_from_config(
             for bound in config.runtime.inbox_bindings
         }
         for bound in config.runtime.inbox_bindings:
+            for name in bound.binding.agents:
+                if name in config.roles:
+                    bound_executors[bound.rule.pattern][name] = _bound_steward(config.roles[name], bound)
             if not bound.readonly and bound.rule.literal is not None:
                 daemon.partitions.register(bound.rule.literal, bound.workdir)
         for registry in (*executors_by_project.values(), *bound_executors.values(), fallback_executors):
@@ -1346,7 +1404,8 @@ def build_daemon_from_config(
                 route = project.route(inbox_id)
             else:
                 bound = config.runtime.workdir_binding(inbox_id)
-                route = bound.route() if bound is not None else None
+                route = replace(bound.route(), forward_to=targets.allowed(inbox_id, bound.forward_to)) if (
+                    bound is not None) else None
             return pilot_inbox(route.project) if route is not None and _on_pilot_route(inbox_id) else route
 
         # One per config generation, so a held event is logged once each time it enters the wait.
@@ -1706,6 +1765,7 @@ async def serve_configured(
                         runner=daemon.runner,
                         limiter=shared_limiter,
                         memory_hub=daemon.memory_hub,
+                        forward_targets=daemon.forward_targets,
                     )
                     handler = replacement.http_handler()
                     if address != (config.channels.host, config.channels.port):
@@ -1725,6 +1785,8 @@ async def serve_configured(
 
                 if replacement.runner is not None:
                     replacement.runner.apply(candidate)
+                if replacement.forward_targets is not None:
+                    replacement.forward_targets.activate(candidate)
                 previous = generation
                 # Stop the old services first so two dispatchers never send the same Outbox row.
                 await previous.stop_services()
