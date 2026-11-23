@@ -2,7 +2,6 @@ import asyncio
 import http.client
 import json
 import os
-import shlex
 import socket
 import sqlite3
 import subprocess
@@ -59,8 +58,6 @@ class FakeOrcaTerminals:
         if verb == "terminal create":
             worktree = flags["--worktree"].removeprefix("path:")
             handle = f"term_{uuid.uuid4().hex[:8]}"
-            # Read now: the runner removes it with the turn.
-            spec = json.loads(Path(shlex.split(flags["--command"])[-1]).read_text())
             screen = (self.root / f"{handle}.screen").open("wb")
             proc = await asyncio.create_subprocess_exec(
                 "/bin/sh", "-c", flags["--command"], cwd=worktree,
@@ -68,7 +65,7 @@ class FakeOrcaTerminals:
             )
             screen.close()
             self.terminals[handle] = {"proc": proc, "title": flags["--title"], "worktree": worktree,
-                                      "incarnation": uuid.uuid4().hex, "command": flags["--command"], "exec": spec.get("exec")}
+                                      "incarnation": uuid.uuid4().hex, "command": flags["--command"]}
             return {"terminal": {"handle": handle, "incarnationId": self.terminals[handle]["incarnation"],
                                  "title": flags["--title"]}}
         if verb == "terminal list":
@@ -362,15 +359,31 @@ class TestVisibleSDE(VisibleCase):
 
     async def test_timeout_closes_the_terminal_and_keeps_the_conversation_resumable(self):
         self.set_plan(sde=[{"hang": True}])
-        outcome = await self.sde(review=False, timeout=0.8).execute([event(self.payload())], None, self.caps)
+        # The timeout fires once the agent runs, however long that takes on a busy machine.
+        turns: list[asyncio.Timeout] = []
+        real = asyncio.timeout
+
+        def timeout(delay):
+            turn = real(delay)
+            if delay == 600.0:
+                turns.append(turn)
+            return turn
+
+        with patch("asyncio.timeout", timeout):
+            task = asyncio.create_task(
+                self.sde(review=False, timeout=600.0).execute([event(self.payload())], None, self.caps))
+            while not task.done() and not self.calls("sde", "interactive"):
+                await asyncio.sleep(0.02)
+            (turn,) = turns
+            turn.reschedule(asyncio.get_running_loop().time())
+            outcome = await task
         assert isinstance(outcome, Emit), outcome
-        self.assertIn("development failed: timed out after 0.8", outcome.messages[0])
+        self.assertIn("development failed: timed out after 600.0", outcome.messages[0])
         (handle,) = self.orca.terminals
         self.assertIsNotNone(self.orca.terminals[handle]["proc"].returncode)
         binding = self.bindings.get(outcome.session_id)
         self.assertIsNone(binding.handle)
-        # From the launch: on a loaded machine the CLI itself may not have started yet.
-        self.assertEqual(binding.native_session_id, arg({"argv": self.orca.terminals[handle]["exec"]}, "--session-id"))
+        self.assertEqual(binding.native_session_id, arg(self.calls("sde", "interactive")[0], "--session-id"))
 
     async def test_interrupt_cancels_without_output_and_closes_the_terminal(self):
         self.set_plan(sde=[{"hang": True}])

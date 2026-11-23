@@ -5,15 +5,17 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, ParamSpec, TypeVar, cast
 
 from runner.cli_drivers import (
     CLIDriver,
     NoopStreamPipe,
+    ParsedCLIOutput,
     StreamEvent,
     StreamPipe,
     default_cli_drivers,
+    format_prefixed_session_id,
 )
 from runner.config import NamespacePolicy, ProjectCheckout, RunnerConfig
 from runner.protocol import (
@@ -28,10 +30,12 @@ from runner.protocol import (
     RunStatus,
     RunnerCapabilities,
     SlotSnapshot,
+    ToolAuthorizer,
     run_identity,
     utc_now_iso,
 )
 from runner.supervisor import ChildEnvError, ProcessSupervisor, build_child_env
+from runner.tool_gate import ToolGate, ToolGateBinding
 from runner.worktree import (
     GitWorktreeBackend,
     OrcaWorktreeBackend,
@@ -72,7 +76,21 @@ async def _to_thread_to_completion(fn: Callable[_P, _T], /, *args: _P.args, **kw
 class _InFlightRun:
     future: asyncio.Future[RunResult]
     cancel_event: asyncio.Event
+    authorizer: ToolAuthorizer | None = None
+    hook_missing: bool = False
     grace_seconds: float = 2.0
+
+
+def _tool_authorization_refusal(req: RunRequest, driver: CLIDriver, authorizer: ToolAuthorizer | None) -> str | None:
+    if authorizer is None:
+        if req.authorize_tools:
+            return "the request requires tool authorization, but no authorizer is attached"
+        if driver.calls_tools is True:
+            return f"executor {req.executor_id!r} calls tools, and no tool authorizer is attached"
+        return None
+    if driver.tool_hook is None:
+        return f"tool authorization is required, but executor {req.executor_id!r} has no tool hook"
+    return None
 
 
 class RunnerDaemon:
@@ -84,6 +102,7 @@ class RunnerDaemon:
         worktree_manager: WorktreeManager | None = None,
         supervisor: ProcessSupervisor | None = None,
         stream_pipe: StreamPipe | None = None,
+        hook_arm_timeout_seconds: float = 60.0,
     ) -> None:
         self._config = config
         self._drivers: dict[str, CLIDriver] = dict(drivers) if drivers is not None else default_cli_drivers()
@@ -96,6 +115,8 @@ class RunnerDaemon:
             runner_id=config.runner_id,
             logs_dir=config.logs_dir,
         )
+        # How long a CLI may run before its tool hook reports in. Cursor takes up to 15 s to start a session.
+        self._hook_arm_timeout = hook_arm_timeout_seconds
         self._stream_pipe: StreamPipe = stream_pipe or NoopStreamPipe()
         self._active_runs: dict[str, _InFlightRun] = {}
         self._completed_runs: dict[str, RunResult] = {}
@@ -111,6 +132,11 @@ class RunnerDaemon:
     @property
     def worktrees(self) -> WorktreeManager:
         return self._worktrees
+
+    def reconfigure(self, *, projects: Mapping[str, ProjectCheckout], drivers: Mapping[str, CLIDriver]) -> None:
+        # For the next runs only: a run in flight holds the checkout and driver it started with.
+        self._config = replace(self._config, projects=dict(projects))
+        self._drivers = dict(drivers)
 
     def close(self) -> None:
         self._worktrees.close()
@@ -151,7 +177,7 @@ class RunnerDaemon:
     async def capabilities(self) -> RunnerCapabilities:
         return self.capabilities_sync()
 
-    async def run(self, req: RunRequest, *, caller_id: str) -> RunResult:
+    async def run(self, req: RunRequest, *, caller_id: str, authorizer: ToolAuthorizer | None = None) -> RunResult:
         started_at = utc_now_iso()
         start_mono = time.monotonic()
 
@@ -185,6 +211,10 @@ class RunnerDaemon:
         if driver is None:
             return self._refused(req, started_at, start_mono, "config_error", f"unknown executor_id: {req.executor_id}")
 
+        refusal = _tool_authorization_refusal(req, driver, authorizer)
+        if refusal is not None:
+            return self._refused(req, started_at, start_mono, "permission_denied", refusal)
+
         if req.interactive and self._config.interactive_surface != "orca":
             return self._refused(
                 req,
@@ -208,7 +238,7 @@ class RunnerDaemon:
             return self._refused(req, started_at, start_mono, "rate_limit", "slots_full")
 
         loop = asyncio.get_running_loop()
-        entry = _InFlightRun(future=loop.create_future(), cancel_event=asyncio.Event())
+        entry = _InFlightRun(future=loop.create_future(), cancel_event=asyncio.Event(), authorizer=authorizer)
         self._active_runs[req.run_id] = entry
         self._run_identities[req.run_id] = identity
         self._active_slots += 1
@@ -395,40 +425,65 @@ class RunnerDaemon:
             return self._refused(req, started_at, start_mono, "permission_denied", str(exc))
 
         pre_fp = await asyncio.to_thread(worktree_fingerprint, resolved.workdir) if req.readonly else None
-        spec = driver.build_command(req, resolved.workdir)
-        try:
-            child_env = build_child_env(
-                os.environ,
-                extra_env=spec.env,
-                credential_lease=req.credential_lease,
-            )
-        except ChildEnvError as exc:
-            return self._refused(req, started_at, start_mono, "permission_denied", str(exc))
+        gate: ToolGate | None = None
+        arm_watch: asyncio.Task[None] | None = None
+        result_line: str | None = None
 
         def _on_line(line: str) -> None:
+            nonlocal result_line
             stripped = line.strip()
             if stripped.startswith("{"):
                 try:
                     parsed = json.loads(stripped)
                     if isinstance(parsed, dict):
-                        self._stream_pipe.on_event(StreamEvent(kind="json", payload=cast(dict[str, Any], parsed)))
+                        payload = cast(dict[str, Any], parsed)
+                        if payload.get("type") == "result":
+                            result_line = stripped
+                        self._stream_pipe.on_event(StreamEvent(kind="json", payload=payload))
                         return
                 except json.JSONDecodeError:
                     pass
             self._stream_pipe.on_event(StreamEvent(kind="text", payload=line))
 
-        sup_out = await self._supervisor.execute(
-            run_id=req.run_id,
-            argv=spec.argv,
-            cwd=resolved.workdir,
-            env=child_env,
-            stdin_text=spec.stdin_text,
-            timeout_seconds=req.timeout_seconds,
-            idle_timeout_seconds=spec.idle_timeout_seconds,
-            cancel_event=entry.cancel_event,
-            grace_seconds=entry.grace_seconds,
-            on_stdout_line=_on_line,
-        )
+        try:
+            binding: ToolGateBinding | None = None
+            if entry.authorizer is not None:
+                gate = ToolGate(
+                    run_id=req.run_id,
+                    authorizer=entry.authorizer,
+                    stopped=entry.cancel_event.is_set,
+                    on_defer=entry.cancel_event.set,
+                )
+                binding = await gate.open()
+            spec = driver.build_command(req, resolved.workdir, tool_gate=binding)
+            try:
+                child_env = build_child_env(
+                    os.environ,
+                    extra_env=spec.env,
+                    credential_lease=req.credential_lease,
+                )
+            except ChildEnvError as exc:
+                return self._refused(req, started_at, start_mono, "permission_denied", str(exc))
+            if gate is not None:
+                arm_watch = asyncio.create_task(self._stop_unless_armed(gate, entry))
+            sup_out = await self._supervisor.execute(
+                run_id=req.run_id,
+                argv=spec.argv,
+                cwd=resolved.workdir,
+                env=child_env,
+                stdin_text=spec.stdin_text,
+                timeout_seconds=req.timeout_seconds,
+                idle_timeout_seconds=spec.idle_timeout_seconds,
+                cancel_event=entry.cancel_event,
+                grace_seconds=entry.grace_seconds,
+                on_stdout_line=_on_line,
+            )
+        finally:
+            if arm_watch is not None:
+                arm_watch.cancel()
+                await asyncio.gather(arm_watch, return_exceptions=True)
+            if gate is not None:
+                await gate.close()
 
         if pre_fp is not None:
             post_fp = await asyncio.to_thread(worktree_fingerprint, resolved.workdir)
@@ -457,7 +512,16 @@ class RunnerDaemon:
                     duration_ms=max(0, int((time.monotonic() - start_mono) * 1000)),
                 )
 
-        parsed = driver.parse_output(sup_out.stdout_excerpt, sup_out.stderr_excerpt, sup_out.exit_code)
+        stdout = sup_out.stdout_excerpt
+        if result_line is not None and result_line not in stdout:
+            # The excerpt keeps the start of a long stream; the line that ends it carries the reply.
+            stdout = f"{stdout}\n{result_line}"
+        parsed = driver.parse_output(stdout, sup_out.stderr_excerpt, sup_out.exit_code)
+        if parsed.executor_session_id is None and gate is not None:
+            # A run stopped by a deferred call may not have printed its session id yet.
+            parsed = replace(
+                parsed, executor_session_id=format_prefixed_session_id(req.executor_id, gate.native_session_id)
+            )
         status: RunStatus
         error_kind: ErrorKind | None = None
         error_summary: str | None = None
@@ -476,6 +540,16 @@ class RunnerDaemon:
             error_kind = "tool_error"
             error_summary = (sup_out.stderr_excerpt.strip() or f"exit_code={sup_out.exit_code}")[:500]
 
+        if gate is not None and gate.deferred is not None:
+            call, decision = gate.deferred
+            status, error_kind = "interrupted", None
+            error_summary = f"tool call {call.tool_name!r} deferred for approval: {decision.reason}"[:500]
+        elif entry.hook_missing or (gate is not None and not gate.armed.is_set() and status == "succeeded"):
+            # Without its hook the CLI acts unchecked, so nothing it says is delivered.
+            status, error_kind = "failed", "permission_denied"
+            error_summary = f"executor {req.executor_id!r} did not load its tool authorization hook; result discarded"
+            parsed = ParsedCLIOutput()
+
         return RunResult(
             run_id=req.run_id,
             runner_id=self._config.runner_id,
@@ -486,6 +560,7 @@ class RunnerDaemon:
             error_kind=error_kind,
             error_summary=error_summary,
             stdout_excerpt=sup_out.stdout_excerpt,
+            final_text=parsed.final_text,
             structured_output=parsed.structured_output,
             log_ref=sup_out.log_ref,
             worktree_ref=resolved.ref,
@@ -493,6 +568,14 @@ class RunnerDaemon:
             ended_at=utc_now_iso(),
             duration_ms=max(0, int((time.monotonic() - start_mono) * 1000)),
         )
+
+    async def _stop_unless_armed(self, gate: ToolGate, entry: _InFlightRun) -> None:
+        try:
+            await asyncio.wait_for(gate.armed.wait(), timeout=self._hook_arm_timeout)
+        except TimeoutError:
+            if not entry.cancel_event.is_set():
+                entry.hook_missing = True
+                entry.cancel_event.set()
 
     def _refused(
         self,

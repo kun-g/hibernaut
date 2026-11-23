@@ -10,6 +10,8 @@ from runner.protocol import (
     InterruptRequest,
     ReclaimRequest,
     RunRequest,
+    ToolCall,
+    ToolDecision,
     utc_now_iso,
 )
 from runner.transport.ws_protocol import (
@@ -121,6 +123,24 @@ class RunnerRelayAgent:
             async with send_lock:
                 await send_json(writer, obj, mask=True)
 
+        pending_decisions: dict[str, asyncio.Future[ToolDecision]] = {}
+
+        async def _authorize(call: ToolCall) -> ToolDecision:
+            fut: asyncio.Future[ToolDecision] = asyncio.get_running_loop().create_future()
+            pending_decisions[call.call_id] = fut
+            try:
+                await _send(
+                    {
+                        "type": "tool.authorize",
+                        "conn_epoch": self._conn_epoch,
+                        "call": call.to_dict(),
+                        "ts": utc_now_iso(),
+                    }
+                )
+                return await fut
+            finally:
+                pending_decisions.pop(call.call_id, None)
+
         bg_tasks: set[asyncio.Task[None]] = set()
         try:
             await client_handshake(reader, writer, host=f"{host}:{port}", path=path)
@@ -186,7 +206,9 @@ class RunnerRelayAgent:
 
                     async def _exec_and_reply(r: RunRequest = req, cid: str = caller_id) -> None:
                         _log.info("run %s accepted (executor %s, owner %s)", r.run_id, r.executor_id, r.owner_scope)
-                        res = await self._daemon.run(r, caller_id=cid)
+                        res = await self._daemon.run(
+                            r, caller_id=cid, authorizer=_authorize if r.authorize_tools else None
+                        )
                         _log.info("run %s ended: %s in %d ms", r.run_id, res.status, res.duration_ms)
                         try:
                             await _send(
@@ -203,6 +225,11 @@ class RunnerRelayAgent:
                     t = asyncio.create_task(_exec_and_reply())
                     bg_tasks.add(t)
                     t.add_done_callback(bg_tasks.discard)
+
+                elif ftype == "tool.decision":
+                    waiting = pending_decisions.get(str(frame.get("call_id", "")))
+                    if waiting is not None and not waiting.done():
+                        waiting.set_result(ToolDecision.from_dict(cast(Mapping[str, Any], frame["decision"])))
 
                 elif ftype == "run.interrupt":
                     ireq = InterruptRequest.from_dict(cast(Mapping[str, Any], frame["request"]))

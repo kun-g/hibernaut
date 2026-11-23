@@ -136,6 +136,33 @@ def _signal_group(pgid: int, sig: signal.Signals) -> bool:
     return True
 
 
+def group_is_only_zombies(pgid: int, *, proc_root: Path = Path("/proc")) -> bool:
+    # In a container whose PID 1 does not reap orphans, killed descendants stay as zombies and killpg() keeps
+    # succeeding on them. False wherever /proc cannot say (macOS) or shows no member: the signal decides then.
+    try:
+        pids = [entry.name for entry in proc_root.iterdir() if entry.name.isdigit()]
+    except OSError:
+        return False
+    seen = False
+    for pid in pids:
+        try:
+            stat = (proc_root / pid / "stat").read_text(encoding="utf-8", errors="replace")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            return False
+        # The command name may itself hold spaces and parentheses; the fields after the last one are fixed:
+        # state, ppid, pgrp, ... with num_threads 15 further on.
+        fields = stat.rpartition(")")[2].split()
+        if len(fields) < 18 or int(fields[2]) != pgid:
+            continue
+        seen = True
+        # A leader thread that exited shows Z while its other threads still run.
+        if fields[0] not in ("Z", "X") or int(fields[17]) > 1:
+            return False
+    return seen
+
+
 async def terminate_process_group(proc: asyncio.subprocess.Process, *, grace_seconds: float = 2.0) -> None:
     # The child runs with start_new_session=True, so its pid is the process group id of everything it started.
     pgid = proc.pid
@@ -157,6 +184,8 @@ async def terminate_process_group(proc: asyncio.subprocess.Process, *, grace_sec
     # Descendants that outlived (or ignored SIGTERM from) the leader would keep writing the worktree.
     deadline = time.monotonic() + max(grace_seconds, 1.0)
     while _signal_group(pgid, signal.SIGKILL) and time.monotonic() < deadline:
+        if group_is_only_zombies(pgid):
+            break
         await asyncio.sleep(0.02)
 
 

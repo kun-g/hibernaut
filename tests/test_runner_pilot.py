@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 import pytest
 
+from agent_runtime.adapters.runner_bridge import RunnerExecutorBridge
 from agent_runtime.adapters.runner_pilot import (
     LAUNCH_PERMISSION,
     ClosedRouteExecutor,
@@ -29,7 +30,15 @@ from agent_runtime.app.main import AlwaysOnDaemon, build_daemon_from_config
 from agent_runtime.core.models import Emit, Event, ForwardRefused, PermissionDecision, RunCancelled, SessionRef, Silent
 from agent_runtime.core.ports import RunCapabilities
 from agent_runtime.engine.closing import close_session
-from runner.protocol import InterruptRequest, InterruptResult, LogRef, RunnerCapabilities, RunRequest, RunResult
+from runner.protocol import (
+    InterruptRequest,
+    InterruptResult,
+    LogRef,
+    RunnerCapabilities,
+    RunRequest,
+    RunResult,
+    ToolAuthorizer,
+)
 from runner.protocol_check import (
     CHECK_SCHEMA,
     PROTOCOL_CHECK_EXECUTOR_ID,
@@ -141,6 +150,17 @@ def test_neither_an_agent_nor_a_driver_may_take_the_executor_name(table: str, en
         parse_config(raw)
 
 
+def test_the_relay_port_must_not_be_the_one_of_the_general_runner() -> None:
+    raw = _raw(port=8790)
+    raw["executors"]["claude"] = {"command": "claude"}
+    raw["runner"] = {"enabled": True, "mode": "relay", "executors": ["claude"], "listen_port": 8790}
+    with pytest.raises(ValueError, match="runner_pilot.port is runner.listen_port"):
+        parse_config(raw)
+    for change in ({"mode": "in_process"}, {"enabled": False}, {"listen_port": 8795}):
+        other = {**raw, "runner": raw["runner"] | change}
+        assert parse_config(other).runner_pilot.port == 8790
+
+
 def test_demo_mode_cannot_open_the_route(tmp_path: Path) -> None:
     raw = _raw()
     raw["runtime"] |= {"db_path": str(tmp_path / "hb.db"), "memory_root": str(tmp_path / "mem")}
@@ -162,7 +182,8 @@ class _FakeRunner:
     async def reclaim_workspace(self, req: Any) -> Any:
         raise NotImplementedError
 
-    async def run(self, req: RunRequest) -> RunResult:
+    async def run(self, req: RunRequest, *, authorizer: ToolAuthorizer | None = None) -> RunResult:
+        assert authorizer is None and not req.authorize_tools
         self.requests.append(req)
         if isinstance(self._result, BaseException):
             raise self._result
@@ -206,7 +227,7 @@ class _Caps:
 def _execute(
     runner: _FakeRunner, *payloads: dict[str, Any], inbox: str = PILOT, rules: dict[str, PermissionDecision] | None = None
 ) -> Emit:
-    executor = ProtocolCheckExecutor(runner=runner, inbox_id=PILOT, project_key="hibernaut", timeout_seconds=9.0)
+    executor = ProtocolCheckExecutor(runner=runner, inbox_id=PILOT, project_key="hibernaut", timeout_seconds=9.0, node_wait_seconds=0)
     events = [Event(inbox_id=inbox, source="github", external_id=str(i), payload=p) for i, p in enumerate(payloads)]
     session = SessionRef(session_id="sess_1", inbox_id=inbox, correlation_key=KEY, work_key=KEY, executor_session_id="x:1")
     outcome = asyncio.run(executor.execute(events, session, _Caps(rules)))
@@ -329,13 +350,18 @@ class _FakeRelay(_FakeRunner):
     listening = True
 
 
-def _daemon(tmp_path: Path, relay: _FakeRelay, *, enabled: bool = True) -> AlwaysOnDaemon:
+def _daemon(
+    tmp_path: Path, relay: _FakeRelay, *, enabled: bool = True, runner: dict[str, Any] | None = None
+) -> AlwaysOnDaemon:
     # The bindings send every task inbox, the pilot's included, to "cli" and allow nothing else there.
     raw = _raw(enabled=enabled)
     checkout = tmp_path / "checkout"
     checkout.mkdir(exist_ok=True)
     raw["runtime"] |= {"db_path": str(tmp_path / "hb.db"), "memory_root": str(tmp_path / "mem")}
     raw["executors"]["other"] = {"command": "true"}
+    if runner is not None:
+        raw["executors"]["claude"] = {"command": "claude"}
+        raw["runner"] = runner
     raw["projects"]["hibernaut"] |= {
         "checkout": str(checkout),
         "inbox_bindings": [
@@ -347,6 +373,28 @@ def _daemon(tmp_path: Path, relay: _FakeRelay, *, enabled: bool = True) -> Alway
     return build_daemon_from_config(
         parse_config(raw, base_dir=tmp_path), runner_pilot=relay if enabled else None, channel=RecordingChannel(),  # type: ignore[arg-type]
     )
+
+
+def test_the_general_runner_and_the_route_are_independent(tmp_path: Path) -> None:
+    relay = _FakeRelay(_result)
+    daemon = _daemon(tmp_path, relay, runner={
+        "enabled": True, "executors": ["claude"], "state_dir": str(tmp_path / "runner"), "block_tools": [LAUNCH_PERMISSION],
+    })
+    try:
+        pilot = daemon.pool._worker_factory(PILOT, "w")
+        assert set(pilot._executors) == {PROTOCOL_CHECK_EXECUTOR_ID}
+        assert isinstance(pilot._executors[PROTOCOL_CHECK_EXECUTOR_ID], ProtocolCheckExecutor)
+        other = daemon.pool._worker_factory(OTHER, "w")._executors
+        assert type(other["claude"]) is RunnerExecutorBridge
+        assert isinstance(other[PROTOCOL_CHECK_EXECUTOR_ID], ClosedRouteExecutor)
+        # A tool the deployment blocks is blocked on the route too.
+        daemon.handler.ingest(inbox_id=PILOT, source="t", external_id="1", payload={"candidate_commit": COMMIT})
+        _process(daemon, PILOT)
+        (sent,) = _rows(daemon, "outbox", PILOT)
+        assert "权限检查未放行（block）" in sent["content"]
+        assert relay.requests == []
+    finally:
+        daemon.close()
 
 
 def _process(daemon: AlwaysOnDaemon, inbox_id: str, executor: Any = None) -> None:
@@ -473,13 +521,11 @@ def test_with_the_route_off_the_bindings_apply_to_the_pilot_inbox_again(tmp_path
 # --- relay admission and waiting
 
 
-def _relay(tmp_path: Path, **kwargs: Any) -> RunnerPilotRelay:
+def _relay(tmp_path: Path) -> RunnerPilotRelay:
     token_file = tmp_path / "relay.token"
     if not token_file.exists():
         write_token(token_file)
-    return RunnerPilotRelay(
-        runner_id=RUNNER_ID, project_key="hibernaut", port=free_port(), token_file=token_file, **kwargs
-    )
+    return RunnerPilotRelay(runner_id=RUNNER_ID, project_key="hibernaut", port=free_port(), token_file=token_file)
 
 
 def test_relay_listens_on_loopback_only_and_reports_a_taken_port(tmp_path: Path) -> None:
@@ -528,17 +574,24 @@ def test_relay_admits_only_the_pilot_node(tmp_path: Path) -> None:
 
 def test_waiting_for_the_node_is_bounded_and_can_be_interrupted(tmp_path: Path) -> None:
     async def scenario() -> None:
-        relay = _relay(tmp_path, node_wait_seconds=0.5)
+        relay = _relay(tmp_path)
         await relay.start()
-        req = RunRequest(run_id="run_w", namespace="hb", project_key="hibernaut", owner_scope=PILOT, work_key="w",
-                         executor_id=PROTOCOL_CHECK_EXECUTOR_ID, readonly=True, prompt="x")
-        with pytest.raises(NoEligibleRunnerError):
-            await relay.run(req)
-        relay._node_wait = 30.0  # pyright: ignore[reportPrivateUsage]
-        executor = ProtocolCheckExecutor(runner=relay, inbox_id=PILOT, project_key="hibernaut", timeout_seconds=9.0)
         event = Event(inbox_id=PILOT, source="t", external_id="1", payload={"candidate_commit": COMMIT})
-        run = asyncio.create_task(executor.execute([event], SessionRef(session_id="s", inbox_id=PILOT), _Caps()))
-        await asyncio.sleep(0.3)
+        session = SessionRef(session_id="s", inbox_id=PILOT)
+
+        def check(**kwargs: Any) -> ProtocolCheckExecutor:
+            return ProtocolCheckExecutor(
+                runner=relay, inbox_id=PILOT, project_key="hibernaut", timeout_seconds=9.0, **kwargs
+            )
+
+        started = time.monotonic()
+        outcome = await check(node_wait_seconds=0.6).execute([event], session, _Caps())
+        assert isinstance(outcome, Emit) and (outcome.status, outcome.close_session) == ("failed", True)
+        assert outcome.telemetry is not None and outcome.telemetry.error_kind == "network"
+        assert 0.5 < time.monotonic() - started < 5
+        run = asyncio.create_task(check().execute([event], session, _Caps()))
+        await asyncio.sleep(0.8)
+        assert not run.done()  # by default it waits longer than the node's heartbeat
         started = time.monotonic()
         run.cancel()
         with pytest.raises(asyncio.CancelledError) as cancelled:

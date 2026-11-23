@@ -44,7 +44,8 @@
           "driver": { "enum": ["claude", "grok", "cursor-agent", "dsh", "custom"] },
           "supports_resume": { "type": "boolean" },
           "supports_stream_json": { "type": "boolean" },
-          "interactive_surface": { "enum": ["none", "orca"] }
+          "interactive_surface": { "enum": ["none", "orca"] },
+          "tool_authorization": { "type": "boolean" }
         }
       }
     },

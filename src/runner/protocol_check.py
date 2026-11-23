@@ -1,4 +1,4 @@
-# The fixed check program of the read-only pilot (docs/runner.md §8). It runs as a script (python -I -S -B <this file>)
+# The fixed check program of the read-only pilot (docs/runner.md §9). It runs as a script (python -I -S -B <this file>)
 # inside the runner's read-only worktree, reads one JSON request from stdin and writes one JSON report to stdout. It
 # imports only the standard library, takes no path from its caller and reads file contents from the named commit's
 # objects, so neither the worktree's state nor the requester can change what is hashed.

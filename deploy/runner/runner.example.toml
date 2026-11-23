@@ -1,4 +1,4 @@
-# 只读试点的独立 Runner（docs/runner.md §8）。复制到部署目录，改成 runner.toml；相对路径以本文件所在目录为准。
+# 只读试点的独立 Runner（docs/runner.md §9）。复制到部署目录，改成 runner.toml；相对路径以本文件所在目录为准。
 # 多出的表或键、放宽的取值都会让服务拒绝启动。
 
 [runner]

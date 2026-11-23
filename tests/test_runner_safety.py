@@ -18,6 +18,7 @@ from runner.cli_drivers import TemplateCLIDriver
 from runner.config import NamespacePolicy, ProjectCheckout, RunnerConfig
 from runner.daemon import RunnerDaemon
 from runner.protocol import ReclaimRequest, RunRequest, RunResult
+from runner import supervisor as supervisor_module
 from runner.registry import WorkspaceAffinityStore
 from runner.transport.in_process import InProcessRunnerClient
 from runner.transport.relay_client import RunnerRelayAgent
@@ -128,7 +129,12 @@ def _alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return not Path("/proc/self/stat").exists()
+    # Without a PID-1 reaper a killed grandchild stays as a zombie, which kill(pid, 0) still finds.
+    return stat.rpartition(")")[2].split()[0] != "Z"
 
 
 def _wait_dead(pid: int, timeout: float = 3.0) -> bool:
@@ -699,3 +705,68 @@ def test_concurrent_resolves_with_same_hint_get_distinct_worktrees(tmp_path: Pat
         asyncio.run(_scenario())
     finally:
         daemon.close()
+
+
+def _proc_stat(root: Path, pid: int, state: str, pgrp: int, threads: int = 1, comm: str = "sh") -> None:
+    (root / str(pid)).mkdir(parents=True)
+    rest = [state, "1", str(pgrp)] + ["0"] * 14 + [str(threads), "0", "0"]
+    (root / str(pid) / "stat").write_text(f"{pid} ({comm}) {' '.join(rest)}\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("members", "gone"),
+    [
+        ([(11, "Z", 11, 1), (12, "Z", 11, 1)], True),
+        ([(11, "Z", 11, 1), (12, "S", 11, 1)], False),
+        ([(11, "Z", 11, 3)], False),  # a leader thread exited while others still run
+        ([(21, "Z", 21, 1)], False),  # nothing of the group is visible: the signal decides, not this scan
+        ([(11, "X", 11, 1), (21, "R", 21, 1)], True),
+    ],
+)
+def test_group_counts_as_gone_only_when_every_visible_member_is_a_zombie(
+    tmp_path: Path, members: list[tuple[int, str, int, int]], gone: bool
+) -> None:
+    (tmp_path / "self").mkdir()
+    for pid, state, pgrp, threads in members:
+        _proc_stat(tmp_path, pid, state, pgrp, threads, comm="a) b (c")
+    assert supervisor_module.group_is_only_zombies(11, proc_root=tmp_path) is gone
+
+
+def test_group_is_not_called_gone_where_there_is_no_proc(tmp_path: Path) -> None:
+    assert supervisor_module.group_is_only_zombies(11, proc_root=tmp_path / "missing") is False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs /proc and PR_SET_CHILD_SUBREAPER")
+def test_reap_does_not_wait_out_the_grace_for_unreaped_zombies(tmp_path: Path) -> None:
+    # Orphans of the group are adopted by this process, which never reaps them: the same as a container whose PID 1
+    # does not wait for its children.
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    assert libc.prctl(36, 1, 0, 0, 0) == 0
+    pidfile = tmp_path / "pids"
+    pids: list[int] = []
+
+    async def _scenario() -> float:
+        proc = await asyncio.create_subprocess_exec(
+            PY, "-c", _SPAWN_SCRIPT, str(pidfile), start_new_session=True, stdout=asyncio.subprocess.DEVNULL
+        )
+        pids.extend(await _wait_pids(pidfile))
+        started = time.monotonic()
+        await supervisor_module.terminate_process_group(proc, grace_seconds=5.0)
+        return time.monotonic() - started
+
+    try:
+        took = asyncio.run(_scenario())
+        leader, grandchild = pids
+        assert not _alive(leader) and not _alive(grandchild)
+        assert Path(f"/proc/{grandchild}").exists(), "the grandchild must still be an unreaped zombie here"
+        assert took < 2.0, f"reap waited {took:.1f}s for a zombie"
+    finally:
+        _kill_quietly(*pids)
+        if len(pids) == 2:
+            try:
+                os.waitpid(pids[1], 0)
+            except ChildProcessError:
+                pass
+        libc.prctl(36, 0, 0, 0, 0)

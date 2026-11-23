@@ -10,8 +10,9 @@ import ssl
 import sys
 import threading
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping, MutableMapping
-from dataclasses import dataclass, field
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, MutableMapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
@@ -86,6 +87,7 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteTaskMetadataStore,
     SQLiteWorkspaceStore,
 )
+from agent_runtime.app.bootstrap import RunnerHandle, open_runner
 from agent_runtime.app.concurrency import (
     ConcurrencyLimiter,
     ConcurrencyLimits,
@@ -98,6 +100,7 @@ from agent_runtime.app.config import (
     HibernautConfig,
     ProjectConfig,
     RoleConfig,
+    RunnerLinkConfig,
     RunnerPilotConfig,
     SwitchboardLinkConfig,
     config_changes,
@@ -380,6 +383,8 @@ class AlwaysOnDaemon:
     open_runs: SQLiteOpenRunStore | None = None
     # Shared by every config generation, like db; closed with it.
     ledger: RunLedger | None = None
+    # Likewise shared; run() and serve_configured() start it before the first Run and stop it after the last.
+    runner: RunnerHandle | None = None
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def register_partition(
@@ -405,6 +410,28 @@ class AlwaysOnDaemon:
         outbox_interval_seconds: float = 1.0,
         webhook_host: str | None = None,
         webhook_port: int | None = None,
+    ) -> None:
+        async with _running_runner(self.runner):
+            await self._run(
+                server=server,
+                stop_event=stop_event,
+                force_stop_event=force_stop_event,
+                timer_interval_seconds=timer_interval_seconds,
+                outbox_interval_seconds=outbox_interval_seconds,
+                webhook_host=webhook_host,
+                webhook_port=webhook_port,
+            )
+
+    async def _run(
+        self,
+        *,
+        server: HTTPServer | None,
+        stop_event: asyncio.Event | None,
+        force_stop_event: asyncio.Event | None,
+        timer_interval_seconds: float,
+        outbox_interval_seconds: float,
+        webhook_host: str | None,
+        webhook_port: int | None,
     ) -> None:
         stopper = stop_event or self._stop_event
         self.pool.bind(asyncio.get_running_loop())
@@ -481,6 +508,18 @@ class AlwaysOnDaemon:
         if self.ledger is not None:
             self.ledger.close()
         self.db.close()
+
+
+@asynccontextmanager
+async def _running_runner(runner: RunnerHandle | None) -> AsyncGenerator[None]:
+    if runner is None:
+        yield
+        return
+    try:
+        await runner.start()
+        yield
+    finally:
+        await runner.stop()
 
 
 def run_ledger_path(db_path: str | Path, ledger_db_path: str | Path | None) -> Path | None:
@@ -909,6 +948,15 @@ def pilot_hold(
     return hold
 
 
+def _permissions(link: RunnerLinkConfig) -> AutoModePermissionAdapter:
+    if not link.enabled:
+        return AutoModePermissionAdapter()
+    return AutoModePermissionAdapter(
+        allow_tools=AutoModePermissionAdapter.DEFAULT_ALLOW_TOOLS | link.allow_tools,
+        block_tools=AutoModePermissionAdapter.DEFAULT_BLOCK_TOOLS | link.block_tools,
+    )
+
+
 def build_daemon_from_config(
     config: HibernautConfig,
     *,
@@ -919,6 +967,7 @@ def build_daemon_from_config(
     switchboard: SwitchboardHandle | None = None,
     ledger: RunLedger | None = None,
     runner_pilot: RunnerPilotRelay | None = None,
+    runner: RunnerHandle | None = None,
     limiter: ConcurrencyLimiter | None = None,
 ) -> AlwaysOnDaemon:
     if demo and config.runner_pilot.enabled:
@@ -1013,6 +1062,10 @@ def build_daemon_from_config(
         ledger_db_path=config.runtime.ledger_db_path or None,
         limiter=limiter,
     )
+
+    if config.runner.enabled and not demo:
+        # A reload passes the running one, whose settings cannot change without a restart.
+        daemon.runner = runner if runner is not None else open_runner(config)
 
     if has_configured_executor and not demo:
         # Instantiate all configured [executors.<id>] per project so AgentWorker can sticky-route.
@@ -1136,6 +1189,9 @@ def build_daemon_from_config(
                 )
                 for exec_name in config.executors
             }
+            if daemon.runner is not None:
+                for exec_name in config.runner.executors:
+                    executors_by_project[proj.name][exec_name] = daemon.runner.bridge(exec_name, proj)
             executors_by_project[proj.name].update(_role_executors(
                 wt_mgr,
                 None if proj.terminal_backend == "orca" else f"project '{proj.name}' has terminal_backend = \"none\"",
@@ -1250,7 +1306,7 @@ def build_daemon_from_config(
                 inbox=daemon.inbox,
                 timers=daemon.timers,
                 memory=daemon.partitions.memory_for(inbox_id),
-                permissions=AutoModePermissionAdapter(),
+                permissions=_permissions(config.runner),
                 outbox=daemon.outbox,
                 executors={PROTOCOL_CHECK_EXECUTOR_ID: executor},
                 project_default_executor=PROTOCOL_CHECK_EXECUTOR_ID,
@@ -1283,7 +1339,7 @@ def build_daemon_from_config(
                 inbox=daemon.inbox,
                 timers=daemon.timers,
                 memory=daemon.partitions.memory_for(inbox_id),
-                permissions=AutoModePermissionAdapter(),
+                permissions=_permissions(config.runner),
                 outbox=daemon.outbox,
                 executors=executors_by_project[project.name] if project is not None else fallback_executors,
                 project_default_executor=project.default_agent if project is not None else None,
@@ -1459,7 +1515,8 @@ async def serve_configured(
     # Before the first pool scans its inbox: held events are not looked at again until the next wake.
     await start_runner_pilot(runner_pilot)
 
-    async with asyncio.TaskGroup() as tasks:
+    # The runner outlives the task group, which ends with the last Run of every generation.
+    async with _running_runner(daemon.runner), asyncio.TaskGroup() as tasks:
         # Shared across config-reload generations so retired Runs keep occupying slots until they finish.
         shared_limiter = daemon.pool.limiter
         generation = _Generation.start(daemon, tasks, outbox_interval_seconds=outbox_interval_seconds, halt=stop)
@@ -1509,6 +1566,13 @@ async def serve_configured(
                         flush=True,
                     )
                     continue
+                if replace(candidate.runner, executors=()) != replace(config.runner, executors=()):
+                    print(
+                        "[config] [runner] changes require a restart.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
                 address = (candidate.channels.host, candidate.channels.port)
                 next_server: WebhookHTTPServer | None = None
                 next_pilot: RunnerPilotRelay | None = None
@@ -1521,6 +1585,7 @@ async def serve_configured(
                         switchboard=switchboard,
                         ledger=daemon.ledger,
                         runner_pilot=next_pilot,
+                        runner=daemon.runner,
                         limiter=shared_limiter,
                     )
                     handler = replacement.http_handler()
@@ -1537,6 +1602,8 @@ async def serve_configured(
                         await next_pilot.stop()
                     continue
 
+                if replacement.runner is not None:
+                    replacement.runner.apply(candidate)
                 previous = generation
                 # Stop the old services first so two dispatchers never send the same Outbox row.
                 await previous.stop_services()
@@ -1685,8 +1752,10 @@ def main() -> None:
             except ValueError as exc:
                 # The rest of the daemon runs; the pilot inbox is held, never run on another executor.
                 print(f"[runner_pilot] {exc}; the pilot inbox stays held.", file=sys.stderr, flush=True)
+        # Nor does it run any agent, so it opens no runner.
+        companion = replace(cfg, runner=RunnerLinkConfig()) if args.mcp_stdio else cfg
         daemon = build_daemon_from_config(
-            cfg, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot
+            companion, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot
         )
         host = cfg.channels.host
         port = cfg.channels.port

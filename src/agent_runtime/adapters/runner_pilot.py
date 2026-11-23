@@ -1,9 +1,7 @@
-# Hibernaut side of the read-only Runner pilot (docs/runner.md §8): the loopback Relay one standalone Runner connects
+# Hibernaut side of the read-only Runner pilot (docs/runner.md §9): the loopback Relay one standalone Runner connects
 # to, and the executor that sends it nothing but a protocol-file check of one commit.
 from __future__ import annotations
 
-import asyncio
-import time
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -21,6 +19,7 @@ from runner.protocol import (
     RunnerPort,
     RunRequest,
     RunResult,
+    ToolAuthorizer,
 )
 from runner.protocol_check import (
     CHECK_SCHEMA,
@@ -39,26 +38,21 @@ from runner.transport.relay_hub import RunnerConnectionLostError, RunnerRelayHub
 RELAY_HOST = "127.0.0.1"
 LAUNCH_PERMISSION = "runner.protocol_check.launch"
 _HEARTBEAT_SECONDS = 5.0
-# Longer than a heartbeat: the node counts a run that just ended as active until its next heartbeat.
+# How long a Run waits for the node to be connected and free. Longer than a heartbeat: the node counts a run that just
+# ended as active until its next heartbeat.
 _NODE_WAIT_SECONDS = 30.0
-_NODE_POLL_SECONDS = 0.2
 
 
 class RunnerPilotRelay:
     # RunnerPort on the pilot's own Relay. It admits exactly one node: the configured id, one slot, the fixed check
     # program as its only executor, the hb namespace and the one project.
-    def __init__(
-        self, *, runner_id: str, project_key: str, port: int, token_file: Path, node_wait_seconds: float = _NODE_WAIT_SECONDS
-    ) -> None:
+    def __init__(self, *, runner_id: str, project_key: str, port: int, token_file: Path) -> None:
         self.runner_id = runner_id
         self.project_key = project_key
         self._port = port
         self._token = read_relay_token(token_file)
-        self._node_wait = node_wait_seconds
         self._hub: RunnerRelayHub | None = None
         self._affinity: WorkspaceAffinityStore | None = None
-        # Runs still waiting for the node: an interrupt ends them here, nothing was sent.
-        self._waiting: dict[str, asyncio.Event] = {}
 
     @property
     def listening(self) -> bool:
@@ -107,29 +101,10 @@ class RunnerPilotRelay:
     async def capabilities(self) -> RunnerCapabilities:
         return await self._active_hub().capabilities()
 
-    async def run(self, req: RunRequest) -> RunResult:
-        # Waits a bounded time for the node to be connected and free; nothing is sent to it before that.
-        deadline = time.monotonic() + self._node_wait
-        while True:
-            try:
-                return await self._active_hub().run(req)
-            except NoEligibleRunnerError:
-                if time.monotonic() >= deadline:
-                    raise
-            interrupted = self._waiting[req.run_id] = asyncio.Event()
-            try:
-                await asyncio.wait_for(interrupted.wait(), timeout=_NODE_POLL_SECONDS)
-            except TimeoutError:
-                continue
-            finally:
-                del self._waiting[req.run_id]
-            raise asyncio.CancelledError("interrupted before it was sent to the runner")
+    async def run(self, req: RunRequest, *, authorizer: ToolAuthorizer | None = None) -> RunResult:
+        return await self._active_hub().run(req, authorizer=authorizer)
 
     async def interrupt(self, req: InterruptRequest) -> InterruptResult:
-        waiting = self._waiting.get(req.run_id)
-        if waiting is not None:
-            waiting.set()
-            return InterruptResult(run_id=req.run_id, accepted=True, state="cancelling")
         return await self._active_hub().interrupt(req)
 
     async def reclaim_workspace(self, req: ReclaimRequest) -> ReclaimResult:
@@ -181,13 +156,22 @@ def _verified_digests(report: dict[str, Any] | None, commit: str) -> dict[str, s
 class ProtocolCheckExecutor(RunnerExecutorBridge):
     # Tool-free by construction: the node starts one fixed program, given a commit id and a hold time. Every result
     # closes its session, so after the route is closed nothing keeps pointing at this executor.
-    def __init__(self, *, runner: RunnerPort, inbox_id: str, project_key: str, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        runner: RunnerPort,
+        inbox_id: str,
+        project_key: str,
+        timeout_seconds: float,
+        node_wait_seconds: float = _NODE_WAIT_SECONDS,
+    ) -> None:
         super().__init__(
             runner=runner,
             executor_id=PROTOCOL_CHECK_EXECUTOR_ID,
             project_key=project_key,
             timeout_seconds=timeout_seconds,
             executor_calls_tools=False,
+            node_wait_seconds=node_wait_seconds,
         )
         self._inbox_id = inbox_id
 
@@ -211,9 +195,9 @@ class ProtocolCheckExecutor(RunnerExecutorBridge):
         except RuntimeError as exc:  # no eligible node, or the node rejected the submission: nothing ran
             return _failed(session, f"未派发到 Runner：{exc}", "network")
 
-    def _build_request(self, events: Sequence[Event], session: SessionRef, run_id: str) -> RunRequest:
+    def _prepare_request(self, req: RunRequest, events: Sequence[Event], session: SessionRef) -> RunRequest:
         return replace(
-            super()._build_request(events, session, run_id),
+            req,
             work_key=session.session_id,
             name_hint=None,
             executor_session_id=None,

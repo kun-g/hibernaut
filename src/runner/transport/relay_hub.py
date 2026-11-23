@@ -4,7 +4,7 @@ import asyncio
 import hmac
 import logging
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, cast
 
 from runner.protocol import (
@@ -16,6 +16,9 @@ from runner.protocol import (
     RunRequest,
     RunResult,
     RunnerCapabilities,
+    ToolAuthorizer,
+    ToolCall,
+    ToolDecision,
     run_identity,
     utc_now_iso,
 )
@@ -108,6 +111,8 @@ class RunnerRelayHub:
         self._pending_rpc: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._inflight: dict[str, asyncio.Future[RunResult]] = {}
         self._inflight_identity: dict[str, RunIdentity] = {}
+        self._authorizers: dict[str, ToolAuthorizer] = {}
+        self._authorize_tasks: set[asyncio.Task[None]] = set()
         self._finished: OrderedDict[str, tuple[RunIdentity, RunResult]] = OrderedDict()
         # Each pending rpc belongs to the connection it was sent on (runner_id, conn_epoch).
         self._rpc_target: dict[str, tuple[str, int]] = {}
@@ -142,6 +147,8 @@ class RunnerRelayHub:
         self._stopping = True
         if self._server is not None:
             self._server.close()
+        for task in list(self._authorize_tasks):
+            task.cancel()
         for conn in list(self._conns.values()):
             await send_close(conn.writer, CLOSE_NORMAL, "hub shutdown", mask=False)
         self._conns.clear()
@@ -154,11 +161,17 @@ class RunnerRelayHub:
             raise NoEligibleRunnerError("no online runners connected")
         return online[0].capabilities
 
-    async def run(self, req: RunRequest, *, caller_id: str = "hibernaut") -> RunResult:
+    async def run(
+        self, req: RunRequest, *, caller_id: str = "hibernaut", authorizer: ToolAuthorizer | None = None
+    ) -> RunResult:
         # run_id is the idempotency key across waiters and retries of one request: every caller of the same run_id
         # shares one submission and one reserved slot, a caller that times out or is cancelled leaves the submission
         # running for the rest, and a finished run is answered from its recorded result. A run_id reused for another
         # request (caller, workspace or executor) is refused, the same rule the daemon applies.
+        if authorizer is not None:
+            req = replace(req, authorize_tools=True)
+        elif req.authorize_tools:
+            raise PermissionError(f"run {req.run_id} requires tool authorization, but no authorizer is attached")
         identity = run_identity(req, caller_id)
         finished = self._finished.get(req.run_id)
         if finished is not None:
@@ -173,6 +186,8 @@ class RunnerRelayHub:
             task = asyncio.ensure_future(self._submit_and_wait(req, caller_id))
             self._inflight[req.run_id] = task
             self._inflight_identity[req.run_id] = identity
+            if authorizer is not None:
+                self._authorizers[req.run_id] = authorizer
             task.add_done_callback(lambda t, rid=req.run_id, ident=identity: self._on_submission_done(rid, ident, t))
         return await asyncio.shield(task)
 
@@ -180,6 +195,7 @@ class RunnerRelayHub:
         if self._inflight.get(run_id) is task:
             del self._inflight[run_id]
             self._inflight_identity.pop(run_id, None)
+            self._authorizers.pop(run_id, None)
         if task.cancelled():
             return
         if task.exception() is not None:  # retrieved here so a submission nobody waits for any more does not warn
@@ -535,6 +551,14 @@ class RunnerRelayHub:
             fut = self._pending_result.get(res.run_id)
             if fut is not None and not fut.done():
                 fut.set_result(res)
+        elif ftype == "tool.authorize":
+            call = ToolCall.from_dict(cast(Mapping[str, Any], frame["call"]))
+            conn = self._conns.get(runner_id)
+            if conn is None or conn.conn_epoch != epoch or not self._sent_on(call.run_id, runner_id, epoch):
+                return
+            task = asyncio.create_task(self._answer_tool_call(conn, call))
+            self._authorize_tasks.add(task)
+            task.add_done_callback(self._authorize_tasks.discard)
         elif ftype == "rpc.reply":
             rpc_id = str(frame.get("rpc_id", ""))
             if self._rpc_target.get(rpc_id) != (runner_id, epoch):
@@ -542,6 +566,30 @@ class RunnerRelayHub:
             fut = self._pending_rpc.get(rpc_id)
             if fut is not None and not fut.done():
                 fut.set_result(frame)
+
+    async def _answer_tool_call(self, conn: _RunnerConn, call: ToolCall) -> None:
+        authorizer = self._authorizers.get(call.run_id)
+        if authorizer is None:
+            decision = ToolDecision(action="block", reason="no tool authorizer is attached to this run")
+        else:
+            try:
+                decision = await authorizer(call)
+            except Exception as exc:  # noqa: BLE001
+                decision = ToolDecision(action="block", reason=f"tool authorization failed: {exc}")
+        try:
+            await self._send(
+                conn,
+                {
+                    "type": "tool.decision",
+                    "conn_epoch": conn.conn_epoch,
+                    "run_id": call.run_id,
+                    "call_id": call.call_id,
+                    "decision": decision.to_dict(),
+                    "ts": utc_now_iso(),
+                },
+            )
+        except OSError:
+            pass
 
     def _sent_on(self, run_id: str, runner_id: str, epoch: int) -> bool:
         return self._run_to_runner.get(run_id) == runner_id and self._run_epoch.get(run_id) == epoch

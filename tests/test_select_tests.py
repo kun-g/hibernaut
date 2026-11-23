@@ -40,7 +40,12 @@ class TestSelectTests(unittest.TestCase):
         self.assertFalse(res.full_suite)
         self.assertEqual(
             res.tests,
-            ("tests/test_runner_pilot.py", "tests/test_runner_service.py", "tests/test_runner_stage1.py"),
+            (
+                "tests/test_runner_pilot.py",
+                "tests/test_runner_service.py",
+                "tests/test_runner_stage1.py",
+                "tests/test_runner_tool_gate.py",
+            ),
         )
 
     def test_runner_service_program_and_deploy_example_select_the_tests_that_start_it(self) -> None:

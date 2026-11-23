@@ -1,4 +1,4 @@
-# Standalone Runner process of the read-only pilot: python -m runner.service --config runner.toml (docs/runner.md §8).
+# Standalone Runner process of the read-only pilot: python -m runner.service --config runner.toml (docs/runner.md §9).
 from __future__ import annotations
 
 import argparse
