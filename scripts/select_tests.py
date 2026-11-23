@@ -65,6 +65,7 @@ STATIC_DEPS: dict[str, tuple[str, ...]] = {
 
 RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("src/agent_runtime/adapters/executor_cli/skills/**", ("src/agent_runtime/adapters/executor_cli/role_skills.py",)),
+    ("src/dashboard/static/**", ("src/dashboard/server.py",)),
     ("hibernaut.example.toml", ("tests/test_bootstrap_loop.py", "tests/test_sde_delivery.py")),
     ("switchboard.example.toml", ("tests/test_switchboard_core.py",)),
     ("taskboard.example.toml", ("tests/taskboard/test_m7_service.py",)),
