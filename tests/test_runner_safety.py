@@ -196,7 +196,7 @@ def test_bridge_cancelled_by_worker_interrupts_run_and_waits_for_reap(tmp_path: 
     _init_repo(repo)
     daemon = RunnerDaemon(_config(tmp_path, repo), drivers=_drivers())
     client = InProcessRunnerClient(daemon, caller_id="hibernaut", bound_namespace="hb")
-    bridge = RunnerExecutorBridge(runner=client, executor_id="spawn", project_key="hibernaut")
+    bridge = RunnerExecutorBridge(runner=client, executor_id="spawn", project_key="hibernaut", executor_calls_tools=False)
     pidfile = tmp_path / "pids-bridge"
     pids: list[int] = []
 
@@ -435,7 +435,7 @@ def test_interrupt_retries_until_run_is_registered(tmp_path: Path) -> None:
         def is_interrupted(self) -> bool:
             return flag["on"]
 
-    bridge = RunnerExecutorBridge(runner=client, executor_id="spawn", project_key="hibernaut")
+    bridge = RunnerExecutorBridge(runner=client, executor_id="spawn", project_key="hibernaut", executor_calls_tools=False)
     ev = Event(inbox_id="proj:hibernaut", source="github", external_id="e2", payload={"body": str(pidfile)})
     sess = SessionRef(session_id="sess_2", inbox_id="proj:hibernaut", correlation_key="github:kun-g/hibernaut#6")
 

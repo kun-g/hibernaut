@@ -31,8 +31,12 @@ class RunnerExecutorBridge:
         project_key: str,
         timeout_seconds: float = 1800.0,
         interrupt_poll_interval: float = 0.05,
+        executor_calls_tools: bool | None = None,
     ) -> None:
         self._runner = runner
+        # None means unknown. Until each tool call inside the runner's CLI goes through PermissionPort.check(), only an
+        # executor declared tool-free may run: anything else would let the CLI act before a block or defer applies.
+        self._executor_calls_tools = executor_calls_tools
         self._executor_id = executor_id
         self._project_key = project_key
         self._timeout_seconds = timeout_seconds
@@ -48,6 +52,17 @@ class RunnerExecutorBridge:
         session: SessionRef,
         caps: RunCapabilities,
     ) -> RunOutcome:
+        if self._executor_calls_tools is not False:
+            capability = "can call tools" if self._executor_calls_tools else "has unknown tool capability"
+            return Emit(
+                messages=(
+                    f"[{self._executor_id}] refused: executor {capability}, and per-call tool authorization "
+                    "(PermissionPort.check) is not wired through the runner yet",
+                ),
+                session_id=session.session_id,
+                executor_session_id=session.executor_session_id,
+                status="refused",
+            )
         run_id = new_id("run")
         work_key = session.work_key or session.correlation_key or session.session_id
         readonly = any(bool(ev.payload.get("readonly")) for ev in events)

@@ -412,7 +412,7 @@ def test_hb_runner_executor_bridge(tmp_path: Path) -> None:
     }
     daemon = RunnerDaemon(cfg, drivers=drivers)
     client = InProcessRunnerClient(daemon, caller_id="hibernaut", bound_namespace="hb")
-    bridge = RunnerExecutorBridge(runner=client, executor_id="claude", project_key="hibernaut")
+    bridge = RunnerExecutorBridge(runner=client, executor_id="claude", project_key="hibernaut", executor_calls_tools=False)
 
     class _DummyCaps:
         @property
@@ -516,3 +516,72 @@ def test_interrupted_result_cancels_with_the_runner_telemetry() -> None:
         translate_run_result(result, session_id="sess_1")
     assert isinstance(info.value, RunCancelled)
     assert info.value.telemetry == RunTelemetry(stderr="interrupted: new_event", exit_code=-15, runner_id="vps-1")
+
+
+class _RecordingRunner:
+    def __init__(self) -> None:
+        self.run_calls = 0
+
+    async def capabilities(self) -> Any:
+        raise AssertionError("not used")
+
+    async def run(self, req: RunRequest) -> RunResult:
+        self.run_calls += 1
+        raise AssertionError(f"runner.run() must not be called, got {req.run_id}")
+
+    async def interrupt(self, req: InterruptRequest) -> Any:
+        raise AssertionError("not used")
+
+    async def reclaim_workspace(self, req: ReclaimRequest) -> Any:
+        raise AssertionError("not used")
+
+
+class _PolicyCaps:
+    def __init__(self, action: str) -> None:
+        self._action = action
+        self.checks: list[str] = []
+
+    @property
+    def memory(self) -> Any:
+        return None
+
+    @property
+    def timers(self) -> Any:
+        return None
+
+    @property
+    def permissions(self) -> Any:
+        caps = self
+
+        class _Perm:
+            def check(self, tool: str, args: Any) -> PermissionDecision:
+                caps.checks.append(tool)
+                return PermissionDecision(action=caps._action, reason=f"{caps._action} by policy")  # type: ignore[arg-type]
+
+        return _Perm()
+
+    def poll_folded_events(self) -> list[Event]:
+        return []
+
+    def is_interrupted(self) -> bool:
+        return False
+
+
+@pytest.mark.parametrize("action", ["block", "defer"])
+@pytest.mark.parametrize("calls_tools", [True, None], ids=["tool-capable", "tools-unknown"])
+def test_bridge_refuses_tool_capable_or_unknown_executors_before_runner_run(action: str, calls_tools: bool | None) -> None:
+    # Until per-call tool authorization reaches the runner, no CLI that may call tools is started through the bridge,
+    # whatever the inbox policy says: block and defer would otherwise be bypassed.
+    runner = _RecordingRunner()
+    bridge = RunnerExecutorBridge(
+        runner=runner,  # type: ignore[arg-type]
+        executor_id="claude",
+        project_key="hibernaut",
+        **({} if calls_tools is None else {"executor_calls_tools": calls_tools}),
+    )
+    ev = Event(inbox_id="proj:hibernaut", source="github", external_id="e1", payload={"title": "Fix", "body": "Do it"})
+    sess = SessionRef(session_id="sess_1", inbox_id="proj:hibernaut", correlation_key="github:kun-g/hibernaut#77")
+    outcome = asyncio.run(bridge.execute([ev], sess, _PolicyCaps(action)))  # type: ignore[arg-type]
+    assert runner.run_calls == 0
+    assert isinstance(outcome, Emit) and outcome.status == "refused"
+    assert "tool" in outcome.messages[0]

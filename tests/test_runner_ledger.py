@@ -69,7 +69,7 @@ def test_slots_full_refusal_is_recorded_as_rate_limit_on_the_executing_runner(tm
     flag = tmp_path / "release"
     daemon = RunnerDaemon(_make_config(tmp_path, repo, max_concurrent=1), drivers=_drivers(flag))
     client = InProcessRunnerClient(daemon, caller_id="hibernaut", bound_namespace="hb")
-    bridge = RunnerExecutorBridge(runner=client, executor_id="claude", project_key="hibernaut")
+    bridge = RunnerExecutorBridge(runner=client, executor_id="claude", project_key="hibernaut", executor_calls_tools=False)
     ledger = RunLedger(tmp_path / "ledger.db", retry_delays=(0.0, 0.0, 0.0))
     inbox, outbox = InMemoryInbox(), InMemoryOutbox()
     event_id = _ingest(inbox)
@@ -120,7 +120,7 @@ def test_successful_runner_run_is_recorded_on_the_executing_runner(tmp_path: Pat
     _init_git_repo(repo, with_remote=True)
     daemon = RunnerDaemon(_make_config(tmp_path, repo), drivers=_drivers(tmp_path / "unused"))
     client = InProcessRunnerClient(daemon, caller_id="hibernaut", bound_namespace="hb")
-    bridge = RunnerExecutorBridge(runner=client, executor_id="claude", project_key="hibernaut")
+    bridge = RunnerExecutorBridge(runner=client, executor_id="claude", project_key="hibernaut", executor_calls_tools=False)
     ledger = RunLedger(tmp_path / "ledger.db")
     inbox, outbox = InMemoryInbox(), InMemoryOutbox()
     event_id = _ingest(inbox)
@@ -157,7 +157,7 @@ def test_new_event_interrupt_of_a_runner_run_is_recorded_on_the_executing_runner
     }
     daemon = RunnerDaemon(_make_config(tmp_path, repo), drivers=drivers)
     client = InProcessRunnerClient(daemon, caller_id="hibernaut", bound_namespace="hb")
-    bridge = RunnerExecutorBridge(runner=client, executor_id="claude", project_key="hibernaut")
+    bridge = RunnerExecutorBridge(runner=client, executor_id="claude", project_key="hibernaut", executor_calls_tools=False)
     ledger = RunLedger(tmp_path / "ledger.db")
     inbox, outbox = InMemoryInbox(), InMemoryOutbox()
     first_id = _ingest(inbox)
