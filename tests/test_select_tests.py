@@ -38,7 +38,7 @@ class TestSelectTests(unittest.TestCase):
     def test_runner_schema_change_selects_schema_consuming_test(self) -> None:
         res = select_tests(["schemas/runner/v1/runner.run_request.schema.json"])
         self.assertFalse(res.full_suite)
-        self.assertEqual(res.tests, ("tests/test_runner_stage1.py",))
+        self.assertEqual(res.tests, ("tests/test_runner_stage1.py", "tests/test_runner_tool_gate.py"))
 
     def test_taskboard_service_entry_and_example_config_select_service_tests(self) -> None:
         entry = select_tests(["src/taskboard/app/__main__.py"])
