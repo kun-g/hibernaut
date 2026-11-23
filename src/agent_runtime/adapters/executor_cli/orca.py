@@ -698,6 +698,7 @@ class OrcaVisibleRunner:
         spec = {
             "title": title,
             "profile": {"name": profile.name, "launcher": launcher.name, "launcher_command": launcher.command,
+                        "launcher_env": launcher.env, "env": profile.env,
                         "billing": profile.billing, "model": profile.model, "effort": profile.effort,
                         "credential_proxy_url": profile.credential_proxy_url},
             "unset": list(unset),
