@@ -320,7 +320,7 @@ class SwitchboardAdapter:
         if result.task.status != "ready":
             return result
         dispatched = self._ingestion.dispatcher.dispatch_ready_task(
-            result.task, trace_id=trace_id, hop_count=hop_count
+            result.task, trace_id=trace_id, hop_count=hop_count, replay=True
         )
         return result if dispatched is None else replace(result, task=dispatched)
 

@@ -319,7 +319,7 @@ WHERE task_id = :target_task_id
 
 #### 步骤 3：领取派发序号
 
-派发前 `try_claim_dispatch()` 同样按版本 CAS，把 `dispatch_seq` 加一并记下 `claimed_ready_at = ready_at`。`claimed_ready_at == ready_at` 表示本次 `ready` 已领过序号，重放时不再领，按原 `dispatch_seq` 重发同一 `external_id`，由 Switchboard 去重。
+派发前 `try_claim_dispatch()` 同样按版本 CAS，把 `dispatch_seq` 加一并记下 `claimed_ready_at = ready_at`。`claimed_ready_at == ready_at` 表示本次 `ready` 已领过序号：只有重放（领号那次入站事件的重投：终态重放、`work.opened` / `work.updated` 重投）才按原 `dispatch_seq` 重发同一 `external_id`，补完发布失败的那次派发，由 Switchboard 去重；其他并发到达的调用（例如两个上游同时完成，后到者发现下游已被先到者领号）直接跳过，由领号者发布，同一 `dispatch_seq` 只解锁一次。
 
 ### 3.4 异常传播规则
 
