@@ -140,7 +140,7 @@ class RunnerExecutorBridge:
         # PermissionPort.check() before it is made: anything else would let the CLI act before a block or defer applies.
         self._executor_calls_tools = executor_calls_tools
         self._authorize_tools = authorize_tools
-        # How long a Run waits for a node that can take it, e.g. for relay nodes to reconnect after a restart.
+        # How long a Run waits for a node that can take it: one with a free slot, or relay nodes reconnecting.
         self._node_wait_seconds = node_wait_seconds
         # Approvals already used. The worker may execute a Run again after an error, with the same approval event.
         self._spent_approvals: set[str] = set()
@@ -156,9 +156,13 @@ class RunnerExecutorBridge:
     async def execute(
         self,
         events: Sequence[Event],
-        session: SessionRef,
+        session: SessionRef | None,
         caps: RunCapabilities,
     ) -> RunOutcome:
+        if session is None:
+            session = SessionRef(
+                session_id=new_id("sess"), inbox_id=events[0].inbox_id, correlation_key=events[0].correlation_key
+            )
         gated = self._executor_calls_tools is not False
         if gated and not self._authorize_tools:
             capability = "can call tools" if self._executor_calls_tools else "has unknown tool capability"
@@ -265,8 +269,13 @@ class RunnerExecutorBridge:
         while True:
             try:
                 if authorizer is None:
-                    return await self._runner.run(req)
-                return await self._runner.run(req, authorizer=authorizer)
+                    result = await self._runner.run(req)
+                else:
+                    result = await self._runner.run(req, authorizer=authorizer)
+                remaining = deadline - loop.time()
+                # slots_full, workspace_busy: nothing ran, and the same request may run once the cause is gone.
+                if result.status != "refused" or result.error_kind != "rate_limit" or remaining <= 0:
+                    return result
             except (NoEligibleRunnerError, NodeAffinityOfflineError):
                 remaining = deadline - loop.time()
                 if remaining <= 0:

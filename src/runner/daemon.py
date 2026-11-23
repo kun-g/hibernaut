@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, ParamSpec, TypeVar, cast
 
 from runner.cli_drivers import (
@@ -131,6 +131,11 @@ class RunnerDaemon:
     @property
     def worktrees(self) -> WorktreeManager:
         return self._worktrees
+
+    def reconfigure(self, *, projects: Mapping[str, ProjectCheckout], drivers: Mapping[str, CLIDriver]) -> None:
+        # For the next runs only: a run in flight holds the checkout and driver it started with.
+        self._config = replace(self._config, projects=dict(projects))
+        self._drivers = dict(drivers)
 
     def close(self) -> None:
         self._worktrees.close()

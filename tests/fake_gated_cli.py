@@ -11,7 +11,8 @@ import json, os, subprocess, sys, time
 argv = sys.argv[1:]
 settings = json.loads(argv[argv.index("--settings") + 1]) if "--settings" in argv else {}
 hooks = {} if os.environ.get("FAKE_IGNORES_HOOKS") else settings.get("hooks", {})
-prompt = sys.stdin.read()
+after_p = argv[argv.index("-p") + 1:][:1] if "-p" in argv else []
+prompt = after_p[0] if after_p and not after_p[0].startswith("--") else sys.stdin.read()
 log = open(os.environ["FAKE_LOG"], "a")
 
 def note(kind, **kw):

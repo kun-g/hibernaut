@@ -23,6 +23,20 @@ _TOOL_HOOK_SCRIPT = Path(__file__).resolve().with_name("tool_hook.py")
 # Longer than the hook's own wait for an answer: a hook the CLI gives up on may count as no objection.
 _TOOL_HOOK_TIMEOUT_SECONDS = 120
 
+# Arguments that would replace what the hook needs, or switch hooks off. A gated driver must not carry them.
+_HOOK_OVERRIDES: Mapping[ToolHookStyle, frozenset[str]] = {
+    "claude": frozenset(
+        {
+            "--settings", "--permission-mode", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+            "--bare", "--safe-mode",
+        }
+    ),
+    "grok": frozenset(
+        {"--agent", "--agents", "--permission-mode", "--always-approve", "--no-subagents", "--disallowed-tools"}
+    ),
+    "cursor-agent": frozenset({"--plugin-dir"}),
+}
+
 _FENCED_JSON_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
 
 
@@ -119,6 +133,16 @@ class TemplateCLIDriver:
     # None means unknown. A driver that says True runs only with an authorizer behind its tool_hook.
     calls_tools: bool | None = None
     tool_hook: ToolHookStyle | None = None
+
+    def __post_init__(self) -> None:
+        if self.tool_hook is None:
+            return
+        for where, tokens in (("args", self.args), ("resume_args", self.resume_args)):
+            for token in tokens:
+                if (flag := token.split("=", 1)[0]) in _HOOK_OVERRIDES[self.tool_hook]:
+                    raise ValueError(
+                        f"executor {self.executor_id!r}: {where} must not set {flag}, which the tool hook depends on"
+                    )
 
     def capability(self, *, interactive_surface: InteractiveSurfaceKind = "none") -> ExecutorCapability:
         # A template driver only starts a headless subprocess with pipes; whatever the node offers, it cannot hand
