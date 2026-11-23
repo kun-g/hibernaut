@@ -43,6 +43,9 @@ class ReclaimResult:
     workdir: str | None = None
     # What happened to the task's local branch when a merged head was given; empty otherwise.
     branch: str = ""
+    # The directory was already removed outside Hibernaut; reclaimed means only its record and sessions went, and
+    # reason then says so for the owning inbox.
+    gone: bool = False
 
 
 def _default_runner(cmd: Sequence[str], cwd: Path | None) -> CommandResult:
@@ -54,6 +57,10 @@ def _default_runner(cmd: Sequence[str], cwd: Path | None) -> CommandResult:
         check=False,
     )
     return CommandResult(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+
+def _present(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
 
 
 def derive_worktree_names(
@@ -284,6 +291,10 @@ class OrcaWorktreeManager:
             return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
         sessions_key, owner = self._users_scope(record, work_key, inbox_id)
         workdir = Path(record.workdir)
+        if not _present(workdir):
+            return self._forget_removed(
+                record, key, sessions_key, owner, notify_outbox, inbox_id, merged_head,
+            )
         refusal = self._refusal(sessions_key, record.branch, record.repo_checkout, workdir, owner, key)
         if refusal is not None:
             self._alert(notify_outbox, inbox_id, refusal)
@@ -345,6 +356,124 @@ class OrcaWorktreeManager:
                 self._alert(notify_outbox, inbox_id, f"Reclaimed '{workdir}'; {branch}")
         return ReclaimResult(reclaimed=True, reason="reclaimed", workdir=record.workdir, branch=branch)
 
+    def _forget_removed(
+        self,
+        record: WorkspaceRecord,
+        key: str,
+        sessions_key: str,
+        owner: str | None,
+        outbox: OutboxPort | None,
+        inbox_id: str | None,
+        merged_head: str | None,
+    ) -> ReclaimResult:
+        # The directory was removed outside Hibernaut (by hand, by Orca, by an older flow). Nothing on disk is left to
+        # protect, so gates 0 and 2-4 and the merge evidence no longer apply: the sessions bound to it cannot resume
+        # there and are closed. What would still run against it (gate 1) keeps the record until it settles.
+        workdir = Path(record.workdir)
+
+        def refused(reason: str) -> ReclaimResult:
+            self._alert(outbox, inbox_id, reason)
+            return ReclaimResult(reclaimed=False, reason=reason, workdir=record.workdir)
+
+        if not workdir.name.startswith("hb-"):
+            return refused(f"Refused reclaim for '{workdir}': directory name lacks 'hb-' prefix")
+        blocked = self._usage_gate(sessions_key, key) or self._still_registered(record)
+        if blocked is not None:
+            return refused(blocked)
+
+        stale_before = (
+            datetime.now(timezone.utc) - timedelta(seconds=self._reclaim_stale_after_seconds)
+        ).isoformat()
+        claim = self._store.claim_for_reclaim(key, seen_updated_at=record.updated_at, stale_before=stale_before)
+        if claim is None:
+            return ReclaimResult(
+                reclaimed=False,
+                reason="workspace changed or is being reclaimed by another caller",
+                workdir=record.workdir,
+            )
+        late = self._usage_gate(sessions_key, key)
+        if late is None and _present(workdir):
+            late = f"Skipped reclaim for '{workdir}': the directory exists again"
+        if late is not None:
+            self._store.release_reclaim(key, claim=claim, status=record.status)
+            return refused(f"{late} (on recheck after claiming the worktree)")
+        # Closed while the claim is held: a worker resolving this workspace meanwhile is refused, not handed a new one.
+        closed = self._close_sessions(sessions_key, owner)
+        if not self._store.finish_reclaim(key, claim=claim):
+            return refused(f"Forgetting the removed '{workdir}' lost its claim; record left to its new owner")
+        branch = ""
+        if merged_head:
+            _, branch = self._delete_local_branch(Path(record.repo_checkout), record.branch, merged_head)
+        sessions = f"closed sessions {', '.join(closed)}" if closed else "no sessions closed"
+        msg = f"Worktree '{workdir}' no longer exists (removed outside Hibernaut): record removed; {sessions}"
+        if branch:
+            msg = f"{msg}; {branch}"
+        self._alert(outbox, inbox_id or record.inbox_id, msg)
+        return ReclaimResult(reclaimed=True, reason=msg, workdir=record.workdir, branch=branch, gone=True)
+
+    def _still_registered(self, record: WorkspaceRecord) -> str | None:
+        # Why a removed directory may not be forgotten yet: git (after a prune) or Orca still lists it, or cannot say.
+        primary = Path(record.repo_checkout)
+        workdir = Path(record.workdir).resolve()
+        listed = self._git_worktree_paths(primary)
+        if listed is not None and workdir in listed:
+            self._runner(["git", "worktree", "prune"], primary)
+            listed = self._git_worktree_paths(primary)
+        if listed is None:
+            return f"Skipped reclaim for '{workdir}': the directory is gone but git cannot list worktrees in {primary}"
+        if workdir in listed:
+            return (f"Skipped reclaim for '{workdir}': the directory is gone but git still registers it after "
+                    "'git worktree prune' (locked?)")
+        if self._backend == "orca":
+            orca = self._orca_worktree_paths(primary)
+            if orca is None:
+                return f"Skipped reclaim for '{workdir}': the directory is gone but Orca could not list its worktrees"
+            if workdir in orca:
+                return f"Skipped reclaim for '{workdir}': the directory is gone but Orca still lists it"
+        return None
+
+    def _git_worktree_paths(self, primary: Path) -> set[Path] | None:
+        if not primary.is_dir():
+            return None
+        res = self._runner(["git", "worktree", "list", "--porcelain", "-z"], primary)
+        if res.returncode != 0:
+            return None
+        return {
+            Path(field.removeprefix("worktree ")).resolve()
+            for field in res.stdout.split("\0")
+            if field.startswith("worktree ")
+        }
+
+    def _orca_worktree_paths(self, primary: Path) -> set[Path] | None:
+        res = self._runner(["orca", "worktree", "list", "--repo", f"path:{primary}", "--limit", "1000", "--json"], primary)
+        if res.returncode != 0:
+            return None
+        try:
+            reply = json.loads(res.stdout)
+            result = reply["result"]
+            rows = result["worktrees"]
+        except (ValueError, KeyError, TypeError):
+            return None
+        if reply.get("ok") is False or result.get("truncated") or not isinstance(rows, list):
+            return None
+        paths: set[Path] = set()
+        for row in cast(list[object], rows):
+            path = cast(dict[str, object], row).get("path") if isinstance(row, dict) else None
+            if isinstance(path, str) and path:
+                paths.add(Path(path).resolve())
+        return paths
+
+    def _close_sessions(self, work_key: str, owner: str | None) -> list[str]:
+        if self._session_store is None:
+            return []
+        closed: list[str] = []
+        for status in ("active", "suspended"):
+            for session in self._session_store.list_sessions(inbox_id=owner, status=status):
+                if session.work_key == work_key:
+                    self._session_store.close_session(session.session_id)
+                    closed.append(session.session_id)
+        return sorted(closed)
+
     def _delete_local_branch(self, primary: Path, branch: str, merged_head: str) -> tuple[bool, str]:
         # Orca keeps a branch it cannot prove merged, and `git branch -d` refuses a squash-merged one; the delivery's
         # merged head is that proof, so only a branch still at exactly that head is force-deleted.
@@ -397,8 +526,10 @@ class OrcaWorktreeManager:
                 occupying = list_fn(work_key, owner) if callable(list_fn) else []
                 suffix = f" ({', '.join(occupying)})" if occupying else f" ({active_refs} active)"
                 return f"Skipped reclaim for '{work_key}': active/suspended session(s) still referencing worktree{suffix}"
+        return self._usage_gate(work_key, storage_key)
 
-        # Gate 1: no reviewer, queued event or unfinished delivery still needs the worktree.
+    def _usage_gate(self, work_key: str, storage_key: str) -> str | None:
+        # Gate 1: no reviewer, queued event, open Run or unfinished delivery still needs the worktree.
         if self._usage is not None:
             blockers = self._usage(work_key)
             if storage_key != work_key:
