@@ -50,28 +50,43 @@ class ReviewScope:
         claims = [self._claim(item) for item in items]
         outside = [i for i, item in enumerate(items) if self._files(item["location"]).isdisjoint(changed)]
         in_changes = {n for i, n in enumerate(claims) if n is not None and i not in outside}
-        pairs: list[tuple[int, int, int]] = []
-        for i in outside:
-            if items[i].get("basis") == INTRODUCED:
-                continue
-            for n, previous in enumerate(self.previous):
-                fit = self._fit(items[i], previous)
-                # Its number is enough for one finding wherever it is (a missing test, moved code), unless a finding
-                # in a changed file already stands for that item. Anything else has to identify the item itself.
-                if fit <= _SAME_PLACE or (claims[i] == n and n not in in_changes):
-                    pairs.append((fit, i, n))
+        candidates = [i for i in outside if items[i].get("basis") != INTRODUCED]
+        fits = {(i, n): self._fit(items[i], previous)
+                for i in candidates for n, previous in enumerate(self.previous)}
         backed: dict[int, int] = {}
-        for _, i, n in sorted(pairs):
-            if i not in backed and n not in backed.values():
-                backed[i] = n
+        # Findings that name their item go first. Its number is enough for one of them wherever it is (a missing test,
+        # moved code), unless a finding in a changed file already stands for that item.
+        for n in range(len(self.previous)):
+            named = [(fits[i, n], i) for i in candidates
+                     if claims[i] == n and (n not in in_changes or fits[i, n] <= _SAME_PLACE)]
+            if named:
+                backed[n] = min(named)[1]
+        # The others have to identify one of the items left by themselves; as many as possible get one.
+        settled = set(backed)
+        rest = sorted((min(fits[i, n] for n in range(len(self.previous))), i) for i in candidates
+                      if i not in backed.values() and self.previous)
+
+        def place(i: int, tried: set[int]) -> bool:
+            for n in sorted(range(len(self.previous)), key=lambda n: fits[i, n]):
+                if n in settled or n in tried or fits[i, n] > _SAME_PLACE:
+                    continue
+                tried.add(n)
+                if n not in backed or place(backed[n], tried):
+                    backed[n] = i
+                    return True
+            return False
+
+        for _, i in rest:
+            place(i, set())
+        kept = set(backed.values())
         reasons = [""] * len(items)
         for i in outside:
             claim = claims[i]
             if items[i].get("basis") == INTRODUCED:
                 reasons[i] = "标为上一轮之后引入，但 location 不在上一轮之后改动的文件里"
-            elif i not in backed and claim is not None:
+            elif i not in kept and claim is not None:
                 reasons[i] = f"上一轮第 {claim + 1} 条已由本轮另一条阻断对应"
-            elif i not in backed:
+            elif i not in kept:
                 reasons[i] = "没有指明上一轮的哪一条，位置与触发条件也对不上，location 不在上一轮之后改动的文件里"
         return reasons
 
@@ -142,10 +157,12 @@ class ReviewScope:
             "An earlier round reviewed the whole change. This round blocks only on:",
             f"1. {unfixed}",
             f"2. `{INTRODUCED}`: a new problem caused by the changes since that review. The location is the line in a "
-            "changed file (listed below) that causes it, even when the damage shows in unchanged code. A requirement a person "
-            "added since that review that the changes do not meet is such a problem, located in the changed file "
-            "closest to it.",
+            "changed file (listed below) that causes it, even when the damage shows in unchanged code. The trigger "
+            "says how that change causes it.",
             "Everything else you find goes to notes, whatever its severity: notes are delivered as follow-ups. "
+            "A requirement a person added since that review is context. Report a finding about it as 2 only when you can "
+            "name the change that causes it; otherwise, unless it is an unfixed item, keep its real location and put it "
+            "in notes.",
             "Hibernaut turns any other blocking item into a note. The full diff above is context.",
             "Files changed since the previous review:",
             *files,

@@ -110,11 +110,11 @@
   - **增量复核**（`review_scope.py`，`ReviewScope`）：第 1 轮通审；有上一轮阻断项或交付步骤交回（`recheck`）、且有 `reviewed_snapshot` 时，阻断只能是上一轮某条没修好（`basis = "unfixed_previous"`，`previous_item` 写它在上一轮的序号），或上一轮之后的改动引入的新问题（`basis = "introduced_since_previous"`，`location` 落在改动的文件里）；完整 diff 仍作上下文，其余只能进 `notes`。规则写在评审契约和任务消息的 `## Incremental review` 小节（含改动文件清单与已记录的跟进），`basis` / `previous_item` 是 `REVIEW_SCHEMA` 的可选字段。**程序判定**：SDE 拿到任一 `Reviewer` 的结论后都调用 `ReviewScope.narrow()`，角色评审与 CLI 评审同一处判定：
     - `location` 落在改动的文件里（`git diff --name-only --no-renames <上轮树> <本轮树>`，含删除和改名前后两个路径）：保留。按文件而不按行判：改一处常在同文件没改的行上出错，按行会误降。
     - 标 `introduced_since_previous` 但不在改动文件里：降级。
-    - 改动文件之外的其余阻断必须对应上一轮的某一条，且上一轮每条最多对应一条，多出来的降级；所以复审对未改动代码的阻断数不会超过上一轮。`previous_item` 有效时位置可以不同（缺测试、代码搬走，不因位置对不上就放过没修好的项），同一序号有多条时取最贴近的：同触发条件、同位置、同文件、其他；改动文件里已有一条对应该序号时，只再接受同触发条件或同位置的。
+    - 改动文件之外的其余阻断必须对应上一轮的某一条，且上一轮每条最多对应一条，多出来的降级；所以复审对未改动代码的阻断数不会超过上一轮。`previous_item` 有效时位置可以不同（缺测试、代码搬走，不因位置对不上就放过没修好的项），先按有效序号各取一条，再让没写序号的去匹配剩下的旧项（尽量多匹配，不互相挤掉）；同一序号有多条时取最贴近的：同触发条件、同位置、同文件、其他；改动文件里已有一条对应该序号时，只再接受同触发条件或同位置的。
     - 没有有效 `previous_item`：只接受能指认原问题的证据——`trigger` 文字相同且在同一文件（或 `location` 文字相同），或 `location` 的起始行落在上一轮那条的行范围里（改动文件之外行号不会移动）；只是同一文件不算，降级。
     - 降级项连同「已降级：原因」写进 `notes`，评审记录另有一行 `Downgraded to notes: ...`，历史写 `round <n> ... (<k> downgraded)`；一条阻断都不剩时结论为 `pass`。
-    - 挂起期间人发来的跟进照常并入需求、先交开发，下一轮仍是增量复核；改动没有满足新增需求算改动引入的问题，`location` 写在最接近的改动文件里。
-  - **跟进汇总**：各轮 `notes`（含降级项）按文字去重（忽略空白、大小写与降级原因）记入检查点 `review_notes`，交付时写进 PR 正文的 `## 跟进` 小节与 Outbox 消息的「跟进：」（没开 PR、停止、无代码改动的消息同样列出）。PR 小节每条一行，`@`、`#` 后插零宽空格以免误提醒人或关 Issue，整篇正文放得下（GitHub 上限 65536 字符）就完整列出，放不下才按剩余空间截断并写明未列条数；Outbox 始终是全文。
+    - 挂起期间人发来的跟进照常并入需求、先交开发，下一轮仍是增量复核；新增需求只作评审上下文，能指出是哪处改动引入问题的才按第二类阻断，否则保留真实位置写进 `notes`。
+  - **跟进汇总**：各轮 `notes`（含降级项）按文字去重（忽略空白、大小写与降级原因）记入检查点 `review_notes`，交付时写进 PR 正文的 `## 跟进` 小节与 Outbox 消息的「跟进：」（没开 PR、停止、无代码改动的消息同样列出）。PR 小节每条一行，`@`、`#` 后插零宽空格以免误提醒人或关 Issue，整篇正文放得下（GitHub 上限 65536 字符）就完整列出，放不下时先把测试证据（再到摘要等）裁到能给跟进留出至多 2000 字符，再按剩余空间截断并写明未列条数，正文不因这一节超限；Outbox 始终是全文。
   - **关闭评审**（`review = false`）：开发完成即交付（`review=off`），不启动评审者。
   - **交付**：一条 `Emit`，含状态、五项启动设置、工作区、摘要、`Change: <kind> (<理由>)`、测试证据、评审历史与最后一次评审结论；项目配置了交付步骤时追加其状态、PR 链接、版本决定、检查、CI 与合并 SHA。`executor_session_id` 回填开发会话 ID。中断沿用 `supervise()`，不写半成品。
 - **SDE 交付步骤**（`PRDelivery`，`adapters/delivery/pr_delivery.py`；状态表 `deliveries`，`SQLiteDeliveryStore`）：SDE 只负责开发、测试与本地提交（`git push`、`gh pr create/merge` 仍被禁用）；发布由 Hibernaut 在 SDE 报告 `done` 且评审通过（或 `review = false`、或拒绝评审重试后以 `review=pending`）后执行。配置只来自部署文件的 `[projects.<name>.delivery]`（`parse_delivery()`，未知键、`auto_merge` 无 `open_pr`、越出仓库的 `version_file`、无 `version` 命名组的 `version_pattern` 等均报 `ValueError`），被改动的仓库无法授予发布权限；不配置则任务以本地提交结束。`SDEExecutor` 的 `delivery` 由组装根按项目注入，未匹配项目的兜底执行器没有交付步骤。

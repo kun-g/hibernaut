@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from agent_runtime.adapters.delivery import DeliveryRequest
+from agent_runtime.adapters.delivery.pr_delivery import _followup_list
 from agent_runtime.adapters.executor_cli.review_scope import ReviewScope, merge_notes
 from agent_runtime.adapters.executor_cli.reviewer import REVIEW_SCHEMA, plain_review_contract, validate_review
 from agent_runtime.adapters.executor_cli.sde import _State
@@ -73,6 +74,27 @@ class TestReviewScope(unittest.TestCase):
         there = block("pkg/mod.py:1", trigger="t", **unfixed)
         self.assertEqual(self.kept(there, block("calc.py:80", trigger="u", **unfixed)), ["pkg/mod.py:1"])
         self.assertEqual(self.kept(there, block("calc.py:2", trigger="u", **unfixed)), ["pkg/mod.py:1", "calc.py:2"])
+
+    def test_explicit_references_keep_their_item_whatever_the_order(self):
+        # Two previous items in one file with the same trigger: either report fits both by its words alone.
+        previous = [block("calc.py:2"), block("calc.py:40")]
+        second = block("calc.py:40", basis="unfixed_previous", previous_item=2)
+        first = block("old.py:2", basis="unfixed_previous", previous_item=1)  # at a caller
+        for items in ((second, first), (first, second)):
+            with self.subTest([i["location"] for i in items]):
+                self.assertEqual(self.kept(*items, previous=previous), [i["location"] for i in items])
+        # A report without a reference takes what is left, and does not push out the one that names its item.
+        bare = block("calc.py:2")
+        self.assertEqual(self.kept(bare, block("old.py:2", previous_item=1), previous=previous),
+                         ["calc.py:2", "old.py:2"])
+
+    def test_reports_without_a_reference_do_not_crowd_each_other_out(self):
+        # calc.py:2 fits both previous items, calc.py:40 (other words) only the second.
+        previous = [block("calc.py:2", trigger="a"), block("calc.py:2-50", trigger="b")]
+        items = [block("calc.py:2", trigger="b"), block("calc.py:40", trigger="c")]
+        for order in (items, items[::-1]):
+            with self.subTest([i["location"] for i in order]):
+                self.assertEqual(self.kept(*order, previous=previous), [i["location"] for i in order])
 
     def test_without_a_reference_another_problem_in_the_same_file_is_a_note(self):
         for label in ({}, {"basis": "unfixed_previous"}, {"basis": "unfixed_previous", "previous_item": 4}):
@@ -271,8 +293,10 @@ class TestRoleReviewRounds(SDEDeliveryCase):
         prompt = self.calls("reviewer")[1]["prompt"]
         self.assertIn(follow_up, prompt)
         scope = prompt.split("## Incremental review\n")[1]
-        # An added requirement the changes do not meet is a problem of those changes.
-        self.assertIn("requirement a person added", scope)
+        # An added requirement is context: it does not move a finding in unchanged code to a changed file.
+        self.assertIn("A requirement a person added since that review", scope)
+        self.assertIn("keep its real location and put it in notes", scope)
+        self.assertNotIn("closest", scope)
         self.assertEqual("## Why this is reviewed again" in prompt, recheck)
 
     async def test_a_follow_up_with_the_approval_of_a_spent_review_stays_incremental(self):
@@ -330,13 +354,13 @@ class TestRoleReviewRounds(SDEDeliveryCase):
 
 
 class TestFollowUpSection(DeliveryCase):
-    def body(self, *followups, summary="s"):
+    def body(self, *followups, summary="s", evidence="e"):
         key = f"task-{getattr(self, 'n', 1)}"
         wt = self.clone(key, f"hb/{key}")
         (wt / "calc.py").write_text("x = 1\n")
         git(wt, "commit", "-qam", "work")
         request = DeliveryRequest(
-            work_key=f"task:{key[-1]}", workdir=wt, title="t", summary=summary, test_evidence="e", change_kind="fix",
+            work_key=f"task:{key[5:]}", workdir=wt, title="t", summary=summary, test_evidence=evidence, change_kind="fix",
             rationale="r", review="pass", followups=followups)
         self.delivery().deliver(request, permissions=self.allow())
         return self.gh_state()["prs"][-1]["body"]
@@ -377,6 +401,30 @@ class TestFollowUpSection(DeliveryCase):
         self.assertEqual(lines[-1], f"- 已截断，另有 {100 - (len(lines) - 1)} 条未列；全文见 Hibernaut 完成消息")
         self.assertGreater(len(lines), 40)
         self.assertIn("## Test evidence", body)
+
+    def test_a_body_with_no_room_left_gives_some_to_the_follow_ups(self):
+        # The rest of the body, heading included, leaves 10 characters: fewer than the notice itself takes.
+        for name, evidence in (("long evidence", "e" * 20_000), ("short evidence", "e")):
+            with self.subTest(name):
+                self.gh_reset()
+                fixed = len(self.body("x", evidence=evidence)) - 2  # without the one-character summary and note
+                self.gh_reset()
+                summary = "s" * (65_526 - fixed)
+                body = self.body("n" * 5_000, summary=summary, evidence=evidence)
+                self.assertLessEqual(len(body), 65_536)
+                lines = self.section(body).splitlines()
+                self.assertTrue(lines[0].startswith("- nnnn"), lines[0][:20])
+                self.assertIn("全文见 Hibernaut 完成消息", lines[-1])
+                if len(evidence) > 1:
+                    self.assertIn(summary, body)
+                for heading in ("## Summary", "## Review", "## Test evidence", "Delivered by Hibernaut"):
+                    self.assertIn(heading, body)
+
+    def test_a_section_that_cannot_fit_its_notice_is_left_out(self):
+        self.assertEqual(_followup_list(["n" * 100], 10), "")
+        self.assertEqual(_followup_list(["n" * 100], -5), "")
+        for room in range(0, 110):
+            self.assertLessEqual(len(_followup_list(["n" * 60, "m" * 60], room)), room)
 
     def gh_reset(self):
         # Another PR body in the same test: a fresh task branch and clone.

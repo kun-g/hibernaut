@@ -45,6 +45,9 @@ _TAIL = 4000
 _MAX_BODY = 65_536
 # A follow-up that does not fit is cut, unless so little would be left that it says nothing.
 _MIN_CUT = 80
+# The rest of a full body gives way until the follow-ups have this much room; what is cut first, and down to what.
+_MIN_FOLLOWUPS = 2_000
+_SHRINKABLE = (("evidence", 500), ("summary", 1_000), ("review", 1_000), ("rationale", 500))
 # No CI result for this long while the base has moved past the PR: GitHub may never run CI for it.
 _EMPTY_CHECKS_GRACE = 300.0
 CIResult = Literal["passed", "failed", "stale"]
@@ -404,7 +407,8 @@ def remote_env(base: Mapping[str, str]) -> dict[str, str]:
 
 
 def _followup_list(notes: Sequence[str], room: int) -> str:
-    # One line each. A zero-width space keeps a quoted decorator or number from pinging a person or closing an issue.
+    # One line each, at most `room` characters; "" when not even the notice of a cut list fits.
+    # A zero-width space keeps a quoted decorator or number from pinging a person or closing an issue.
     lines = ["- " + re.sub(r"([@#])(?=\w)", "\\1\u200b", " ".join(note.split())) for note in notes]
     full = "\n".join(lines)
     if len(full) <= room:
@@ -415,6 +419,8 @@ def _followup_list(notes: Sequence[str], room: int) -> str:
 
     shown: list[str] = []
     left = room - len(ending(len(lines)))
+    if left < 0:
+        return ""
     for line in lines:
         if len(line) + 1 > left:
             if left > _MIN_CUT:
@@ -842,23 +848,33 @@ class PRDelivery:
                         "recomputes it before merging.")
         review = f"review={req.review}" + (f"\n\n{req.review_detail}" if req.review_detail else "")
         issue = self._issue_line(req.issue)
-        before = [
-            *([issue] if issue else []),
-            f"## Summary\n{req.summary or '(none)'}",
-            f"## Change\nKind: {req.change_kind}\n\nRationale: {req.rationale or '(none)'}",
-            f"## Version\n{version}",
-            f"## Checks (run by Hibernaut on {rec.head_sha[:12]})\n{checks}",
-            f"## Review\n{review}",
-        ]
-        after = [
-            f"## Test evidence (from the developer)\n```text\n{_tail(req.test_evidence, 20000)}\n```",
-            f"Delivered by Hibernaut for task `{req.work_key}`.",
-        ]
+        text = {"summary": req.summary or "(none)", "rationale": req.rationale or "(none)", "review": review,
+                "evidence": _tail(req.test_evidence, 20000)}
+
+        def compose(followups: str | None) -> str:
+            return "\n\n".join([
+                *([issue] if issue else []),
+                f"## Summary\n{text['summary']}",
+                f"## Change\nKind: {req.change_kind}\n\nRationale: {text['rationale']}",
+                f"## Version\n{version}",
+                f"## Checks (run by Hibernaut on {rec.head_sha[:12]})\n{checks}",
+                f"## Review\n{text['review']}",
+                *([f"## 跟进\n{followups}"] if followups is not None else []),
+                f"## Test evidence (from the developer)\n```text\n{text['evidence']}\n```",
+                f"Delivered by Hibernaut for task `{req.work_key}`.",
+            ])
+
         if not req.followups:
-            return "\n\n".join([*before, *after])
-        heading = "## 跟进\n"
-        room = _MAX_BODY - len("\n\n".join([*before, heading, *after]))
-        return "\n\n".join([*before, heading + _followup_list(req.followups, room), *after])
+            return compose(None)
+        wanted = min(len(_followup_list(req.followups, _MAX_BODY)), _MIN_FOLLOWUPS)
+        for part, floor in _SHRINKABLE:
+            short = wanted + len(compose("")) - _MAX_BODY
+            if short <= 0:
+                break
+            keep = max(floor, len(text[part]) - short - 3)
+            if keep + 3 < len(text[part]):
+                text[part] = _tail(text[part], keep) if part == "evidence" else text[part][:keep] + "..."
+        return compose(_followup_list(req.followups, _MAX_BODY - len(compose(""))) or None)
 
     def _list_prs(self, cwd: Path, branch: str) -> list[dict[str, Any]]:
         proc = self._gh(cwd, "pr", "list", "--head", branch, "--base", self._config.base_branch, "--state", "all",
