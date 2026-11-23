@@ -894,7 +894,8 @@ class TestLimitKeys(PoolCase):
 
 
 class TestAgents(PoolCase):
-    # A limit belongs to the [executors.<id>]; agents are picked by the inbox bindings and counted for their executor.
+    # Agents are picked by the inbox bindings and counted on their own; a limit on the [executors.<id>] they share caps
+    # them together.
     BINDINGS = [
         {"pattern": "proj:a", "default_agent": "claude"},
         {"pattern": "proj:a:.+", "default_agent": "writer", "agents": ["writer", "fixer", "claude"],
@@ -988,6 +989,94 @@ class TestAgents(PoolCase):
         self.assertTrue(limiter.try_acquire("proj:a", project_key="a", executor_key="claude-code"))
         self.assertFalse(limiter.available("proj:a:1", project_key="a", executor_key="claude-code"))
 
+    def agent_raw(self, *, driver=None, **agents):
+        raw = super().raw(projects={"a": {"inbox_id": ["proj:a", "proj:a:.+"], "inbox_bindings": [
+            {"pattern": "proj:a", "default_agent": "steward"}, {"pattern": "proj:a:.+", "default_agent": "sde"},
+        ]}})
+        # The agent "sde", not an executor of that name, is what these tests run.
+        del raw["executors"]["sde"]
+        raw["executors"]["claude-code"] = {"harness": "claude-code", **(driver or {})}
+        raw["agents"] = {"steward": {"role": "steward", "executor": "claude-code", **agents.get("steward", {})},
+                         "sde": {"role": "sde", "executor": "claude-code", "review": False, "interactive": False,
+                                 **agents.get("sde", {})}}
+        return raw
+
+    @contextlib.asynccontextmanager
+    async def agent_daemon(self, **options):
+        for executor in ("SDEExecutor", "StewardExecutor"):
+            self.enterContext(patch(f"agent_runtime.app.main.{executor}",
+                                    lambda *, profile, **_: self.probe.executor(profile.name)))
+        raw = self.agent_raw(**options)
+        with patch.object(self, "raw", lambda **_: raw):
+            async with self.daemon() as daemon:
+                yield daemon
+
+    async def test_a_full_agent_does_not_hold_back_another_one_on_the_same_driver(self):
+        async with self.agent_daemon(sde={"max_concurrency": 1}) as daemon:
+            self.post(daemon, "proj:a:1", "block-1")
+            self.post(daemon, "proj:a:2", "block-2")
+            await self.until(lambda: self.probe.active == [("sde", "block-1")])
+            self.post(daemon, "proj:a", "block-front-desk")
+            await self.until(lambda: ("steward", "block-front-desk") in self.probe.active)
+            await self.settle()
+            self.assertEqual(self.probe.active, [("sde", "block-1"), ("steward", "block-front-desk")])
+            self.probe.release("block-1")
+            await self.until(lambda: ("sde", "block-2") in self.probe.active)
+            self.probe.release("block-2", "block-front-desk")
+            await self.idle(daemon)
+        self.assertEqual(self.probe.peak("executor", "sde"), 1)
+
+    async def test_an_agent_limit_counts_across_inboxes_up_to_its_own_number(self):
+        async with self.agent_daemon(sde={"max_concurrency": 2}) as daemon:
+            for n in range(4):
+                self.post(daemon, f"proj:a:{n}", f"block-{n}")
+            await self.until(lambda: len(self.probe.active) == 2)
+            self.post(daemon, "proj:a", "front-desk")
+            await self.until(lambda: "front-desk" in self.probe.finished)
+            self.assertEqual(self.probe.peak("executor", "sde"), 2)
+            self.probe.release(*(f"block-{n}" for n in range(4)))
+            await self.idle(daemon)
+        self.assertEqual(self.probe.peak("executor", "sde"), 2)
+        self.assertEqual(len(self.probe.finished), 5)
+
+    async def test_a_limit_set_on_the_driver_still_caps_its_agents_together(self):
+        async with self.agent_daemon(driver={"max_concurrency": 2}, sde={"max_concurrency": 1}) as daemon:
+            self.post(daemon, "proj:a:1", "block-1")
+            self.post(daemon, "proj:a", "block-front-desk")
+            await self.until(lambda: len(self.probe.active) == 2)
+            # The driver is full although the second front desk inbox's agent has no limit of its own.
+            self.post(daemon, "proj:a:2", "other", executor="steward")
+            await self.settle()
+            self.assertNotIn("other", self.probe.started)
+            self.probe.release("block-1")
+            await self.until(lambda: "other" in self.probe.finished)
+            self.probe.release("block-front-desk")
+            await self.idle(daemon)
+
+    async def test_one_inbox_with_two_agents_of_a_driver_waits_for_the_limited_one(self):
+        async with self.agent_daemon(sde={"max_concurrency": 1}) as daemon:
+            self.post(daemon, "proj:a:1", "block-1")
+            await self.until(lambda: self.probe.active == [("sde", "block-1")])
+            self.post(daemon, "proj:a:2", "by-steward", executor="steward", key="k1")
+            self.post(daemon, "proj:a:2", "block-2", key="k2")
+            await self.until(lambda: "by-steward" in self.probe.finished)
+            await self.settle()
+            self.assertEqual(self.probe.active, [("sde", "block-1")])
+            self.probe.release("block-1")
+            await self.until(lambda: self.probe.active == [("sde", "block-2")])
+            self.probe.release("block-2")
+            await self.idle(daemon)
+        self.assertEqual(self.probe.peak("executor", "sde"), 1)
+
+    async def test_keys_name_the_agent_and_its_driver(self):
+        daemon = build_daemon_from_config(parse_config(self.agent_raw(sde={"max_concurrency": 1})))
+        self.addCleanup(daemon.close)
+        self._seq = 0
+        for inbox_id, agent in (("proj:a", "steward"), ("proj:a:1", "sde")):
+            self.post(daemon, inbox_id, "t")
+            keys = daemon.pool._limit_keys(inbox_id)
+            self.assertEqual((keys.project, keys.agent, keys.executor), ("a", agent, "claude-code"))
+
     async def test_events_that_run_no_agent_need_no_slot(self):
         daemon = build_daemon_from_config(parse_config(self.raw()))
         self.addCleanup(daemon.close)
@@ -1032,8 +1121,38 @@ class TestAgentLimitConfig(unittest.TestCase):
                        "steward": {"role": "steward", "executor": "claude-code"}},
         })
 
-    def test_only_executors_carry_a_limit(self):
-        self.assertEqual(concurrency_limits(self.config(2)).executors, {"cli": 2, "claude-code": 2})
+    def test_a_driver_limit_is_not_copied_to_its_agents(self):
+        limits = concurrency_limits(self.config(2))
+        self.assertEqual((limits.executors, limits.agents), ({"cli": 2, "claude-code": 2}, {}))
+
+    def test_agents_carry_limits_of_their_own(self):
+        cfg = parse_config({
+            "executors": {"cli": {"command": "x", "max_concurrency": 3}, "claude-code": {"harness": "claude-code"}},
+            "agents": {"cli": {"executor": "cli", "max_concurrency": 2}, "ops": {"executor": "cli", "max_concurrency": 1},
+                       "sde": {"role": "sde", "executor": "claude-code", "review": False, "max_concurrency": 2},
+                       "steward": {"role": "steward", "executor": "claude-code"}},
+        })
+        limits = concurrency_limits(cfg)
+        self.assertEqual((limits.executors, limits.agents), ({"cli": 3}, {"cli": 2, "ops": 1, "sde": 2}))
+
+    def test_legacy_executors_keep_their_limit_as_an_executor_limit(self):
+        cfg = parse_config({"executors": {"sde": {"role": "sde", "review": False, "max_concurrency": 2}}})
+        limits = concurrency_limits(cfg)
+        self.assertEqual((limits.executors, limits.agents), ({"sde": 2}, {}))
+
+    def test_an_invalid_agent_limit_is_rejected_with_its_path(self):
+        for bad in (0, -1, True, "2", 1.5):
+            for agent in ({"executor": "cli"}, {"role": "steward", "executor": "claude-code"}):
+                with self.subTest(bad=bad, agent=agent), self.assertRaisesRegex(
+                        ValueError, "^agents.x.max_concurrency must be a positive integer"):
+                    parse_config({"executors": {"cli": {"command": "x"}, "claude-code": {"harness": "claude-code"}},
+                                  "agents": {"x": {**agent, "max_concurrency": bad}}})
+
+    def test_an_agent_limit_above_the_global_one_loads_with_a_warning(self):
+        with self.assertLogs("agent_runtime.app.config", level="WARNING") as logs:
+            parse_config({"runtime": {"max_concurrency": 2}, "executors": {"cli": {"command": "x"}},
+                          "agents": {"ops": {"executor": "cli", "max_concurrency": 3}}})
+        self.assertEqual([r.getMessage().split(" = ")[0] for r in logs.records], ["agents.ops.max_concurrency"])
 
     def test_a_limit_above_the_global_one_warns_once_for_each_executor(self):
         with self.assertLogs("agent_runtime.app.config", level="WARNING") as logs:

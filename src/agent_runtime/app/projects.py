@@ -3,11 +3,13 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Generic, Protocol, TypeVar, cast
 
+from agent_runtime.adapters.memory_fs import check_inbox_id
 from agent_runtime.app.inbox_patterns import UncomparablePattern, common_match
-from agent_runtime.core.models import Event, InboxBinding, InboxMatchRule
+from agent_runtime.core.models import Event, InboxBinding, InboxMatchRule, InboxRoute
 from agent_runtime.core.ports import SessionStorePort
 from agent_runtime.engine.worker import ExecutorFailed
 
@@ -116,6 +118,8 @@ class AgentConfig:
     effort: str = ""
     checkout_access: str = ""
     description: str = ""
+    # Inboxes running this agent at once, whatever driver it shares.
+    max_concurrency: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +128,23 @@ class ProjectBinding:
     binding: InboxBinding
 
 
+@dataclass(frozen=True, slots=True)
+class WorkdirBinding:
+    # An inbox of no project: its agents start in this directory, which no event can change.
+    rule: InboxRule
+    binding: InboxBinding
+    workdir: str
+    readonly: bool = False
+
+    def route(self) -> InboxRoute:
+        # A scope of its own: work is forwarded neither to a project nor to another binding's directory.
+        return InboxRoute(project=f"runtime.inbox_bindings:{self.binding.inbox}", binding=self.binding,
+                          has_bindings=True)
+
+
 _BINDING_KEYS = frozenset({"pattern", "default_agent", "agents", "rules"})
+_WORKDIR_KEYS = frozenset({"workdir", "checkout_access"})
+CHECKOUT_ACCESS = ("readwrite", "readonly")
 _MATCH_KEYS = frozenset({"source", "event_type", "tags", "agent"})
 
 
@@ -173,47 +193,153 @@ def parse_inbox_bindings(
     for index, item in enumerate(_tables(f"projects.{project}.inbox_bindings", raw)):
         where = f"projects.{project}.inbox_bindings[{index}]"
         _only(where, item, _BINDING_KEYS)
-        pattern = _text(where, item, "pattern", required=True) or ""
-        try:
-            rule = InboxRule.parse(pattern)
-        except re.error as exc:
-            raise ValueError(f"{where}: invalid pattern {pattern!r}: {exc}") from exc
-        if any(b.rule.pattern == rule.pattern for b in bindings):
-            raise ValueError(f"{where}: pattern {pattern!r} is listed twice")
+        rule = _binding_rule(where, item, [b.rule for b in bindings])
         if rule.literal is not None and not any(r.matches(rule.literal) for r in inbox_rules):
-            raise ValueError(f"{where}: {pattern!r} is not an inbox of projects.{project} (see its inbox_id)")
-        agents = _texts(where, item, "agents")
-
-        def check(at: str, key: str, agent: str, agents: tuple[str, ...] = agents) -> str:
-            if agent not in declared:
-                raise ValueError(f"{at}: {key} '{agent}' is not declared in [agents] (declared: "
-                                 f"{', '.join(sorted(declared)) or 'none'})")
-            if agents and agent not in agents:
-                raise ValueError(f"{at}: {key} '{agent}' is not in agents ({', '.join(agents)})")
-            return agent
-
-        for agent in agents:
-            check(where, "agents entry", agent)
-        rules: list[InboxMatchRule] = []
-        for position, entry in enumerate(_tables(f"{where}.rules", item.get("rules", []))):
-            at = f"{where}.rules[{position}]"
-            _only(at, entry, _MATCH_KEYS)
-            match = InboxMatchRule(
-                agent=check(at, "agent", _text(at, entry, "agent", required=True) or ""),
-                source=_text(at, entry, "source"),
-                event_type=_text(at, entry, "event_type"),
-                tags=_texts(at, entry, "tags"),
-            )
-            if match.source is None and match.event_type is None and not match.tags:
-                raise ValueError(f"{at}: needs source, event_type or tags (default_agent takes everything else)")
-            rules.append(match)
-        bindings.append(ProjectBinding(rule=rule, binding=InboxBinding(
-            inbox=pattern,
-            default_agent=check(where, "default_agent", _text(where, item, "default_agent", required=True) or ""),
-            agents=agents,
-            rules=tuple(rules),
-        )))
+            raise ValueError(f"{where}: {rule.text!r} is not an inbox of projects.{project} (see its inbox_id)")
+        bindings.append(ProjectBinding(rule=rule, binding=_binding(where, item, rule, declared)))
     return tuple(bindings)
+
+
+def parse_workdir_bindings(
+    raw: object, *, declared: Mapping[str, AgentConfig], resolve: Callable[[str], str]
+) -> tuple[WorkdirBinding, ...]:
+    if raw is None:
+        return ()
+    # Roles work in a project: in its worktrees, its reviews or, read-only, its main checkout.
+    plain = [name for name, agent in declared.items() if agent.role is None]
+    bindings: list[WorkdirBinding] = []
+    for index, item in enumerate(_tables("runtime.inbox_bindings", raw)):
+        where = f"runtime.inbox_bindings[{index}]"
+        _only(where, item, _BINDING_KEYS | _WORKDIR_KEYS)
+        rule = _binding_rule(where, item, [b.rule for b in bindings])
+        if rule.literal is not None:
+            try:
+                check_inbox_id(rule.literal)
+            except ValueError as exc:
+                raise ValueError(f"{where}: {exc}") from exc
+        workdir = resolve(_text(where, item, "workdir", required=True) or "")
+        access = item.get("checkout_access", CHECKOUT_ACCESS[0])
+        if access not in CHECKOUT_ACCESS:
+            raise ValueError(f"{where}: checkout_access must be one of {', '.join(CHECKOUT_ACCESS)}, got {access!r}")
+        binding = _binding(where, item, rule, declared.keys())
+        for agent in (binding.default_agent, *binding.agents, *(r.agent for r in binding.rules)):
+            if agent not in plain:
+                raise ValueError(f"{where}: agent '{agent}' has role '{declared[agent].role}', which only works in a "
+                                 "project; use an agent on a CLI executor")
+        bindings.append(WorkdirBinding(
+            rule=rule, workdir=workdir, readonly=access == "readonly",
+            # An omitted list means any agent that can work here, not any declared one.
+            binding=binding if binding.agents else replace(binding, agents=tuple(plain)),
+        ))
+    return tuple(bindings)
+
+
+def _binding_rule(where: str, item: Mapping[str, Any], earlier: Sequence[InboxRule]) -> InboxRule:
+    pattern = _text(where, item, "pattern", required=True) or ""
+    try:
+        rule = InboxRule.parse(pattern)
+    except re.error as exc:
+        raise ValueError(f"{where}: invalid pattern {pattern!r}: {exc}") from exc
+    if any(known.pattern == rule.pattern for known in earlier):
+        raise ValueError(f"{where}: pattern {pattern!r} is listed twice")
+    return rule
+
+
+def _binding(where: str, item: Mapping[str, Any], rule: InboxRule, declared: Collection[str]) -> InboxBinding:
+    agents = _texts(where, item, "agents")
+
+    def check(at: str, key: str, agent: str) -> str:
+        if agent not in declared:
+            raise ValueError(f"{at}: {key} '{agent}' is not declared in [agents] (declared: "
+                             f"{', '.join(sorted(declared)) or 'none'})")
+        if agents and agent not in agents:
+            raise ValueError(f"{at}: {key} '{agent}' is not in agents ({', '.join(agents)})")
+        return agent
+
+    for agent in agents:
+        check(where, "agents entry", agent)
+    rules: list[InboxMatchRule] = []
+    for position, entry in enumerate(_tables(f"{where}.rules", item.get("rules", []))):
+        at = f"{where}.rules[{position}]"
+        _only(at, entry, _MATCH_KEYS)
+        match = InboxMatchRule(
+            agent=check(at, "agent", _text(at, entry, "agent", required=True) or ""),
+            source=_text(at, entry, "source"),
+            event_type=_text(at, entry, "event_type"),
+            tags=_texts(at, entry, "tags"),
+        )
+        if match.source is None and match.event_type is None and not match.tags:
+            raise ValueError(f"{at}: needs source, event_type or tags (default_agent takes everything else)")
+        rules.append(match)
+    return InboxBinding(
+        inbox=rule.text,
+        default_agent=check(where, "default_agent", _text(where, item, "default_agent", required=True) or ""),
+        agents=agents,
+        rules=tuple(rules),
+    )
+
+
+class _CheckedOut(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def checkout(self) -> str: ...
+
+    @property
+    def inbox_rules(self) -> tuple[InboxRule, ...]: ...
+
+
+def _directory_key(path: Path) -> object:
+    # The same directory under another spelling, link or letter case is the same one.
+    try:
+        found = path.stat()
+    except OSError:
+        return path
+    return found.st_dev, found.st_ino
+
+
+def validate_workdir_bindings(bindings: Sequence[WorkdirBinding], projects: Iterable[_CheckedOut]) -> None:
+    listed = list(projects)
+    writers: dict[object, WorkdirBinding] = {}
+    checkouts = {_directory_key(Path(p.checkout).expanduser().resolve()): p for p in listed}
+    for bound in bindings:
+        where = f"runtime.inbox_bindings pattern {bound.binding.inbox!r}"
+        for proj in listed:
+            for rule in proj.inbox_rules:
+                _require_apart(where, bound.rule, proj.name, rule)
+        if bound.readonly:
+            continue
+        # Two inboxes run at the same time, so a directory that may be written has one inbox.
+        if bound.rule.literal is None:
+            raise ValueError(f"{where} may match more than one inbox, which would share a writable workdir; name one "
+                             "inbox or set checkout_access = \"readonly\"")
+        workdir = Path(bound.workdir).resolve()
+        other = writers.setdefault(_directory_key(workdir), bound)
+        if other is not bound:
+            raise ValueError(f"{where} and {other.binding.inbox!r} have the same writable workdir {bound.workdir}; "
+                             "give each its own or set checkout_access = \"readonly\"")
+        for directory in (workdir, *workdir.parents):
+            project = checkouts.get(_directory_key(directory))
+            if project is not None:
+                raise ValueError(f"{where}: writable workdir {bound.workdir} is in the checkout of projects.{project.name}")
+
+
+def _require_apart(where: str, rule: InboxRule, project: str, theirs: InboxRule) -> None:
+    # An inbox of a project belongs to it alone; what cannot be told apart is refused as well.
+    shared: str | None = None
+    if rule.literal is not None and theirs.matches(rule.literal):
+        shared = rule.literal
+    elif theirs.literal is not None and rule.matches(theirs.literal):
+        shared = theirs.literal
+    elif rule.literal is None and theirs.literal is None:
+        try:
+            shared = common_match(rule.pattern, theirs.pattern)
+        except UncomparablePattern as exc:
+            raise ValueError(f"{where} cannot be compared with inbox_id pattern {theirs.text!r} of "
+                             f"projects.{project}: {exc}") from exc
+    if shared is not None:
+        raise ValueError(f"{where} also matches inbox_id {shared!r} of projects.{project}")
 
 
 class _Bound(Protocol):
@@ -422,7 +548,7 @@ class ProjectInboxMap(Mapping[str, V], Generic[P, V]):
 
 
 class UnmatchedProjectHold:
-    # Hold policy for an inbox that matches no [projects] entry. An event that would need the project's checkout
+    # Hold policy for an inbox that matches no [projects] entry and no [[runtime.inbox_bindings]]. An event that would need the project's checkout
     # stays pending and unclaimed until a restart or config reload brings a rule that matches; events that name
     # their own workdir, review target, approval or close request run as before. One WARNING per held event and
     # hold instance (each worker pool generation builds its own).
@@ -433,17 +559,20 @@ class UnmatchedProjectHold:
     def __call__(self, event: Event) -> str | None:
         if self._runs_without_project(event):
             return None
-        reason = (
-            f"inbox_id {event.inbox_id!r} matches no [projects] entry and the event names no explicit_workdir; "
-            "it stays pending until a project's inbox_id rule matches (restart or config reload)"
-        )
+        reason = self._reason(event)
         if event.event_id not in self._warned:
             self._warned.add(event.event_id)
             _log.warning(
-                "Event %s (source=%s, external_id=%s) in inbox %s is waiting for a project: %s",
+                "Event %s (source=%s, external_id=%s) in inbox %s is waiting: %s",
                 event.event_id, event.source, event.external_id, event.inbox_id, reason,
             )
         return reason
+
+    def _reason(self, event: Event) -> str:
+        return (
+            f"inbox_id {event.inbox_id!r} matches no [projects] entry and no [[runtime.inbox_bindings]], and the event "
+            "names no explicit_workdir; it stays pending until one matches (restart or config reload)"
+        )
 
     def _runs_without_project(self, event: Event) -> bool:
         payload = event.payload
@@ -461,3 +590,19 @@ class UnmatchedProjectHold:
         else:
             session = None
         return session is not None and session.status == "suspended"
+
+
+class MissingWorkdirHold(UnmatchedProjectHold):
+    # The same for an inbox bound to a workdir that is not there: it is never created, and no event is lost to it.
+    def __init__(self, sessions: SessionStorePort, workdir: str) -> None:
+        super().__init__(sessions)
+        self._workdir = workdir
+
+    def __call__(self, event: Event) -> str | None:
+        return None if Path(self._workdir).is_dir() else super().__call__(event)
+
+    def _reason(self, event: Event) -> str:
+        return (
+            f"workdir {self._workdir} of inbox_id {event.inbox_id!r} is not a directory; it stays pending until it is "
+            "(checked again at the inbox's next event, restart or config reload)"
+        )

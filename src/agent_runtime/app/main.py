@@ -104,6 +104,7 @@ from agent_runtime.app.config import (
 from agent_runtime.app.projects import (
     AmbiguousProjectMatch,
     ProjectRouter,
+    MissingWorkdirHold,
     UnmatchedProjectHold,
     build_routing_manifest,
 )
@@ -220,13 +221,14 @@ class AsyncWorkerPool:
         for inbox_id in () if self._limiter.saturated() else tuple(self._queue):
             cached = self._queued_keys.get(inbox_id)
             if cached is not None and not self._limiter.available(
-                    inbox_id, project_key=cached.project, executor_key=cached.executor):
+                    inbox_id, project_key=cached.project, executor_key=cached.executor, agent_key=cached.agent):
                 continue
             # Cached keys only rule an inbox out; it is admitted on fresh ones. Another thread may have stored a
             # change (an event replayed for another executor) whose wake has not reached the loop yet.
             keys = self._limit_keys(inbox_id) if self._limit_keys is not None else LimitKeys()
             self._queued_keys[inbox_id] = keys
-            if self._limiter.try_acquire(inbox_id, project_key=keys.project, executor_key=keys.executor):
+            if self._limiter.try_acquire(inbox_id, project_key=keys.project, executor_key=keys.executor,
+                                         agent_key=keys.agent):
                 self._queue.remove(inbox_id)
                 self._queued.discard(inbox_id)
                 del self._queued_keys[inbox_id]
@@ -571,6 +573,7 @@ def concurrency_limits(config: HibernautConfig) -> ConcurrencyLimits:
             **config.driver_limits,
             **{n: e.max_concurrency for n, e in executors.items() if e.max_concurrency is not None},
         },
+        agents={n: a.max_concurrency for n, a in config.agents.items() if a.max_concurrency is not None},
     )
 
 
@@ -582,10 +585,10 @@ def executor_quota_hold(
     keys: LimitKeyResolver,
     route: LimitRoute,
 ) -> Callable[[Event], str | None] | None:
-    if not limits.executors:
+    if not limits.executors and not limits.agents:
         return route.hold
     return ExecutorQuotaHold(inbox_id, limiter=pool.limiter, on_defer=pool.defer, inner=route.hold,
-                             executor_of=lambda event: keys.event_executor(event, route))
+                             keys_of=lambda event: keys.event_keys(event, route))
 
 
 def build_daemon(
@@ -1080,6 +1083,24 @@ def build_daemon_from_config(
             for exec_name in config.executors
         }
         fallback_executors.update(_role_executors(default_mgr, "the inbox matches no [projects] entry"))
+        # Only the agents that can work outside a project are registered for an inbox bound to a workdir.
+        bound_executors: dict[str, dict[str, ExecutorPort]] = {
+            bound.rule.pattern: {
+                exec_name: LocalCLIExecutor(
+                    worktree_manager=default_mgr,
+                    inbox_checkout_map=inbox_checkout_map,
+                    templates=config.executors,
+                    default_executor=exec_name,
+                    bound_workdir=bound.workdir,
+                    readonly=bound.readonly,
+                )
+                for exec_name in config.executors
+            }
+            for bound in config.runtime.inbox_bindings
+        }
+        for bound in config.runtime.inbox_bindings:
+            if not bound.readonly and bound.rule.literal is not None:
+                daemon.partitions.register(bound.rule.literal, bound.workdir)
 
         def _manager_for(inbox_id: str | None, work_key: str) -> OrcaWorktreeManager:
             if inbox_id is not None:
@@ -1112,15 +1133,23 @@ def build_daemon_from_config(
                 project = router.resolve(inbox_id)
             except (ValueError, AmbiguousProjectMatch):
                 return None
-            return project.route(inbox_id) if project is not None else None
+            if project is not None:
+                return project.route(inbox_id)
+            bound = config.runtime.workdir_binding(inbox_id)
+            return bound.route() if bound is not None else None
 
         # One per config generation, so a held event is logged once each time it enters the wait.
         unmatched_hold = UnmatchedProjectHold(daemon.sessions)
+        workdir_holds = {b.rule.pattern: MissingWorkdirHold(daemon.sessions, b.workdir)
+                         for b in config.runtime.inbox_bindings}
 
         def _cli_route(inbox_id: str) -> LimitRoute:
             project = router.resolve(inbox_id)
             if project is None:
-                return LimitRoute(hold=unmatched_hold)
+                bound = config.runtime.workdir_binding(inbox_id)
+                if bound is None:
+                    return LimitRoute(hold=unmatched_hold)
+                return LimitRoute(binding=bound.binding, hold=workdir_holds[bound.rule.pattern])
             return LimitRoute(project=project.name, default_executor=project.default_agent,
                               binding=project.route(inbox_id).binding)
 
@@ -1133,6 +1162,11 @@ def build_daemon_from_config(
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
             # Raises AmbiguousProjectMatch before any lease, executor or workspace exists for the inbox.
             project = router.resolve(inbox_id)
+            bound = config.runtime.workdir_binding(inbox_id) if project is None else None
+            if project is not None:
+                executors = executors_by_project[project.name]
+            else:
+                executors = bound_executors[bound.rule.pattern] if bound is not None else fallback_executors
             wt_mgr = wt_mgr_by_project[project.name] if project is not None else default_mgr
             reclaim = worktree_reclaimer(wt_mgr, outbox=daemon.outbox, inbox_id=inbox_id,
                                          delivery=project.delivery if project is not None else None,
@@ -1144,7 +1178,7 @@ def build_daemon_from_config(
                 memory=daemon.partitions.memory_for(inbox_id),
                 permissions=AutoModePermissionAdapter(),
                 outbox=daemon.outbox,
-                executors=executors_by_project[project.name] if project is not None else fallback_executors,
+                executors=executors,
                 project_default_executor=project.default_agent if project is not None else None,
                 global_default_executor=config.runtime.default_agent,
                 routes=_route,

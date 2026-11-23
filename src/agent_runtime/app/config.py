@@ -36,10 +36,13 @@ from agent_runtime.app.projects import (
     AgentConfig,
     InboxRule,
     ProjectBinding,
+    WorkdirBinding,
     parse_inbox_bindings,
     parse_inbox_rules,
+    parse_workdir_bindings,
     validate_project_bindings,
     validate_project_rules,
+    validate_workdir_bindings,
 )
 from agent_runtime.core.models import InboxRoute, NewEventPolicy
 
@@ -59,6 +62,11 @@ class RuntimeConfig:
     default_executor: str = "claude"
     # Background reclaim of merged task worktrees a delivery-time reclaim had to skip; 0 turns it off.
     worktree_sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS
+    # Inboxes of no project, each with the directory its agents start in; the first that matches applies.
+    inbox_bindings: tuple[WorkdirBinding, ...] = ()
+
+    def workdir_binding(self, inbox_id: str) -> WorkdirBinding | None:
+        return next((b for b in self.inbox_bindings if b.rule.matches(inbox_id)), None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +137,7 @@ ROLES = (CODE_REVIEWER_ROLE, SDE_ROLE, STEWARD_ROLE)
 _LEGACY_REVIEWER = "coder-reviewer"
 # Deployment mode shared by every role, as an executor or an agent; visible is the old name of interactive.
 ROLE_DEPLOYMENT_KEYS = frozenset({"interactive", "visible"})
-# A limit belongs to the [executors.<id>] table, whichever agents run on it; an [agents.<id>] cannot set one.
+# On [executors.<id>] it caps all agents running on that driver together, on [agents.<id>] just that agent.
 EXECUTOR_LIMIT_KEYS = frozenset({"max_concurrency"})
 READONLY_CHECKOUT = "readonly"
 
@@ -189,7 +197,7 @@ def _parse_role(
                       max_concurrency=_max_concurrency(f"executors.{name}", item))
 
 
-_AGENT_KEYS = frozenset({"role", "executor", "description"})
+_AGENT_KEYS = frozenset({"role", "executor", "description"}) | EXECUTOR_LIMIT_KEYS
 
 
 def _parse_agent(
@@ -225,7 +233,8 @@ def _parse_agent(
         if unknown:
             raise ValueError(f"executors.{name}: {', '.join(unknown)} not supported for role '{role}'; "
                              "the driver's own settings belong in [executors]")
-    merged = {**bases[driver], **{k: v for k, v in item.items() if k not in ("executor", "description")}}
+    own = {k: v for k, v in item.items() if k not in _AGENT_KEYS or k == "role"}
+    merged = {**bases[driver], **own}
     return _parse_role(name, merged, launchers=launchers, anthropic_url=anthropic_url, base_dir=base_dir)
 
 
@@ -650,14 +659,17 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         except ValueError as exc:
             raise _as_agent_error(agent_id, exc) from exc
         description = str(entry.get("description", "")).strip()
+        agent_limit = _max_concurrency(f"agents.{agent_id}", entry)
         if isinstance(built, CLITemplate):
             executors[agent_id] = built
-            agents[agent_id] = AgentConfig(name=agent_id, executor=str(entry["executor"]), description=description)
+            agents[agent_id] = AgentConfig(name=agent_id, executor=str(entry["executor"]), description=description,
+                                           max_concurrency=agent_limit)
         else:
             roles[agent_id] = built
             agents[agent_id] = AgentConfig(
                 name=agent_id, executor=str(entry["executor"]), role=built.role, model=built.profile.model,
                 effort=built.profile.effort, checkout_access=built.checkout_access, description=description,
+                max_concurrency=agent_limit,
             )
     if "default_agent" in rt_raw and runtime.default_agent not in agents:
         raise ValueError(f"runtime.default_agent '{runtime.default_agent}' is not declared in [agents]")
@@ -717,10 +729,15 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         )
     validate_project_rules(projects.values())
     validate_project_bindings(projects.values())
+    runtime = dataclasses.replace(runtime, inbox_bindings=parse_workdir_bindings(
+        rt_raw.get("inbox_bindings"), declared=agents, resolve=lambda path: _resolve_path(path, base_dir),
+    ))
+    validate_workdir_bindings(runtime.inbox_bindings, projects.values())
 
     for where, limit in (
         *((f"executors.{n}", e.max_concurrency) for n, e in {**executors, **roles}.items()),
         *((f"executors.{n}", value) for n, value in base_limits.items()),
+        *((f"agents.{n}", a.max_concurrency) for n, a in agents.items()),
         *((f"projects.{n}", p.max_concurrency) for n, p in projects.items()),
     ):
         if limit is not None and limit > runtime.max_concurrency:
