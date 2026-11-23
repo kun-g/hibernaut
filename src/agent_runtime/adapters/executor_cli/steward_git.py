@@ -15,6 +15,9 @@ _MAX_CONTENT_FILES = 500
 _GIT_CONFIG = ("core.fsmonitor=false", "log.showSignature=false", "gpg.program=false", "gpg.openpgp.program=false",
                "gpg.x509.program=false", "gpg.ssh.program=false")
 _PLAIN = ("--no-ext-diff", "--no-textconv")
+# Whether a submodule's files changed is asked of a git run inside it, under that repository's configuration.
+_NO_SUBMODULES = "--ignore-submodules=dirty"
+_READS_CHECKOUT = ("status", "diff", "blame", "grep", "ls-files")
 
 
 class ToolError(Exception):
@@ -124,10 +127,36 @@ def check_git_args(args: Sequence[str]) -> GitCall:
     return GitCall(command, tuple(options), tuple(plain), tuple(paths))
 
 
-def exec_git(checkout: Path, args: Sequence[str], ok: Sequence[int] = (0,)) -> str:
+def _git_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    # Without optional locks `git status` does not even refresh the index.
-    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    # Without optional locks `git status` does not even refresh the index; a missing object is not fetched either.
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1")
+    return env
+
+
+def _without_filters(checkout: Path, env: dict[str, str]) -> dict[str, str]:
+    # Comparing the checkout runs the configured content filters. In the environment, since a filter's name may hold "=".
+    try:
+        listed = subprocess.run(
+            ["git", "config", "--name-only", "-z", "--get-regexp", r"^filter\."], cwd=checkout, env=env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="surrogateescape", timeout=_GIT_TIMEOUT,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        raise ToolError(f"git: {exc}") from exc
+    if listed.returncode not in (0, 1):
+        raise ToolError(f"git config exited {listed.returncode}: {listed.stderr.strip()[-2000:]}")
+    drivers = dict.fromkeys(name.rpartition(".")[0] for name in listed.stdout.split("\0") if name.count(".") > 1)
+    unset = [(f"{driver}.{key}", value) for driver in drivers
+             for key, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))]
+    for index, (key, value) in enumerate(unset):
+        env |= {f"GIT_CONFIG_KEY_{index}": key, f"GIT_CONFIG_VALUE_{index}": value}
+    return {**env, "GIT_CONFIG_COUNT": str(len(unset))}
+
+
+def exec_git(checkout: Path, args: Sequence[str], ok: Sequence[int] = (0,)) -> str:
+    env = _git_env()
+    if args[0] in _READS_CHECKOUT:
+        env = _without_filters(checkout, env)
     try:
         done = subprocess.run(
             ["git", "--no-pager", *(part for item in _GIT_CONFIG for part in ("-c", item)), *args],
@@ -156,6 +185,17 @@ def _exact(path: str) -> str:
     return path
 
 
+def _blob(checkout: Path, commit: str, path: str) -> str:
+    # Only a regular file: git shows a submodule's commit or a directory under a path just as well.
+    entries = exec_git(checkout, ["ls-tree", "-z", "--full-tree", commit, "--", path]).split("\0")
+    for entry in entries:
+        fields, _, name = entry.partition("\t")
+        mode, kind, found = (*fields.split(" "), "", "", "")[:3]
+        if name == path and kind == "blob" and mode.startswith("100"):
+            return found
+    raise ToolError(f"git: {path} is not a file in that commit")
+
+
 def _diff_revision(checkout: Path, revision: str) -> str:
     left, dots, right = revision.partition("...") if "..." in revision else revision.partition("..")
     if not dots:
@@ -172,16 +212,18 @@ def plan_git(checkout: Path, call: GitCall) -> tuple[list[str], list[str]]:
     command, options, revisions = call.command, call.options, call.revisions
     if command == "show" and revisions and ":" in revisions[0]:
         revision, path = revisions[0].split(":", 1)
-        return [_exact(path)], ["show", *_PLAIN, f"{_commit(checkout, revision)}:{path}"]
+        return [_exact(path)], ["cat-file", "blob", _blob(checkout, _commit(checkout, revision), path)]
     if command == "blame":
         [path] = call.paths
-        return [_exact(path)], ["blame", *options, *(_commit(checkout, r) for r in revisions), "--", path]
+        return [_exact(path)], ["blame", "--no-textconv", *options, *(_commit(checkout, r) for r in revisions), "--", path]
     if command == "show":
         revisions = tuple(_commit(checkout, r) for r in revisions or ("HEAD",))
     elif command == "diff":
         revisions = tuple(_diff_revision(checkout, r) for r in revisions)
     if not call.content:
         plain = _PLAIN if command in ("diff", "log", "show") else ()
+        if command in ("status", "diff"):
+            plain = (*plain, _NO_SUBMODULES)
         tail = ("--", *call.paths) if call.paths or command in ("diff", "show") else ()
         return [], [command, *plain, *options, *revisions, *tail]
     # A patch: first which files it touches, without renames, so every line of it belongs to one of them.
@@ -191,7 +233,7 @@ def plan_git(checkout: Path, call: GitCall) -> tuple[list[str], list[str]]:
                     for commit in revisions]
     else:
         compared = [o for o in options if o in ("--cached", "--staged", "--merge-base")]
-        listings = [["diff", *_PLAIN, "--name-only", "-z", "--no-renames", "--no-relative", *compared, *revisions]]
+        listings = [["diff", *_PLAIN, _NO_SUBMODULES, "--name-only", "-z", "--no-renames", "--no-relative", *compared, *revisions]]
     files = [name for listing in listings
              for name in exec_git(checkout, [*listing, "--", *call.paths]).split("\0") if name]
     files = list(dict.fromkeys(files))
@@ -202,6 +244,6 @@ def plan_git(checkout: Path, call: GitCall) -> tuple[list[str], list[str]]:
         return [], ["show", *_PLAIN, "--no-patch", *shown, *revisions] if command == "show" else []
     # Only the files listed here, whatever changes in the checkout meanwhile.
     return files, [
-        command, *_PLAIN, *options, "--no-renames", "--submodule=short", "--no-relative", *revisions, "--",
+        command, *_PLAIN, *options, _NO_SUBMODULES, "--no-renames", "--submodule=short", "--no-relative", *revisions, "--",
         *(f":(top,literal){name}" for name in files),
     ]

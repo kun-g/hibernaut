@@ -94,6 +94,14 @@ def carried_spec(event: Event) -> ForwardSpec | None:
         origin_key=_text(payload.get("origin_key")),
         delegation_id=forwarded_piece(event) or None,
         work_key=_text(payload.get("work_key")) if payload.get("forwarded_from") == event.inbox_id else None,
+        replayed=is_replay(event),
+    )
+
+
+def is_replay(event: Event) -> bool:
+    # Asked for by an operator: this event itself, or the work it continues.
+    return _text(event.payload.get("_replay_id")) is not None or (
+        event.source in _AGENT_SOURCES and event.payload.get("replayed") is True
     )
 
 
@@ -107,9 +115,39 @@ def forwarded_piece(event: Event) -> str | None:
     return _text(event.payload.get("delegation_id")) or event.external_id
 
 
+def passed_on(event: Event) -> bool:
+    # A forward of a piece that the sending session owed itself; a piece it sent out bears the forward's own id.
+    piece = forwarded_piece(event)
+    return bool(piece) and piece != event.external_id
+
+
+def returned_piece(event: Event) -> str | None:
+    return _text(event.payload.get("delegation_id")) if event.source == RETURN_SOURCE else None
+
+
 def returned_pieces(events: Sequence[Event]) -> set[str]:
-    return {piece for evt in events
-            if evt.source == RETURN_SOURCE and (piece := _text(evt.payload.get("delegation_id")))}
+    return {piece for evt in events if (piece := returned_piece(evt))}
+
+
+def settled_return(event: Event, sessions: SessionStorePort) -> bool:
+    # A result of a piece that the session waiting for it has settled already, by another result or a cancel.
+    piece = returned_piece(event)
+    if piece is None or is_replay(event):
+        return False
+    asked = ForwardSpec(target_inbox=event.inbox_id, return_to=event.inbox_id,
+                        parent_session_id=_text(event.payload.get("parent_session_id")))
+    for session in (
+        sessions.get(event.session_id) if event.session_id else None,
+        sessions.find_by_correlation_key(event.inbox_id, event.correlation_key) if event.correlation_key else None,
+        _asking_session(sessions, asked),
+    ):
+        known = session.forward if session is not None and session.inbox_id == event.inbox_id else None
+        # The event that settled it may run again, after a crash before it was marked done.
+        if known is not None and (piece in known.cancelled_returns or any(
+            done == piece and by != event.event_id for done, by in known.settled_returns
+        )):
+            return True
+    return False
 
 
 def same_piece(event: Event, batch: Sequence[Event]) -> bool:
@@ -120,7 +158,8 @@ def same_piece(event: Event, batch: Sequence[Event]) -> bool:
 
 
 def own_task(event: Event, sessions: SessionStorePort) -> Event:
-    # A piece sent to a conversation whose session still owes another one gets a session and worktree of its own.
+    # A piece sent to a conversation whose session still owes or waits for another one gets a session and worktree of
+    # its own.
     piece = forwarded_piece(event)
     if piece is None or not event.correlation_key:
         return event
@@ -130,7 +169,10 @@ def own_task(event: Event, sessions: SessionStorePort) -> Event:
     else:
         holder = sessions.find_by_correlation_key(event.inbox_id, event.correlation_key)
     owed = holder.forward if holder is not None else None
-    if owed is not None and owed.return_to is not None and owed.delegation_id != piece:
+    elsewhere = event.session_id is None and bool(piece) and event.payload.get("forwarded_from") != event.inbox_id
+    if owed is not None and owed.delegation_id != piece and (
+        owed.return_to is not None or (elsewhere and bool(owed.pending_returns))
+    ):
         return replace(event, session_id=None, correlation_key=f"forward:{event.external_id}:{event.correlation_key}")
     if holder is not None and holder.correlation_key:
         return replace(event, correlation_key=holder.correlation_key)
@@ -143,18 +185,24 @@ def run_spec(events: Sequence[Event], session: SessionRef | None) -> ForwardSpec
     carried = [(evt, spec) for evt in events if (spec := carried_spec(evt)) is not None]
     returned_now = returned_pieces(events)
     waiting = tuple(p for p in (saved.pending_returns if saved is not None else ()) if p not in returned_now)
+    settled = tuple(dict.fromkeys((
+        *(saved.settled_returns if saved is not None else ()),
+        *((piece, evt.event_id) for evt in events if (piece := returned_piece(evt))),
+    )))
     if carried:
         hops = max(spec.hop_count for _, spec in carried)
-        if saved is not None:
+        if saved is not None and (saved.return_to is not None or saved.pending_returns):
+            # Still part of the chain this session is in; a chain that is over leaves nothing to the next one.
             hops = max(hops, saved.hop_count)
         forwards = [spec for evt, spec in carried if evt.source == FORWARD_SOURCE]
         if forwards:
             latest = next((spec for spec in reversed(forwards) if spec.return_to), forwards[-1])
             if latest.return_to is None and saved is not None and saved.return_to is not None:
                 # Handed on inside the inbox: the session still owes what it owed.
-                return replace(saved, hop_count=hops, pending_returns=waiting, work_key=latest.work_key or saved.work_key)
+                return replace(saved, hop_count=hops, pending_returns=waiting, settled_returns=settled,
+                               work_key=latest.work_key or saved.work_key)
             return replace(
-                latest, hop_count=hops, pending_returns=waiting,
+                latest, hop_count=hops, pending_returns=waiting, settled_returns=settled,
                 cancelled_returns=saved.cancelled_returns if saved is not None else (),
                 owed_failures=saved.owed_failures if saved is not None else (),
                 work_key=latest.work_key or (saved.work_key if saved is not None else None),
@@ -163,13 +211,13 @@ def run_spec(events: Sequence[Event], session: SessionRef | None) -> ForwardSpec
         if saved is None:
             # The parent session is gone: this one answers outside and starts no new parent.
             return replace(returned, hop_count=hops)
-        return replace(saved, hop_count=hops, pending_returns=waiting)
+        return replace(saved, hop_count=hops, pending_returns=waiting, settled_returns=settled)
     if saved is None:
         return None
     fresh = any(not is_approval(evt) and not evt.source.startswith("timer:") for evt in events)
     if fresh and saved.return_to is None:
         # A new message from outside starts a new chain.
-        return replace(saved, hop_count=0, forwarded_from=None)
+        return replace(saved, hop_count=0, forwarded_from=None, handed_on=False)
     return saved
 
 
@@ -249,6 +297,8 @@ def return_payload(
                        ("delegation_id", spec.delegation_id)):
         if value:
             payload[key] = value
+    if spec.replayed:
+        payload["replayed"] = True
     if delivery is not None:
         payload["delivery"] = {"state": delivery.state, "pr_url": delivery.pr_url, "hold": delivery.hold,
                                "hold_detail": delivery.hold_detail}
@@ -417,6 +467,21 @@ class ForwardStage:
         if relayed and agent == self.agent_id:
             raise ForwardRefused(f"agent '{self.agent_id}' cannot forward to itself in '{target}'")
         back = _text(return_to)
+        passing = False
+        if spec is not None and spec.return_to is not None:
+            # The same work goes on with another agent, and what is owed for it with it.
+            passing = relayed if back is None else back == spec.return_to != self.inbox_id
+        inside = relayed if back is None else back != self.inbox_id
+        if (passing and any(map(passed_on, self.staged))) or (spec is not None and spec.handed_on and inside):
+            raise ForwardRefused(
+                "this work is already handed on to another agent, which answers for it; end your turn without a result"
+            )
+        if passing:
+            assert spec is not None
+            back = spec.return_to
+            asker = _asking_session(self.sessions, spec)
+            if relayed and asker is not None and (asker.inbox_id, asker.agent_id) == (target, agent):
+                raise ForwardRefused(f"agent '{agent}' waits for your result here; end your turn with it")
         if back is not None:
             if back == target and not relayed:
                 raise ForwardRefused(f"return_to '{back}' is the target inbox itself")
@@ -437,7 +502,7 @@ class ForwardStage:
             raise ForwardRefused(decision.reason, "block")
         if decision.action == "defer" and not (approved_request_id and self.approval(approved_request_id)):
             raise ForwardRefused(decision.reason, "defer")
-        event = self._event(target, agent, body, title.strip(), wanted, back, hops, spec, events)
+        event = self._event(target, agent, body, title.strip(), wanted, back, hops, spec, events, passing)
         self.staged.append(event)
         # A copy: the caller may do what it likes with its receipt, what was checked above is what goes out.
         return deepcopy(event)
@@ -454,7 +519,7 @@ class ForwardStage:
 
     def _event(
         self, target: str, agent: str | None, text: str, title: str, tags: Sequence[str], return_to: str | None,
-        hops: int, spec: ForwardSpec | None, events: Sequence[Event],
+        hops: int, spec: ForwardSpec | None, events: Sequence[Event], passing: bool,
     ) -> Event:
         root = (spec.origin_key if spec is not None else None) or self.correlation_key
         payload: dict[str, Any] = {
@@ -462,7 +527,6 @@ class ForwardStage:
             "hop_count": hops + 1,
             "forwarded_from": self.inbox_id,
             "forwarded_by": self.agent_id,
-            "parent_session_id": self.session.session_id,
             **_reply_fields(spec, events),
         }
         for key in _INHERITED_KEYS:
@@ -471,11 +535,15 @@ class ForwardStage:
                 payload[key] = value
         external_id = chain_external_id("forward", events, len(self.staged))
         piece = external_id if return_to else None
-        if spec is not None and return_to is not None and return_to == spec.return_to != self.inbox_id:
-            # What this session owes itself is passed on, so whoever answers first settles that one piece.
-            piece = spec.delegation_id
+        parent: str | None = self.session.session_id
+        if passing and spec is not None:
+            # The receiver owes it to the session that waits for it, as if that one had sent it the work: this session
+            # is out of it, so closing it ends nothing there.
+            piece, parent = spec.delegation_id, spec.parent_session_id
+        replayed = (passing and spec is not None and spec.replayed) or any(map(is_replay, events))
         for key, value in (("title", title), ("tags", list(tags)), ("agent_id", agent), ("return_to", return_to),
-                           ("origin_key", root), ("delegation_id", piece)):
+                           ("origin_key", root), ("delegation_id", piece), ("parent_session_id", parent),
+                           ("replayed", replayed)):
             if value:
                 payload[key] = value
         key = root
@@ -508,12 +576,18 @@ class ForwardStage:
 
     def own_returns(self) -> tuple[str, ...]:
         return tuple(piece for evt in self.staged
-                     if evt.payload.get("return_to") == self.inbox_id and (piece := forwarded_piece(evt)))
+                     if evt.payload.get("return_to") == self.inbox_id and not passed_on(evt)
+                     and (piece := forwarded_piece(evt)))
+
+    def passes_on(self, spec: ForwardSpec | None) -> bool:
+        return spec is not None and spec.delegation_id is not None and any(
+            passed_on(evt) and forwarded_piece(evt) == spec.delegation_id for evt in self.staged
+        )
 
     def hand_over(self, link: TaskLink) -> bool:
-        # The task goes with the first piece whose agent answers outside by itself.
+        # The task goes with the first piece this session gets no result for: its agent finishes the work.
         for index, evt in enumerate(self.staged):
-            if "return_to" in evt.payload:
+            if "return_to" in evt.payload and not passed_on(evt):
                 continue
             fields: dict[str, Any] = {"task_id": link.task_id}
             if link.trace_id:

@@ -135,6 +135,12 @@ class ForwardSpec:
     pending_returns: tuple[str, ...] = ()
     # Pieces this session no longer waits for because no result will come.
     cancelled_returns: tuple[str, ...] = ()
+    # (piece, event) of every result this session has worked on: another event with the same piece comes too late.
+    settled_returns: tuple[tuple[str, str], ...] = ()
+    # What this session owed is owed by the agent it handed it on to: nothing it says about that work goes outside.
+    handed_on: bool = False
+    # An operator replayed the event that brought this piece: its result counts although the piece is settled.
+    replayed: bool = False
     # Failed events of this session that do not end the task outside: told to the agent it owed a result, or a
     # refused message while the task goes on.
     owed_failures: tuple[str, ...] = ()

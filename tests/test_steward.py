@@ -488,6 +488,85 @@ class ToolTests(StewardCase):
             self.assertNotIn("needle", text, args)
         self.assertIn("open.txt", asked)
 
+    async def test_a_path_in_history_shows_only_a_file(self) -> None:
+        (self.repo / "secrets").mkdir()
+        (self.repo / "secrets/key.txt").write_text("needle\n")
+        (self.repo / "open.txt").write_text("in the open\n")
+        (self.repo / "link").symlink_to("open.txt")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "add both")
+        commit = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"], check=True, capture_output=True,
+                                text=True).stdout.strip()
+        # A submodule entry whose commit happens to be in this repository.
+        git(self.repo, "update-index", "--add", "--cacheinfo", f"160000,{commit},vendor/mod")
+        git(self.repo, "commit", "-qm", "add a submodule")
+
+        class Policy:
+            def check(self, tool_name: str, args: dict[str, Any]) -> PermissionDecision:
+                private = tool_name == "read_file" and args["path"].startswith("secrets/")
+                return PermissionDecision("block" if private else "allow", "private")
+
+        self.caps.permissions = Policy()
+        for path in ("vendor/mod", "vendor", "secrets", "link", "missing.txt", "open.txt/"):
+            failed, text = await self.tool("git", args=["show", f"HEAD:{path}"])
+            self.assertTrue(failed, (path, text))
+            self.assertNotIn("needle", text, path)
+        self.assertEqual(await self.tool("git", args=["show", "HEAD:open.txt"]), (False, "in the open\n"))
+        # In a patch a submodule is its commit id, whatever the configuration asks for.
+        git(self.repo, "config", "diff.submodule", "log")
+        for args in (["show", "HEAD"], ["diff", "HEAD~1", "HEAD"], ["diff"], ["show", "HEAD", "--stat", "--summary"],
+                     ["diff", "--stat", "HEAD~1", "HEAD"], ["log", "--stat", "-n", "1"]):
+            failed, text = await self.tool("git", args=args)
+            self.assertFalse(failed, text)
+            self.assertNotIn("needle", text, args)
+
+    async def test_git_runs_no_configured_program(self) -> None:
+        marker = self.root / "ran"
+        converter = self.root / "convert"
+        converter.write_text(f"#!/bin/sh\ntouch {marker}\necho CONVERTED\n")
+        converter.chmod(0o755)
+        (self.repo / ".gitattributes").write_text("*.txt diff=up filter=a=b.c\n")
+        (self.repo / "open.txt").write_text("raw line\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "add it")
+        (self.repo / "open.txt").write_text("raw line 2\n")
+        for key in ("diff.up.textconv", "diff.up.command", "filter.a=b.c.clean", "filter.a=b.c.process"):
+            git(self.repo, "config", key, str(converter))
+        git(self.repo, "config", "filter.a=b.c.required", "true")
+        for args, expected in (
+            (["blame", "open.txt"], "raw line 2"), (["blame", "HEAD", "--", "open.txt"], "raw line"),
+            (["diff"], "+raw line 2"), (["diff", "--stat"], "open.txt"), (["status", "--short"], "M open.txt"),
+            (["show", "HEAD"], "+raw line"), (["show", "HEAD:open.txt"], "raw line"), (["log", "--stat"], "open.txt"),
+        ):
+            failed, text = await self.tool("git", args=args)
+            self.assertFalse(failed, (args, text))
+            self.assertIn(expected, text, args)
+            self.assertNotIn("CONVERTED", text, args)
+            self.assertFalse(marker.exists(), args)
+        self.assertFalse((await self.tool("search_files", pattern="raw"))[0])
+        self.assertFalse((await self.tool("list_files"))[0])
+        self.assertFalse(marker.exists())
+
+    async def test_git_never_enters_a_submodule(self) -> None:
+        inner = self.root / "inner"
+        marker = self.root / "entered"
+        hook = self.root / "monitor"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        subprocess.run(["git", "init", "-q", str(inner)], check=True)
+        (inner / "f").write_text("x\n")
+        for args in (["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@x", "commit", "-qm", "x"]):
+            subprocess.run(["git", "-C", str(inner), *args], check=True)
+        git(self.repo, "-c", "protocol.file.allow=always", "submodule", "--quiet", "add", str(inner), "mod")
+        git(self.repo, "commit", "-qam", "add the submodule")
+        git(self.repo / "mod", "config", "filter.x.clean", str(hook))
+        (self.repo / "mod/.gitattributes").write_text("* filter=x\n")
+        (self.repo / "mod/f").write_text("y\n")
+        for args in (["status"], ["diff"], ["diff", "--stat"], ["diff", "HEAD"]):
+            failed, text = await self.tool("git", args=args)
+            self.assertFalse(failed, (args, text))
+            self.assertFalse(marker.exists(), args)
+
     async def test_a_merge_shows_only_files_that_may_be_read(self) -> None:
         (self.repo / "key.txt").write_text("base\n")
         git(self.repo, "add", "-A")

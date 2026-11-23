@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteSessionStoreAdapter
 from agent_runtime.core.models import (
+    CLOSE_SOURCE,
     FORWARD_SOURCE,
     INTERNAL_SOURCES,
     MAX_FORWARD_HOPS,
@@ -121,13 +122,13 @@ class ForwardCase(unittest.IsolatedAsyncioTestCase):
         self.policy: Any = "defer"
         self.ledger: Ledger | None = None
 
-    def worker(self, name: str = "w1") -> AgentWorker:
+    def worker(self, name: str = "w1", hold: Any = None) -> AgentWorker:
         return AgentWorker(
             worker_id=name, inbox=self.inbox, timers=InMemoryTimerStore(), memory=InMemoryMemoryStore(),
             permissions=self.permissions, outbox=self.outbox, lock=self.lock, sessions=self.sessions,
             executors=self.agents, project_default_executor="steward", global_default_executor="steward",
             routes=routes, on_forward=self.woken.append, new_event_policy=self.policy, max_retries=1,
-            run_ledger=self.ledger,
+            run_ledger=self.ledger, hold=hold,
         )
 
     def ingest(self, inbox_id: str = MAIN, *, source: str = "switchboard:feishu", key: str | None = "feishu:1",
@@ -138,8 +139,11 @@ class ForwardCase(unittest.IsolatedAsyncioTestCase):
         ))
         return event
 
-    async def run_inbox(self, inbox_id: str = MAIN) -> list[RunReport]:
-        return await self.worker().process_inbox(inbox_id)
+    def gate(self, action: Any, reason: str = "ask first") -> None:
+        self.permissions = InMemoryPermission({"inbox.forward": PermissionDecision(action, reason)})
+
+    async def run_inbox(self, inbox_id: str = MAIN, hold: Any = None) -> list[RunReport]:
+        return await self.worker(hold=hold).process_inbox(inbox_id)
 
     def sent(self, kind: str = "emit") -> list[Any]:
         return [m for m in self.outbox.fetch_pending(limit=1000) if m.metadata.get("kind") == kind]
@@ -735,6 +739,69 @@ class ReturnTests(ForwardCase):
         self.assertEqual([e.session_id for e in self.queued(MAIN)], [steward.session_id])
 
 
+class InboxOwnershipTests(ForwardCase):
+    # A worker holds the lease of one inbox, so it never touches a session of another.
+    async def foreign(self) -> SessionRef:
+        self.agents["sde"].script = lambda _e, _s, _c: Suspend("req1", "merge?", "{}")
+        self.ingest(SDE, key="task:1")
+        await self.run_inbox(SDE)
+        session = self.sessions.find_by_request_id("req1")
+        assert session is not None
+        self.agents["sde"].runs.clear()
+        return session
+
+    async def test_a_close_in_one_inbox_does_not_reach_a_session_of_another(self) -> None:
+        session = await self.foreign()
+        for how, event in (
+            ("session_id", {"session_id": session.session_id}),
+            ("source", {"session_id": session.session_id, "source": "session:close"}),
+            ("request", {"approval_request_id": "req1"}),
+        ):
+            with self.subTest(how):
+                event = self.ingest(MAIN, key=None, action="close_session", **event)  # type: ignore[arg-type]
+                await self.run_inbox()
+                self.assertEqual(self.sessions.get(session.session_id), session)
+                self.assertEqual([e.status for e in self.inbox.all_events() if e.event_id == event.event_id], ["failed"])
+
+    async def test_a_close_naming_its_target_in_the_payload_does_not_either(self) -> None:
+        session = await self.foreign()
+        event, _ = self.inbox.append(Event(
+            inbox_id=MAIN, source="test", external_id="c", payload={"action": "close_session",
+                                                                    "session_id": session.session_id}))
+        await self.run_inbox()
+        self.assertEqual(self.sessions.get(session.session_id), session)
+        self.assertEqual([e.status for e in self.inbox.all_events() if e.event_id == event.event_id], ["failed"])
+        own, _ = self.inbox.append(Event(
+            inbox_id=SDE, source="test", external_id="c", payload={"action": "close_session",
+                                                                   "session_id": session.session_id}))
+        await self.run_inbox(SDE)
+        self.assertEqual(self.sessions.get(session.session_id).status, "closed")  # type: ignore[union-attr]
+
+    async def test_hibernauts_own_close_request_goes_on_to_the_inbox_it_belongs_to(self) -> None:
+        session = await self.foreign()
+        for payload, session_id in (({}, session.session_id), ({"session_id": session.session_id}, None)):
+            self.inbox.append(Event(inbox_id=MAIN, source=CLOSE_SOURCE, external_id=f"c{session_id}", payload=payload,
+                                    session_id=session_id))
+        self.assertTrue(self.lock.acquire(SDE, "busy", 60))
+        await self.run_inbox()
+        self.assertEqual(self.sessions.get(session.session_id), session)
+        self.assertIn(SDE, self.woken)
+        self.lock.release(SDE, "busy")
+        await self.run_inbox(SDE)
+        self.assertEqual(self.sessions.get(session.session_id).status, "closed")  # type: ignore[union-attr]
+
+    async def test_a_message_in_one_inbox_does_not_run_a_session_of_another(self) -> None:
+        session = await self.foreign()
+        for fields in ({"session_id": session.session_id, "text": "hi"}, {"approval_request_id": "req1", "approved": True}):
+            event = self.ingest(MAIN, key=None, **fields)  # type: ignore[arg-type]
+            self.assertIsNone(AgentWorker.expected_executor_id(
+                event, self.sessions, project_default="steward", global_default=None))
+            await self.run_inbox()
+            self.assertEqual(self.sessions.get(session.session_id), session)
+            self.assertEqual([e.status for e in self.inbox.all_events() if e.event_id == event.event_id], ["failed"])
+        self.assertEqual([a.runs for a in self.agents.values()], [[]] * 5)
+
+
 class DelegationTests(ForwardCase):
     # Every piece of work sent out for a result is told apart from every other one, from the forward to its return.
     async def owed_twice(self, between: Script | None = None) -> None:
@@ -906,6 +973,450 @@ class DelegationTests(ForwardCase):
         reports = await self.run_inbox()
         self.assertFalse(reports[-1].pending_elsewhere)
 
+    async def handed_on(self, outcome: RunOutcome | None = None) -> SessionRef:
+        # The steward's piece, handed on by the developer to the writer.
+        self.forward("steward", SDE, "x", return_to=MAIN)
+        self.ingest(reply_channel="feishu", reply_target="oc_1")
+        await self.run_inbox()
+        self.forward("sde", DOCS, "document it", return_to=MAIN, outcome=outcome)
+        await self.run_inbox(SDE)
+        self.agents["steward"].script = lambda _e, _s, _c: Silent()
+        self.answer("writer", "documented")
+        middle = self.agents["sde"].runs[0][1]
+        assert middle is not None
+        return middle
+
+    def cancels(self) -> list[Event]:
+        return [e for e in self.inbox.all_events() if e.source == RETURN_CANCELLED_SOURCE and e.status != "dropped"]
+
+    async def test_whoever_takes_a_piece_over_is_the_only_one_who_owes_it(self) -> None:
+        middle = await self.handed_on()
+        saved = self.sessions.get(middle.session_id)
+        assert saved is not None and saved.forward is not None
+        self.assertEqual((saved.forward.return_to, saved.forward.delegation_id), (None, None))
+        # Closed before the writer answers: neither the piece nor the writer's session ends with it.
+        self.ingest(SDE, key=None, session_id=middle.session_id, action="close_session")
+        await self.run_inbox(SDE)
+        await self.run_inbox(DOCS)
+        self.assertEqual(self.cancels(), [])
+        self.assertEqual([e.payload["text"] for e in self.returned()], ["documented"])
+        self.answer("steward", "all done")
+        [report] = await self.run_inbox()
+        self.assertFalse(report.pending_elsewhere)
+        self.assertEqual([m.content for m in self.sent()], ["all done"])
+
+    async def test_closing_the_one_who_asked_ends_the_piece_with_whoever_has_it(self) -> None:
+        await self.handed_on()
+        steward = self.agents["steward"].runs[0][1]
+        assert steward is not None
+        self.agents["writer"].script = lambda _e, _s, _c: Silent()
+        await self.run_inbox(DOCS)
+        self.ingest(key=None, session_id=steward.session_id, action="close_session")
+        await self.run_inbox()
+        await self.run_inbox(DOCS)
+        writer = self.agents["writer"].runs[0][1]
+        assert writer is not None
+        self.assertEqual(self.sessions.get(writer.session_id).status, "closed")  # type: ignore[union-attr]
+
+    async def test_what_is_said_after_handing_a_piece_on_stays_inside(self) -> None:
+        middle = await self.handed_on(Emit(messages=("secret progress",)))
+        self.assertEqual(self.returned(), [])
+        for outcome in (Silent(), Emit(messages=("secret timer",))):
+            self.agents["sde"].script = lambda _e, _s, _c, outcome=outcome: outcome
+            self.ingest(SDE, key=None, session_id=middle.session_id, source="timer:poll")
+            [report] = await self.run_inbox(SDE)
+            self.assertTrue(report.pending_elsewhere)
+        await self.run_inbox(DOCS)
+        self.assertEqual([e.payload["text"] for e in self.returned()], ["documented"])
+        self.assertNotIn("secret", self.outbound())
+        # A new message from outside is answered outside.
+        self.answer("sde", "hello")
+        self.ingest(SDE, key=None, session_id=middle.session_id, text="hi")
+        await self.run_inbox(SDE)
+        self.assertEqual([m.content for m in self.sent()], ["hello"])
+
+    async def test_a_failure_after_handing_a_piece_on_stays_inside(self) -> None:
+        middle = await self.handed_on()
+        self.crash("sde", "secret")
+        timer = self.ingest(SDE, key=None, session_id=middle.session_id, source="timer:poll")
+        with self.assertRaises(ExecutorFailed):
+            await self.run_inbox(SDE)
+        await self.run_inbox(DOCS)
+        self.assertEqual([(e.payload["text"], e.payload["status"]) for e in self.returned()], [("documented", "done")])
+        self.assertNotIn("secret", self.outbound())
+        saved = self.sessions.get(middle.session_id)
+        assert saved is not None and saved.forward is not None
+        # So no channel ends the task for it either.
+        self.assertIn(timer.event_id, saved.forward.owed_failures)
+
+    async def test_a_suspended_session_that_handed_its_piece_on_answers_nobody_with_it(self) -> None:
+        middle = await self.handed_on(Suspend("req1", "ok?", "{}"))
+        self.answer("sde", "secret")
+        self.ingest(SDE, key=None, session_id=middle.session_id, approval_request_id="req1", approved=True,
+                    event_type="approval.decided")
+        await self.run_inbox(SDE)
+        await self.run_inbox(DOCS)
+        self.assertEqual([e.payload["text"] for e in self.returned()], ["documented"])
+        self.assertNotIn("secret", self.outbound())
+
+    async def test_a_failed_run_hands_nothing_on(self) -> None:
+        await self.handed_on(Emit(messages=("broken",), status="failed"))
+        self.assertEqual(self.queued(DOCS), [])
+        self.assertEqual([(e.payload["text"], e.payload["status"]) for e in self.returned()], [("broken", "failed")])
+
+    async def test_a_piece_is_handed_on_once(self) -> None:
+        for second in ({"target_inbox": f"{SDE}:b", "return_to": MAIN},
+                       {"target_inbox": SDE, "target_agent": "code-reviewer"}):
+            with self.subTest(second):
+                self.setUp()
+                self.forward("steward", SDE, "x", return_to=MAIN)
+                self.ingest()
+                await self.run_inbox()
+                refused: list[str] = []
+
+                def script(
+                    _e: Sequence[Event], _s: SessionRef | None, caps: RunCapabilities,
+                    second: dict[str, str] = second, refused: list[str] = refused,
+                ) -> RunOutcome:
+                    caps.forward_to_inbox(DOCS, "document it", return_to=MAIN)
+                    try:
+                        caps.forward_to_inbox(text="more", **second)  # type: ignore[arg-type]
+                    except ForwardRefused as exc:
+                        refused.append(str(exc))
+                    return Silent()
+
+                self.agents["sde"].script = script
+                with patch.dict(BINDINGS, {f"{SDE}:b": BINDINGS[SDE]}):
+                    await self.run_inbox(SDE)
+                self.assertEqual(len(refused), 1)
+                self.assertIn("already handed on", refused[0])
+                self.assertEqual(len(self.queued(DOCS)), 1)
+
+    async def test_a_result_of_a_piece_that_is_settled_is_not_worked_on_again(self) -> None:
+        for how in ("returned", "cancelled"):
+            with self.subTest(how):
+                self.setUp()
+                self.forward("steward", SDE, "x", return_to=MAIN)
+                self.ingest()
+                await self.run_inbox()
+                self.agents["steward"].script = lambda _e, _s, _c: Silent()
+                steward = self.agents["steward"].runs[0][1]
+                assert steward is not None
+                [piece] = self.queued(SDE)
+                late = {"text": "late", "status": "done", "hop_count": 2, "delegation_id": piece.external_id,
+                        "parent_session_id": steward.session_id, "forwarded_from": DOCS, "forwarded_by": "writer"}
+                if how == "returned":
+                    self.answer("sde", "first")
+                    await self.run_inbox(SDE)
+                else:
+                    self.ingest(source=RETURN_CANCELLED_SOURCE, key=None, session_id=steward.session_id,
+                                delegation_id=piece.external_id, reason="gone", forwarded_from=SDE, forwarded_by="sde")
+                await self.run_inbox()
+                runs = len(self.agents["steward"].runs)
+                for session_id, key in ((steward.session_id, None), (None, "feishu:1")):
+                    event = self.ingest(source=RETURN_SOURCE, key=key, session_id=session_id, **late)
+                    self.assertIsNone(AgentWorker.expected_executor_id(
+                        event, self.sessions, project_default="steward", global_default=None))
+                    await self.run_inbox()
+                    self.assertEqual([e.status for e in self.inbox.all_events() if e.event_id == event.event_id], ["done"])
+                self.assertEqual(len(self.agents["steward"].runs), runs)
+                # An operator who replays one means it.
+                self.ingest(source=RETURN_SOURCE, key=None, session_id=steward.session_id, _replay_id="r1", **late)
+                await self.run_inbox()
+                self.assertEqual(len(self.agents["steward"].runs), runs + 1)
+
+    async def test_a_result_queued_before_its_cancel_counts(self) -> None:
+        self.forward("steward", SDE, "x", return_to=MAIN)
+        self.ingest()
+        await self.run_inbox()
+        steward = self.agents["steward"].runs[0][1]
+        assert steward is not None
+        [piece] = self.queued(SDE)
+        self.answer("steward", "all done")
+        self.answer("sde", "result")
+        await self.run_inbox(SDE)
+        self.ingest(source=RETURN_CANCELLED_SOURCE, key=None, session_id=steward.session_id,
+                    delegation_id=piece.external_id, reason="gone", forwarded_from=SDE, forwarded_by="sde")
+        await self.run_inbox()
+        self.assertEqual([m.content for m in self.sent()], ["all done"])
+        self.assertEqual(self.sent("return_withheld"), [])
+
+    async def test_a_relay_takes_over_what_its_session_owes(self) -> None:
+        self.forward("steward", SDE, "x", return_to=MAIN)
+        self.ingest(reply_channel="feishu", reply_target="oc_1")
+        await self.run_inbox()
+        steward = self.agents["steward"].runs[0][1]
+        assert steward is not None
+        [piece] = self.queued(SDE)
+        self.forward("sde", SDE, "review it", target_agent="code-reviewer")
+        self.answer("code-reviewer", "review: secret finding")
+        reports = await self.run_inbox(SDE)
+        self.assertEqual([r.pending_elsewhere for r in reports], [True, True])
+        [back] = self.returned()
+        self.assertEqual(
+            (back.payload["text"], back.payload["delegation_id"], back.session_id),
+            ("review: secret finding", piece.external_id, steward.session_id),
+        )
+        self.assertNotIn("secret", self.outbound())
+        self.answer("steward", "all done")
+        [report] = await self.run_inbox()
+        self.assertFalse(report.pending_elsewhere)
+        for session in self.sessions.list_sessions():
+            if session.inbox_id == SDE:
+                self.ingest(SDE, key=None, session_id=session.session_id, action="close_session")
+        await self.run_inbox(SDE)
+        self.assertEqual(self.cancels(), [])
+
+    async def test_a_relay_inside_the_inbox_that_waits_answers_the_one_who_asked(self) -> None:
+        # steward -> code-reviewer (result wanted in the same inbox) -> ops, which takes the piece over.
+        self.forward("steward", MAIN, "review", target_agent="code-reviewer", return_to=MAIN)
+        self.forward("code-reviewer", MAIN, "check it", target_agent="ops")
+        self.answer("ops", "checked")
+        first = self.agents["steward"].script
+
+        def steward(events: Sequence[Event], session: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
+            if events[0].source == RETURN_SOURCE:
+                return Emit(messages=(f"all done: {events[0].payload['text']}",))
+            return first(events, session, caps)
+
+        self.agents["steward"].script = steward
+        self.ingest()
+        reports = await self.run_inbox()
+        self.assertEqual([m.content for m in self.sent()], ["all done: checked"])
+        self.assertEqual([r.pending_elsewhere for r in reports], [True, True, True, False])
+        runs = self.agents["steward"].runs
+        self.assertEqual(runs[0][1].session_id, runs[1][1].session_id)  # type: ignore[union-attr]
+        reviewer = self.sessions.get(self.agents["code-reviewer"].runs[0][1].session_id)  # type: ignore[union-attr]
+        self.assertEqual(reviewer.forward.pending_returns, ())  # type: ignore[union-attr]
+
+    async def test_a_piece_is_not_handed_to_the_session_that_waits_for_it(self) -> None:
+        self.forward("steward", MAIN, "review", target_agent="code-reviewer", return_to=MAIN)
+        refused: list[str] = []
+
+        def reviewer(_e: Sequence[Event], _s: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
+            with self.assertRaises(ForwardRefused) as caught:
+                caps.forward_to_inbox(MAIN, "done", target_agent="steward")
+            refused.append(str(caught.exception))
+            self.answer("steward", "all done")
+            return Emit(messages=("looks good",))
+
+        self.agents["code-reviewer"].script = reviewer
+        self.ingest()
+        await self.run_inbox()
+        [reason] = refused
+        self.assertIn("end your turn with it", reason)
+        self.assertEqual([e.payload["text"] for e in self.returned()], ["looks good"])
+
+    async def test_the_result_of_a_replayed_piece_goes_back_again(self) -> None:
+        for handed_on in (False, True):
+            with self.subTest(handed_on=handed_on):
+                self.setUp()
+                self.forward("steward", SDE, "x", return_to=MAIN)
+                self.ingest()
+                await self.run_inbox()
+                [piece] = self.queued(SDE)
+
+                def fail(_e: Sequence[Event], _s: SessionRef | None, _c: RunCapabilities) -> RunOutcome:
+                    raise RuntimeError("boom")
+
+                self.agents["sde"].script = fail
+                with self.assertRaises(ExecutorFailed):
+                    await self.run_inbox(SDE)
+                heard: list[object] = []
+
+                def steward(events: Sequence[Event], _s: SessionRef | None, _c: RunCapabilities) -> RunOutcome:
+                    heard.extend(e.payload["status"] for e in events)
+                    return Silent()
+
+                self.agents["steward"].script = steward
+                await self.run_inbox()
+                self.assertEqual(heard, ["failed"])
+                self.inbox.replay(piece.event_id)
+                # Not even a decision in between makes it an ordinary late result.
+                self.agents["sde"].script = lambda _e, _s, _c: Suspend("req1", "ok?", "{}")
+                await self.run_inbox(SDE)
+                if handed_on:
+                    self.forward("sde", SDE, "review it", target_agent="code-reviewer")
+                    self.answer("code-reviewer", "fixed")
+                else:
+                    self.answer("sde", "fixed")
+                self.ingest(SDE, key=None, approval_request_id="req1", approved=True, event_type="approval.decided")
+                await self.run_inbox(SDE)
+                await self.run_inbox()
+                self.assertEqual(heard, ["failed", "done"])
+
+    async def test_a_result_held_back_from_the_claim_still_beats_its_cancel(self) -> None:
+        self.forward("steward", SDE, "x", return_to=MAIN)
+        self.ingest()
+        await self.run_inbox()
+        steward = self.agents["steward"].runs[0][1]
+        assert steward is not None
+        [piece] = self.queued(SDE)
+        self.answer("steward", "all done")
+        self.answer("sde", "result")
+        await self.run_inbox(SDE)
+        self.ingest(source=RETURN_CANCELLED_SOURCE, key=None, session_id=steward.session_id,
+                    delegation_id=piece.external_id, reason="gone", forwarded_from=SDE, forwarded_by="sde")
+        await self.run_inbox(hold=lambda evt: "busy" if evt.source == RETURN_SOURCE else None)
+        self.assertEqual(self.sent("return_withheld"), [])
+        await self.run_inbox()
+        self.assertEqual([m.content for m in self.sent()], ["all done"])
+
+    async def test_an_ended_wait_does_not_end_work_that_was_handed_on(self) -> None:
+        # It waits for a part of its own while the writer has the piece: nobody is told that the task ended.
+        self.forward("steward", SDE, "x", return_to=MAIN)
+        self.ingest()
+        await self.run_inbox()
+
+        def both(_e: Sequence[Event], _s: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
+            caps.forward_to_inbox(DOCS, "part", return_to=SDE)
+            caps.forward_to_inbox(DOCS, "the rest", return_to=MAIN)
+            return Silent()
+
+        self.agents["sde"].script = both
+        await self.run_inbox(SDE)
+        part = next(e for e in self.queued(DOCS) if e.payload["text"] == "part")
+        middle = self.agents["sde"].runs[0][1]
+        assert middle is not None
+        self.ingest(SDE, source=RETURN_CANCELLED_SOURCE, key=None, session_id=middle.session_id,
+                    delegation_id=part.external_id, reason="gone", forwarded_from=DOCS, forwarded_by="writer")
+        await self.run_inbox(SDE)
+        self.assertEqual((self.sent("return_withheld"), self.returned()), ([], []))
+
+    async def test_a_result_settled_meanwhile_is_not_folded(self) -> None:
+        self.forward("steward", SDE, "x", return_to=MAIN)
+        self.ingest()
+        await self.run_inbox()
+        steward = self.agents["steward"].runs[0][1]
+        assert steward is not None
+        [piece] = self.queued(SDE)
+        late = {"text": "late", "status": "done", "hop_count": 2, "delegation_id": piece.external_id,
+                "parent_session_id": steward.session_id, "forwarded_from": DOCS, "forwarded_by": "writer"}
+        folded: list[Event] = []
+        self.policy = "fold"
+
+        def run(events: Sequence[Event], _s: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
+            if events[0].payload.get("text") != "late":
+                self.ingest(source=RETURN_SOURCE, key=None, session_id=steward.session_id, **late)
+                self.ingest(key=None, session_id=steward.session_id, text="late")
+                folded.extend(caps.poll_folded_events())
+            return Silent()
+
+        self.agents["steward"].script = run
+        self.answer("sde", "first")
+        await self.run_inbox(SDE)
+        # Folded into the Run that settles the piece, then into one that comes after it.
+        await self.run_inbox()
+        self.ingest(key=None, session_id=steward.session_id, text="next")
+        await self.run_inbox()
+        self.assertEqual([e.source for e in folded], ["switchboard:feishu"] * 2)
+        self.assertEqual(len(self.agents["steward"].runs), 3)
+
+    async def test_two_results_of_one_piece_claimed_together_are_one(self) -> None:
+        self.forward("steward", SDE, "x", return_to=MAIN)
+        self.ingest()
+        await self.run_inbox()
+        steward = self.agents["steward"].runs[0][1]
+        assert steward is not None
+        [piece] = self.queued(SDE)
+        back = {"status": "done", "hop_count": 2, "delegation_id": piece.external_id, "forwarded_from": DOCS}
+        for text in ("first", "second"):
+            self.ingest(source=RETURN_SOURCE, key=None, session_id=steward.session_id, text=text, **back)
+        heard: list[object] = []
+
+        def run(events: Sequence[Event], _s: SessionRef | None, _c: RunCapabilities) -> RunOutcome:
+            heard.extend(e.payload["text"] for e in events)
+            return Silent()
+
+        self.agents["steward"].script = run
+        await self.run_inbox()
+        self.assertEqual(heard, ["first"])
+
+    async def test_a_cancel_queued_before_a_result_ends_the_piece(self) -> None:
+        self.forward("steward", SDE, "x", return_to=MAIN)
+        self.ingest(reply_channel="feishu", reply_target="oc_1")
+        await self.run_inbox()
+        steward = self.agents["steward"].runs[0][1]
+        assert steward is not None
+        [piece] = self.queued(SDE)
+        self.ingest(source=RETURN_CANCELLED_SOURCE, key=None, session_id=steward.session_id,
+                    delegation_id=piece.external_id, reason="gone", forwarded_from=SDE, forwarded_by="sde")
+        self.ingest(source=RETURN_SOURCE, key=None, session_id=steward.session_id, text="late", status="done",
+                    hop_count=2, delegation_id=piece.external_id, forwarded_from=SDE)
+        await self.run_inbox()
+        self.assertEqual((len(self.sent("return_withheld")), len(self.agents["steward"].runs)), (1, 1))
+
+    async def test_a_result_is_worked_on_again_after_a_crash_before_it_was_marked(self) -> None:
+        self.forward("steward", SDE, "x", return_to=MAIN)
+        self.ingest()
+        await self.run_inbox()
+        self.answer("sde", "result")
+        await self.run_inbox(SDE)
+        self.agents["steward"].script = lambda _e, _s, _c: Silent()
+        with patch.object(self.inbox, "mark_done", side_effect=OSError("disk")), self.assertRaises(OSError):
+            await self.run_inbox()
+        await self.run_inbox()
+        self.assertEqual([events[0].source for events, _ in self.agents["steward"].runs[1:]], [RETURN_SOURCE] * 2)
+
+    async def test_a_task_goes_with_the_piece_that_is_handed_on(self) -> None:
+        self.forward("steward", SDE, "x", return_to=MAIN)
+        self.ingest()
+        await self.run_inbox()
+        self.ingest(SDE, key="feishu:1", event_type="work.ready", task_id="t9", hop_count=1)
+        self.forward("sde", SDE, "review it", target_agent="code-reviewer")
+        self.answer("code-reviewer", "fine")
+        await self.run_inbox(SDE)
+        done = [(m.metadata["task_action"], m.metadata.get("stage"), m.metadata["session_id"])
+                for m in self.outbox.fetch_pending(limit=1000) if m.metadata.get("task_id") == "t9"]
+        sde, reviewer = (self.agents[a].runs[0][1].session_id for a in ("sde", "code-reviewer"))  # type: ignore[union-attr]
+        self.assertEqual([d for d in done if d[0] != "claim"],
+                         [("update_stage", "forwarded", sde), ("complete", None, reviewer)])
+
+    async def test_a_settled_chain_does_not_shorten_the_next_one(self) -> None:
+        self.gate("block")
+        self.ingest(SDE, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=MAIN, hop_count=MAX_FORWARD_HOPS,
+                    text="one", delegation_id="one")
+        self.answer("sde", "did one")
+        await self.run_inbox(SDE)
+        [card] = self.sent("approval_request")
+        self.ingest(SDE, key=None, approval_request_id=card.metadata["approval_request_id"], approved=True,
+                    event_type="approval.decided")
+        await self.run_inbox(SDE)
+        self.permissions = InMemoryPermission()
+        self.ingest(SDE, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=MAIN, hop_count=1, text="two",
+                    delegation_id="two")
+        self.answer("sde", "did two")
+        await self.run_inbox(SDE)
+        first, second = (s for _, s in self.agents["sde"].runs)
+        assert first is not None and second is not None
+        self.assertEqual(first.session_id, second.session_id)
+        [back] = self.returned()
+        self.assertEqual((back.payload["text"], back.payload["hop_count"]), ("did two", 2))
+
+    async def test_a_session_that_waits_for_one_chain_does_not_take_a_piece_of_another(self) -> None:
+        # It has answered the first piece, but a part it sent out for it is still away, with that chain's hops.
+        def first(_e: Sequence[Event], _s: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
+            caps.forward_to_inbox(DOCS, "document it", return_to=SDE)
+            return Emit(messages=("did one",))
+
+        self.agents["sde"].script = first
+        self.ingest(SDE, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=MAIN, hop_count=1, text="one",
+                    delegation_id="one")
+        await self.run_inbox(SDE)
+        self.agents["sde"].script = lambda _e, _s, _c: Suspend("req1", "ok?", "{}")
+        self.ingest(SDE, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=MAIN, hop_count=1, text="two",
+                    delegation_id="two")
+        await self.run_inbox(SDE)
+        self.answer("writer", "documented")
+        await self.run_inbox(DOCS)
+        self.agents["sde"].script = lambda _e, _s, _c: Silent()
+        await self.run_inbox(SDE)
+        self.answer("sde", "did two")
+        self.ingest(SDE, key=None, approval_request_id="req1", approved=True, event_type="approval.decided")
+        await self.run_inbox(SDE)
+        self.assertEqual([(e.payload["text"], e.payload["hop_count"]) for e in self.returned()],
+                         [("did one", 2), ("did two", 2)])
+
     async def test_a_refused_follow_up_leaves_the_piece_owed(self) -> None:
         def split(_e: Sequence[Event], _s: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
             caps.forward_to_inbox(SDE, "code", return_to=MAIN)
@@ -1037,8 +1548,48 @@ class InternalEventTests(ForwardCase):
 
 class HeldReturnTests(ForwardCase):
     # A return that is refused waits for a person; it never turns into an answer to the outside.
-    def gate(self, action: Any, reason: str = "ask first") -> None:
-        self.permissions = InMemoryPermission({"inbox.forward": PermissionDecision(action, reason)})
+    async def test_a_close_and_an_approval_claimed_together_are_decided_in_order(self) -> None:
+        for order in (("close", "approve"), ("approve", "close")):
+            for target in ("child", "holder"):
+                with self.subTest(order=order, target=target):
+                    self.setUp()
+                    await self.owed()
+                    self.gate("defer")
+                    _report, card = await self.held()
+                    child = self.agents["sde"].runs[0][1]
+                    assert child is not None
+                    closed = child.session_id if target == "child" else card.metadata["session_id"]
+                    events = {}
+                    for step in order:
+                        if step == "close":
+                            events[step] = self.ingest(SDE, source=CLOSE_SOURCE, key=None, session_id=closed)
+                        else:
+                            events[step] = self.ingest(
+                                SDE, key=None, approval_request_id=card.metadata["approval_request_id"], approved=True,
+                                event_type="approval.decided")
+                    await self.run_inbox(SDE)
+                    won = [RETURN_CANCELLED_SOURCE] if order[0] == "close" else [RETURN_SOURCE]
+                    self.assertEqual([e.source for e in self.queued(MAIN)], won)
+                    status = {e.event_id: e.status for e in self.inbox.all_events()}
+                    self.assertEqual(status[events["approve"].event_id], "failed" if order[0] == "close" else "done")
+                    self.assertEqual(len(self.agents["sde"].runs), 1)
+
+    async def test_a_session_closed_earlier_in_the_claim_is_not_resumed(self) -> None:
+        self.agents["sde"].script = lambda _e, _s, _c: Suspend("req1", "merge?", "{}")
+        self.ingest(SDE, key="task:1")
+        await self.run_inbox(SDE)
+        session = self.agents["sde"].runs[0][1]
+        assert session is not None
+        self.ingest(SDE, source=CLOSE_SOURCE, key=None, session_id=session.session_id)
+        approval = self.ingest(SDE, key=None, approval_request_id="req1", approved=True)
+        # Grouped with the close only under its session; a decision is a batch of its own.
+        with patch.object(AgentWorker, "_group_into_batches", lambda worker, events: [
+            (worker._resolve_session(e), [e]) for e in events  # pyright: ignore[reportPrivateUsage]
+        ]):
+            await self.run_inbox(SDE)
+        self.assertEqual(self.sessions.get(session.session_id).status, "closed")  # type: ignore[union-attr]
+        self.assertEqual(len(self.agents["sde"].runs), 1)
+        self.assertEqual([e.status for e in self.inbox.all_events() if e.event_id == approval.event_id], ["failed"])
 
     async def owed(self) -> str:
         self.forward("steward", SDE, "x", return_to=MAIN)
@@ -1508,7 +2059,9 @@ class StorageTests(unittest.TestCase):
         spec = ForwardSpec(target_inbox=SDE, target_agent="sde", return_to=MAIN, hop_count=2, forwarded_from=MAIN,
                            parent_session_id="p", reply_channel="feishu", reply_target="oc", origin_key="k",
                            delegation_id="forward:e:0", work_key="wk", pending_returns=("forward:a:0", "forward:a:1"),
-                           cancelled_returns=("forward:b:0",), owed_failures=("evt",))
+                           cancelled_returns=("forward:b:0",), owed_failures=("evt",),
+                           settled_returns=(("forward:c:0", "evt_1"), ("forward:d:0", "evt_2")), handed_on=True,
+                           replayed=True)
         with tempfile.TemporaryDirectory() as tmp:
             db = SQLiteDatabase(Path(tmp) / "x.db")
             store = SQLiteSessionStoreAdapter(db)

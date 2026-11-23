@@ -611,6 +611,12 @@ def _forward_from_json(raw: object, inbox_id: str) -> ForwardSpec | None:
         value = item.get(key)
         return tuple(map(str, cast(list[object], value))) if isinstance(value, list) else ()
 
+    def pairs(key: str) -> tuple[tuple[str, str], ...]:
+        value = item.get(key)
+        rows = cast(list[object], value) if isinstance(value, list) else []
+        return tuple((str(cast(list[object], row)[0]), str(cast(list[object], row)[1])) for row in rows
+                     if isinstance(row, list) and len(cast(list[object], row)) == 2)
+
     def count(key: str, fallback: int) -> int:
         value = item.get(key)
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else fallback
@@ -629,6 +635,9 @@ def _forward_from_json(raw: object, inbox_id: str) -> ForwardSpec | None:
         work_key=text("work_key"),
         pending_returns=texts("pending_returns"),
         cancelled_returns=texts("cancelled_returns"),
+        settled_returns=pairs("settled_returns"),
+        handed_on=item.get("handed_on") is True,
+        replayed=item.get("replayed") is True,
         owed_failures=texts("owed_failures"),
         held=_held_from_json(item.get("held")),
     )

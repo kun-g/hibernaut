@@ -154,7 +154,8 @@ class StewardTools:
             {"name": "forward_to_inbox",
              "description": "Hand work to another agent through its inbox. Nothing waits for it: end your turn after "
                             "forwarding. Without return_to that agent answers the person directly; with return_to "
-                            "(normally your own inbox) its result comes back to you as an agent:return event.",
+                            "(normally your own inbox) its result comes back to you as an agent:return event. Work "
+                            "another agent waits for goes on whole: name its return_to, then end your turn with silent.",
              "inputSchema": _schema(
                  ("target_inbox", "text"),
                  target_inbox={**_TEXT, "description": "An inbox id from the routing manifest."},

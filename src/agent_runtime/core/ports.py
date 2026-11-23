@@ -166,7 +166,8 @@ class RunCapabilities(Protocol):
     # the target, the hop limit and PermissionPort (tool "inbox.forward") and raises ForwardRefused; a "defer" refusal
     # can be tried again in the Run resumed by its approval, naming that approval_request_id. The event is queued
     # only if the Run ends with a result: an interrupted or failed Run forwards nothing. With return_to the result
-    # comes back to that inbox as an agent:return event instead of going to the reply channel.
+    # comes back to that inbox as an agent:return event instead of going to the reply channel. A session that owes a
+    # result itself hands that on once, by naming the same return_to or by a relay in its own inbox without one.
     def forward_to_inbox(
         self,
         target_inbox: str,
