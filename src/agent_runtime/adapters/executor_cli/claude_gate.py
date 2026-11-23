@@ -7,6 +7,9 @@
 # agent each run in a process group of their own, ended with everything in it on SIGHUP/SIGTERM/SIGINT or when
 # Hibernaut removes this terminal's lease file (it does so whenever it closes the terminal), and the probe at its
 # deadline. Started as `python -I <this file> <spec.json>`, so it never imports code from the worktree it runs in.
+#
+# With "once" in the spec it checks a one-off command instead, inside cli_terminal.py: it reports only by its exit code
+# and stderr, prints nothing on the command's stdout, and becomes the command, which that wrapper then supervises.
 from __future__ import annotations
 
 import json
@@ -35,6 +38,7 @@ from agent_runtime.adapters.executor_cli.cli_terminal import (  # noqa: E402
     end_group,
     exited,
     ignore_signals,
+    one_shot_env,
     starting,
     stop_on_signals,
 )
@@ -54,25 +58,31 @@ def _report(path: Path, body: dict[str, Any]) -> None:
 
 def main(spec_path: str) -> int:
     running: list[subprocess.Popen[bytes]] = []
+    spec: dict[str, Any] = {}
     stop_on_signals()
     try:
-        return _main(json.loads(Path(spec_path).read_text(encoding="utf-8")), running)
+        spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
+        return _main(spec, running)
     except Stopped as stop:
         return 128 + stop.signum
     except _Released:
-        print("\n[hibernaut] Hibernaut closed this terminal; ending it.", flush=True)
+        print("\n[hibernaut] Hibernaut closed this terminal; ending it.", file=sys.stderr, flush=True)
         return 1
     finally:
         ignore_signals()
         for proc in running:
-            end_group(proc)
+            # Only the probe can be running in a one-off check; cli_terminal.py ends this process after its own grace.
+            end_group(proc, grace=0 if spec.get("once") else None)
 
 
 def _main(spec: dict[str, Any], running: list[subprocess.Popen[bytes]]) -> int:
-    status = Path(spec["status"])
+    once = spec.get("once") is True
     lease = Path(spec["lease"])
     env = {k: v for k, v in os.environ.items() if k not in spec["unset"]}
     env.update(spec["set"])
+    if once:
+        # The wrapper stripped what it inherited; the configured environment must not bring it back.
+        env = one_shot_env(env)
     p = spec["profile"]
     # A daemon started before this file was updated writes specs without the env fields.
     profile = ClaudeCodeProfile(
@@ -87,10 +97,13 @@ def _main(spec: dict[str, Any], running: list[subprocess.Popen[bytes]]) -> int:
     try:
         check_init(profile, _probe(spec["probe"], env, spec["probe_timeout"], lease, running))
     except ClaudeCodeError as exc:
-        _report(status, {"ok": False, "error": str(exc)})
+        if not once:
+            _report(Path(spec["status"]), {"ok": False, "error": str(exc)})
         print(f"[hibernaut] {profile.name}: {exc}", file=sys.stderr, flush=True)
         return 1
-    _report(status, {"ok": True})
+    if once:
+        return _become(spec["exec"], env, lease)
+    _report(Path(spec["status"]), {"ok": True})
     print(f"[hibernaut] {spec['title']}: starting {p['launcher']} ({p['billing']}, {p['model']}, effort {p['effort']})",
           flush=True)
     return _supervise(spec["exec"], env, lease, running)
@@ -152,6 +165,19 @@ def _probe(argv: list[str], env: dict[str, str], timeout: float, lease: Path,
         text = errors.decode("utf-8", errors="replace").strip()
         raise ClaudeCodeError(f"exited ({proc.returncode}) before reporting its session: {text[-2000:]}")
     return found[0]
+
+
+def _become(argv: list[str], env: dict[str, str], lease: Path) -> int:
+    if not lease.exists():
+        raise _Released
+    # Python ignores these, and an ignored signal stays ignored in the program that takes this one's place.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
+    try:
+        os.execvpe(argv[0], argv, env)
+    except OSError as exc:
+        print(f"[hibernaut] cannot start {argv[0]}: {exc.strerror or exc}", file=sys.stderr, flush=True)
+        return 127
 
 
 def _supervise(argv: list[str], env: dict[str, str], lease: Path, running: list[subprocess.Popen[bytes]]) -> int:

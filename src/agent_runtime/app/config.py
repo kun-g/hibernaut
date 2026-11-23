@@ -24,6 +24,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     parse_profile,
 )
 from agent_runtime.adapters.executor_cli.executor import CLI_TERMINALS, DEFAULT_CLI_TEMPLATES, CLITemplate
+from agent_runtime.adapters.executor_cli.orca import registered_checkout
 from agent_runtime.adapters.executor_cli.peer_handoff import PeerHandoffConfig
 from agent_runtime.adapters.executor_cli.reviewer import CODE_REVIEWER_ROLE
 from agent_runtime.adapters.executor_cli.role_skills import ROLE_ALIASES, canonical_role
@@ -36,10 +37,13 @@ from agent_runtime.app.projects import (
     AgentConfig,
     InboxRule,
     ProjectBinding,
+    WorkdirBinding,
     parse_inbox_bindings,
     parse_inbox_rules,
+    parse_workdir_bindings,
     validate_project_bindings,
     validate_project_rules,
+    validate_workdir_bindings,
 )
 from agent_runtime.core.models import InboxRoute, NewEventPolicy
 from runner.cli_drivers import TemplateCLIDriver, ToolHookStyle
@@ -60,6 +64,11 @@ class RuntimeConfig:
     default_executor: str = "claude"
     # Background reclaim of merged task worktrees a delivery-time reclaim had to skip; 0 turns it off.
     worktree_sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS
+    # Inboxes of no project, each with the directory its agents start in; the first that matches applies.
+    inbox_bindings: tuple[WorkdirBinding, ...] = ()
+
+    def workdir_binding(self, inbox_id: str) -> WorkdirBinding | None:
+        return next((b for b in self.inbox_bindings if b.rule.matches(inbox_id)), None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +139,7 @@ ROLES = (CODE_REVIEWER_ROLE, SDE_ROLE, STEWARD_ROLE)
 _LEGACY_REVIEWER = "coder-reviewer"
 # Deployment mode shared by every role, as an executor or an agent; visible is the old name of interactive.
 ROLE_DEPLOYMENT_KEYS = frozenset({"interactive", "visible"})
-# A limit belongs to the [executors.<id>] table, whichever agents run on it; an [agents.<id>] cannot set one.
+# On [executors.<id>] it caps all agents running on that driver together, on [agents.<id>] just that agent.
 EXECUTOR_LIMIT_KEYS = frozenset({"max_concurrency"})
 READONLY_CHECKOUT = "readonly"
 
@@ -145,6 +154,9 @@ class RoleConfig:
     interactive: bool = True
     # "readonly": the role works in the main checkout, writes nothing there and never gets a worktree.
     checkout_access: str = ""
+    # Steward only: where it runs instead of the project's checkout, and the branch that directory has to be on.
+    workdir: str = ""
+    branch: str = ""
     max_concurrency: int | None = None
 
 
@@ -157,11 +169,20 @@ def _max_concurrency(where: str, item: Mapping[str, Any]) -> int | None:
     return value
 
 
+def _optional_text(where: str, item: Mapping[str, Any], key: str) -> str:
+    value = item.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{where}: {key} must be a non-empty string")
+    return value.strip()
+
+
 def _role_options(role: str) -> frozenset[str]:
     if role == SDE_ROLE:
         return SDE_OPTION_KEYS | ROLE_DEPLOYMENT_KEYS
     if role == STEWARD_ROLE:
-        return ROLE_DEPLOYMENT_KEYS | {"checkout_access"}
+        return ROLE_DEPLOYMENT_KEYS | {"checkout_access", "workdir", "branch"}
     return ROLE_DEPLOYMENT_KEYS
 
 
@@ -183,14 +204,17 @@ def _parse_role(
             raise ValueError(f"executors.{name}: checkout_access must be \"{READONLY_CHECKOUT}\" for role '{role}'")
         if _interactive(name, {"interactive": False, **item} if "visible" not in item else item):
             raise ValueError(f"executors.{name}: interactive is not supported for role '{role}'; leave it out")
+        workdir = _optional_text(f"executors.{name}", item, "workdir")
         return RoleConfig(role=role, profile=profile, interactive=False, checkout_access=access,
+                          workdir=_resolve_path(workdir, base_dir) if workdir else "",
+                          branch=_optional_text(f"executors.{name}", item, "branch"),
                           max_concurrency=_max_concurrency(f"executors.{name}", item))
     return RoleConfig(role=role, profile=profile, sde=_sde_options(name, item) if role == SDE_ROLE else None,
                       interactive=_interactive(name, item),
                       max_concurrency=_max_concurrency(f"executors.{name}", item))
 
 
-_AGENT_KEYS = frozenset({"role", "executor", "description"})
+_AGENT_KEYS = frozenset({"role", "executor", "description"}) | EXECUTOR_LIMIT_KEYS
 
 
 def _parse_agent(
@@ -226,7 +250,8 @@ def _parse_agent(
         if unknown:
             raise ValueError(f"executors.{name}: {', '.join(unknown)} not supported for role '{role}'; "
                              "the driver's own settings belong in [executors]")
-    merged = {**bases[driver], **{k: v for k, v in item.items() if k not in ("executor", "description")}}
+    own = {k: v for k, v in item.items() if k not in _AGENT_KEYS or k == "role"}
+    merged = {**bases[driver], **own}
     return _parse_role(name, merged, launchers=launchers, anthropic_url=anthropic_url, base_dir=base_dir)
 
 
@@ -399,6 +424,16 @@ def _resolve_path(raw: str, base_dir: Path | None) -> str:
     if not resolved.is_absolute() and base_dir is not None:
         resolved = base_dir / resolved
     return str(resolved)
+
+
+def _project_checkout(name: str, item: Mapping[str, Any], repo: str) -> str:
+    checkout = str(item.get("checkout") or "").strip()
+    if checkout:
+        return checkout
+    try:
+        return registered_checkout(repo)
+    except ValueError as exc:
+        raise ValueError(f"projects.{name}: checkout is not set, and Orca has none for it: {exc}") from exc
 
 
 def _outbox_dir(raw: Any, base_dir: Path | None) -> str:
@@ -655,7 +690,8 @@ async def config_changes(
             raw = tomllib.loads(contents.decode("utf-8"))
             if not raw:
                 raise ValueError("empty configuration")
-            config = parse_config(raw, base_dir=path.resolve().parent)
+            # Off the event loop: a project without a checkout is looked up through the Orca command.
+            config = await asyncio.to_thread(parse_config, raw, base_dir=path.resolve().parent)
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
             detail = f": {exc}" if type(exc) is ValueError else ""
             print(
@@ -792,14 +828,17 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         except ValueError as exc:
             raise _as_agent_error(agent_id, exc) from exc
         description = str(entry.get("description", "")).strip()
+        agent_limit = _max_concurrency(f"agents.{agent_id}", entry)
         if isinstance(built, CLITemplate):
             executors[agent_id] = built
-            agents[agent_id] = AgentConfig(name=agent_id, executor=str(entry["executor"]), description=description)
+            agents[agent_id] = AgentConfig(name=agent_id, executor=str(entry["executor"]), description=description,
+                                           max_concurrency=agent_limit)
         else:
             roles[agent_id] = built
             agents[agent_id] = AgentConfig(
                 name=agent_id, executor=str(entry["executor"]), role=built.role, model=built.profile.model,
                 effort=built.profile.effort, checkout_access=built.checkout_access, description=description,
+                max_concurrency=agent_limit,
             )
     if "default_agent" in rt_raw and runtime.default_agent not in agents:
         raise ValueError(f"runtime.default_agent '{runtime.default_agent}' is not declared in [agents]")
@@ -845,7 +884,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             inbox_id=primary,
             rules=rules,
             repo=repo,
-            checkout=str(item["checkout"]),
+            checkout=_project_checkout(str(name), item, repo),
             worktree_backend=cast(Literal["orca", "git"], backend),
             terminal_backend=terminal,
             orca_create_terminal=bool(item.get("orca_create_terminal", False)),
@@ -859,10 +898,16 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         )
     validate_project_rules(projects.values())
     validate_project_bindings(projects.values())
+    runtime = dataclasses.replace(runtime, inbox_bindings=parse_workdir_bindings(
+        rt_raw.get("inbox_bindings"), declared=agents, resolve=lambda path: _resolve_path(path, base_dir),
+    ))
+    validate_workdir_bindings(runtime.inbox_bindings, projects.values(),
+                              {name: role.workdir for name, role in roles.items() if role.workdir})
 
     for where, limit in (
         *((f"executors.{n}", e.max_concurrency) for n, e in {**executors, **roles}.items()),
         *((f"executors.{n}", value) for n, value in base_limits.items()),
+        *((f"agents.{n}", a.max_concurrency) for n, a in agents.items()),
         *((f"projects.{n}", p.max_concurrency) for n, p in projects.items()),
     ):
         if limit is not None and limit > runtime.max_concurrency:

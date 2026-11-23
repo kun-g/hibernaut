@@ -445,7 +445,7 @@ class TestProjectAdoption(unittest.TestCase):
     def test_repository_guidance_selects_versioning_by_activity_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            for rel in ("AGENTS.md", "guidance.toml", "docs/process/versioning.md"):
+            for rel in ("AGENTS.md", "guidance.toml", "docs/process/versioning.md", "docs/inbox-conventions.md"):
                 (repo / rel).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy(REPO / rel, repo / rel)
             git(repo, "init", "-q", "-b", "main")
