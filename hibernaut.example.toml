@@ -279,3 +279,26 @@ gh_command = "gh"
 # mcp_url = "https://switchboard.example.com/mcp"
 # consumer_id = "hibernaut"
 # ca_file = "private-ca.pem"         # optional, relative to this file
+
+# 可选：让 CLI agent 经 Runner 运行（默认关闭，不写这一段时一切照旧）。每次工具调用先经权限策略：放行、拒绝，或挂起
+# 整个 Run 等人批准（批准只放行一次参数相同的调用）。只换下 executors 列出的 CLI agent，角色执行器（sde、code-reviewer、
+# steward）不变。改这一段要重启（executors 除外）。设计与限制见 docs/runner.md §6、§7。
+# [runner]
+# enabled = true
+# mode = "in_process"                    # in_process：本进程执行 | relay：本进程只调度，由远端节点反向连入执行
+# executors = ["claude"]                 # 不填 = 命令名或执行器名为 claude / grok / cursor-agent 的全部 CLI agent（dsh 没有工具钩子）
+#                                        # in_process 下其 args / resume_args 不得带 --settings、--permission-mode 等会改掉钩子的参数
+# allow_tools = ["Read", "Grep", "Glob", "Edit", "Write"]   # 工具名按各 CLI 的叫法；不在这里也不在内置名单里的工具一律挂起问人
+# block_tools = ["WebFetch"]             # 优先于 allow_tools；参数含 rm -rf 等危险内容的调用始终拒绝
+# timeout_seconds = 1800                 # 单次 Run 的硬上限
+# node_wait_seconds = 60                 # 没有空槽（relay：或没有节点在线）时最多等多久，超时按执行失败处理
+# in_process：
+# runner_id = "local"                    # 记入执行账本的节点名
+# max_concurrent = 4                     # 不填 = runtime.max_concurrency
+# worktree_backend = "git"               # git | orca
+# state_dir = "runner"                   # 不填 = runtime.db_path 所在目录下的 runner/；logs_dir 不填 = <state_dir>/logs
+# relay：
+# listen_host = "127.0.0.1"              # 只说明文 ws；跨网络时前面要有 TLS
+# listen_port = 8790
+# token_env = "HIBERNAUT_RUNNER_TOKEN"   # 节点共享 token 所在的环境变量，启动时取出并从环境里删除
+# affinity_db_path = "runner/affinity.db"   # 不填 = runtime.db_path 所在目录下的 runner/affinity.db

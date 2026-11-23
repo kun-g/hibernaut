@@ -270,6 +270,8 @@ consumer_id = "{CONSUMER}"
         self.wait(lambda: self.delivery(event_id) == ("acked", 1), "delivery_log acked by hibernaut")
         self.wait(lambda: any(body == "echo: hello over relay" for _, body in self.reports()), "execution.reported")
         self.wait(lambda: "echo: hello over relay" in self.outbound_bodies(), "outbound_messages row")
+        # Switchboard records the upload before Hibernaut reads the answer and marks the row.
+        self.wait(lambda: self.hb_outbox()[0][1] == "sent", "outbox sent")
         (_, status, attempts, next_retry_at), = self.hb_outbox()
         self.assertEqual((status, attempts, next_retry_at), ("sent", 0, None))
         self.assertEqual([body for _, body in self.reports()], ["echo: hello over relay"])

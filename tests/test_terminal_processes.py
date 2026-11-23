@@ -266,6 +266,57 @@ class TestSessionCheckBeforeACommand(Case):
         self.assertEqual((run.exit_code, run.stdout, run.stderr), (5, b"out\n", b"err\n"))
 
 
+# Runs one start of a wrapper script with a SIGTERM delivered after the CLI is running but before Popen returns.
+STOPPED_WHILE_STARTING = """
+import os, signal, subprocess, sys, time
+from pathlib import Path
+from agent_runtime.adapters.executor_cli import claude_gate, cli_terminal
+
+start, root = sys.argv[1], Path(sys.argv[2])
+pids = root / "pids"
+argv = ["/bin/sh", "-c", f'echo $$ > "{pids}"; sleep 60 & echo $! >> "{pids}"; wait']
+real = subprocess.Popen
+
+def popen(*args, **kwargs):
+    proc = real(*args, **kwargs)
+    while not pids.exists() or len(pids.read_text().split()) < 2:
+        time.sleep(0.02)
+    os.kill(os.getpid(), signal.SIGTERM)
+    time.sleep(0.1)
+    return proc
+
+subprocess.Popen = popen
+(root / "lease").touch()
+if start == "cli":
+    sys.exit(cli_terminal.main(str(root / "spec.json")))
+run = {"probe": lambda spec, running: claude_gate._probe(argv, dict(os.environ), 30.0, root / "lease", running),
+       "agent": lambda spec, running: claude_gate._supervise(argv, dict(os.environ), root / "lease", running)}[start]
+claude_gate._main = run
+sys.exit(claude_gate.main(str(root / "spec.json")))
+"""
+
+
+class TestStopWhileStarting(Case):
+    async def test_a_signal_that_arrives_while_the_process_starts_still_ends_it(self):
+        spec = {"title": "t", "cwd": str(self.root), "env": {}, "timeout_seconds": 30.0, "argv": self.busy_cli(),
+                **{name: str(self.root / name) for name in ("stdout", "stderr", "exit.json")}}
+        (self.root / "spec.json").write_text(json.dumps(spec))
+        for start in ("cli", "probe", "agent"):
+            with self.subTest(start):
+                self.pids.unlink(missing_ok=True)
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-c", STOPPED_WHILE_STARTING, start, str(self.root),
+                    env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, sys.path))},
+                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL)
+                self.addCleanup(lambda proc=proc: proc.returncode is None and proc.kill())
+                self.assertEqual(await asyncio.wait_for(proc.wait(), 30), 128 + signal.SIGTERM)
+                pids = self.recorded()
+                self.addCleanup(lambda pids=pids: [os.kill(p, signal.SIGKILL) for p in pids if alive(p)])
+                self.assertEqual(len(pids), 2)
+                await self.all_gone(pids)
+        self.assertFalse((self.root / "exit.json").exists())
+
+
 class TestCLIGroupSignals(unittest.TestCase):
     # The CLI's process group is named by its leader's pid. Once the leader is reaped that pid can name an unrelated
     # group, so every signal to the group must go out while the leader is still unreaped (running or a zombie).

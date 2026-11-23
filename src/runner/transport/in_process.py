@@ -11,6 +11,7 @@ from runner.protocol import (
     RunRequest,
     RunResult,
     RunnerCapabilities,
+    ToolAuthorizer,
 )
 
 
@@ -29,9 +30,11 @@ class InProcessRunnerClient:
     async def capabilities(self) -> RunnerCapabilities:
         return await self._daemon.capabilities()
 
-    async def run(self, req: RunRequest) -> RunResult:
-        enforced = replace(req, namespace=self._bound_namespace)
-        return await self._daemon.run(enforced, caller_id=self._caller_id)
+    async def run(self, req: RunRequest, *, authorizer: ToolAuthorizer | None = None) -> RunResult:
+        enforced = replace(
+            req, namespace=self._bound_namespace, authorize_tools=req.authorize_tools or authorizer is not None
+        )
+        return await self._daemon.run(enforced, caller_id=self._caller_id, authorizer=authorizer)
 
     async def interrupt(self, req: InterruptRequest) -> InterruptResult:
         return await self._daemon.interrupt(req, caller_id=self._caller_id)

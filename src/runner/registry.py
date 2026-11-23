@@ -294,4 +294,6 @@ class RunnerRouter:
             return False
         if req.interactive and (caps.interactive_surface != "orca" or executor.interactive_surface != "orca"):
             return False
+        if req.authorize_tools and not executor.tool_authorization:
+            return False
         return True

@@ -43,6 +43,7 @@ from agent_runtime.app.projects import (
     validate_project_rules,
 )
 from agent_runtime.core.models import InboxRoute, NewEventPolicy
+from runner.cli_drivers import TemplateCLIDriver, ToolHookStyle
 
 _log = logging.getLogger(__name__)
 
@@ -355,6 +356,39 @@ class SwitchboardLinkConfig:
     ca_file: str | None = None
 
 
+RunnerMode = Literal["in_process", "relay"]
+_RUNNER_MODES: tuple[RunnerMode, ...] = ("in_process", "relay")
+_TOOL_HOOK_STYLES: tuple[ToolHookStyle, ...] = ("claude", "grok", "cursor-agent")
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerLinkConfig:
+    enabled: bool = False
+    mode: RunnerMode = "in_process"
+    # The CLI agents that run on the runner; the others keep running as local subprocesses.
+    executors: tuple[str, ...] = ()
+    timeout_seconds: float = 1800.0
+    # How long a Run waits for a node with a free slot (relay: also for nodes to connect) before it fails.
+    node_wait_seconds: float = 60.0
+    # Added to the permission policy; a tool in neither list, nor in the built-in ones, asks a person.
+    allow_tools: frozenset[str] = frozenset()
+    block_tools: frozenset[str] = frozenset()
+    # in_process
+    runner_id: str = "local"
+    max_concurrent: int | None = None
+    worktree_backend: WorktreeBackend = "git"
+    state_dir: str = ""
+    logs_dir: str = ""
+    # relay: where this process listens for nodes, and the environment variable holding their shared token.
+    listen_host: str = "127.0.0.1"
+    listen_port: int = 8790
+    token_env: str = "HIBERNAUT_RUNNER_TOKEN"
+    affinity_db_path: str = ""
+
+
+_RUNNER_KEYS = frozenset(f.name for f in dataclasses.fields(RunnerLinkConfig))
+
+
 @dataclass(frozen=True, slots=True)
 class HibernautConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
@@ -371,6 +405,7 @@ class HibernautConfig:
     gdrive: GDriveConfig = field(default_factory=GDriveConfig)
     switchboard: SwitchboardLinkConfig = field(default_factory=SwitchboardLinkConfig)
     peer: PeerHandoffConfig = field(default_factory=PeerHandoffConfig)
+    runner: RunnerLinkConfig = field(default_factory=RunnerLinkConfig)
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
 
@@ -489,6 +524,113 @@ def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> Switchb
         relay_url=relay_url,
         mcp_url=mcp_url,
         ca_file=ca_file,
+    )
+
+
+def tool_hook_style(agent: AgentConfig, template: CLITemplate) -> ToolHookStyle | None:
+    # By the CLI it starts; an executor whose command is a wrapper is recognized by its own name.
+    named = (Path(template.command).name, agent.executor)
+    return next((style for style in _TOOL_HOOK_STYLES if style in named), None)
+
+
+def runner_driver(agent: AgentConfig, template: CLITemplate) -> TemplateCLIDriver:
+    style = tool_hook_style(agent, template)
+    return TemplateCLIDriver(
+        executor_id=agent.name,
+        driver_kind=style or "custom",
+        command=template.command,
+        args=template.args,
+        resume_args=tuple(a.replace("{executor_session_id}", "{native_session_id}") for a in template.resume_args),
+        env=dict(template.env),
+        # Claude's json and stream-json output both end in a result object; plain text has no such line.
+        supports_stream_json=True,
+        calls_tools=True,
+        tool_hook=style,
+    )
+
+
+def parse_runner_link(
+    raw: Any, *, agents: Mapping[str, AgentConfig], templates: Mapping[str, CLITemplate], base_dir: Path | None = None,
+) -> RunnerLinkConfig:
+    if raw is None:
+        return RunnerLinkConfig()
+    if not isinstance(raw, dict):
+        raise ValueError("[runner] must be a table")
+    item = cast(dict[str, Any], raw)
+    unknown = sorted(set(item) - _RUNNER_KEYS)
+    if unknown:
+        raise ValueError(f"[runner] has unknown keys: {', '.join(unknown)}")
+    defaults = RunnerLinkConfig()
+    enabled = item.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("runner.enabled must be true or false")
+    mode = next((m for m in _RUNNER_MODES if m == item.get("mode", defaults.mode)), None)
+    if mode is None:
+        raise ValueError('runner.mode must be "in_process" or "relay"')
+    backend = item.get("worktree_backend", defaults.worktree_backend)
+    if backend not in ("git", "orca"):
+        raise ValueError('runner.worktree_backend must be "git" or "orca"')
+
+    def seconds(key: str, default: float, *, zero: bool = False) -> float:
+        value = item.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or (
+            value < 0 or (value == 0 and not zero)
+        ):
+            raise ValueError(f"runner.{key} must be a {'non-negative' if zero else 'positive'} number")
+        return float(value)
+
+    def text(key: str, default: str) -> str:
+        value = item.get(key, default)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"runner.{key} must be a non-empty string")
+        return value.strip()
+
+    def path(key: str) -> str:
+        return _resolve_path(text(key, ""), base_dir) if key in item else ""
+
+    def names(key: str) -> tuple[str, ...]:
+        value = item.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in cast(list[object], value)):
+            raise ValueError(f"runner.{key} must be a list of names")
+        return tuple(dict.fromkeys(str(v).strip() for v in cast(list[object], value)))
+
+    slots = item.get("max_concurrent")
+    if slots is not None and (isinstance(slots, bool) or not isinstance(slots, int) or slots < 1):
+        raise ValueError("runner.max_concurrent must be a positive integer")
+    port = item.get("listen_port", defaults.listen_port)
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+        raise ValueError("runner.listen_port must be a port number (0 picks a free one)")
+
+    gateable = [n for n, t in templates.items() if n in agents and tool_hook_style(agents[n], t) is not None]
+    executors = names("executors") if "executors" in item else tuple(gateable)
+    if enabled:
+        if not executors:
+            raise ValueError("runner.executors names no CLI executor to run (claude, grok and cursor-agent have a tool hook)")
+        for name in executors:
+            if name not in templates or name not in agents:
+                reason = "has a role and launches itself" if name in agents else "is not a declared CLI executor"
+                raise ValueError(f"runner.executors: '{name}' {reason}")
+            if mode == "in_process":
+                driver = runner_driver(agents[name], templates[name])  # raises when its arguments override the hook
+                if driver.tool_hook is None:
+                    raise ValueError(f"runner.executors: '{name}' has no tool hook the runner can authorize its calls with")
+    return RunnerLinkConfig(
+        enabled=enabled,
+        mode=mode,
+        executors=executors,
+        timeout_seconds=seconds("timeout_seconds", defaults.timeout_seconds),
+        node_wait_seconds=seconds("node_wait_seconds", defaults.node_wait_seconds, zero=True),
+        allow_tools=frozenset(names("allow_tools")),
+        block_tools=frozenset(names("block_tools")),
+        runner_id=text("runner_id", defaults.runner_id),
+        max_concurrent=slots,
+        worktree_backend=backend,
+        state_dir=path("state_dir"),
+        logs_dir=path("logs_dir"),
+        listen_host=text("listen_host", defaults.listen_host),
+        listen_port=port,
+        token_env=text("token_env", defaults.token_env),
+        affinity_db_path=path("affinity_db_path"),
     )
 
 
@@ -816,5 +958,6 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         gdrive=gdrive,
         switchboard=parse_switchboard_link(raw.get("switchboard"), base_dir=base_dir),
         peer=parse_peer(raw.get("peer"), base_dir=base_dir),
+        runner=parse_runner_link(raw.get("runner"), agents=agents, templates=executors, base_dir=base_dir),
         config_dir=str(base_dir) if base_dir is not None else "",
     )
