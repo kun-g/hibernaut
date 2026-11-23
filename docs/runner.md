@@ -40,10 +40,12 @@
 - **只读 Run 不挂主检出**：`readonly=True` 的 Run 使用按上述四元组派生的独立 detached worktree（`<prefix>-ro-<hash>`，不进 `workspaces` 表，也不上报为亲和），每次运行前重置到任务 worktree 已提交的 `HEAD`（没有任务 worktree 时为 `default_base_ref`）。运行后指纹变化即 `checkout --force` + `clean -ffdx` 还原，再返回 `failed`（`permission_denied`）。回收该四元组时一并删除。
 - **HB 适配层**：`RunnerExecutorBridge.execute` 被 Worker 取消（`interrupt` 策略或停机）时，向 Runner 发 `interrupt` 并等到 Run 出终态再继续抛出取消；Runner 尚未登记该 `run_id`（`not_found`）时按轮询间隔重发。
 - **反向 WebSocket 换连接**：Hub 按提交时的 `conn_epoch` 记录每个在途 Run。同一 `runner_id` 的新连接顶替旧连接（Close 4009）或旧连接断开时，旧连接上的在途 Run 以 `RunnerConnectionLostError`（`ConnectionError` 子类）结束并释放预扣槽位；Runner 侧随连接取消这些 Run 并回收进程组，调用方换新 `run_id` 重试，进程组回收前会收到 `workspace_busy`。
+- **`run_id` 是跨等待者的幂等键**：Hub 对同一 `run_id` 只提交一次、只预扣一个槽位，后来的调用者等待同一次提交；某个调用者超时或被取消不影响其余调用者，也不撤销提交。`run.submit` 发出后不设 ack 期限（Runner 可能已在执行），只有连接断开或被顶替才以 `RunnerConnectionLostError` 结束。Agent 收到本机已在执行或已完成的 `run_id` 时直接接受并交给 `RunnerDaemon.run` 挂接已有执行，不因槽位满回 `slots_full`。
+- **git / orca 子进程不占事件循环**：`RunnerDaemon` 经 `asyncio.to_thread` 调用 worktree 解析、写入校验、指纹、只读还原与回收，Agent 的 `hello` 读取 `ready_work_keys` 也在线程里，其他 Run 的看门狗、中断与进程组回收照常推进。不同 `work_key` 的解析因此可能并发，分配目录名与分支名时把表里已登记（含 `creating`）的名字视为占用。
 - **Orca 后端**：`orca worktree create` 带 `--repo path:<主检出>`、`--base-branch <解析后的提交>`、`--no-parent`、`--setup skip`、`--json`，以回执里的绝对路径与分支（须为请求的分支或其 `-N` 后缀）为准登记，回收时按该路径 `orca worktree rm`。
 
 ## 7. 架构门禁
 
 - `.importlinter` 契约 `runner-zero-business-deps` 禁止 `runner` 导入 `agent_runtime`、`taskboard`、`switchboard`、`workshop`、`memory_hub`；
 - `pyrightconfig.json` 将 `src/runner` 纳入 strict 类型检查；
-- `tests/test_runner_stage1.py` 与 `tests/test_runner_stage2.py` 覆盖协议、AST 隔离、Worktree 三道保险、看门狗、跨网反向 WS 调度与 `conn_epoch` 防脑裂；`tests/test_runner_safety.py` 覆盖第 6 节的不变量：取消后进程组（含忽略 `SIGTERM` 的孙进程）被回收、`workspace_busy`、Bridge 被取消时中断并等待、只读 Run 的独立 worktree 与还原、顶替连接时在途 Run 失败并释放槽位、Orca 回执路径与非法回执。
+- `tests/test_runner_stage1.py` 与 `tests/test_runner_stage2.py` 覆盖协议、AST 隔离、Worktree 三道保险、看门狗、跨网反向 WS 调度与 `conn_epoch` 防脑裂；`tests/test_runner_safety.py` 覆盖第 6 节的不变量：取消后进程组（含忽略 `SIGTERM` 的孙进程）被回收、`workspace_busy`、Bridge 被取消时中断并等待、只读 Run 的独立 worktree 与还原、顶替连接时在途 Run 失败并释放槽位、Orca 回执路径与非法回执、槽位满时重复提交同一 `run_id` 仍被接受且只执行一次、ack 迟到仍返回结果、同一 `run_id` 的重叠等待只提交一次、worktree 创建不阻塞事件循环、并发解析同名提示得到不同目录。

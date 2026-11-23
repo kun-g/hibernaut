@@ -111,7 +111,7 @@ class RunnerRelayAgent:
                     "type": "hello",
                     "token": self._token,
                     "capabilities": self._daemon.capabilities_sync().to_dict(),
-                    "ready_work_keys": self._daemon.worktrees.list_ready_work_keys(),
+                    "ready_work_keys": await asyncio.to_thread(self._daemon.worktrees.list_ready_work_keys),
                     "ts": utc_now_iso(),
                 }
             )
@@ -142,7 +142,8 @@ class RunnerRelayAgent:
                     req = RunRequest.from_dict(cast(Mapping[str, Any], frame["request"]))
                     caller_id = str(frame.get("caller_id", "hibernaut"))
                     caps = self._daemon.capabilities_sync()
-                    if caps.slots.available <= 0 and self._daemon.query_run(req.run_id) is None:
+                    # A run_id this node already runs (or ran) needs no new slot: daemon.run joins that execution.
+                    if caps.slots.available <= 0 and not self._daemon.knows_run(req.run_id):
                         await _send(
                             {
                                 "type": "run.accepted",

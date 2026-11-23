@@ -88,6 +88,9 @@ class RunnerDaemon:
     def query_run(self, run_id: str) -> RunResult | None:
         return self._completed_runs.get(run_id)
 
+    def knows_run(self, run_id: str) -> bool:
+        return run_id in self._active_runs or run_id in self._completed_runs
+
     def capabilities_sync(self) -> RunnerCapabilities:
         available = max(0, self._config.max_concurrent - self._active_slots)
         return RunnerCapabilities(
@@ -233,7 +236,9 @@ class RunnerDaemon:
                 reason=f"runs still active on this workspace: {', '.join(sorted(active))}",
                 blockers=("run_active",),
             )
-        return self._worktrees.reclaim(
+        # git/orca subprocesses run off the event loop so other runs' watchdogs and interrupts keep ticking.
+        return await asyncio.to_thread(
+            self._worktrees.reclaim,
             policy=policy,
             project=project,
             owner_scope=req.owner_scope,
@@ -280,7 +285,8 @@ class RunnerDaemon:
         start_mono: float,
     ) -> RunResult:
         try:
-            resolved = self._worktrees.resolve(
+            resolved = await asyncio.to_thread(
+                self._worktrees.resolve,
                 policy=policy,
                 project=project,
                 owner_scope=req.owner_scope,
@@ -289,7 +295,8 @@ class RunnerDaemon:
                 name_hint=req.name_hint,
             )
             if not req.readonly:
-                self._worktrees.assert_writable(
+                await asyncio.to_thread(
+                    self._worktrees.assert_writable,
                     policy=policy,
                     project=project,
                     owner_scope=req.owner_scope,
@@ -299,7 +306,7 @@ class RunnerDaemon:
         except WorkspaceIsolationError as exc:
             return self._refused(req, started_at, start_mono, "permission_denied", str(exc))
 
-        pre_fp = worktree_fingerprint(resolved.workdir) if req.readonly else None
+        pre_fp = await asyncio.to_thread(worktree_fingerprint, resolved.workdir) if req.readonly else None
         spec = driver.build_command(req, resolved.workdir)
         try:
             child_env = strip_long_lived_secrets(
@@ -336,9 +343,9 @@ class RunnerDaemon:
         )
 
         if pre_fp is not None:
-            post_fp = worktree_fingerprint(resolved.workdir)
+            post_fp = await asyncio.to_thread(worktree_fingerprint, resolved.workdir)
             if post_fp != pre_fp:
-                restore_readonly_worktree(resolved.workdir, resolved.ref.head_sha)
+                await asyncio.to_thread(restore_readonly_worktree, resolved.workdir, resolved.ref.head_sha)
                 return RunResult(
                     run_id=req.run_id,
                     runner_id=self._config.runner_id,

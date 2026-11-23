@@ -394,8 +394,13 @@ class WorktreeManager:
 
             base_dir = self._base_dir(primary)
             hint = sanitize_name_hint(work_key, name_hint)
-            existing_branches = _local_branches(primary) | set(registered.keys())
-            dir_name, branch = self._allocate_names(policy.prefix, hint, base_dir, existing_branches)
+            # Resolves for different work_keys run concurrently in worker threads; a name another record holds
+            # (even one still 'creating', whose directory does not exist yet) is taken.
+            held = self._conn.execute("SELECT dir_name, branch FROM workspaces").fetchall()
+            existing_branches = _local_branches(primary) | set(registered.keys()) | {str(r[1]) for r in held}
+            dir_name, branch = self._allocate_names(
+                policy.prefix, hint, base_dir, existing_branches, held_dirs={str(r[0]) for r in held}
+            )
             target_dir = (base_dir / dir_name).resolve()
 
             now = utc_now_iso()
@@ -611,14 +616,14 @@ class WorktreeManager:
         return blockers
 
     def _allocate_names(
-        self, prefix: str, hint: str, base_dir: Path, existing_branches: set[str]
+        self, prefix: str, hint: str, base_dir: Path, existing_branches: set[str], *, held_dirs: set[str]
     ) -> tuple[str, str]:
         idx = 1
         while True:
             suffix = "" if idx == 1 else f"-{idx}"
             dir_name = f"{prefix}-{hint}{suffix}"
             branch = f"{prefix}/{hint}{suffix}"
-            if not (base_dir / dir_name).exists() and branch not in existing_branches:
+            if dir_name not in held_dirs and not (base_dir / dir_name).exists() and branch not in existing_branches:
                 return dir_name, branch
             idx += 1
 

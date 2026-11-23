@@ -78,6 +78,7 @@ class RunnerRelayHub:
         self._pending_ack: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._pending_result: dict[str, asyncio.Future[RunResult]] = {}
         self._pending_rpc: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._inflight: dict[str, asyncio.Future[RunResult]] = {}
         self._hb_task: asyncio.Task[None] | None = None
         self._rpc_seq = 0
 
@@ -117,6 +118,22 @@ class RunnerRelayHub:
         return online[0].capabilities
 
     async def run(self, req: RunRequest, *, caller_id: str = "hibernaut") -> RunResult:
+        # run_id is the idempotency key across waiters: every caller of the same run_id shares one submission and
+        # one reserved slot, and a caller that times out or is cancelled leaves the submission running for the rest.
+        task = self._inflight.get(req.run_id)
+        if task is None:
+            task = asyncio.ensure_future(self._submit_and_wait(req, caller_id))
+            self._inflight[req.run_id] = task
+            task.add_done_callback(lambda t, rid=req.run_id: self._on_submission_done(rid, t))
+        return await asyncio.shield(task)
+
+    def _on_submission_done(self, run_id: str, task: asyncio.Future[RunResult]) -> None:
+        if self._inflight.get(run_id) is task:
+            del self._inflight[run_id]
+        if not task.cancelled():
+            task.exception()  # retrieved here so a submission nobody waits for any more does not warn
+
+    async def _submit_and_wait(self, req: RunRequest, caller_id: str) -> RunResult:
         excluded: set[str] = set()
         loop = asyncio.get_running_loop()
         while True:
@@ -148,7 +165,9 @@ class RunnerRelayHub:
                         "ts": utc_now_iso(),
                     },
                 )
-                ack = await asyncio.wait_for(ack_fut, timeout=self._ack_timeout)
+                # No ack deadline: once sent, the runner may already be executing, so giving up here would leave a
+                # run nobody waits for. A lost connection fails this future (_fail_runs_of).
+                ack = await ack_fut
             except BaseException:
                 self._pending_ack.pop(req.run_id, None)
                 self._forget_run(req.run_id)

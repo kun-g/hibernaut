@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import subprocess
@@ -16,14 +17,23 @@ from agent_runtime.core.models import Event, PermissionDecision, SessionRef
 from runner.cli_drivers import TemplateCLIDriver
 from runner.config import NamespacePolicy, ProjectCheckout, RunnerConfig
 from runner.daemon import RunnerDaemon
-from runner.protocol import ReclaimRequest, RunRequest
+from runner.protocol import ReclaimRequest, RunRequest, RunResult
 from runner.registry import WorkspaceAffinityStore
 from runner.transport.in_process import InProcessRunnerClient
 from runner.transport.relay_client import RunnerRelayAgent
 from runner.transport import relay_hub as relay_hub_module
 from runner.transport.relay_hub import RunnerRelayHub
-from runner.transport.ws_protocol import OP_CLOSE, encode_frame
-from runner.worktree import CommandOutput, OrcaWorktreeBackend, WorktreeManager
+from runner.transport.ws_protocol import (
+    OP_CLOSE,
+    WSConnectionClosed,
+    WSProtocolError,
+    client_handshake,
+    encode_frame,
+    recv_json,
+    send_json,
+    server_handshake,
+)
+from runner.worktree import CommandOutput, CreatedWorktree, GitWorktreeBackend, OrcaWorktreeBackend, WorktreeManager
 
 PY = sys.executable
 
@@ -444,4 +454,240 @@ def test_interrupt_retries_until_run_is_registered(tmp_path: Path) -> None:
         asyncio.run(_scenario())
     finally:
         _kill_quietly(*pids)
+        daemon.close()
+
+
+# Appends one line per execution to the path in argv[1], then reports success after a short delay.
+_COUNT_SCRIPT = (
+    "import json, sys, time\n"
+    "open(sys.argv[1], 'a').write('x\\n')\n"
+    "time.sleep(1.0)\n"
+    "print(json.dumps({'outcome': 'emit', 'message': 'ok'}))\n"
+)
+
+
+def _count_drivers() -> dict[str, TemplateCLIDriver]:
+    return {"count": TemplateCLIDriver(executor_id="count", driver_kind="custom", command=PY, args=("-c", _COUNT_SCRIPT, "{prompt}"))}
+
+
+def test_agent_accepts_duplicate_submit_of_inflight_run_when_slots_full(tmp_path: Path) -> None:
+    # A plain WebSocket server stands in for the hub so the agent sees the same run.submit twice.
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    daemon = RunnerDaemon(_config(tmp_path, repo, runner_id="full-1", max_concurrent=1), drivers=_count_drivers())
+    counter = tmp_path / "count-agent"
+    req = _req("run_dup_1", executor_id="count", prompt=str(counter))
+
+    async def _scenario() -> None:
+        frames: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        ready = asyncio.Event()
+        conn: dict[str, asyncio.StreamWriter] = {}
+
+        async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            await server_handshake(reader, writer, expected_path="/ws/runner")
+            await recv_json(reader, writer, expect_masked=True, send_masked=False)
+            await send_json(writer, {"type": "welcome", "runner_id": "full-1", "conn_epoch": 1, "heartbeat_sec": 30}, mask=False)
+            conn["w"] = writer
+            ready.set()
+            try:
+                while True:
+                    await frames.put(await recv_json(reader, writer, expect_masked=True, send_masked=False))
+            except (WSConnectionClosed, WSProtocolError, OSError, asyncio.IncompleteReadError):
+                pass
+            finally:
+                writer.close()
+
+        server = await asyncio.start_server(_handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        agent = RunnerRelayAgent(daemon=daemon, hub_url=f"ws://127.0.0.1:{port}/ws/runner", token="tok")
+        await agent.start()
+        await asyncio.wait_for(ready.wait(), 5.0)
+        submit = {"type": "run.submit", "conn_epoch": 1, "caller_id": "hibernaut", "request": req.to_dict()}
+
+        await send_json(conn["w"], submit, mask=False)
+        first = await asyncio.wait_for(frames.get(), 5.0)
+        assert first["type"] == "run.accepted" and first["accepted"] is True
+        while not counter.exists():
+            await asyncio.sleep(0.02)
+        assert daemon.capabilities_sync().slots.available == 0
+
+        await send_json(conn["w"], submit, mask=False)
+        second = await asyncio.wait_for(frames.get(), 5.0)
+        assert second["type"] == "run.accepted"
+        assert second["accepted"] is True, f"in-flight run_id rejected: {second.get('reason')}"
+
+        completed = [await asyncio.wait_for(frames.get(), 10.0) for _ in range(2)]
+        assert [f["type"] for f in completed] == ["run.completed", "run.completed"]
+        assert {f["result"]["status"] for f in completed} == {"succeeded"}
+        assert counter.read_text(encoding="utf-8") == "x\n", "the duplicate submit started a second execution"
+
+        await agent.stop()
+        server.close()
+        await server.wait_closed()
+
+    try:
+        asyncio.run(_scenario())
+    finally:
+        daemon.close()
+
+
+def test_hub_keeps_waiting_after_ack_timeout(tmp_path: Path) -> None:
+    # A raw agent acknowledges only after the hub's ack timeout; the hub must still return the result.
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    affinity = WorkspaceAffinityStore(tmp_path / "affinity.db")
+    hub = RunnerRelayHub(shared_token="tok", affinity=affinity, heartbeat_seconds=30.0, ack_timeout_seconds=0.2)
+    caps_daemon = RunnerDaemon(_config(tmp_path, repo, runner_id="late-1"), drivers=_count_drivers())
+    req = _req("run_late_ack", executor_id="count", prompt="unused", readonly=True)
+
+    async def _scenario() -> None:
+        host, port = await hub.start("127.0.0.1", 0)
+        reader, writer = await asyncio.open_connection(host, port)
+        await client_handshake(reader, writer, host=f"{host}:{port}", path="/ws/runner")
+        await send_json(
+            writer,
+            {"type": "hello", "token": "tok", "capabilities": caps_daemon.capabilities_sync().to_dict(), "ready_work_keys": []},
+            mask=True,
+        )
+        welcome = await recv_json(reader, writer, expect_masked=False, send_masked=True)
+        epoch = welcome["conn_epoch"]
+
+        run_task = asyncio.create_task(hub.run(req))
+        submit = await recv_json(reader, writer, expect_masked=False, send_masked=True)
+        assert submit["type"] == "run.submit"
+        await asyncio.sleep(0.6)
+        await send_json(writer, {"type": "run.accepted", "conn_epoch": epoch, "run_id": req.run_id, "accepted": True}, mask=True)
+        result = RunResult(
+            run_id=req.run_id,
+            runner_id="late-1",
+            status="succeeded",
+            executor_id="count",
+            started_at="2026-11-23T00:00:00+00:00",
+            ended_at="2026-11-23T00:00:01+00:00",
+            duration_ms=1000,
+        )
+        await send_json(writer, {"type": "run.completed", "conn_epoch": epoch, "result": result.to_dict()}, mask=True)
+
+        got = await asyncio.wait_for(run_task, 5.0)
+        assert got.status == "succeeded"
+        rec = hub.registry.get("late-1")
+        assert rec is not None and rec.reserved_slots == 0
+
+        writer.close()
+        await hub.stop()
+
+    try:
+        asyncio.run(_scenario())
+    finally:
+        caps_daemon.close()
+        affinity.close()
+
+
+def test_hub_overlapping_waiters_on_one_run_id_share_one_submission(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    affinity = WorkspaceAffinityStore(tmp_path / "affinity.db")
+    hub = RunnerRelayHub(shared_token="tok", affinity=affinity, heartbeat_seconds=30.0)
+    daemon = RunnerDaemon(_config(tmp_path, repo, runner_id="share-1", max_concurrent=2), drivers=_count_drivers())
+    counter = tmp_path / "count-hub"
+    req = _req("run_shared", executor_id="count", prompt=str(counter))
+
+    async def _scenario() -> None:
+        host, port = await hub.start("127.0.0.1", 0)
+        agent = RunnerRelayAgent(daemon=daemon, hub_url=f"ws://{host}:{port}/ws/runner", token="tok")
+        await agent.start()
+        await agent.wait_connected()
+
+        impatient = asyncio.create_task(asyncio.wait_for(hub.run(req), 0.4))
+        await asyncio.sleep(0.1)
+        patient = asyncio.create_task(hub.run(req))
+        await asyncio.sleep(0.1)
+        rec = hub.registry.get("share-1")
+        assert rec is not None and rec.reserved_slots == 1, "the second waiter reserved another slot"
+
+        with pytest.raises(asyncio.TimeoutError):
+            await impatient
+        got = await asyncio.wait_for(patient, 10.0)
+        assert got.status == "succeeded"
+        assert counter.read_text(encoding="utf-8") == "x\n"
+        assert rec.reserved_slots == 0
+
+        await agent.stop()
+        await hub.stop()
+
+    try:
+        asyncio.run(_scenario())
+    finally:
+        daemon.close()
+        affinity.close()
+
+
+def test_worktree_commands_do_not_block_the_event_loop(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    class _SlowBackend(GitWorktreeBackend):
+        def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> CreatedWorktree:
+            time.sleep(1.0)  # a slow `orca worktree create` / `git worktree add`
+            return super().create(primary_checkout=primary_checkout, workdir=workdir, branch=branch, base_ref=base_ref)
+
+    cfg = _config(tmp_path, repo)
+    mgr = WorktreeManager(db_path=cfg.state_dir / "runner_workspaces.db", backend=_SlowBackend())
+    daemon = RunnerDaemon(cfg, drivers=_drivers(), worktree_manager=mgr)
+
+    async def _scenario() -> None:
+        gaps: list[float] = []
+        stop = asyncio.Event()
+
+        async def _ticker() -> None:
+            last = time.monotonic()
+            while not stop.is_set():
+                await asyncio.sleep(0.02)
+                now = time.monotonic()
+                gaps.append(now - last)
+                last = now
+
+        ticker = asyncio.create_task(_ticker())
+        await asyncio.sleep(0.1)
+        res = await daemon.run(_req("run_slow_create", executor_id="cwd", work_key="gh#11"), caller_id="hibernaut")
+        stop.set()
+        await ticker
+        assert res.status == "succeeded"
+        assert max(gaps) < 0.5, f"event loop stalled for {max(gaps):.2f}s during worktree creation"
+
+    try:
+        asyncio.run(_scenario())
+    finally:
+        daemon.close()
+
+
+def test_concurrent_resolves_with_same_hint_get_distinct_worktrees(tmp_path: Path) -> None:
+    # Resolves now run in worker threads, so two work_keys can allocate names while the other is still creating.
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    class _SlowBackend(GitWorktreeBackend):
+        def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> CreatedWorktree:
+            time.sleep(0.5)
+            return super().create(primary_checkout=primary_checkout, workdir=workdir, branch=branch, base_ref=base_ref)
+
+    cfg = _config(tmp_path, repo)
+    mgr = WorktreeManager(db_path=cfg.state_dir / "runner_workspaces.db", backend=_SlowBackend())
+    daemon = RunnerDaemon(cfg, drivers=_drivers(), worktree_manager=mgr)
+
+    def _with_hint(run_id: str, work_key: str) -> RunRequest:
+        return dataclasses.replace(_req(run_id, executor_id="cwd", work_key=work_key), name_hint="same-hint")
+
+    async def _scenario() -> None:
+        a, b = await asyncio.gather(
+            daemon.run(_with_hint("run_hint_a", "gh#21"), caller_id="hibernaut"),
+            daemon.run(_with_hint("run_hint_b", "gh#22"), caller_id="hibernaut"),
+        )
+        assert a.status == "succeeded" and b.status == "succeeded", (a.error_summary, b.error_summary)
+        dirs = {Path(json.loads(r.stdout_excerpt)["cwd"]).resolve().name for r in (a, b)}
+        assert dirs == {"hb-same-hint", "hb-same-hint-2"}
+
+    try:
+        asyncio.run(_scenario())
+    finally:
         daemon.close()
