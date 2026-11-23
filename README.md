@@ -20,6 +20,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 人工审批 | 权限门禁返回 `defer`、agent 需要人回答或交付受阻时挂起，审批后从断点继续 |
 | 安全 | agent 进程不持有真实密钥：API key 由外置代理注入，Drive 密钥由独立系统用户保管，GitHub 走宿主机凭据 |
 | 运维 | 配置热加载、跟随 `origin/main` 自动更新；Outbox 上报失败按 5/15/45/135/405 秒持久化退避，重启不丢进度 |
+| 执行账本 | 同仓的独立包 `src/ledger/`：每个 Run 记一条档案（结局、执行器、耗时、错误类别、日志、token 与费用），同进程 Switchboard 的审计也记入，存在独立的 `ledger.db`；执行器失败按类别分流（瞬时故障 5/15/45 秒退避重试，配置或权限错误第 1 次即停，执行故障不重试），最终失败发告警；MCP 只读工具查询 Run、日志、审计与执行器统计，`hibernaut_replay_event` 重放失败事件。设计见 [`docs/observability-ledger-design.md`](docs/observability-ledger-design.md) |
 | Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard |
 | Taskboard | 同仓的独立包：多来源任务归集（一个任务可挂多个来源）、5 态状态机、DAG 依赖与环检测、上游完成后自动解锁下游，经 Switchboard 发 `work.ready` 或给人发待办通知；SQLite 存储。独立常驻服务 `python -m taskboard.app` 经 Relay 消费 Switchboard 事件、经 Switchboard `/mcp` 上行，并以 HTTP `/mcp`（可挂同域子路径，如 `/taskboard/mcp`）或 `--mcp-stdio` 提供 7 个 `tb_*` MCP 工具；Hibernaut 接 `work.ready` 执行，并以 `execution.reported` 回报 `claim` / `update_stage` / `complete` / `release`（审批挂起后恢复仍回写同一任务）。设计见 [`docs/taskboard.md`](docs/taskboard.md) |
 | Runner | 同仓的独立包，只依赖标准库：代码执行宿主，负责 worktree 隔离与安全回收、子进程监管（硬超时与静默看门狗）、多 CLI 驱动与会话续接；本机同进程直调，或经反向 WebSocket 由控制面按工作区亲和调度多个节点。`agent_runtime.adapters.runner_bridge.RunnerExecutorBridge` 把它适配为 `ExecutorPort`，目前未接入 `hibernaut.toml`，默认执行器不变。设计见 [`docs/runner.md`](docs/runner.md) |
@@ -67,14 +68,16 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 
 | 配置段 | 管什么 |
 | :--- | :--- |
-| `[runtime]` | 数据库与记忆目录、并发数、新事件策略（`defer` / `fold` / `interrupt`）、全局默认执行器 |
+| `[runtime]` | 数据库与记忆目录、全局并发上限 `max_concurrency`、新事件策略（`defer` / `fold` / `interrupt`）、全局默认执行器；`ledger_db_path` 是执行账本的独立数据库（默认 `db_path` 同目录的 `ledger.db`，运行日志在它旁边的 `logs/runs/`） |
 | `[channels]` | HTTP 端口、MCP 的密钥环境变量名；`outbox_dir` 设置后每条 Outbox 消息另存为该目录下一个带任务上下文的 Markdown 文件；配置了 `auto_merge` 却停在 PR 未合并时，状态为「待合并」并写明 PR 链接与未合并原因 |
-| `[executors.<id>]` | CLI 模板；写 `role = "sde"` 或 `role = "code-reviewer"` 则是角色执行器。SDE 的 `review`、`reviewer` 决定评审开关和评审者 |
+| `[executors.<id>]` | CLI 模板；写 `role = "sde"` 或 `role = "code-reviewer"` 则是角色执行器。SDE 的 `review`、`reviewer` 决定评审开关和评审者；可选 `max_concurrency` 限制同时跑该执行器的 Inbox 数（跨项目合计） |
 | `[launchers.<name>]`、`[credential_proxy]` | Claude Code 启动命令；`billing = "api"` 时经外置凭据代理 |
-| `[projects.<name>]` | 仓库、检出路径、服务的 `inbox_id`（字符串或正则数组）、默认 `executor`、worktree 与终端后端 |
+| `[projects.<name>]` | 仓库、检出路径、服务的 `inbox_id`（字符串或正则数组）、默认 `executor`、worktree 与终端后端；可选 `max_concurrency` 限制本项目同时在跑的 Inbox 数 |
 | `[projects.<name>.delivery]` | PR 交付：开 PR、自动合并、版本文件、检查命令、是否要求评审和 CI、冲突与检查失败交回开发的次数上限（`max_handbacks`）、合并后是否删除源分支（`delete_branch`）、来自 GitHub Issue 的任务在 PR 正文里怎么写这个 Issue（`issue_link`：`closes` 合并后关闭 / `refs` 只关联，默认 / `none` 不写） |
 | `[gdrive]` | Drive 任务队列，部署见 [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md)。任务可引用队列根下 `附件/` 里的文件（frontmatter `attachments` 写文件 ID 或原名，逗号分隔、`[a, b]` 或逐行 `- a` 均可，或正文里写该文件的 Drive ID），Run 开始时下载到 `attachments_dir`（默认数据库旁的 `attachments/`，在 worktree 之外），任务正文末尾附上路径、大小和 sha256，会话结案后删除。上传 `.md` 任务文件时关掉 Drive「将上传的文件转换为 Google 文档格式」 |
-| `[switchboard]` | 同进程运行 Switchboard 或经 Relay 连接远程 Switchboard；公网 VPS 容器部署见 [`deploy/switchboard/`](deploy/switchboard/README.md) |
+| `[switchboard]` | 同进程运行 Switchboard 或经 Relay 连接远程 Switchboard；公网 VPS 容器部署见 [`deploy/switchboard/`](deploy/switchboard/README.md)，与 Taskboard 同域部署见 [`deploy/taskboard/`](deploy/taskboard/README.md) |
+
+并发上限分三级：全局、项目、执行器，后两级不写就不单独限制，大于全局值时以全局为准。满额的一级只让受它限制的 Inbox 按到达顺序排队，其他 Inbox 照常运行。
 
 GitHub 入站只经 Switchboard。把 GitHub Webhook 指向 Switchboard 的 `/webhooks/github`，在 `switchboard.toml` 里设置 `[github] require_label` 和仓库路由，使路由目标匹配 Hibernaut 项目的 `inbox_id`，再启用同进程桥接或 Relay。未部署 Taskboard 时，按 `switchboard.example.toml` 的 `[routing.event_consumers]` 示例把 `work.opened`、`work.updated`、`work.closed` 路由到 Hibernaut。部署 Taskboard 时保持默认路由，按 [`taskboard.example.toml`](taskboard.example.toml) 写 `taskboard.toml`，设置 `SWITCHBOARD_RELAY_TOKEN`、`SWITCHBOARD_MCP_TOKEN`、`TASKBOARD_MCP_TOKEN` 后运行 `python -m taskboard.app --config taskboard.toml`；`[intake] auto_ready_sources`（默认 `["github"]`）来源的 Issue / PR（包括后贴触发标签的旧 Issue）直接进入 `ready`，由 Taskboard 发 `work.ready` 给 Hibernaut，Hibernaut 执行时把状态回写 Taskboard（这些内部同步不发评论）。人工待办与依赖异常通知没有可回复的来源时发往 `switchboard.toml` 的 `[outbound] notify_target`，未设置则发往 `approval_target`。Switchboard 与 Taskboard 共用一个域名时，`[http] base_path`（如 `/switchboard`）让 Switchboard 在带前缀和不带前缀的路径上都可访问。升级前使用本机 Issue 轮询或 daemon Webhook 的部署需要先切换入口。
 
@@ -114,14 +117,17 @@ python3 scripts/run_updating.py --config hibernaut.toml
 
 | 文档 | 内容 |
 | :--- | :--- |
-| [`docs/architecture.md`](docs/architecture.md) | 完整设计：生命周期（§1）、分层（§2）、会话与路由及各入口（§3）、执行器、评审、SDE、PR 交付、worktree、多 inbox 项目、热加载（§4）、并发与新事件策略（§5）、Switchboard（§7）、ccpeer（§9）、Taskboard（§10）、Runner（§11） |
+| [`docs/architecture.md`](docs/architecture.md) | 完整设计：生命周期（§1）、分层（§2）、会话与路由及各入口（§3）、执行器、评审、SDE、PR 交付、worktree、多 inbox 项目、热加载（§4）、并发与新事件策略（§5）、Switchboard（§7）、ccpeer（§9）、Taskboard（§10）、执行账本（§11）、Runner（§12） |
 | [`docs/taskboard.md`](docs/taskboard.md) | Taskboard 完整设计方案：职责边界、5 态状态机、DAG 解锁与异常传播、Flow 展开、与 Switchboard 的 Schema 契约、DDL 与门禁 |
+| [`docs/observability-ledger-design.md`](docs/observability-ledger-design.md) | 执行账本（Observability / Ledger）设计基线：定位与边界、双层数据契约、错误分类与分流、日志与计费、重放与 Memory 闸门；接线见架构文档 §11 |
 | [`docs/runner.md`](docs/runner.md) | Runner 执行面设计（v1.0 定稿）：`RunnerPort` 协议与双模传输、多节点注册与亲和、worktree 三道保险、CLI 驱动与看门狗；交互蓝图 [`docs/runner_blueprint.html`](docs/runner_blueprint.html) |
 | [`docs/glossary.md`](docs/glossary.md) | 术语表（术语以它为准） |
 | [`AGENTS.md`](AGENTS.md) | 开发规范与提交门禁 |
 | [`docs/dispatch/`](docs/dispatch) | 派单模板：SDE 任务（`/events`、Drive）、独立评审 |
 | [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md) | Drive 队列凭据代理的安装与维护 |
 | [`deploy/switchboard/`](deploy/switchboard/README.md) | Switchboard 公网 VPS 容器部署（Docker Compose + Caddy 自动 TLS，或接入 Dokploy / Traefik 等已有反向代理）、GitHub App 收事件与回写评论、`scripts/onboard_project.py` 一键接入新仓库、Hibernaut 配对、冒烟验收、灰度切流与回滚 |
+| [`deploy/taskboard/`](deploy/taskboard/README.md) | Switchboard + Taskboard 同域子路径联合部署（`/switchboard`、`/taskboard`，Dokploy / Traefik 或 Caddy）、各服务独立 ref 与配置哈希的按需更新、路由切流与一键回滚、旧域名平滑下线 |
+| [`scripts/prepare_taskboard_deploy.py`](scripts/prepare_taskboard_deploy.py) | `render`：校验两份配置、生成 `TASKBOARD_MCP_TOKEN`（0600 文件，默认打码）、算配置哈希与切流状态；`smoke --base-url https://<域名>`：两个健康检查、`/taskboard/mcp` 无令牌 401、带令牌列出 7 个 `tb_*` 工具 |
 | [`deploy/ccpeer/`](deploy/ccpeer/README.md) | `ccpeer` 接收端的 launchd 常驻部署（登录自启、崩溃拉起）、运行时文件、同名接收端规则与手工排查命令；`handoff = "peer"` 的项目依赖它 |
 | [`docs/adr/`](docs/adr) | 架构决策记录 |
 
@@ -139,8 +145,10 @@ src/switchboard/  # 独立包，不依赖 agent_runtime
 src/ccpeer/       # 独立包：与本机 Claude Code 会话收发消息（发送、会话发现、常驻接收端），只依赖标准库
 src/taskboard/    # 独立包：多源任务归集与 DAG 编排（core/ L0、ports.py L1、engine/ L2、adapters/ L3、app/ 配置与入口），只依赖标准库与 switchboard
 src/runner/       # 独立包：代码执行宿主（worktree、进程监管、CLI 驱动、反向 WebSocket 多节点调度），只依赖标准库
+src/ledger/       # 独立包：执行账本与审计（独立 ledger.db、运行日志、错误分类、MCP 只读查询），只依赖标准库
 schemas/taskboard/  # Taskboard 与 Switchboard 之间事件 metadata 的 JSON Schema（Draft 2020-12）
 schemas/runner/v1/  # Runner 协议（capabilities、run_request、run_result、interrupt、reclaim）的 JSON Schema（Draft 2020-12）
+schemas/v1/         # 执行账本的 AuditRecord / RunRecord JSON Schema（ADR-0001，Draft 2020-12）
 ```
 
 提交前三道门禁必须全绿：
@@ -149,5 +157,5 @@ schemas/runner/v1/  # Runner 协议（capabilities、run_request、run_result、
 pip install -e ".[dev]"
 lint-imports   # 分层与反向依赖检查
 pytest -v      # 契约、并发、端到端测试（本地快检可用 pytest -n auto $(python scripts/select_tests.py)）
-pyright        # core/、engine/、switchboard/、ccpeer/、taskboard/、runner/ 的 strict 类型检查
+pyright        # core/、engine/、switchboard/、ccpeer/、taskboard/、runner/、ledger/ 的 strict 类型检查
 ```

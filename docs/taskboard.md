@@ -28,7 +28,11 @@ Phase 1 代码由 PR #58（`db0c9b4`）合入：包在 `src/taskboard/`，事件
 
 ### 1.3 内部整洁分层
 
-Taskboard 按整洁架构分 L0–L3 四层，依赖只能由外向内：
+Taskboard 按整洁架构分 L0–L3 四层，最外是组装根 `app/`，依赖只能由外向内：
+
+```text
+app（组装根）→ L3 adapters → L2 engine → L1 ports → L0 core
+```
 
 ```text
 +---------------------------------------------------------------------------+
@@ -49,6 +53,7 @@ Taskboard 按整洁架构分 L0–L3 四层，依赖只能由外向内：
 2. **L1 Ports（`src/taskboard/ports.py`）**：`typing.Protocol` 端口：`TaskStorePort`、`EventPublisherPort`、`AuditSinkPort`。
 3. **L2 Engine（`src/taskboard/engine/`）**：`IngestionService`（入站事件与 7 个 `tb_*` 工具方法）、`UnlockDispatcher`（解锁扫描与派发）、`FlowExpander`（Flow 展开），编排内核与端口。
 4. **L3 Adapters（`src/taskboard/adapters/`）**：基于 `sqlite3` 的 `SQLiteTaskStore`、对接 Switchboard `CanonicalEvent` / `EventBusPort` 的 `SwitchboardAdapter`、审计适配器（`SafeAuditAdapter`、`NoopAuditSink`、`RecordingAuditSink`）。
+5. **组装根（`src/taskboard/app/`）**：配置解析与服务入口（`python -m taskboard.app`），装配以上各层；任何一层都不得导入它。
 
 过渡期以单仓独立包 `src/taskboard/` 组织，`.importlinter` 约束单向依赖，禁止逆向或跨域调用（见 [7.2.2](#722-importlinter-门禁)）。
 
@@ -319,7 +324,7 @@ WHERE task_id = :target_task_id
 
 #### 步骤 3：领取派发序号
 
-派发前 `try_claim_dispatch()` 同样按版本 CAS，把 `dispatch_seq` 加一并记下 `claimed_ready_at = ready_at`。`claimed_ready_at == ready_at` 表示本次 `ready` 已领过序号，重放时不再领，按原 `dispatch_seq` 重发同一 `external_id`，由 Switchboard 去重。
+派发前 `try_claim_dispatch()` 同样按版本 CAS，把 `dispatch_seq` 加一并记下 `claimed_ready_at = ready_at`。`claimed_ready_at == ready_at` 表示本次 `ready` 已领过序号：只有重放（领号那次入站事件的重投：终态重放、`work.opened` / `work.updated` 重投）才按原 `dispatch_seq` 重发同一 `external_id`，补完发布失败的那次派发，由 Switchboard 去重；其他并发到达的调用（例如两个上游同时完成，后到者发现下游已被先到者领号）直接跳过，由领号者发布，同一 `dispatch_seq` 只解锁一次。
 
 ### 3.4 异常传播规则
 
@@ -566,11 +571,16 @@ src/taskboard/
 │   ├── ingestion.py             # IngestionService：入站事件处理与 7 个 tb_* 工具方法
 │   ├── dispatcher.py            # UnlockDispatcher：解锁扫描、派发与异常通知
 │   └── flow_expander.py         # FlowExpander：Flow 展开
-└── adapters/                    # L3 适配器
+├── adapters/                    # L3 适配器
+│   ├── __init__.py
+│   ├── sqlite_store.py          # SQLiteTaskStore：DDL、WAL、CAS
+│   ├── switchboard_adapter.py   # SwitchboardAdapter：事件收发与 Schema 校验
+│   └── audit_adapter.py         # SafeAuditAdapter、NoopAuditSink、RecordingAuditSink
+└── app/                         # 组装根，最上层
     ├── __init__.py
-    ├── sqlite_store.py          # SQLiteTaskStore：DDL、WAL、CAS
-    ├── switchboard_adapter.py   # SwitchboardAdapter：事件收发与 Schema 校验
-    └── audit_adapter.py         # SafeAuditAdapter、NoopAuditSink、RecordingAuditSink
+    ├── __main__.py              # python -m taskboard.app
+    ├── config.py                # taskboard.toml 解析与校验
+    └── main.py                  # 服务装配与启停
 
 schemas/taskboard/               # 仓库根目录，JSON Schema 契约
 ├── work_opened.metadata.schema.json
@@ -608,6 +618,7 @@ forbidden_modules =
 name = Taskboard Clean Architecture L3 -> L2 -> L1 -> L0 unidirectional layers
 type = layers
 layers =
+    taskboard.app
     taskboard.adapters
     taskboard.engine
     taskboard.ports
@@ -626,7 +637,7 @@ forbidden_modules =
     taskboard.ports
 ```
 
-另外，Switchboard 一侧的 `switchboard-zero-business-deps`、`ccpeer-zero-business-deps` 契约禁止这两个包反向导入 `taskboard`。`tests/taskboard/test_m4_architecture_and_schemas.py` 另用 AST 检查同样的分层边界。
+另外，Switchboard 一侧的 `switchboard-zero-business-deps`、`ccpeer-zero-business-deps` 契约禁止这两个包反向导入 `taskboard`。`tests/taskboard/test_m4_architecture_and_schemas.py` 另用 AST 检查分层边界（含下层不得导入 `taskboard.app`），并断言 `taskboard-clean-layers` 的层次。
 
 ---
 
@@ -707,7 +718,7 @@ forbidden_modules =
 | 6.2 `work.opened` 必填 | `source_ref`、`title` | metadata 必填 `work_kind`、`trace_id`、`hop_count`；`title` 取信封 `subject`，`source_ref` 可取 `correlation_key` |
 | 7.1 DDL | `source_ref NOT NULL` 全局唯一、`assignee` 默认 `''`、`task_type` 默认 `default`、`priority` 默认 3、时间由 SQLite 默认值生成 | `source_ref` 可空、非空时局部唯一；`assignee` 默认 `agent:default`、`task_type` 默认 `general`、`priority` 默认 2；新增 `claimed_ready_at`、`artifact_ref`、`reply_target`；时间由应用层写入 |
 | 7.2.1 目录 | `core/entities.py`、`dag_engine.py`；`engine/ingestion_service.py`、`unlock_dispatcher.py`；`adapters/audit_sink_adapter.py`；Schema 在 `src/taskboard/schemas/` | `core/models.py`、`errors.py`、`merge.py`、`dag.py`；`engine/ingestion.py`、`dispatcher.py`；`adapters/audit_adapter.py`；Schema 在仓库根目录 `schemas/taskboard/`，文件名带 `.metadata` |
-| 7.2.2 契约 | `contract:1`–`contract:3`，`root_package = taskboard` | `taskboard-no-runtime-deps`（另禁 `memory`）、`taskboard-clean-layers`、`taskboard-core-pure`（另禁 `taskboard.ports`、`taskboard.engine`） |
+| 7.2.2 契约 | `contract:1`–`contract:3`，`root_package = taskboard` | `taskboard-no-runtime-deps`（另禁 `memory`）、`taskboard-clean-layers`（最上层另有 `taskboard.app`）、`taskboard-core-pure`（另禁 `taskboard.ports`、`taskboard.engine`） |
 | 8.1 Schema | 正文内联 JSON | 链接到仓库文件并列关键约束；实现另含 `state`、`preferred_executor`、`target_assignee`、`reason` 等字段，`assignee` 正则允许 `:` |
 | 8.2 错误 | 8 个 | 另有基类 `TaskboardError` 与 `PublishFailedError` |
 | 8.3 `tb_list_tasks` 出参 | `list[TaskItem]` | `list[TaskView]` |

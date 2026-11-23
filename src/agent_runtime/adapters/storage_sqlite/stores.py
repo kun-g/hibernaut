@@ -276,6 +276,59 @@ class SQLiteInboxAdapter:
                     (error, *part),
                 )
 
+    def replay(
+        self,
+        event_id: str,
+        *,
+        executor_id_override: str | None = None,
+        force: bool = False,
+        replay_of_run_id: str | None = None,
+    ) -> Event:
+        with self._db.transaction() as conn:
+            row = conn.execute(
+                f"SELECT {_EVENT_COLUMNS} FROM event_inbox WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Event not found: {event_id}")
+            event = self._row_to_event(row)
+            check_replayable(event, force)
+            payload = replay_payload(event.payload, executor_id_override, replay_of_run_id)
+            # Only the row's own status changes; the inbox lease is untouched, so a Run in progress keeps it and the
+            # replayed event waits its turn like any new pending event.
+            conn.execute(
+                """
+                UPDATE event_inbox
+                SET status = 'pending', attempts = 0, last_error = NULL, payload_json = ?
+                WHERE event_id = ? AND status = ?
+                """,
+                (json.dumps(payload, ensure_ascii=False), event_id, event.status),
+            )
+        return replace(event, payload=payload, status="pending")
+
+
+def check_replayable(event: Event, force: bool) -> None:
+    if event.status == "failed" or (force and event.status == "done"):
+        return
+    if event.status == "processing":
+        raise ValueError(f"Event {event.event_id} is processing; a replay never takes a Run in progress")
+    if event.status == "dropped":
+        raise ValueError(f"Event {event.event_id} is a dropped duplicate and cannot be replayed")
+    hint = " (force=True also replays a done event)" if event.status == "done" else ""
+    raise ValueError(f"Event {event.event_id} is {event.status}; only failed events are replayed{hint}")
+
+
+def replay_payload(
+    payload: dict[str, Any], executor_id_override: str | None, replay_of_run_id: str | None
+) -> dict[str, Any]:
+    updated = dict(payload)
+    if executor_id_override:
+        updated["executor_id"] = executor_id_override
+    if replay_of_run_id:
+        updated["_replay_of_run_id"] = replay_of_run_id
+    else:
+        updated.pop("_replay_of_run_id", None)
+    return updated
+
 
 class SQLiteTimerAdapter:
     def __init__(self, db: SQLiteDatabase) -> None:

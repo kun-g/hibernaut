@@ -4,9 +4,15 @@
 [runtime]
 db_path = "./hibernaut.db"
 memory_root = "./agent_memory"
+# 分级并发上限，单位是同时在跑的 Inbox 数，三级同时满足才派发：这里是全局上限；[executors.<id>] 与 [projects.<name>] 各可再写
+# 可选的 max_concurrency（整数，>= 1；不写 = 只受上层限制；大于全局值时以全局为准并记一条 WARNING）。
+# 某一级满额只让受它限制的 Inbox 排队（先到先跑），后面配额有余的 Inbox 照常派发。
 max_concurrency = 4
 new_event_policy = "defer"   # defer | fold | interrupt
 default_executor = "claude"
+# 执行账本（每个 Run 的档案与 Switchboard 审计）的独立 SQLite 文件；留空 = db_path 同目录的 ledger.db，
+# 运行日志写在它旁边的 logs/runs/YYYY-MM-DD/<run_id>.log（14 天或 500 MB 滚动清理）。改动需要重启。
+# ledger_db_path = ""
 # 后台回收清扫：启动时一轮，之后每隔这么多秒一轮，回收交付时因排队事件、在线会话等被跳过、PR 已合并且已无人使用的 hb-* worktree；
 # 门禁与回收方式同交付时的回收，跳过只记日志，回收成功才发一条通知；0 = 关闭
 worktree_sweep_interval_seconds = 300.0
@@ -73,6 +79,7 @@ billing = "subscription"
 model = "claude-opus-5-5"
 effort = "high"
 timeout_seconds = 1800.0
+# max_concurrency = 2           # 可选：同时跑 sde 的 Inbox 上限，跨项目合计；普通 CLI 执行器与 code-reviewer 同样可写。SDE 内置评审算在 sde 的名额里
 review = true                   # true：送 reviewer 评审，changes_requested 时修复后复审，pass 才交付；false：测试与检查完成后直接交付
 reviewer = "code-reviewer"      # review = true 时必填有效值：role = "code-reviewer" 的执行器，或任一普通 CLI 执行器（含内置 claude / cursor-agent / grok / dsh）
 # reviewer = "grok-reviewer"    # 用 [executors.grok-reviewer] 模板非交互评审：prompt 末尾要求只输出一个 JSON 结论，格式错重试一次；模板写 terminal = "orca" 时在 Orca 终端里可旁观。
@@ -126,6 +133,8 @@ orca_create_terminal = false    # agent launch opens its own terminal
 handoff = "mcp"              # mcp | peer；Claude Code 角色会话取任务、交结果的方式。peer 需要下面 [peer] 的接收端常驻（hb 启动时检查，不在则启动失败）
 # 可选：项目级默认执行器（未设置时回退到 runtime.default_executor）
 # executor = "claude"
+# 可选：本项目同时在跑的 Inbox 上限（见 [runtime] max_concurrency）
+# max_concurrency = 2
 
 # 可选：SDE 任务的交付步骤（由 Hibernaut 执行，SDE 只在任务分支本地提交）。不写本节则任务以本地提交结束。
 # 授权只来自本部署文件，被改动的仓库改不了；开 PR 与合并分开授权，权限门禁分别是 delivery.open_pr 与 delivery.merge。

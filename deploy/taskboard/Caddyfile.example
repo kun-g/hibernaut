@@ -1,0 +1,16 @@
+# Copy to Caddyfile and replace hub.example.com with the domain whose A/AAAA record points at this VPS.
+# One domain, two services by sub-path. `handle` keeps the prefix (unlike `handle_path`): Switchboard and
+# Taskboard serve it themselves through [http] base_path = "/switchboard" / "/taskboard".
+# reverse_proxy passes WebSocket upgrades through, so wss://<domain>/switchboard/ws/relay needs no extra rule.
+hub.example.com {
+	encode gzip
+	handle /switchboard/* {
+		reverse_proxy switchboard:8790
+	}
+	handle /taskboard/* {
+		reverse_proxy taskboard:8791
+	}
+	handle {
+		respond 404
+	}
+}

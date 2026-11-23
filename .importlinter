@@ -5,6 +5,7 @@ root_packages =
     ccpeer
     taskboard
     runner
+    ledger
 include_external_packages = True
 
 [importlinter:contract:clean-layers]
@@ -56,6 +57,18 @@ forbidden_modules =
     runner
     memory_hub
 
+[importlinter:contract:ledger-zero-business-deps]
+name = Ledger has zero business dependencies
+type = forbidden
+source_modules =
+    ledger
+forbidden_modules =
+    agent_runtime
+    switchboard
+    taskboard
+    runner
+    memory_hub
+
 [importlinter:contract:taskboard-no-runtime-deps]
 name = Taskboard must not depend on execution runtime or memory/broker internals
 type = forbidden
@@ -73,6 +86,7 @@ forbidden_modules =
 name = Taskboard Clean Architecture L3 -> L2 -> L1 -> L0 unidirectional layers
 type = layers
 layers =
+    taskboard.app
     taskboard.adapters
     taskboard.engine
     taskboard.ports

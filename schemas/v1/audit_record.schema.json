@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kun-g/hibernaut/schemas/v1/audit_record.schema.json",
+  "title": "AuditRecord",
+  "description": "Lightweight append-only side-channel audit event shared across Switchboard, Taskboard, Hibernaut, Runner, Broker, and Ledger.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "audit_id",
+    "occurred_at",
+    "service",
+    "stage",
+    "outcome",
+    "severity"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "audit_id": {
+      "type": "string",
+      "pattern": "^aud_[A-Za-z0-9_-]+$"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "service": {
+      "type": "string",
+      "enum": [
+        "switchboard",
+        "taskboard",
+        "hibernaut",
+        "runner",
+        "broker",
+        "ledger"
+      ]
+    },
+    "stage": {
+      "type": "string",
+      "minLength": 1
+    },
+    "outcome": {
+      "type": "string",
+      "minLength": 1
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "info",
+        "warn",
+        "error"
+      ]
+    },
+    "correlation_key": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "trace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "scope": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "external_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "actor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "duration_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "detail": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

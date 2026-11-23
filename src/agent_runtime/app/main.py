@@ -9,6 +9,7 @@ import signal
 import ssl
 import sys
 import threading
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -82,6 +83,14 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteTaskMetadataStore,
     SQLiteWorkspaceStore,
 )
+from agent_runtime.app.concurrency import (
+    ConcurrencyLimiter,
+    ConcurrencyLimits,
+    ExecutorQuotaHold,
+    InboxRoute,
+    LimitKeyResolver,
+    LimitKeys,
+)
 from agent_runtime.app.config import (
     HibernautConfig,
     RoleConfig,
@@ -90,7 +99,7 @@ from agent_runtime.app.config import (
     load_config,
 )
 from agent_runtime.app.projects import ProjectRouter, UnmatchedProjectHold
-from agent_runtime.core.models import NewEventPolicy
+from agent_runtime.core.models import Event, NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, OutboxPort, RunCapabilities
 from agent_runtime.engine import (
     AgentWorker,
@@ -100,6 +109,8 @@ from agent_runtime.engine import (
     TimerScheduler,
 )
 from agent_runtime.engine.worker import ExecutorFailed
+from agent_runtime.adapters.ledger_bridge import RunLedger
+from switchboard.ports import AuditSinkPort
 from switchboard.app import EnvCredentialBroker, Switchboard, build_switchboard
 from switchboard.config import load_config as load_switchboard_config
 
@@ -124,24 +135,39 @@ class AsyncWorkerPool:
         on_run_reports: Callable[[list[RunReport]], None] | None = None,
         on_inbox_failed: Callable[[str], None] | None = None,
         pending_inboxes: Callable[[], Iterable[str]] | None = None,
+        limits: ConcurrencyLimits | None = None,
+        limit_keys: Callable[[str], LimitKeys] | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be >= 1")
         self._worker_factory = worker_factory
         self._max_concurrency = max_concurrency
+        self._limiter = ConcurrencyLimiter(max_concurrency, limits)
+        self._limit_keys = limit_keys
         self._on_run_reports = on_run_reports
         self._on_inbox_failed = on_inbox_failed
         self._pending_inboxes = pending_inboxes
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        # Inboxes waiting to run, oldest first; one whose quota is full stays in place while later ones pass it.
+        self._queue: deque[str] = deque()
         self._queued: set[str] = set()
+        # Limit keys a queued inbox was last refused with, dropped by its next wake, so a rescan that refuses it again
+        # costs no database reads.
+        self._queued_keys: dict[str, LimitKeys] = {}
+        # Set on every change that can make a queued inbox runnable or end a worker loop.
+        self._changed = asyncio.Event()
         self._active: dict[str, AgentWorker] = {}
         self._requeue: set[str] = set()
+        self._deferred: set[str] = set()
         self._idle_event = asyncio.Event()
         self._idle_event.set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pool_id = f"pool-{next(_POOL_IDS)}"
         self._handoff: Callable[[str], None] | None = None
         self.reports: list[RunReport] = []
+
+    @property
+    def limiter(self) -> ConcurrencyLimiter:
+        return self._limiter
 
     def bind(self, loop: asyncio.AbstractEventLoop) -> None:
         # Bind before ingress can reach the pool, so wakes from HTTP threads are marshalled from the first request.
@@ -167,11 +193,37 @@ class AsyncWorkerPool:
             active_worker.notify_new_event(inbox_id)
             self._requeue.add(inbox_id)
             return
+        self._queued_keys.pop(inbox_id, None)
+        self._changed.set()
         if inbox_id in self._queued:
             return
         self._queued.add(inbox_id)
         self._idle_event.clear()
-        self._queue.put_nowait(inbox_id)
+        self._queue.append(inbox_id)
+
+    def defer(self, inbox_id: str) -> None:
+        # The inbox's worker left events behind for want of an executor slot: queue it again once this dispatch ends.
+        if inbox_id in self._active:
+            self._deferred.add(inbox_id)
+
+    def _claim_ready(self) -> str | None:
+        # The first queued inbox with quota in every dimension. Never waits, so a full quota holds up only its own
+        # inboxes and occupies no worker.
+        for inbox_id in () if self._limiter.saturated() else tuple(self._queue):
+            cached = self._queued_keys.get(inbox_id)
+            if cached is not None and not self._limiter.available(
+                    inbox_id, project_key=cached.project, executor_key=cached.executor):
+                continue
+            # Cached keys only rule an inbox out; it is admitted on fresh ones. Another thread may have stored a
+            # change (an event replayed for another executor) whose wake has not reached the loop yet.
+            keys = self._limit_keys(inbox_id) if self._limit_keys is not None else LimitKeys()
+            self._queued_keys[inbox_id] = keys
+            if self._limiter.try_acquire(inbox_id, project_key=keys.project, executor_key=keys.executor):
+                self._queue.remove(inbox_id)
+                self._queued.discard(inbox_id)
+                del self._queued_keys[inbox_id]
+                return inbox_id
+        return None
 
     def retire(self, handoff: Callable[[str], None], *, interruptible: bool = True) -> None:
         # Called on the event loop when a config reload replaces this pool. Runs in progress finish with this
@@ -181,11 +233,14 @@ class AsyncWorkerPool:
         for worker in self._active.values():
             worker.retire(interruptible=interruptible)
         self._requeue.clear()
-        while not self._queue.empty():
-            inbox_id = self._queue.get_nowait()
-            self._queue.task_done()
-            self._queued.discard(inbox_id)
+        self._deferred.clear()
+        waiting = tuple(self._queue)
+        self._queue.clear()
+        self._queued.clear()
+        self._queued_keys.clear()
+        for inbox_id in waiting:
             handoff(inbox_id)
+        self._changed.set()
         if not self._active:
             self._idle_event.set()
 
@@ -199,22 +254,21 @@ class AsyncWorkerPool:
 
     async def _worker_loop(self, worker_idx: int, stop_event: asyncio.Event) -> None:
         worker_id = f"{self._pool_id}-worker-{worker_idx}"
-        while self._handoff is None and (not stop_event.is_set() or not self._queue.empty()):
-            try:
-                inbox_id = await asyncio.wait_for(self._queue.get(), timeout=0.05)
-            except asyncio.TimeoutError:
+        while self._handoff is None and (not stop_event.is_set() or self._queue):
+            inbox_id = self._claim_ready()
+            if inbox_id is None:
+                # No await between the scan and the wait, so no change is missed.
+                self._changed.clear()
+                await self._changed.wait()
                 continue
 
-            self._queued.discard(inbox_id)
-            if self._handoff is not None:
-                self._queue.task_done()
-                self._handoff(inbox_id)
-                break
+            settled = False
             try:
                 # Inside the try: a factory that refuses the inbox (AmbiguousProjectMatch) leaves its events pending.
                 worker = self._worker_factory(inbox_id, worker_id)
                 self._active[inbox_id] = worker
                 batch_reports = await worker.process_inbox(inbox_id)
+                settled = True
                 self.reports.extend(batch_reports)
                 if batch_reports and self._on_run_reports is not None:
                     try:
@@ -224,7 +278,8 @@ class AsyncWorkerPool:
                             "Post-run callback failed for inbox %s",
                             inbox_id,
                         )
-            except ExecutorFailed:
+            except ExecutorFailed as exc:
+                settled = exc.batch_settled
                 logging.getLogger(__name__).exception(
                     "Executor failed for inbox %s; batch remains pending",
                     inbox_id,
@@ -239,17 +294,28 @@ class AsyncWorkerPool:
                         )
             finally:
                 self._active.pop(inbox_id, None)
-                self._queue.task_done()
+                self._limiter.release(inbox_id)
+                self._changed.set()
+                # A batch that failed but stays pending (no such executor, ambiguous project) waits for the next wake:
+                # requeueing it here would retry it in a loop.
+                deferred = settled and inbox_id in self._deferred
+                self._deferred.discard(inbox_id)
                 if self._handoff is not None:
                     # The lease is released now; the current pool picks up whatever arrived meanwhile.
                     self._handoff(inbox_id)
                     if not self._active:
                         self._idle_event.set()
-                elif inbox_id in self._requeue:
+                elif deferred or inbox_id in self._requeue:
                     self._requeue.discard(inbox_id)
                     self._wake_on_loop(inbox_id)
                 elif not self._queued and not self._active:
                     self._idle_event.set()
+            # A dispatch may finish without ever suspending (lease held elsewhere); let wakes and other workers in.
+            await asyncio.sleep(0)
+
+    async def _notice_stop(self, stop_event: asyncio.Event) -> None:
+        await stop_event.wait()
+        self._changed.set()
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
         self._loop = asyncio.get_running_loop()
@@ -262,10 +328,11 @@ class AsyncWorkerPool:
             asyncio.create_task(self._worker_loop(idx, stop_event))
             for idx in range(self._max_concurrency)
         ]
+        stop_watch = asyncio.create_task(self._notice_stop(stop_event))
         try:
             await asyncio.gather(*tasks)
         finally:
-            for task in tasks:
+            for task in (*tasks, stop_watch):
                 if not task.done():
                     task.cancel()
 
@@ -297,6 +364,8 @@ class AlwaysOnDaemon:
     gdrive_poll_interval_seconds: float = 30.0
     ingest_only: bool = False
     open_runs: SQLiteOpenRunStore | None = None
+    # Shared by every config generation, like db; closed with it.
+    ledger: RunLedger | None = None
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def register_partition(
@@ -395,7 +464,18 @@ class AlwaysOnDaemon:
                 )
 
     def close(self) -> None:
+        if self.ledger is not None:
+            self.ledger.close()
         self.db.close()
+
+
+def run_ledger_path(db_path: str | Path, ledger_db_path: str | Path | None) -> Path | None:
+    # An in-memory runtime database has no directory to put ledger.db in, so it runs without a ledger.
+    if ledger_db_path:
+        return Path(ledger_db_path).expanduser().resolve()
+    if str(db_path) == ":memory:":
+        return None
+    return Path(db_path).expanduser().resolve().parent / "ledger.db"
 
 
 async def drain_pools(
@@ -475,6 +555,28 @@ def _report_failed_events(inbox: SQLiteInboxAdapter, writer: DriveResultWriter, 
         )
 
 
+def concurrency_limits(config: HibernautConfig) -> ConcurrencyLimits:
+    executors = {**config.executors, **config.roles}
+    return ConcurrencyLimits(
+        projects={n: p.max_concurrency for n, p in config.projects.items() if p.max_concurrency is not None},
+        executors={n: e.max_concurrency for n, e in executors.items() if e.max_concurrency is not None},
+    )
+
+
+def executor_quota_hold(
+    inbox_id: str,
+    *,
+    pool: AsyncWorkerPool,
+    limits: ConcurrencyLimits,
+    keys: LimitKeyResolver,
+    route: InboxRoute,
+) -> Callable[[Event], str | None] | None:
+    if not limits.executors:
+        return route.hold
+    return ExecutorQuotaHold(inbox_id, limiter=pool.limiter, on_defer=pool.defer, inner=route.hold,
+                             executor_of=lambda event: keys.event_executor(event, route))
+
+
 def build_daemon(
     *,
     db_path: str | Path = "./hibernaut.db",
@@ -507,8 +609,16 @@ def build_daemon(
     outbox_display_base: str | Path | None = None,
     approval_events_url: str = "http://127.0.0.1:8080/events",
     runs_root: str | Path | None = None,
+    limits: ConcurrencyLimits | None = None,
+    project_for: Callable[[str], str | None] | None = None,
+    ledger: RunLedger | None = None,
+    ledger_db_path: str | Path | None = None,
 ) -> AlwaysOnDaemon:
     db = database if database is not None else SQLiteDatabase(db_path)
+    if ledger is None and (database is None or ledger_db_path):
+        ledger_path = run_ledger_path(db_path, ledger_db_path)
+        ledger = RunLedger(ledger_path) if ledger_path is not None else None
+    run_ledger = ledger.recorder if ledger is not None else None
     if runs_root is None and database is None and str(db_path) != ":memory:":
         runs_root = Path(db_path).expanduser().resolve().parent / "runs"
     # Directories of Runs that a stop detached; orphans past the retention period are removed at startup.
@@ -547,6 +657,10 @@ def build_daemon(
         usage=SQLiteWorkUsage(db).blockers,
     )
 
+    def _quota_hold(inbox_id: str) -> Callable[[Event], str | None] | None:
+        return executor_quota_hold(inbox_id, pool=pool, limits=resolved_limits, keys=limit_keys,
+                                   route=InboxRoute(default_executor=project_default_executor))
+
     def _make_worker(inbox_id: str, worker_id: str) -> AgentWorker:
         if executors_factory is not None:
             return AgentWorker(
@@ -562,10 +676,12 @@ def build_daemon(
                 on_worktree_reclaim=lambda wk, _iid=inbox_id: resolved_wt_mgr.reclaim(
                     wk, notify_outbox=outbox, inbox_id=_iid
                 ),
+                hold=_quota_hold(inbox_id),
                 lock=lock,
                 sessions=sessions,
                 run_start_listener=gdrive_writer,
                 open_runs=open_runs,
+                run_ledger=run_ledger,
                 code_version=__version__,
                 lease_ttl_seconds=lease_ttl_seconds,
                 new_event_policy=new_event_policy,
@@ -582,10 +698,12 @@ def build_daemon(
             on_worktree_reclaim=lambda wk, _iid=inbox_id: resolved_wt_mgr.reclaim(
                 wk, notify_outbox=outbox, inbox_id=_iid
             ),
+            hold=_quota_hold(inbox_id),
             lock=lock,
             sessions=sessions,
             run_start_listener=gdrive_writer,
             open_runs=open_runs,
+            run_ledger=run_ledger,
             code_version=__version__,
             lease_ttl_seconds=lease_ttl_seconds,
             new_event_policy=new_event_policy,
@@ -628,9 +746,22 @@ def build_daemon(
             return
         _report_failed_events(inbox, gdrive_writer, inbox_id)
 
+    def _route(inbox_id: str) -> InboxRoute:
+        return InboxRoute(project=project_for(inbox_id) if project_for is not None else None,
+                          default_executor=project_default_executor)
+
+    resolved_limits = limits or ConcurrencyLimits()
+    limit_keys = LimitKeyResolver(
+        limits=resolved_limits, inbox=inbox, sessions=sessions, open_runs=open_runs, route=_route,
+        global_default_executor=global_default_executor or (
+            default_executor.executor_id if executors_factory is None and executor_factory is None else None
+        ),
+    )
     pool = AsyncWorkerPool(
         worker_factory=_make_worker,
         max_concurrency=max_concurrency,
+        limits=resolved_limits,
+        limit_keys=limit_keys,
         on_run_reports=_on_reports if gdrive_writer is not None else None,
         on_inbox_failed=_on_failed if gdrive_writer is not None else None,
         # Events a stopped process accepted while draining, and Runs it detached, are picked up here.
@@ -652,6 +783,7 @@ def build_daemon(
         worktree_manager=resolved_wt_mgr,
         outbox=outbox,
         bearer_token=mcp_bearer_token,
+        ledger=ledger,
     )
 
     return AlwaysOnDaemon(
@@ -687,6 +819,7 @@ def build_daemon(
         gdrive_poll_interval_seconds=gdrive_poll_interval_seconds,
         ingest_only=ingest_only,
         open_runs=open_runs,
+        ledger=ledger,
     )
 
 
@@ -698,6 +831,7 @@ def build_daemon_from_config(
     demo: bool = False,
     gdrive_client: DriveClientProtocol | None = None,
     switchboard: SwitchboardHandle | None = None,
+    ledger: RunLedger | None = None,
 ) -> AlwaysOnDaemon:
     # Every inbox -> project lookup goes through the router, so pattern-matched inboxes get their project's settings
     # and an inbox matching two projects raises AmbiguousProjectMatch instead of picking one.
@@ -751,9 +885,17 @@ def build_daemon_from_config(
                 f"handoff = \"peer\" for {', '.join(peer_projects)}, but {exc}"
             ) from exc
 
+    limits = concurrency_limits(config)
+
+    def _project_name(inbox_id: str) -> str | None:
+        project = router.resolve(inbox_id)
+        return project.name if project is not None else None
+
     daemon = build_daemon(
         db_path=config.runtime.db_path,
         database=database,
+        limits=limits,
+        project_for=_project_name,
         memory_root=config.runtime.memory_root,
         max_concurrency=config.runtime.max_concurrency,
         channel=resolved_channel,
@@ -777,6 +919,8 @@ def build_daemon_from_config(
         outbox_display_base=config.config_dir or None,
         approval_events_url=local_events_url(config.channels.host, config.channels.port),
         runs_root=Path(config.runtime.db_path).expanduser().resolve().parent / "runs",
+        ledger=ledger,
+        ledger_db_path=config.runtime.ledger_db_path or None,
     )
 
     if has_configured_executor and not demo:
@@ -933,6 +1077,17 @@ def build_daemon_from_config(
         # One per config generation, so a held event is logged once each time it enters the wait.
         unmatched_hold = UnmatchedProjectHold(daemon.sessions)
 
+        def _cli_route(inbox_id: str) -> InboxRoute:
+            project = router.resolve(inbox_id)
+            if project is None:
+                return InboxRoute(hold=unmatched_hold)
+            return InboxRoute(project=project.name, default_executor=project.executor)
+
+        limit_keys = LimitKeyResolver(
+            limits=limits, inbox=daemon.inbox, sessions=daemon.sessions, open_runs=daemon.open_runs, route=_cli_route,
+            global_default_executor=config.runtime.default_executor,
+        )
+
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
             # Raises AmbiguousProjectMatch before any lease, executor or workspace exists for the inbox.
             project = router.resolve(inbox_id)
@@ -951,9 +1106,11 @@ def build_daemon_from_config(
                 project_default_executor=project.executor if project is not None else None,
                 global_default_executor=config.runtime.default_executor,
                 on_worktree_reclaim=reclaim,
-                hold=unmatched_hold if project is None else None,
+                hold=executor_quota_hold(inbox_id, pool=daemon.pool, limits=limits, keys=limit_keys,
+                                         route=_cli_route(inbox_id)),
                 run_start_listener=daemon.gdrive_result_writer,
                 open_runs=daemon.open_runs,
+                run_ledger=daemon.ledger.recorder if daemon.ledger is not None else None,
                 code_version=__version__,
                 lock=daemon.lock,
                 sessions=daemon.sessions,
@@ -974,6 +1131,8 @@ def build_daemon_from_config(
         daemon.pool = AsyncWorkerPool(
             worker_factory=_cli_worker_factory,
             max_concurrency=config.runtime.max_concurrency,
+            limits=limits,
+            limit_keys=limit_keys,
             on_run_reports=_cli_on_reports if daemon.gdrive_result_writer is not None else None,
             on_inbox_failed=_cli_on_failed if daemon.gdrive_result_writer is not None else None,
             pending_inboxes=startup_inboxes(daemon.inbox, daemon.open_runs),
@@ -993,6 +1152,7 @@ def build_daemon_from_config(
             outbox=daemon.outbox,
             bearer_token=mcp_token,
             worktree_manager_for=_manager_for,
+            ledger=daemon.ledger,
         )
 
     if resolved_gdrive_client is not None:
@@ -1027,14 +1187,16 @@ def start_switchboard(
     link: SwitchboardLinkConfig,
     *,
     environ: MutableMapping[str, str] | None = None,
+    audit: AuditSinkPort | None = None,
 ) -> SwitchboardHandle | None:
+    # audit reaches only the in-process Switchboard (Stage A); a relay's audits stay with the remote hub.
     if not link.enabled:
         return None
     credentials = EnvCredentialBroker(take_switchboard_secrets(environ))
     if link.mode == "relay":
         return open_switchboard_relay(link, credentials)
     assert link.config_path is not None
-    board = build_switchboard(load_switchboard_config(link.config_path), credentials=credentials)
+    board = build_switchboard(load_switchboard_config(link.config_path), credentials=credentials, audit=audit)
     board.start()
     print(f"[hibernaut] [switchboard] in-process switchboard listening on {board.http.base_url}", file=sys.stderr, flush=True)
     return board
@@ -1120,9 +1282,10 @@ async def serve_configured(
             async for candidate in changes:
                 if candidate == config:
                     continue
-                if (candidate.runtime.db_path, candidate.runtime.memory_root) != (
+                if (candidate.runtime.db_path, candidate.runtime.memory_root, candidate.runtime.ledger_db_path) != (
                     config.runtime.db_path,
                     config.runtime.memory_root,
+                    config.runtime.ledger_db_path,
                 ):
                     print(
                         "[config] Storage path changes require a restart.",
@@ -1145,6 +1308,7 @@ async def serve_configured(
                         database=daemon.db,
                         demo=demo,
                         switchboard=switchboard,
+                        ledger=daemon.ledger,
                     )
                     handler = replacement.http_handler()
                     if address != (config.channels.host, config.channels.port):
@@ -1277,10 +1441,17 @@ def main() -> None:
     board: SwitchboardHandle | None = None
     if args.config:
         cfg = load_config(args.config)
+        ledger_path = run_ledger_path(cfg.runtime.db_path, cfg.runtime.ledger_db_path)
+        # Opened before the Switchboard, whose in-process audits it records; the daemon owns and closes it.
+        ledger = RunLedger(ledger_path) if ledger_path is not None else None
         # The stdio MCP companion runs beside a daemon that already owns the Switchboard port or relay
         # connection; a second relay agent with the same consumer_id would supersede the daemon's.
-        board = None if args.mcp_stdio else start_switchboard(cfg.switchboard)
-        daemon = build_daemon_from_config(cfg, demo=args.demo, switchboard=board)
+        board = (
+            None
+            if args.mcp_stdio
+            else start_switchboard(cfg.switchboard, audit=ledger.switchboard_audit() if ledger is not None else None)
+        )
+        daemon = build_daemon_from_config(cfg, demo=args.demo, switchboard=board, ledger=ledger)
         host = cfg.channels.host
         port = cfg.channels.port
     else:

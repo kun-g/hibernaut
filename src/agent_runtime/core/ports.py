@@ -6,10 +6,13 @@ from typing import Any, Protocol, runtime_checkable
 
 from agent_runtime.core.models import (
     Event,
+    FailureRoute,
     OpenRun,
     OutboxMessage,
     PermissionDecision,
+    RunLedgerEntry,
     RunOutcome,
+    RunTelemetry,
     SessionRef,
     SessionStatus,
     TimerKind,
@@ -30,6 +33,18 @@ class InboxPort(Protocol):
     def requeue_processing(self, event_ids: Sequence[str]) -> None: ...
     def mark_done(self, event_ids: Sequence[str]) -> None: ...
     def mark_failed(self, event_ids: Sequence[str], error: str) -> None: ...
+    # Control-plane replay: a 'failed' event (with force, also a 'done' one) becomes 'pending' with attempts 0 and
+    # no last_error, and queues like any new event; it never takes a Run in progress ('processing') and never
+    # reopens a 'dropped' duplicate. Raises ValueError otherwise. The overrides land in the payload as
+    # 'executor_id' and '_replay_of_run_id'.
+    def replay(
+        self,
+        event_id: str,
+        *,
+        executor_id_override: str | None = None,
+        force: bool = False,
+        replay_of_run_id: str | None = None,
+    ) -> Event: ...
 
 
 class TimerPort(Protocol):
@@ -117,6 +132,20 @@ class RunStartListener(Protocol):
         events: Sequence[Event],
         correlation_key: str | None,
     ) -> Mapping[str, Mapping[str, Any]] | None: ...
+
+
+class RunLedgerPort(Protocol):
+    # Classifies a failed attempt (an exception, or the telemetry of an Emit the executor marked failed or
+    # refused) and says how the worker handles it.
+    def route_failure(
+        self,
+        executor_id: str,
+        *,
+        error: BaseException | None = None,
+        telemetry: RunTelemetry | None = None,
+    ) -> FailureRoute: ...
+    # Side channel: called once per finished Run; the worker logs a failure and the Run goes on.
+    def record_run(self, entry: RunLedgerEntry) -> None: ...
 
 
 class RunCapabilities(Protocol):

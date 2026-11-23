@@ -4,9 +4,12 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
+from unittest import mock
 
 from agent_runtime.adapters.executor_cli.worktree import CommandResult, OrcaWorktreeManager
 from agent_runtime.adapters.storage_sqlite import (
@@ -23,6 +26,72 @@ INBOX = "proj:concurrency"
 
 def _event(external_id: str) -> Event:
     return Event(inbox_id=INBOX, source="stress", external_id=external_id, payload={"k": external_id})
+
+
+class _ReclaimClock:
+    # Reclaim staleness is judged on this clock: claims and renewals are stamped with it and the
+    # stale cutoff is read from it, so a test moves past the stale window instead of sleeping.
+    def __init__(self) -> None:
+        self._now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self._lock = threading.Lock()
+
+    def now(self, tz: tzinfo | None = None) -> datetime:
+        _ = tz
+        with self._lock:
+            self._now += timedelta(microseconds=1)  # distinct stamps, as the store requires
+            return self._now
+
+    def iso(self) -> str:
+        return self.now().isoformat()
+
+    def advance(self, seconds: float) -> str:
+        with self._lock:
+            self._now += timedelta(seconds=seconds)
+            return self._now.isoformat()
+
+    @contextmanager
+    def installed(self) -> Iterator[None]:
+        with (
+            mock.patch("agent_runtime.adapters.executor_cli.worktree.datetime", self),
+            mock.patch("agent_runtime.adapters.storage_sqlite.workspaces.utc_now_iso", self.iso),
+        ):
+            yield
+
+
+class _RenewalWatch:
+    # Wraps the store's renewal to report failures and renewals stamped after the clock moved.
+    def __init__(
+        self,
+        store: SQLiteWorkspaceStore,
+        clock: _ReclaimClock,
+        *,
+        on_error: Callable[[list[BaseException]], None] | None = None,
+    ) -> None:
+        self._clock = clock
+        self._real = store.renew_reclaim
+        self._on_error = on_error
+        self._moved_at: str | None = None
+        self.errors: list[BaseException] = []
+        self.failed = threading.Event()
+        self.renewed_since_move = threading.Event()
+        store.renew_reclaim = self._renew  # type: ignore[method-assign]
+
+    def move_past_stale_window(self) -> None:
+        self._moved_at = self._clock.advance(3600)
+
+    def _renew(self, work_key: str, *, claim: str) -> str | None:
+        try:
+            token = self._real(work_key, claim=claim)
+        except BaseException as exc:
+            self.errors.append(exc)
+            if self._on_error is not None:
+                self._on_error(self.errors)
+            self.failed.set()
+            raise
+        moved_at = self._moved_at
+        if token is not None and moved_at is not None and token > moved_at:
+            self.renewed_since_move.set()
+        return token
 
 
 class TestSQLiteThreadSafety(unittest.TestCase):
@@ -257,91 +326,95 @@ class TestSQLiteThreadSafety(unittest.TestCase):
         db.close()
 
     def test_slow_removal_keeps_claim_fresh_against_takeover(self) -> None:
-        db = SQLiteDatabase(self.db_path)
-        store = SQLiteWorkspaceStore(db)
-        self._ready_workspace(store)
-        in_remove = threading.Event()
-        finish_remove = threading.Event()
-        removals: list[tuple[str, ...]] = []
+        clock = _ReclaimClock()
+        with clock.installed():
+            db = SQLiteDatabase(self.db_path)
+            store = SQLiteWorkspaceStore(db)
+            self._ready_workspace(store)
+            watch = _RenewalWatch(store, clock)
+            in_remove = threading.Event()
+            finish_remove = threading.Event()
+            removals: list[tuple[str, ...]] = []
 
-        def runner(argv: Sequence[str], cwd: Path | None) -> CommandResult:
-            _ = cwd
-            if "remove" in argv:
-                removals.append(tuple(argv))
-                in_remove.set()
-                finish_remove.wait(timeout=5)
-            return CommandResult(0, "", "")
-
-        manager = OrcaWorktreeManager(
-            workspace_store=store,
-            backend="git",
-            runner=runner,
-            reclaim_stale_after_seconds=0.15,
-        )
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            first = pool.submit(manager.reclaim, "x")
-            self.assertTrue(in_remove.wait(timeout=5))
-            threading.Event().wait(0.3)  # past the stale window; heartbeat must have renewed
-            second = manager.reclaim("x")
-            finish_remove.set()
-            self.assertTrue(first.result(timeout=5).reclaimed)
-
-        self.assertFalse(second.reclaimed)
-        self.assertEqual(len(removals), 1)
-        db.close()
-
-    def test_heartbeat_survives_a_transient_lock_on_renewal(self) -> None:
-        db = SQLiteDatabase(self.db_path, busy_timeout_ms=20)
-        store = SQLiteWorkspaceStore(db)
-        self._ready_workspace(store)
-        # Stands in for another process; used from the remove and heartbeat threads.
-        blocker = sqlite3.connect(self.db_path, check_same_thread=False)
-        renew_errors: list[BaseException] = []
-        real_renew = store.renew_reclaim
-
-        def spy_renew(work_key: str, *, claim: str) -> str | None:
-            try:
-                return real_renew(work_key, claim=claim)
-            except BaseException as exc:
-                renew_errors.append(exc)
-                if len(renew_errors) == 1:
-                    blocker.commit()  # the lock is held only across the first renewal
-                raise
-
-        store.renew_reclaim = spy_renew  # type: ignore[method-assign]
-        in_remove = threading.Event()
-        finish_remove = threading.Event()
-        removals: list[tuple[str, ...]] = []
-
-        def runner(argv: Sequence[str], cwd: Path | None) -> CommandResult:
-            _ = cwd
-            if "remove" in argv:
-                removals.append(tuple(argv))
-                if len(removals) == 1:
-                    blocker.execute("BEGIN IMMEDIATE")
+            def runner(argv: Sequence[str], cwd: Path | None) -> CommandResult:
+                _ = cwd
+                if "remove" in argv:
+                    removals.append(tuple(argv))
                     in_remove.set()
                     finish_remove.wait(timeout=5)
-            return CommandResult(0, "", "")
+                return CommandResult(0, "", "")
 
-        manager = OrcaWorktreeManager(
-            workspace_store=store,
-            backend="git",
-            runner=runner,
-            reclaim_stale_after_seconds=0.2,
-        )
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            first = pool.submit(manager.reclaim, "x")
-            self.assertTrue(in_remove.wait(timeout=5))
-            threading.Event().wait(0.45)  # two stale windows after the failed renewal
-            second = manager.reclaim("x")
-            finish_remove.set()
-            self.assertTrue(first.result(timeout=5).reclaimed)
+            manager = OrcaWorktreeManager(
+                workspace_store=store,
+                backend="git",
+                runner=runner,
+                reclaim_stale_after_seconds=0.15,
+            )
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                first = pool.submit(manager.reclaim, "x")
+                self.assertTrue(in_remove.wait(timeout=5))
+                # Past the stale window: only a renewal stamped after this point keeps the claim live.
+                watch.move_past_stale_window()
+                self.assertTrue(watch.renewed_since_move.wait(timeout=5))
+                second = manager.reclaim("x")
+                finish_remove.set()
+                self.assertTrue(first.result(timeout=5).reclaimed)
 
-        self.assertEqual(len(renew_errors), 1)
-        self.assertFalse(second.reclaimed)
-        self.assertEqual(len(removals), 1)
-        blocker.close()
-        db.close()
+            self.assertFalse(second.reclaimed)
+            self.assertEqual(len(removals), 1)
+            db.close()
+
+    def test_heartbeat_survives_a_transient_lock_on_renewal(self) -> None:
+        clock = _ReclaimClock()
+        with clock.installed():
+            db = SQLiteDatabase(self.db_path, busy_timeout_ms=20)
+            store = SQLiteWorkspaceStore(db)
+            self._ready_workspace(store)
+            # Stands in for another process; used from the remove and heartbeat threads.
+            blocker = sqlite3.connect(self.db_path, check_same_thread=False)
+
+            def on_error(errors: list[BaseException]) -> None:
+                if len(errors) == 1:
+                    blocker.commit()  # the lock is held only across the first renewal
+
+            watch = _RenewalWatch(store, clock, on_error=on_error)
+            in_remove = threading.Event()
+            finish_remove = threading.Event()
+            removals: list[tuple[str, ...]] = []
+
+            def runner(argv: Sequence[str], cwd: Path | None) -> CommandResult:
+                _ = cwd
+                if "remove" in argv:
+                    removals.append(tuple(argv))
+                    if len(removals) == 1:
+                        blocker.execute("BEGIN IMMEDIATE")
+                        in_remove.set()
+                        finish_remove.wait(timeout=5)
+                return CommandResult(0, "", "")
+
+            manager = OrcaWorktreeManager(
+                workspace_store=store,
+                backend="git",
+                runner=runner,
+                reclaim_stale_after_seconds=0.2,
+            )
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                first = pool.submit(manager.reclaim, "x")
+                self.assertTrue(in_remove.wait(timeout=5))
+                self.assertTrue(watch.failed.wait(timeout=5))
+                # The claim is stale from here on unless the heartbeat outlived the failed renewal.
+                watch.move_past_stale_window()
+                self.assertTrue(watch.renewed_since_move.wait(timeout=5))
+                second = manager.reclaim("x")
+                finish_remove.set()
+                self.assertTrue(first.result(timeout=5).reclaimed)
+
+            self.assertEqual(len(watch.errors), 1)
+            self.assertIsInstance(watch.errors[0], sqlite3.OperationalError)
+            self.assertFalse(second.reclaimed)
+            self.assertEqual(len(removals), 1)
+            blocker.close()
+            db.close()
 
     def test_reclaim_that_lost_its_claim_keeps_the_new_record(self) -> None:
         db = SQLiteDatabase(self.db_path)
