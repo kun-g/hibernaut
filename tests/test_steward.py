@@ -22,8 +22,11 @@ from agent_runtime.adapters.executor_cli import (
     StewardExecutor,
 )
 from agent_runtime.adapters.executor_cli import steward_tools
+from agent_runtime.adapters.executor_cli import claude_code, orca
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
+from agent_runtime.adapters.executor_cli.orca import OrcaCommandTerminal, TerminalUnavailable
 from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
+from agent_runtime.adapters.executor_cli.steward import STEWARD_SCHEMA
 from agent_runtime.adapters.executor_cli.steward_git import GitRefused, check_git_args
 from agent_runtime.adapters.memory_fs import FileSystemMemoryAdapter
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter
@@ -55,6 +58,8 @@ from agent_runtime.engine.worker import AgentWorker
 from tests.fakes import InMemoryOutbox, InMemoryPermission, RecordingChannel
 from tests.test_coder_reviewer import fake_command, git, make_repo
 from tests.test_sde_executor import make_base_repo
+from tests.test_terminal_processes import alive, until
+from tests.test_visible_roles import FakeOrcaTerminals
 
 MAIN = "proj:x"
 SDE = "proj:x:sde"
@@ -67,12 +72,13 @@ class Caps:
         self.timers: Any = None
         self.forwards: list[dict[str, Any]] = []
         self.refusal: ForwardRefused | None = None
+        self.interrupted: Any = lambda: False
 
     def poll_folded_events(self) -> list[Event]:
         return []
 
     def is_interrupted(self) -> bool:
-        return False
+        return self.interrupted()
 
     def forward_to_inbox(self, target_inbox: str, text: str, **kwargs: Any) -> Event:
         if self.refusal is not None and not kwargs.get("approved_request_id"):
@@ -84,8 +90,12 @@ class Caps:
 
 class StewardCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
         self.repo = make_repo(self.root)
+        self.orca = FakeOrcaTerminals(self.root)
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
+        self.runs = self.root / "runs"
+        self.terminal: Any = OrcaCommandTerminal(root=self.runs, poll_interval=0.02, liveness_interval=0.2)
         self.log = self.root / "calls.jsonl"
         self.plan = self.root / "plan.json"
         self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan)}))
@@ -97,7 +107,10 @@ class StewardCase(unittest.IsolatedAsyncioTestCase):
         self.manifest = "Inboxes:\n- `proj:x:sde`"
         self.set_plan()
 
-    def executor(self, checkouts: dict[str, str] | None = None) -> StewardExecutor:
+    async def asyncTearDown(self) -> None:
+        await self.orca.close_all()
+
+    def executor(self, checkouts: dict[str, str] | None = None, **options: Any) -> StewardExecutor:
         return StewardExecutor(
             profile=ClaudeCodeProfile(
                 name="steward", launcher=ClaudeCodeLauncher(name="fake", command=fake_command(self.root)),
@@ -108,6 +121,8 @@ class StewardCase(unittest.IsolatedAsyncioTestCase):
             events=self.inbox,
             manifest=lambda: self.manifest,
             in_project=lambda inbox_id: inbox_id.startswith("proj:x"),
+            terminal=self.terminal,
+            **options,
         )
 
     def set_plan(self, *steps: dict[str, Any]) -> None:
@@ -117,7 +132,8 @@ class StewardCase(unittest.IsolatedAsyncioTestCase):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
     def launches(self) -> list[dict[str, Any]]:
-        return [c for c in self.calls() if "answers" not in c]
+        # Without the session checks, which start the launcher with no tools and stop it at its first message.
+        return [c for c in self.calls() if "answers" not in c and c["role"] != "probe"]
 
     def answers(self) -> list[list[Any]]:
         return [a for c in self.calls() if "answers" in c for a in c["answers"]]
@@ -670,7 +686,7 @@ class ToolTests(StewardCase):
                 check_git_args(args)
 
 
-class SuspendTests(StewardCase):
+class SuspendCase(StewardCase):
     def suspended(self, outcome: Suspend, native: str | None = "native-1") -> SessionRef:
         return SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward", executor_session_id=native,
                           status="suspended", checkpoint=outcome.session_checkpoint,
@@ -681,6 +697,8 @@ class SuspendTests(StewardCase):
             "event_type": "approval.decided", "approval_request_id": outcome.request_id, "approved": approved,
         })
 
+
+class SuspendTests(SuspendCase):
     async def test_a_deferred_launch_waits_and_then_runs_the_original_event(self) -> None:
         self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("defer", "ask")})
         outcome = await self.run_steward(self.event("triage this"))
@@ -813,6 +831,405 @@ class SuspendTests(StewardCase):
         self.assertIn("also update the docs", self.launches()[-1]["prompt"])
 
 
+class TerminalTests(SuspendCase):
+    # The Steward's claude runs in an Orca terminal, never as a child of this process: FakeOrcaTerminals runs the
+    # terminal's command in a real shell, so the wrapper, the session check and the fake claude all really run.
+    def handles(self) -> list[str]:
+        return list(self.orca.terminals)
+
+    def assert_closed(self, count: int = 1) -> None:
+        self.assertEqual(len(self.handles()), count)
+        for handle in self.handles():
+            self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
+            self.assertIsNotNone(self.orca.terminals[handle]["proc"].returncode)
+        self.assertEqual(list(self.runs.iterdir()), [])
+
+    async def all_gone(self, pidfile: Path) -> None:
+        pids = [int(p) for p in pidfile.read_text().split()]
+        self.assertEqual(len(pids), 2)
+        self.assertTrue(await until(lambda: not any(alive(p) for p in pids)), pids)
+
+    async def test_it_runs_in_an_orca_terminal_and_starts_no_subprocess(self) -> None:
+        self.set_plan({"output": {"action": "reply", "message": "on it"}})
+        started: list[tuple[Any, ...]] = []
+        real = asyncio.create_subprocess_exec
+
+        async def record(*args: Any, **kwargs: Any) -> Any:
+            started.append(args)
+            return await real(*args, **kwargs)
+
+        with patch("asyncio.create_subprocess_exec", new=record), \
+                patch.object(claude_code, "run_claude_code", side_effect=AssertionError("started as a subprocess")):
+            outcome = await self.run_steward(self.event("the secret task"))
+        assert isinstance(outcome, Emit)
+        self.assertEqual((outcome.messages, outcome.status), (("on it",), "done"))
+        [handle] = self.handles()
+        term = self.orca.terminals[handle]
+        # The only process started is the fake Orca's own terminal shell.
+        self.assertEqual(started, [("/bin/sh", "-c", term["command"])])
+        self.assertEqual(Path(term["worktree"]), self.repo)
+        self.assertEqual(term["title"], "steward · proj:x")
+        self.assertNotIn("the secret task", term["command"])
+        self.assertNotIn("You are steward", term["command"])
+        [call] = self.launches()
+        self.assertEqual(call["argv"][:3], ["-p", "--output-format", "json"])
+        self.assertNotIn("--verbose", call["argv"])
+        self.assertIn("the secret task", call["prompt"])
+        self.assertFalse(any("the secret task" in a for a in call["argv"]))
+        self.assert_closed()
+
+    async def test_the_arguments_reach_claude_unchanged(self) -> None:
+        session = SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward", executor_session_id="native-1")
+        self.set_plan({"calls": [{"tool": "read_file", "arguments": {"path": "calc.py"}}],
+                       "output": {"action": "reply", "message": "read it"}})
+        outcome = await self.run_steward(session=session)
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.executor_session_id, "native-1")
+        [call] = self.launches()
+        self.assertEqual(arg(call, "--resume"), "native-1")
+        self.assertEqual(json.loads(arg(call, "--json-schema")), STEWARD_SCHEMA)
+        self.assertIn("You are steward", arg(call, "--append-system-prompt"))
+        self.assertEqual((arg(call, "--model"), arg(call, "--effort"), arg(call, "--permission-mode")),
+                         ("claude-sonnet-5-5", "medium", "dontAsk"))
+        server = json.loads(arg(call, "--mcp-config"))["mcpServers"]["hibernaut_steward"]
+        self.assertEqual(server["args"][0], "-I")
+        self.assertTrue(server["args"][1].endswith("steward_mcp.py"))
+        # The tools answered over that server's socket.
+        self.assertIn("divide", self.answers()[-1][1])
+
+    async def test_a_prompt_longer_than_an_argument_may_be(self) -> None:
+        await self.run_steward(self.event("x" * 400_000))
+        self.assertIn("x" * 400_000, self.launches()[0]["prompt"])
+
+    async def test_a_verbose_result_is_read_too(self) -> None:
+        self.set_plan({"output": {"action": "reply", "message": "on it"}})
+        with patch.dict(os.environ, {"FAKE_VERBOSE": "1"}):
+            outcome = await self.run_steward()
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.messages, ("on it",))
+
+    async def test_the_environment_keeps_its_rules(self) -> None:
+        # The terminal's own credentials and routing go; what the launcher and the executor set stays, a gateway
+        # for a model that is not Claude's included.
+        inherited = {"ANTHROPIC_API_KEY": "paid", "CLAUDE_CODE_OAUTH_TOKEN": "t", "CLAUDE_CODE_USE_BEDROCK": "1",
+                     "ANTHROPIC_BASE_URL": "http://elsewhere", "ORCA_PANE_KEY": "pane", "ORCA_TAB_ID": "tab",
+                     "ORCA_AGENT_HOOK_PORT": "1", "ORCA_AGENT_LAUNCH_ID": "l", "ORCA_WORKTREE_ID": "wt"}
+        executor = self.executor()
+        executor._profile = replace(  # pyright: ignore[reportPrivateUsage]
+            executor._profile, model="codex/gpt-6.2", env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:3425",  # pyright: ignore[reportPrivateUsage]
+                                                           "ANTHROPIC_AUTH_TOKEN": "gateway"},
+            launcher=replace(executor._profile.launcher, env={"FAKE_MARK": "launcher"}))  # pyright: ignore[reportPrivateUsage]
+        with patch.dict(os.environ, {**inherited, "FAKE_API_KEY_SOURCE": "ANTHROPIC_AUTH_TOKEN"}):
+            outcome = await executor.execute([self.event()], None, self.caps)
+        self.assertIsInstance(outcome, Silent)
+        [call] = self.launches()
+        self.assertEqual((call["paid_env"], call["base_url"], call["auth_token"], call["mark"]),
+                         (["ANTHROPIC_AUTH_TOKEN"], "http://127.0.0.1:3425", "gateway", "launcher"))
+        self.assertEqual(arg(call, "--model"), "codex/gpt-6.2")
+        # Orca must not register this session, or it reopens it once the process ends.
+        self.assertNotIn("ORCA_PANE_KEY", call["orca_env"])
+        self.assertEqual([k for k in call["orca_env"] if k in inherited], ["ORCA_WORKTREE_ID"])
+
+    async def test_a_session_on_another_account_or_model_is_stopped_before_it_runs(self) -> None:
+        for env, expected in (({"FAKE_API_KEY_SOURCE": "ANTHROPIC_API_KEY"}, "billing is 'subscription'"),
+                              ({"FAKE_MODEL": "claude-haiku-4-5"}, "Claude Code selected 'claude-haiku-4-5'")):
+            with self.subTest(expected), patch.dict(os.environ, env):
+                outcome = await self.run_steward()
+                assert isinstance(outcome, Emit)
+                self.assertEqual(outcome.status, "failed")
+                self.assertIn(expected, outcome.messages[0])
+                self.assertEqual(self.launches(), [])
+        self.assert_closed(2)
+
+    async def test_a_failed_run_closes_its_terminal(self) -> None:
+        self.set_plan({"error": "overloaded"}, {"exit": 3})
+        for expected in ("overloaded", "exited (3) without a result: crashed"):
+            outcome = await self.run_steward()
+            assert isinstance(outcome, Emit)
+            self.assertEqual(outcome.status, "failed")
+            self.assertIn(expected, outcome.messages[0])
+        self.assert_closed(2)
+
+    async def test_a_launcher_that_does_not_start_is_a_failure(self) -> None:
+        executor = self.executor()
+        executor._profile = replace(executor._profile, launcher=ClaudeCodeLauncher(  # pyright: ignore[reportPrivateUsage]
+            name="gone", command=str(self.root / "no-such-claude")))
+        outcome = await executor.execute([self.event()], None, self.caps)
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("no-such-claude", outcome.messages[0])
+        self.assert_closed()
+
+    async def test_a_timeout_closes_the_terminal_and_ends_claude(self) -> None:
+        pids = self.root / "pids"
+        self.set_plan({"pidfile": str(pids)})
+        executor = self.executor()
+        executor._profile = replace(executor._profile, timeout_seconds=6.0)  # pyright: ignore[reportPrivateUsage]
+        outcome = await executor.execute([self.event()], None, self.caps)
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("timed out after 6s", outcome.messages[0])
+        self.assert_closed()
+        await self.all_gone(pids)
+
+    async def test_an_interrupt_closes_the_terminal_and_ends_claude(self) -> None:
+        pids = self.root / "pids"
+        self.set_plan({"pidfile": str(pids)})
+        self.caps.interrupted = lambda: pids.exists() and len(pids.read_text().split()) == 2
+        with self.assertRaises(asyncio.CancelledError):
+            await self.run_steward()
+        self.assert_closed()
+        await self.all_gone(pids)
+
+    async def test_claude_ends_even_when_orca_loses_the_close(self) -> None:
+        pids = self.root / "pids"
+        self.set_plan({"pidfile": str(pids)})
+        self.orca.lose_closes = True
+        self.caps.interrupted = lambda: pids.exists() and len(pids.read_text().split()) == 2
+        with self.assertRaises(asyncio.CancelledError):
+            await self.run_steward()
+        await self.all_gone(pids)
+
+    async def test_without_orca_the_run_waits_for_a_person_instead_of_a_subprocess(self) -> None:
+        async def broken(*args: str, cwd: Path) -> dict[str, Any]:
+            raise RuntimeError("Orca is not running")
+
+        with patch("agent_runtime.adapters.executor_cli.orca._orca", new=broken):
+            outcome = await self.run_steward(self.event("triage this"))
+            assert isinstance(outcome, Suspend)
+            self.assertIn("Orca is not running", outcome.prompt)
+            # Still unavailable after the approval: asked again, nothing lost.
+            again = await self.run_steward(self.decision(outcome, True), session=self.suspended(outcome))
+            assert isinstance(again, Suspend)
+            self.assertNotEqual(again.request_id, outcome.request_id)
+        self.assertEqual(self.calls(), [])
+        waiting = await self.run_steward(self.event("one more thing"), session=self.suspended(again))
+        assert isinstance(waiting, Suspend)
+        self.set_plan({"output": {"action": "reply", "message": "done"}})
+        final = await self.run_steward(self.decision(waiting, True), session=self.suspended(waiting))
+        assert isinstance(final, Emit)
+        self.assertEqual(final.messages, ("done",))
+        [call] = self.launches()
+        self.assertIn("triage this", call["prompt"])
+        self.assertIn("one more thing", call["prompt"])
+        self.assertEqual(arg(call, "--resume"), "native-1")
+
+    async def test_a_rejected_retry_stops(self) -> None:
+        self.terminal = TerminalUnavailable("project 'x' has terminal_backend = \"none\"")
+        outcome = await self.run_steward()
+        assert isinstance(outcome, Suspend)
+        self.assertIn("terminal_backend = \"none\"", outcome.prompt)
+        final = await self.run_steward(self.decision(outcome, False), session=self.suspended(outcome))
+        assert isinstance(final, Emit)
+        self.assertEqual(final.status, "stopped")
+        self.assertEqual((self.calls(), self.orca.calls), ([], []))
+
+    async def test_a_retry_approval_does_not_stand_in_for_a_launch_approval(self) -> None:
+        available, self.terminal = self.terminal, TerminalUnavailable("no terminal")
+        outcome = await self.run_steward()
+        assert isinstance(outcome, Suspend)
+        self.terminal = available
+        self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("defer", "ask")})
+        asked = await self.run_steward(self.decision(outcome, True), session=self.suspended(outcome))
+        assert isinstance(asked, Suspend)
+        self.assertEqual((asked.prompt, self.calls()), ("ask", []))
+        # An approved launch that met no terminal keeps its approval.
+        self.terminal = TerminalUnavailable("no terminal")
+        unopened = await self.run_steward(self.decision(asked, True), session=self.suspended(asked))
+        assert isinstance(unopened, Suspend)
+        self.assertIn("no terminal", unopened.prompt)
+        self.terminal = available
+        final = await self.run_steward(self.decision(unopened, True), session=self.suspended(unopened))
+        self.assertIsInstance(final, Silent)
+
+    async def test_a_terminal_lost_during_the_run_waits_for_a_person(self) -> None:
+        pids = self.root / "pids"
+        self.set_plan({"pidfile": str(pids)})
+        task = asyncio.create_task(self.run_steward(self.event("triage this")))
+        self.assertTrue(await until(lambda: pids.exists() and len(pids.read_text().split()) == 2))
+        [handle] = self.handles()
+        await self.orca.close(handle)
+        outcome = await task
+        assert isinstance(outcome, Suspend)
+        self.assertIn(f"Orca terminal {handle} was closed before", outcome.prompt)
+        await self.all_gone(pids)
+
+    async def test_a_terminal_lost_after_a_forward_is_a_failure(self) -> None:
+        # A failed Run sends none of its forwards; a suspended one would, and the retry would send them again.
+        pids = self.root / "pids"
+        self.set_plan({"calls": [{"tool": "forward_to_inbox", "arguments": {"target_inbox": SDE, "text": "do it"}}],
+                       "pidfile_after": str(pids)})
+        task = asyncio.create_task(self.run_steward())
+        self.assertTrue(await until(lambda: pids.exists() and len(pids.read_text().split()) == 2))
+        await self.orca.close(self.handles()[0])
+        outcome = await task
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("was closed before", outcome.messages[0])
+
+
+class WorkdirTests(SuspendCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.other = self.root / "other"
+        git(self.root, "clone", "-q", str(self.repo), str(self.other))
+        (self.other / "only-here.md").write_text("the other directory\n")
+
+    async def test_the_configured_directory_replaces_the_checkout(self) -> None:
+        self.set_plan({"calls": [{"tool": "read_file", "arguments": {"path": "only-here.md"}}]})
+        outcome = await self.executor(workdir=str(self.other)).execute([self.event()], None, self.caps)
+        self.assertIsInstance(outcome, Silent)
+        [call] = self.launches()
+        self.assertEqual(os.path.realpath(call["cwd"]), str(self.other))
+        self.assertIn("the other directory", self.answers()[-1][1])
+        [term] = self.orca.created()
+        self.assertEqual(Path(term["worktree"]), self.other)
+
+    async def test_a_missing_directory_is_named(self) -> None:
+        outcome = await self.executor(workdir=str(self.root / "gone")).execute([self.event()], None, self.caps)
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn(str(self.root / "gone"), outcome.messages[0])
+
+    async def test_another_branch_waits_for_a_person_and_is_not_switched(self) -> None:
+        git(self.other, "checkout", "-qb", "elsewhere")
+        before = git_state(self.other)
+        options = {"workdir": str(self.other), "branch": "release"}
+        outcome = await self.executor(**options).execute([self.event("triage this")], None, self.caps)
+        assert isinstance(outcome, Suspend)
+        for part in (str(self.other), "'elsewhere'", "'release'"):
+            self.assertIn(part, outcome.prompt)
+        self.assertEqual((git_state(self.other), self.calls(), self.orca.calls), (before, [], []))
+        # Checked again before every run, the approved one included.
+        again = await self.executor(**options).execute([self.decision(outcome, True)], self.suspended(outcome), self.caps)
+        assert isinstance(again, Suspend)
+        git(self.other, "checkout", "-qb", "release")
+        final = await self.executor(**options).execute([self.decision(again, True)], self.suspended(again), self.caps)
+        self.assertIsInstance(final, Silent)
+        self.assertIn("triage this", self.launches()[-1]["prompt"])
+
+    async def test_a_directory_on_no_branch_waits_too(self) -> None:
+        git(self.other, "checkout", "-q", "--detach")
+        plain = self.root / "plain"
+        plain.mkdir()
+        for workdir, expected in ((self.other, "no branch"), (plain, "git")):
+            outcome = await self.executor(workdir=str(workdir), branch="main").execute([self.event()], None, self.caps)
+            assert isinstance(outcome, Suspend)
+            self.assertIn(expected, outcome.prompt)
+        self.assertEqual(self.calls(), [])
+
+
+def orca_repo(path: Path, key: str | None) -> dict[str, Any]:
+    return {"kind": "git", "path": str(path), "gitRemoteIdentity": {"canonicalKey": key} if key else None}
+
+
+class WorkdirConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
+        self.repo = self.root / "checkout"
+        self.repo.mkdir()
+        self.repos: list[dict[str, Any]] | Exception = []
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.orca.registered_repos", new=self.registered))
+        self.listed = 0
+
+    def registered(self) -> list[dict[str, Any]]:
+        self.listed += 1
+        if isinstance(self.repos, Exception):
+            raise self.repos
+        return self.repos
+
+    def raw(self, *, checkout: bool = True, **steward: Any) -> dict[str, Any]:
+        raw = tomllib.loads(CONFIG.format(root=self.root, repo=self.repo, command="claude"))
+        raw["agents"]["steward"].update(steward)
+        if not checkout:
+            del raw["projects"]["x"]["checkout"]
+        return raw
+
+    def parse(self, **options: Any) -> Any:
+        return parse_config(self.raw(**options), base_dir=self.root)
+
+    def steward(self, config: Any) -> Any:
+        daemon = build_daemon_from_config(config)
+        self.addCleanup(daemon.db.close)
+        return daemon.pool._worker_factory(MAIN, "w")._executors["steward"]  # pyright: ignore
+
+    def used(self, config: Any) -> str:
+        found = self.steward(config)._directory(MAIN)  # pyright: ignore[reportPrivateUsage]
+        return str(found)
+
+    def test_workdir_then_checkout_then_the_checkout_orca_has_registered(self) -> None:
+        self.assertEqual(self.used(self.parse(workdir="sub/dir")), str(self.root / "sub/dir"))
+        self.assertEqual(self.parse(workdir="~/notes").roles["steward"].workdir, str(Path("~/notes").expanduser()))
+        self.assertEqual(self.used(self.parse()), str(self.repo))
+        self.assertEqual(self.listed, 0)
+        registered = self.root / "registered"
+        registered.mkdir()
+        self.repos = [orca_repo(self.root / "a", None), orca_repo(self.root / "b", "github.com/acme/xy"),
+                      {"kind": "folder", "path": str(self.root)}, orca_repo(registered, "github.com/Acme/X")]
+        config = self.parse(checkout=False)
+        # The whole project works in it, not only its Steward.
+        self.assertEqual(config.projects["x"].checkout, str(registered))
+        self.assertEqual(self.used(config), str(registered))
+
+    def test_a_checkout_orca_does_not_know_is_an_error(self) -> None:
+        cases: list[tuple[list[dict[str, Any]] | Exception, str]] = [
+            ([orca_repo(self.repo, "github.com/acme/other")], "no repository acme/x is registered in Orca"),
+            ([orca_repo(self.repo, "github.com/acme/x"), orca_repo(self.root, "github.com/acme/x")], "more than one"),
+            ([orca_repo(self.root / "gone", "github.com/acme/x")], "gone"),
+            (RuntimeError("Orca is not running"), "Orca is not running"),
+        ]
+        for self.repos, expected in cases:
+            with self.subTest(expected), self.assertRaisesRegex(ValueError, "projects.x: checkout is not set.*" + expected):
+                self.parse(checkout=False)
+
+    def test_workdir_and_branch_are_checked(self) -> None:
+        for key in ("workdir", "branch"):
+            for value in ("", "  ", 3, ["a"]):
+                with self.subTest(key=key, value=value), \
+                        self.assertRaisesRegex(ValueError, f"agents.steward: {key} must be a non-empty string"):
+                    self.parse(**{key: value})
+        raw = self.raw()
+        raw["agents"]["sde"]["workdir"] = "x"
+        with self.assertRaisesRegex(ValueError, "agents.sde: workdir not supported for role 'sde'"):
+            parse_config(raw)
+
+    def test_the_branch_reaches_the_steward(self) -> None:
+        self.assertEqual(self.steward(self.parse(branch="main"))._branch, "main")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.steward(self.parse())._branch, "")  # pyright: ignore[reportPrivateUsage]
+
+    def test_the_steward_gets_terminals_only_where_the_project_has_them(self) -> None:
+        self.assertIsInstance(self.steward(self.parse())._terminal, OrcaCommandTerminal)  # pyright: ignore
+        raw = self.raw()
+        raw["projects"]["x"]["terminal_backend"] = "none"
+        raw["runtime"]["db_path"] = str(self.root / "other.db")
+        unavailable = self.steward(parse_config(raw))._terminal  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(unavailable, TerminalUnavailable)
+        self.assertIn("terminal_backend", unavailable.reason)
+
+
+class RegisteredReposTests(unittest.TestCase):
+    def test_the_repositories_come_from_the_orca_command(self) -> None:
+        bin_dir = Path(self.enterContext(tempfile.TemporaryDirectory())) / "bin"
+        bin_dir.mkdir()
+        script = bin_dir / "orca"
+
+        def answer(body: str) -> None:
+            script.write_text(f"#!/bin/sh\n[ \"$*\" = 'repo list --json' ] || exit 9\n{body}\n")
+            script.chmod(0o700)
+
+        with patch.dict(os.environ, {"PATH": f"{bin_dir}:/usr/bin:/bin"}):
+            answer("""echo '{"ok": true, "result": {"repos": [{"path": "/r"}]}}'""")
+            self.assertEqual(orca.registered_repos(), [{"path": "/r"}])
+            for body, expected in (("echo broken >&2; exit 1", "broken"), ("echo nonsense", ""),
+                                   ("""echo '{"ok": false}'""", "")):
+                answer(body)
+                with self.assertRaisesRegex(RuntimeError, f"orca repo list.*{expected}"):
+                    orca.registered_repos()
+            script.unlink()
+            with self.assertRaisesRegex(RuntimeError, "orca repo list"):
+                orca.registered_repos()
+
+
 CONFIG = """
 [runtime]
 db_path = "{root}/x.db"
@@ -842,6 +1259,7 @@ description = "develops tasks"
 repo = "acme/x"
 checkout = "{repo}"
 worktree_backend = "git"
+terminal_backend = "orca"
 inbox_id = ["proj:x", "proj:x:.+"]
 default_agent = "steward"
 
@@ -868,7 +1286,12 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         self.log = self.root / "calls.jsonl"
         self.plan = self.root / "plan.json"
         self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan)}))
+        self.orca = FakeOrcaTerminals(self.root)
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
         self.channel = RecordingChannel()
+
+    async def asyncTearDown(self) -> None:
+        await self.orca.close_all()
 
     def raw(self) -> dict[str, Any]:
         return tomllib.loads(CONFIG.format(root=self.root, repo=self.repo, command=fake_command(self.root)))
@@ -888,7 +1311,8 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         return daemon
 
     def launches(self) -> list[dict[str, Any]]:
-        return [c for c in map(json.loads, self.log.read_text().splitlines()) if "answers" not in c]
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [c for c in calls if "answers" not in c and c["role"] != "probe"]
 
     def set_plan(self, steward: Sequence[dict[str, Any]], sde: Sequence[dict[str, Any]] = ()) -> None:
         self.plan.write_text(json.dumps({"steward": list(steward), "sde": list(sde)}))
@@ -923,6 +1347,35 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(git_state(self.repo)[0], "")
         sources = [e.source for e in daemon.inbox.list_events()]
         self.assertEqual(sorted(sources), sorted(["switchboard:feishu", FORWARD_SOURCE, RETURN_SOURCE]))
+
+    async def test_a_run_retried_after_orca_was_unavailable_stays_in_its_trace(self) -> None:
+        self.set_plan([{"calls": [{"tool": "forward_to_inbox", "arguments": {"target_inbox": SDE, "text": "do it"}}]}],
+                      [{"write": {"calc.py": "x = 1\n"}}])
+
+        async def broken(*args: str, cwd: Path) -> dict[str, Any]:
+            raise RuntimeError("Orca is not running")
+
+        with patch("agent_runtime.adapters.executor_cli.orca._orca", new=broken):
+            daemon = await self.run_daemon((MAIN, "feishu:1", {"text": "x", "trace_id": "trace-1"}))
+        [card] = daemon.outbox.fetch_pending(limit=50)
+        self.assertIn("Orca is not running", card.content)
+        self.assertFalse(self.log.exists())
+        daemon.handler.ingest(
+            inbox_id=MAIN, source="switchboard:feishu", external_id="decision",
+            payload={"event_type": "approval.decided", "approved": True,
+                     "approval_request_id": card.metadata["approval_request_id"]},
+        )
+        stop = asyncio.Event()
+        pool = asyncio.create_task(daemon.pool.run_forever(stop))
+        await daemon.pool.wait_until_idle(60)
+        stop.set()
+        await pool
+        self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde"])
+        events = daemon.inbox.list_events()
+        [asked] = [e for e in events if e.external_id == "e0"]
+        [forwarded] = [e for e in events if e.source == FORWARD_SOURCE]
+        self.assertEqual((forwarded.payload["trace_id"], forwarded.payload["parent_event_id"]),
+                         ("trace-1", asked.event_id))
 
     async def test_a_deferred_return_waits_for_its_own_approval(self) -> None:
         self.set_plan(

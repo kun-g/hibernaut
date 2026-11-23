@@ -19,6 +19,7 @@ from agent_runtime.adapters.executor_cli.orca import (
     TerminalRunFailed,
     _close_quietly,  # pyright: ignore[reportPrivateUsage]
     close_terminals,
+    session_gate,
 )
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore, TerminalBinding
@@ -156,6 +157,16 @@ class TestCLITerminalProcesses(Case):
         self.assertEqual(await asyncio.wait_for(wrapper.wait(), 8), 1)
         await self.all_gone(pids)
 
+    async def test_input_reaches_the_cli(self):
+        text = "a prompt, é\n" * 30_000
+        run = await self.terminal.run(title="t", workdir=self.repo, argv=["/bin/cat"], env={}, timeout_seconds=20,
+                                      is_interrupted=lambda: False, stdin=text)
+        self.assertEqual((run.exit_code, run.stdout.decode()), (0, text))
+        handle, wrapper = self.wrapper()
+        self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
+        self.assertIsNotNone(wrapper.returncode)
+        self.assertEqual(list((self.root / "runs").iterdir()), [])
+
 
 class TestCLITerminalScript(unittest.IsolatedAsyncioTestCase):
     # The wrapper on its own, without Hibernaut watching: its deadline and the signals of a closing terminal.
@@ -197,6 +208,62 @@ class TestCLITerminalScript(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await until(lambda: proc.poll() is not None))
                 self.assertEqual(proc.returncode, 128 + sig)
                 self.assertTrue(await until(lambda: not any(alive(p) for p in pids)))
+
+
+class TestSessionCheckBeforeACommand(Case):
+    # A one-off Claude Code command: the gate checks the session first and then becomes the command, so the wrapper
+    # ends it like any other.
+    def setUp(self):
+        super().setUp()
+        self.terminal = OrcaCommandTerminal(root=self.root / "runs", poll_interval=0.02, liveness_interval=0.2)
+        self.interrupted = False
+
+    def run_checked(self, argv, env):
+        profile = ClaudeCodeProfile(name="steward", env=env,
+                                    launcher=ClaudeCodeLauncher(name="fake", command=fake_command(self.root)))
+        return self.terminal.run(title="t", workdir=self.repo, argv=argv, env={}, timeout_seconds=20,
+                                 is_interrupted=lambda: self.interrupted, gate=session_gate(profile))
+
+    async def test_stopping_during_the_session_check_ends_the_probe(self):
+        for lose in (False, True):
+            with self.subTest(lose_closes=lose):
+                self.pids.unlink(missing_ok=True)
+                self.orca.lose_closes, self.interrupted = lose, False
+                task = asyncio.create_task(self.run_checked(["/bin/echo", "ran"], {"FAKE_PROBE_PIDFILE": str(self.pids)}))
+                pids = await self.started(2)
+                self.interrupted = True
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                await self.all_gone(pids)
+
+    async def test_the_command_takes_the_gates_place_and_ends_with_its_terminal(self):
+        task = asyncio.create_task(self.run_checked(self.busy_cli(), {}))
+        pids = await self.started(2)
+        self.interrupted = True
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self.all_gone(pids)
+
+    async def test_a_failed_check_never_starts_the_command(self):
+        run = await self.run_checked(["/bin/sh", "-c", f"touch {self.root}/ran"],
+                                     {"FAKE_API_KEY_SOURCE": "ANTHROPIC_API_KEY"})
+        self.assertNotEqual(run.exit_code, 0)
+        self.assertIn(b"billing is 'subscription'", run.stderr)
+        self.assertEqual(run.stdout, b"")
+        self.assertFalse((self.root / "ran").exists())
+
+    async def test_configured_variables_orca_tracks_sessions_by_do_not_come_back(self):
+        # The gate applies the configured environment after the wrapper removed Orca's variables.
+        script = "import json, os; print(json.dumps(dict(os.environ)))"
+        with patch.dict(os.environ, ORCA_SESSION_ENV):
+            run = await self.run_checked([sys.executable, "-I", "-c", script], {**ORCA_SESSION_ENV, **OTHER_ENV})
+        env = json.loads(run.stdout)
+        self.assertEqual(set(ORCA_SESSION_ENV) & set(env), set())
+        self.assertEqual({k: env.get(k) for k in OTHER_ENV}, OTHER_ENV)
+
+    async def test_only_the_commands_own_output_is_returned(self):
+        run = await self.run_checked(["/bin/sh", "-c", "echo out; echo err >&2; exit 5"], {})
+        self.assertEqual((run.exit_code, run.stdout, run.stderr), (5, b"out\n", b"err\n"))
 
 
 # Runs one start of a wrapper script with a SIGTERM delivered after the CLI is running but before Popen returns.

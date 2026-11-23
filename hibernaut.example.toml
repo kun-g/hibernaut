@@ -116,7 +116,8 @@ interactive = true              # 开发对话在交互终端里续接（存活�
 # SDE 按派单 payload 的 activities（优先）或 tags / labels 选规范，评审再按 diff 路径补选；规范一律从任务开始时记录的 commit 读取（见 README「Project Guidance」）。
 # skills = ["builtin:sde", "~/team-skills/release-notes"]
 
-# Steward agent：项目的前台，读事件后自己答复或转投给别的 agent。在主检出里只读运行，不建 worktree：没有 Edit / Write / Bash，
+# Steward agent：项目的前台，读事件后自己答复或转投给别的 agent。每轮在工作目录的 Orca 终端里一次性跑 claude -p，跑完即关，不作
+# daemon 子进程；项目 terminal_backend 不是 orca 或 Orca 打不开终端时挂起并说明原因，批准后重试。只读，不建 worktree：没有 Edit / Write / Bash，
 # 只有 Read / Grep / Glob、只读 git、读写项目 Memory、查本项目的会话与事件、forward_to_inbox（每次都过 PermissionPort，最多 3 跳）。
 # 它能路由到哪些 inbox 和 agent，每次唤醒由本配置现拼进提示，不写在 Skill 里。
 [agents.steward]
@@ -127,6 +128,8 @@ model = "claude-sonnet-4-5"
 effort = "medium"
 checkout_access = "readonly"    # 只能是 readonly（默认值）；steward 总是非交互运行，不能写 interactive = true
 skills = ["builtin:steward"]    # 可省略，默认即此项
+# workdir = "~/stewards/hibernaut"   # 可选：工作目录（~ 可用，相对路径以本文件所在目录为准），须是 Orca 认得的检出；未写用项目 checkout。多个项目要不同目录就各写一个 steward agent
+# branch = "main"               # 可选：每次运行前核对工作目录的当前分支，不一致则挂起说明原因；只核对，不切换
 
 [executors.cursor-agent]
 command = "cursor-agent"
@@ -168,7 +171,7 @@ description = "巡检与例行检查"
 # 服务多个 inbox 的项目，每个写任务都在该 inbox 自己的 hb-* worktree 里运行。
 inbox_id = ["proj:hibernaut", "proj:hibernaut:.+"]
 repo = "kun-g/hibernaut"
-checkout = "/absolute/path/to/your/hibernaut"
+checkout = "/absolute/path/to/your/hibernaut"   # 可省略：按 repo 在 Orca 已登记的仓库（orca repo list）里找主检出，找不到或不止一个则加载报错
 worktree_backend = "orca"    # orca | git
 terminal_backend = "orca"    # orca | none；交互角色会话的后端，与 worktree_backend 独立。默认：orca 项目为 orca，git 项目为 none
 orca_create_terminal = false    # agent launch opens its own terminal

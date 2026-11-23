@@ -207,12 +207,14 @@ def child_env(profile: ClaudeCodeProfile, base: Mapping[str, str]) -> dict[str, 
     return env
 
 
-def harness_args(profile: ClaudeCodeProfile, *, permission_mode: str, role_args: Sequence[str]) -> list[str]:
+def harness_args(
+    profile: ClaudeCodeProfile, *, permission_mode: str, role_args: Sequence[str], stream: bool = True
+) -> list[str]:
     # An explicit mode is mandatory: launchers such as claude-sg fall back to bypassPermissions without one.
+    # Without the stream only the result is printed, so the session has to be checked before (claude_gate.py).
     return [
         "-p",
-        "--output-format", "stream-json",
-        "--verbose",
+        *(("--output-format", "stream-json", "--verbose") if stream else ("--output-format", "json")),
         "--model", profile.model,
         "--effort", profile.effort,
         "--permission-mode", permission_mode,
@@ -325,11 +327,34 @@ async def _read_stream(
     who = f"{profile.harness} (launcher '{profile.launcher.name}')"
     if not initialized:
         raise ClaudeCodeError(f"{who} exited ({returncode}) before reporting its session: {stderr[-2000:]}")
+    return _checked_result(who, result, returncode, stderr)
+
+
+def _checked_result(who: str, result: dict[str, Any] | None, returncode: int | None, stderr: str) -> dict[str, Any]:
     if result is None:
         raise ClaudeCodeError(f"{who} exited ({returncode}) without a result: {stderr[-2000:]}")
     if result.get("is_error") or result.get("subtype") != "success":
         raise ClaudeCodeError(f"{who} reported an error: {str(result.get('result', ''))[:2000]}")
     return result
+
+
+def print_result(profile: ClaudeCodeProfile, *, returncode: int | None, stdout: bytes, stderr: bytes) -> dict[str, Any]:
+    # What `--output-format json` left: the result message, or with a user's verbose setting an array of every message.
+    # A launcher may print lines of its own around it.
+    text = stdout.decode("utf-8", errors="replace").strip()
+    result: dict[str, Any] | None = None
+    for candidate in (text, *reversed(text.splitlines())):
+        try:
+            parsed: object = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        messages = cast(list[object], parsed) if isinstance(parsed, list) else [parsed]
+        found = [cast(dict[str, Any], m) for m in messages if isinstance(m, dict)]
+        result = next((m for m in reversed(found) if m.get("type") == "result"), None)
+        if result is not None:
+            break
+    return _checked_result(f"{profile.harness} (launcher '{profile.launcher.name}')", result, returncode,
+                           stderr.decode("utf-8", errors="replace").strip())
 
 
 def check_init(profile: ClaudeCodeProfile, init: Mapping[str, Any]) -> None:
