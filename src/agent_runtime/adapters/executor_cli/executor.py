@@ -41,6 +41,8 @@ class CLITemplate:
     orca_agent: str | None = None
     # Only CLIReviewer reads it: "orca" runs the review in a visible Orca terminal of the worktree.
     terminal: Literal["none", "orca"] = "none"
+    # Read by the worker pool: inboxes running this executor at once, across all projects; None leaves it unlimited.
+    max_concurrency: int | None = None
 
 
 CLI_TERMINALS: tuple[Literal["none", "orca"], ...] = ("none", "orca")

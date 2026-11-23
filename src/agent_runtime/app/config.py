@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 import math
 import re
 import sys
@@ -30,6 +31,8 @@ from agent_runtime.adapters.executor_cli.worktree import WorktreeBackend
 from agent_runtime.adapters.permissions.security import proxy_service_url
 from agent_runtime.app.projects import InboxRule, parse_inbox_rules, validate_project_rules
 from agent_runtime.core.models import NewEventPolicy
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +83,8 @@ class ProjectConfig:
     delivery: DeliveryConfig | None = None
     # Every rule routing an inbox to this project; empty means just the primary inbox_id.
     rules: tuple[InboxRule, ...] = ()
+    # Inboxes of this project running at once; None leaves only runtime.max_concurrency.
+    max_concurrency: int | None = None
 
     @property
     def inbox_rules(self) -> tuple[InboxRule, ...]:
@@ -96,8 +101,8 @@ class ProjectConfig:
 ROLES = (CODE_REVIEWER_ROLE, SDE_ROLE)
 # Before code-reviewer the review role and its usual executor were both named coder-reviewer.
 _LEGACY_REVIEWER = "coder-reviewer"
-# Deployment mode shared by every role executor; visible is the old name of interactive.
-ROLE_DEPLOYMENT_KEYS = frozenset({"interactive", "visible"})
+# Deployment settings shared by every role executor; visible is the old name of interactive.
+ROLE_DEPLOYMENT_KEYS = frozenset({"interactive", "visible", "max_concurrency"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +113,16 @@ class RoleConfig:
     # True: every run needs a session a person can join, opened by the project's terminal_backend; without one the
     # run stops with the reason. False: runs are non-interactive.
     interactive: bool = True
+    max_concurrency: int | None = None
+
+
+def _max_concurrency(where: str, item: dict[str, Any]) -> int | None:
+    value = item.get("max_concurrency")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{where}.max_concurrency must be a positive integer, got {value!r}")
+    return value
 
 
 def _interactive(name: str, item: dict[str, Any]) -> bool:
@@ -453,7 +468,8 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             )
             options = _sde_options(str(name), item) if role == SDE_ROLE else None
             roles[str(name)] = RoleConfig(role=str(role), profile=profile, sde=options,
-                                          interactive=_interactive(str(name), item))
+                                          interactive=_interactive(str(name), item),
+                                          max_concurrency=_max_concurrency(f"executors.{name}", item))
             continue
         env_raw = item.get("env", {})
         resume_raw = item.get("resume_args")
@@ -479,6 +495,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             timeout_seconds=timeout,
             orca_agent=orca_agent,
             terminal=cli_terminal,
+            max_concurrency=_max_concurrency(f"executors.{name}", item),
         )
 
     for name, role_cfg in list(roles.items()):
@@ -524,8 +541,19 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             handoff=cast(Handoff, handoff),
             executor=proj_exec or None,
             delivery=delivery,
+            max_concurrency=_max_concurrency(f"projects.{name}", item),
         )
     validate_project_rules(projects.values())
+
+    for where, limited in (
+        *((f"executors.{n}", e) for n, e in {**executors, **roles}.items()),
+        *((f"projects.{n}", p) for n, p in projects.items()),
+    ):
+        if limited.max_concurrency is not None and limited.max_concurrency > runtime.max_concurrency:
+            _log.warning(
+                "%s.max_concurrency = %d is above runtime.max_concurrency = %d, which caps it",
+                where, limited.max_concurrency, runtime.max_concurrency,
+            )
 
     gd_raw = raw.get("gdrive", {})
     gd_interval = float(gd_raw.get("poll_interval_seconds", 30.0))

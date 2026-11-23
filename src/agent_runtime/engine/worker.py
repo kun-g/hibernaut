@@ -77,6 +77,8 @@ class ExecutorFailed(RuntimeError):
         super().__init__(*args)
         # The run ledger's classification of the last failed attempt; None without a ledger.
         self.route = route
+        # True once the failed batch is marked failed; otherwise it is still pending and would fail again at once.
+        self.batch_settled = False
 
 
 class _RunInterrupted(Exception):
@@ -641,6 +643,26 @@ class AgentWorker:
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).exception("Closing finished session %s failed", session_id)
 
+    @classmethod
+    def expected_executor_id(
+        cls,
+        event: Event,
+        sessions: SessionStorePort,
+        *,
+        project_default: str | None,
+        global_default: str | None,
+    ) -> str | None:
+        # The executor _select_executor picks for this event's batch, known before it is claimed; None when the event
+        # runs no executor (a close request) or none can be told.
+        if cls._is_close_session_batch([event]):
+            return None
+        session = cls._session_for(event, sessions)
+        if cls._resumes_suspended([event], session):
+            return cls._suspended_holder([event], session)
+        return resolve_executor_id(
+            cls._routed_executor_id(event), session, project_default, global_default or ""
+        ) or None
+
     def _select_executor(
         self,
         batch: list[Event],
@@ -860,6 +882,7 @@ class AgentWorker:
             ledger_error = exc
             all_failed_ids = batch_ids + [e.event_id for e in folded_events]
             self._inbox.mark_failed(all_failed_ids, str(exc.__cause__ or exc))
+            exc.batch_settled = True
             _drop_registration()
             if exc.route is not None:
                 self._alert_failed_run(
@@ -1178,19 +1201,20 @@ class AgentWorker:
             evt.payload.get("approval_request_id") == session_ref.pending_request_id for evt in batch
         )
 
+    @classmethod
     def _suspended_holder(
-        self,
+        cls,
         batch: list[Event],
         session_ref: SessionRef | None,
     ) -> str | None:
-        if not self._resumes_suspended(batch, session_ref):
+        if not cls._resumes_suspended(batch, session_ref):
             return None
         assert session_ref is not None
         if session_ref.executor_id:
             return session_ref.executor_id
         for evt in batch:
             if evt.payload.get("approval_request_id") == session_ref.pending_request_id:
-                named = self._routed_executor_id(evt)
+                named = cls._routed_executor_id(evt)
                 if named is not None:
                     return named
         return None
@@ -1228,16 +1252,20 @@ class AgentWorker:
         )
 
     def _resolve_session(self, event: Event) -> SessionRef | None:
+        return self._session_for(event, self._sessions)
+
+    @staticmethod
+    def _session_for(event: Event, sessions: SessionStorePort) -> SessionRef | None:
         # 4-level priority: approval_request_id -> explicit session_id -> (inbox_id, correlation_key) -> new.
         request_id = event.payload.get("approval_request_id")
         if isinstance(request_id, str) and request_id:
-            suspended = self._sessions.find_by_request_id(request_id)
+            suspended = sessions.find_by_request_id(request_id)
             if suspended is not None:
                 return suspended
         if event.session_id:
-            return self._sessions.get(event.session_id)
+            return sessions.get(event.session_id)
         if event.correlation_key:
-            return self._sessions.find_by_correlation_key(event.inbox_id, event.correlation_key)
+            return sessions.find_by_correlation_key(event.inbox_id, event.correlation_key)
         return None
 
     async def _execute_with_retry(
