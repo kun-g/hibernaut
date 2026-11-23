@@ -22,6 +22,9 @@ from agent_runtime.core.models import (
     Silent,
     Suspend,
     TaskLink,
+    explicit_trace_id,
+    resolve_trace_id,
+    resolve_trigger_event,
 )
 from agent_runtime.core.ports import PermissionPort, SessionStorePort
 
@@ -72,6 +75,13 @@ def is_approval(event: Event) -> bool:
 def task_hop_count(event: Event) -> object:
     # A forwarded event's own hop_count counts agent hops; Taskboard's travels beside it.
     return event.payload.get("task_hop_count" if event.source in _AGENT_SOURCES else "hop_count")
+
+
+def task_trace_id(event: Event) -> object:
+    # Likewise trace_id, the chain's; a forward queued before the two were kept apart has only the task's.
+    if event.source in _AGENT_SOURCES and "task_trace_id" in event.payload:
+        return event.payload["task_trace_id"]
+    return event.payload.get("trace_id")
 
 
 def carried_spec(event: Event) -> ForwardSpec | None:
@@ -203,8 +213,40 @@ def own_task(event: Event, sessions: SessionStorePort) -> Event:
     return event
 
 
+def run_lineage(events: Sequence[Event], session: SessionRef | None) -> tuple[str, str]:
+    # The trace of this Run and the event it descends from.
+    pieces = [evt for evt in events if forwarded_piece(evt)]
+    if pieces:
+        # The same one run_spec answers for.
+        return resolve_trace_id(pieces[-1]), pieces[-1].event_id
+    saved = session.forward if session is not None else None
+    trigger = resolve_trigger_event(events)
+    if saved is not None and saved.trace_id:
+        timers = all(evt.source.startswith("timer:") for evt in events)
+        if saved.return_to is not None or any(map(is_approval, events)) or (
+            timers and explicit_trace_id(trigger) is None
+        ):
+            # Still the work it was: what it owes, or what a person decided on, stays in its chain.
+            known = [evt for evt in events if explicit_trace_id(evt) == saved.trace_id]
+            return saved.trace_id, known[-1].event_id if known else saved.parent_event_id
+    link = session.task_link if session is not None else None
+    if explicit_trace_id(trigger) is None and link is not None and link.trace_id:
+        return link.trace_id, trigger.event_id
+    return resolve_trace_id(trigger), trigger.event_id
+
+
+def with_lineage(spec: ForwardSpec, events: Sequence[Event], session: SessionRef | None) -> ForwardSpec:
+    trace_id, parent_event_id = run_lineage(events, session)
+    return replace(spec, trace_id=trace_id, parent_event_id=parent_event_id)
+
+
 def run_spec(events: Sequence[Event], session: SessionRef | None) -> ForwardSpec | None:
     # How the work of this Run reached it: what its events carry, on top of what the session already knew.
+    spec = _chain_spec(events, session)
+    return with_lineage(spec, events, session) if spec is not None else None
+
+
+def _chain_spec(events: Sequence[Event], session: SessionRef | None) -> ForwardSpec | None:
     saved = session.forward if session is not None else None
     if saved is not None and saved.closed:
         # At work again.
@@ -320,6 +362,11 @@ def return_session(sessions: SessionStorePort, spec: ForwardSpec) -> str | None:
     return session.session_id if session is not None and is_open(session) else None
 
 
+def _lineage_fields(spec: ForwardSpec) -> dict[str, str]:
+    fields = {"trace_id": spec.trace_id, "parent_event_id": spec.parent_event_id}
+    return {key: value for key, value in fields.items() if value}
+
+
 def return_payload(
     *,
     inbox_id: str,
@@ -338,6 +385,7 @@ def return_payload(
         "hop_count": spec.hop_count + 1,
         "forwarded_from": inbox_id,
         "forwarded_by": agent_id,
+        **_lineage_fields(spec),
         **_reply_fields(spec, events),
     }
     for key, value in (("title", title), ("parent_session_id", spec.parent_session_id),
@@ -389,6 +437,7 @@ def cancel_event(
             "delegation_id": spec.delegation_id,
             "forwarded_from": inbox_id,
             "forwarded_by": agent_id,
+            **_lineage_fields(spec),
             **_reply_fields(spec, ()),
             **{key: reply[key] for key in ("reply_channel", "reply_target") if reply.get(key)},
         },
@@ -572,11 +621,14 @@ class ForwardStage:
         hops: int, spec: ForwardSpec | None, events: Sequence[Event], passing: bool,
     ) -> Event:
         root = (spec.origin_key if spec is not None else None) or self.correlation_key
+        trace_id, parent_event_id = run_lineage(events, self.session)
         payload: dict[str, Any] = {
             "text": text,
             "hop_count": hops + 1,
             "forwarded_from": self.inbox_id,
             "forwarded_by": self.agent_id,
+            "trace_id": trace_id,
+            "parent_event_id": parent_event_id,
             **_reply_fields(spec, events),
         }
         for key in _INHERITED_KEYS:
@@ -639,9 +691,7 @@ class ForwardStage:
         for index, evt in enumerate(self.staged):
             if "return_to" in evt.payload and not passed_on(evt):
                 continue
-            fields: dict[str, Any] = {"task_id": link.task_id}
-            if link.trace_id:
-                fields["trace_id"] = link.trace_id
+            fields: dict[str, Any] = {"task_id": link.task_id, "task_trace_id": link.trace_id}
             if link.hop_count is not None:
                 fields["task_hop_count"] = link.hop_count
             self.staged[index] = replace(evt, payload={**evt.payload, **fields})
