@@ -320,6 +320,8 @@ from pathlib import Path
 from agent_runtime.adapters.executor_cli import claude_gate, cli_terminal
 
 start, window, root = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+# The FIFO and the injected signal identify the stop window, including on the first poll after launch.
+cli_terminal.POLL_SECONDS = claude_gate._POLL_SECONDS = 0.005
 argv = ["/bin/sh", "-c", f'sleep 60 & echo "$$ $!" > "{root / "started"}"; wait']
 if start == "once":
     # cli_terminal.py kills a one-off gate after its own grace, so the gate must spend none on a probe that ignores TERM.

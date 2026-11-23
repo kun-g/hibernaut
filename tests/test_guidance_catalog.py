@@ -225,9 +225,13 @@ class _Harness(unittest.IsolatedAsyncioTestCase):
         self.caps.is_interrupted.return_value = False
         self.caps.memory.load_baseline.return_value = {}
         self.launcher = ClaudeCodeLauncher(name="fake", command=fake_command(self.root))
-        self.repo = make_project(self.root)
-        git(self.repo, "checkout", "-qb", "hb/task-1")
+        self.repo = self.task_repo()
         self.start = head(self.repo)
+
+    def task_repo(self):
+        repo = make_project(self.root)
+        git(repo, "checkout", "-qb", "hb/task-1")
+        return repo
 
     def set_plan(self, sde=(), reviewer=()):
         for name in ("sde", "reviewer"):
@@ -476,32 +480,34 @@ class TestNonAsciiDiffPaths(_Harness):
     CN_DOC = "docs/规范/版本.md"
     CN_BODY = "CN-VERSION-BODY: 改版本时同步更新 版本/当前.txt。"
 
-    def setUp(self):
-        super().setUp()
-        git(self.repo, "checkout", "-q", "main")
-        (self.repo / "docs/规范").mkdir(parents=True)
-        (self.repo / self.CN_DOC).write_text(self.CN_BODY + "\n", encoding="utf-8")
-        (self.repo / "版本").mkdir()
-        (self.repo / "版本/当前.txt").write_text("1.0.0\n", encoding="utf-8")
-        catalog = (self.repo / "guidance.toml").read_text(encoding="utf-8") + (
-            '\n[[docs]]\npath = "docs/规范/版本.md"\nsummary = "中文版本规范"\n'
-            'paths = ["版本/*.txt", "docs/规范/版本.md"]\n'
-        )
-        (self.repo / "guidance.toml").write_text(catalog, encoding="utf-8")
-        git(self.repo, "add", "-A")
-        git(self.repo, "commit", "-qm", "中文规范")
-        git(self.repo, "checkout", "-qb", "hb/task-cn")
-        self.base = head(self.repo)
-        quoted = subprocess.run(["git", "ls-files", "版本"], cwd=self.repo, capture_output=True,
-                                text=True, check=True).stdout
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        repo = make_project(Path(cls.enterClassContext(tempfile.TemporaryDirectory())))
+        (repo / "docs/规范").mkdir(parents=True)
+        (repo / cls.CN_DOC).write_text(cls.CN_BODY + "\n", encoding="utf-8")
+        (repo / "版本").mkdir()
+        (repo / "版本/当前.txt").write_text("1.0.0\n", encoding="utf-8")
+        with (repo / "guidance.toml").open("a", encoding="utf-8") as catalog:
+            catalog.write('\n[[docs]]\npath = "docs/规范/版本.md"\nsummary = "中文版本规范"\n'
+                          'paths = ["版本/*.txt", "docs/规范/版本.md"]\n')
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "中文规范")
+        git(repo, "checkout", "-qb", "hb/task-cn")
+        cls.template = repo
+
+    def task_repo(self):
+        repo = shutil.copytree(self.template, self.root / "proj")
         # Precondition: this git quotes the path, so the regression is real on this machine.
+        quoted = subprocess.run(["git", "ls-files", "版本"], cwd=repo, capture_output=True, text=True, check=True).stdout
         self.assertIn('"', quoted)
+        return repo
 
     def assert_cn_selected(self, call, touched):
         guidance = section(call["prompt"])
         self.assertIn(f"Selected because: diff touches {touched}", guidance)
         self.assertIn(f"### Selected guidance: {self.CN_DOC}", guidance)
-        self.assertIn(f"Source: {self.base}:{self.CN_DOC}", guidance)
+        self.assertIn(f"Source: {self.start}:{self.CN_DOC}", guidance)
         self.assertIn(self.CN_BODY, guidance)
 
     async def explicit_review(self):

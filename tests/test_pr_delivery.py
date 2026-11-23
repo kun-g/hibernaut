@@ -190,10 +190,7 @@ class DeliveryCase(unittest.TestCase):
         self._tmpl_seed = tmpl_seed
         self._main_moved = False
         self.bare = self.root / "remote.git"
-        self.seed = self.root / "seed"
         shutil.copytree(tmpl_bare, self.bare)
-        shutil.copytree(tmpl_seed, self.seed)
-        _repoint_origin(self.seed, tmpl_bare, self.bare)
         self.state_file = self.root / "gh-state.json"
         self.state_file.write_text(json.dumps({"bare": str(self.bare)}))
         gh = self.root / "gh"
@@ -210,6 +207,10 @@ class DeliveryCase(unittest.TestCase):
         self.store = SQLiteDeliveryStore(self.db)
         self.env = {**os.environ, "FAKE_GH_STATE": str(self.state_file), "GH_TOKEN": "leak", "GITHUB_TOKEN": "leak"}
         self.sleeps: list[float] = []
+
+    @functools.cached_property
+    def seed(self):
+        return self.clone("seed", None)
 
     def _bare_unchanged(self) -> bool:
         if self._main_moved:
