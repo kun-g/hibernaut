@@ -5,7 +5,7 @@ import json
 import os
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -17,6 +17,7 @@ from agent_runtime.core.models import (
     Emit,
     Event,
     RunOutcome,
+    RunTelemetry,
     SessionRef,
     Silent,
     Suspend,
@@ -190,15 +191,18 @@ class LocalCLIExecutor:
         stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
 
+        # For the run ledger: the process's output becomes the Run's log, its exit code and stderr classify a failure.
+        telemetry = RunTelemetry(stdout=stdout, stderr=stderr, exit_code=returncode)
         if returncode != 0:
             detail = stderr or stdout or "unknown error"
             return Emit(
                 messages=(f"[CLI:{template.name} exit={returncode}] {detail}",),
                 session_id=session_id,
                 status="failed",
+                telemetry=telemetry,
             )
 
-        return self._parse_outcome(stdout, session_id=session_id)
+        return replace(self._parse_outcome(stdout, session_id=session_id), telemetry=telemetry)
 
     def _render_cli_args(
         self,

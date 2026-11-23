@@ -129,8 +129,18 @@ class PermissionDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class RunTelemetry:
+    # What an executor saw of its process, kept only for the run ledger (log, usage, error class); never shown to
+    # channels and not part of an outcome's equality.
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Silent:
     executor_session_id: str | None = None
+    telemetry: RunTelemetry | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +164,7 @@ class Emit:
     close_session: bool = False
     # Where the delivery step left the change; the worker passes it to channels as task_context["delivery"].
     delivery: DeliveryOutcome | None = None
+    telemetry: RunTelemetry | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,9 +174,47 @@ class Suspend:
     session_checkpoint: str
     session_id: str | None = None
     executor_session_id: str | None = None
+    telemetry: RunTelemetry | None = field(default=None, compare=False)
 
 
 RunOutcome: TypeAlias = Silent | Emit | Suspend
+
+# How a Run ended as the run ledger records it: a RunOutcome kind, or a Run that never produced one.
+RunEndKind: TypeAlias = Literal["silent", "emit", "suspend", "interrupted", "error"]
+# transient: retry after the route's delays; deterministic: stop at the first failure; execution: no retry, keep
+# the worktree and log for a post-mortem.
+FailureCategory: TypeAlias = Literal["transient", "deterministic", "execution"]
+
+
+@dataclass(frozen=True, slots=True)
+class FailureRoute:
+    error_kind: str
+    category: FailureCategory
+    # Seconds to wait before each further attempt; empty means the first failure is final.
+    retry_delays: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RunLedgerEntry:
+    run_id: str
+    inbox_id: str
+    session_id: str
+    event_ids: tuple[str, ...]
+    executor_id: str
+    started_at: str
+    ended_at: str
+    duration_ms: int
+    outcome_kind: RunEndKind
+    emit_status: EmitStatus | None = None
+    correlation_key: str | None = None
+    trace_id: str | None = None
+    work_key: str | None = None
+    parent_session_id: str | None = None
+    replay_of_run_id: str | None = None
+    executor_session_id: str | None = None
+    error_kind: str | None = None
+    error_summary: str | None = None
+    telemetry: RunTelemetry | None = None
 
 
 @dataclass(frozen=True, slots=True)

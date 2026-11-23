@@ -100,6 +100,8 @@ from agent_runtime.engine import (
     TimerScheduler,
 )
 from agent_runtime.engine.worker import ExecutorFailed
+from agent_runtime.adapters.ledger_bridge import RunLedger
+from switchboard.ports import AuditSinkPort
 from switchboard.app import EnvCredentialBroker, Switchboard, build_switchboard
 from switchboard.config import load_config as load_switchboard_config
 
@@ -297,6 +299,8 @@ class AlwaysOnDaemon:
     gdrive_poll_interval_seconds: float = 30.0
     ingest_only: bool = False
     open_runs: SQLiteOpenRunStore | None = None
+    # Shared by every config generation, like db; closed with it.
+    ledger: RunLedger | None = None
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def register_partition(
@@ -395,7 +399,18 @@ class AlwaysOnDaemon:
                 )
 
     def close(self) -> None:
+        if self.ledger is not None:
+            self.ledger.close()
         self.db.close()
+
+
+def run_ledger_path(db_path: str | Path, ledger_db_path: str | Path | None) -> Path | None:
+    # An in-memory runtime database has no directory to put ledger.db in, so it runs without a ledger.
+    if ledger_db_path:
+        return Path(ledger_db_path).expanduser().resolve()
+    if str(db_path) == ":memory:":
+        return None
+    return Path(db_path).expanduser().resolve().parent / "ledger.db"
 
 
 async def drain_pools(
@@ -507,8 +522,14 @@ def build_daemon(
     outbox_display_base: str | Path | None = None,
     approval_events_url: str = "http://127.0.0.1:8080/events",
     runs_root: str | Path | None = None,
+    ledger: RunLedger | None = None,
+    ledger_db_path: str | Path | None = None,
 ) -> AlwaysOnDaemon:
     db = database if database is not None else SQLiteDatabase(db_path)
+    if ledger is None and (database is None or ledger_db_path):
+        ledger_path = run_ledger_path(db_path, ledger_db_path)
+        ledger = RunLedger(ledger_path) if ledger_path is not None else None
+    run_ledger = ledger.recorder if ledger is not None else None
     if runs_root is None and database is None and str(db_path) != ":memory:":
         runs_root = Path(db_path).expanduser().resolve().parent / "runs"
     # Directories of Runs that a stop detached; orphans past the retention period are removed at startup.
@@ -566,6 +587,7 @@ def build_daemon(
                 sessions=sessions,
                 run_start_listener=gdrive_writer,
                 open_runs=open_runs,
+                run_ledger=run_ledger,
                 code_version=__version__,
                 lease_ttl_seconds=lease_ttl_seconds,
                 new_event_policy=new_event_policy,
@@ -586,6 +608,7 @@ def build_daemon(
             sessions=sessions,
             run_start_listener=gdrive_writer,
             open_runs=open_runs,
+            run_ledger=run_ledger,
             code_version=__version__,
             lease_ttl_seconds=lease_ttl_seconds,
             new_event_policy=new_event_policy,
@@ -652,6 +675,7 @@ def build_daemon(
         worktree_manager=resolved_wt_mgr,
         outbox=outbox,
         bearer_token=mcp_bearer_token,
+        ledger=ledger,
     )
 
     return AlwaysOnDaemon(
@@ -687,6 +711,7 @@ def build_daemon(
         gdrive_poll_interval_seconds=gdrive_poll_interval_seconds,
         ingest_only=ingest_only,
         open_runs=open_runs,
+        ledger=ledger,
     )
 
 
@@ -698,6 +723,7 @@ def build_daemon_from_config(
     demo: bool = False,
     gdrive_client: DriveClientProtocol | None = None,
     switchboard: SwitchboardHandle | None = None,
+    ledger: RunLedger | None = None,
 ) -> AlwaysOnDaemon:
     # Every inbox -> project lookup goes through the router, so pattern-matched inboxes get their project's settings
     # and an inbox matching two projects raises AmbiguousProjectMatch instead of picking one.
@@ -777,6 +803,8 @@ def build_daemon_from_config(
         outbox_display_base=config.config_dir or None,
         approval_events_url=local_events_url(config.channels.host, config.channels.port),
         runs_root=Path(config.runtime.db_path).expanduser().resolve().parent / "runs",
+        ledger=ledger,
+        ledger_db_path=config.runtime.ledger_db_path or None,
     )
 
     if has_configured_executor and not demo:
@@ -954,6 +982,7 @@ def build_daemon_from_config(
                 hold=unmatched_hold if project is None else None,
                 run_start_listener=daemon.gdrive_result_writer,
                 open_runs=daemon.open_runs,
+                run_ledger=daemon.ledger.recorder if daemon.ledger is not None else None,
                 code_version=__version__,
                 lock=daemon.lock,
                 sessions=daemon.sessions,
@@ -993,6 +1022,7 @@ def build_daemon_from_config(
             outbox=daemon.outbox,
             bearer_token=mcp_token,
             worktree_manager_for=_manager_for,
+            ledger=daemon.ledger,
         )
 
     if resolved_gdrive_client is not None:
@@ -1027,14 +1057,16 @@ def start_switchboard(
     link: SwitchboardLinkConfig,
     *,
     environ: MutableMapping[str, str] | None = None,
+    audit: AuditSinkPort | None = None,
 ) -> SwitchboardHandle | None:
+    # audit reaches only the in-process Switchboard (Stage A); a relay's audits stay with the remote hub.
     if not link.enabled:
         return None
     credentials = EnvCredentialBroker(take_switchboard_secrets(environ))
     if link.mode == "relay":
         return open_switchboard_relay(link, credentials)
     assert link.config_path is not None
-    board = build_switchboard(load_switchboard_config(link.config_path), credentials=credentials)
+    board = build_switchboard(load_switchboard_config(link.config_path), credentials=credentials, audit=audit)
     board.start()
     print(f"[hibernaut] [switchboard] in-process switchboard listening on {board.http.base_url}", file=sys.stderr, flush=True)
     return board
@@ -1120,9 +1152,10 @@ async def serve_configured(
             async for candidate in changes:
                 if candidate == config:
                     continue
-                if (candidate.runtime.db_path, candidate.runtime.memory_root) != (
+                if (candidate.runtime.db_path, candidate.runtime.memory_root, candidate.runtime.ledger_db_path) != (
                     config.runtime.db_path,
                     config.runtime.memory_root,
+                    config.runtime.ledger_db_path,
                 ):
                     print(
                         "[config] Storage path changes require a restart.",
@@ -1145,6 +1178,7 @@ async def serve_configured(
                         database=daemon.db,
                         demo=demo,
                         switchboard=switchboard,
+                        ledger=daemon.ledger,
                     )
                     handler = replacement.http_handler()
                     if address != (config.channels.host, config.channels.port):
@@ -1277,10 +1311,17 @@ def main() -> None:
     board: SwitchboardHandle | None = None
     if args.config:
         cfg = load_config(args.config)
+        ledger_path = run_ledger_path(cfg.runtime.db_path, cfg.runtime.ledger_db_path)
+        # Opened before the Switchboard, whose in-process audits it records; the daemon owns and closes it.
+        ledger = RunLedger(ledger_path) if ledger_path is not None else None
         # The stdio MCP companion runs beside a daemon that already owns the Switchboard port or relay
         # connection; a second relay agent with the same consumer_id would supersede the daemon's.
-        board = None if args.mcp_stdio else start_switchboard(cfg.switchboard)
-        daemon = build_daemon_from_config(cfg, demo=args.demo, switchboard=board)
+        board = (
+            None
+            if args.mcp_stdio
+            else start_switchboard(cfg.switchboard, audit=ledger.switchboard_audit() if ledger is not None else None)
+        )
+        daemon = build_daemon_from_config(cfg, demo=args.demo, switchboard=board, ledger=ledger)
         host = cfg.channels.host
         port = cfg.channels.port
     else:

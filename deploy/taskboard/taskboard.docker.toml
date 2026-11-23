@@ -1,0 +1,24 @@
+# Container baseline for deploy/taskboard. Copy to taskboard.toml next to docker-compose.yml.
+# Secrets never go here: they come from .env (see .env.example). Paths are inside the container; /data is the
+# taskboard_data volume.
+
+[http]
+host = "0.0.0.0"  # reachable only on the compose network; the reverse proxy is the public entry
+port = 8791
+# Prefix-keeping proxy routes (Traefik path /taskboard, Caddy handle /taskboard/*) land on /taskboard/mcp.
+base_path = "/taskboard"
+max_body_bytes = 1048576
+
+[sqlite]
+path = "/data/taskboard.db"
+busy_timeout_ms = 5000
+
+[switchboard]
+# Same compose network: straight to the switchboard service, not out through the public domain.
+relay_url = "ws://switchboard:8790/ws/relay"
+mcp_url = "http://switchboard:8790/mcp"
+consumer_id = "taskboard"
+
+[intake]
+# Labelled GitHub issues become ready tasks and are dispatched to Hibernaut at once.
+auto_ready_sources = ["github"]

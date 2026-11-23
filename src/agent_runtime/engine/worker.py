@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import AsyncGenerator, Callable, Collection, Generator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Never, assert_never, cast
@@ -11,10 +12,14 @@ from agent_runtime.core.models import (
     DeliveryOutcome,
     Emit,
     Event,
+    FailureRoute,
     NewEventPolicy,
     OpenRun,
     RunDetached,
+    RunEndKind,
+    RunLedgerEntry,
     RunOutcome,
+    RunTelemetry,
     TASK_CONTEXT_KEY,
     TASK_SYNC_KIND,
     SessionRef,
@@ -35,6 +40,7 @@ from agent_runtime.core.ports import (
     PermissionPort,
     ResumableExecutorPort,
     RunCapabilities,
+    RunLedgerPort,
     RunStartListener,
     SessionStorePort,
     TimerPort,
@@ -67,7 +73,10 @@ class RunReport:
 
 
 class ExecutorFailed(RuntimeError):
-    pass
+    def __init__(self, *args: object, route: FailureRoute | None = None) -> None:
+        super().__init__(*args)
+        # The run ledger's classification of the last failed attempt; None without a ledger.
+        self.route = route
 
 
 class _RunInterrupted(Exception):
@@ -189,6 +198,27 @@ def _emit_task_fields(link: TaskLink, emit: Emit) -> dict[str, Any]:
     return _task_fields(link, "complete")
 
 
+def _end_kind(outcome: RunOutcome) -> RunEndKind:
+    match outcome:
+        case Silent():
+            return "silent"
+        case Emit():
+            return "emit"
+        case Suspend():
+            return "suspend"
+        case _ as unreachable:
+            never_val: Never = unreachable
+            assert_never(never_val)
+
+
+def _replay_of_run_id(events: Sequence[Event]) -> str | None:
+    for evt in events:
+        raw = evt.payload.get("_replay_of_run_id")
+        if isinstance(raw, str) and raw:
+            return raw
+    return None
+
+
 def _task_title(events: list[Event]) -> str:
     # payload title first, then the Drive file name, then a GitHub issue or pull request title.
     candidates: list[list[object]] = [[], [], []]
@@ -226,6 +256,7 @@ class AgentWorker:
         hold: Callable[[Event], str | None] | None = None,
         run_start_listener: RunStartListener | None = None,
         open_runs: OpenRunPort | None = None,
+        run_ledger: RunLedgerPort | None = None,
         code_version: str = "",
         lease_ttl_seconds: float = 60.0,
         max_retries: int = 2,
@@ -258,6 +289,8 @@ class AgentWorker:
         self._run_start_listener = run_start_listener
         # Without a registry every executor runs as a plain ExecutorPort and a stop waits for its Runs.
         self._open_runs = open_runs
+        # Without a run ledger nothing is recorded and a failing executor is retried max_retries times.
+        self._run_ledger = run_ledger
         self._code_version = code_version
         self._lock = lock
         self._sessions = sessions
@@ -789,6 +822,12 @@ class AgentWorker:
             if registered is not None and registry is not None:
                 registry.discard(registered.session_id)
 
+        started_at = utc_now_iso()
+        started = time.monotonic()
+        # None: the Run did not end here (detached); the next process records it when it resumes the Run.
+        end_kind: RunEndKind | None = "error"
+        ledger_outcome: RunOutcome | None = None
+        ledger_error: BaseException | None = None
         if handle is not None:
             self._handles.add(handle)
         try:
@@ -807,17 +846,30 @@ class AgentWorker:
                     handle=handle,
                     resume=resuming,
                 )
+            end_kind, ledger_outcome = _end_kind(outcome), outcome
         except _RunInterrupted:
+            end_kind = "interrupted"
             requeue_ids = batch_ids + [e.event_id for e in folded_events]
             self._inbox.requeue_processing(requeue_ids)
             _drop_registration()
             return _BatchEnd(ids=requeue_ids, interrupted=True)
         except _RunDetached:
+            end_kind = None
             return _BatchEnd(ids=batch_ids + [e.event_id for e in folded_events], detached=True)
         except ExecutorFailed as exc:
+            ledger_error = exc
             all_failed_ids = batch_ids + [e.event_id for e in folded_events]
             self._inbox.mark_failed(all_failed_ids, str(exc.__cause__ or exc))
             _drop_registration()
+            if exc.route is not None:
+                self._alert_failed_run(
+                    inbox_id,
+                    active_session.session_id,
+                    executor.executor_id,
+                    exc,
+                    len(all_failed_ids),
+                    self._report_metadata(batch + folded_events, batch_correlation_key, executor.executor_id, run_id),
+                )
             if claimed_link is not None:
                 # Otherwise the task would stay in_progress on Taskboard with nothing working on it.
                 self._release_failed_task(
@@ -827,12 +879,30 @@ class AgentWorker:
                     self._report_metadata(batch + folded_events, batch_correlation_key, executor.executor_id, run_id),
                 )
             raise
-        except BaseException:
+        except BaseException as exc:
+            # A cancelled Run (forced stop) ends like an interrupted one: no result, events back to pending.
+            if isinstance(exc, asyncio.CancelledError):
+                end_kind = "interrupted"
+            else:
+                ledger_error = exc
             _drop_registration()
             raise
         finally:
             if handle is not None:
                 self._handles.discard(handle)
+            if end_kind is not None:
+                self._record_run(
+                    run_id=run_id,
+                    inbox_id=inbox_id,
+                    session=active_session,
+                    executor_id=executor.executor_id,
+                    events=batch + folded_events,
+                    started_at=started_at,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    end_kind=end_kind,
+                    outcome=ledger_outcome,
+                    error=ledger_error,
+                )
 
         # Resolved once from what the Run actually consumed (a folded work.ready can name a new task); this link is
         # both reported and saved on the session.
@@ -1180,9 +1250,9 @@ class AgentWorker:
         handle: _RunHandle | None = None,
         resume: bool = False,
     ) -> RunOutcome:
-        last_exc: Exception | None = None
         resumable = self._resumable(executor) if handle is not None else None
-        for attempt in range(self._max_retries + 1):
+        attempt = 0
+        while True:
             try:
                 if resumable is not None and handle is not None:
                     if resume:
@@ -1192,11 +1262,124 @@ class AgentWorker:
             except (asyncio.CancelledError, RunDetached):
                 raise
             except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                if attempt < self._max_retries:
-                    await asyncio.sleep(0.01 * (attempt + 1))
-        assert last_exc is not None
-        raise ExecutorFailed(f"Executor failed after {self._max_retries + 1} attempts") from last_exc
+                # Each failed attempt is routed on its own: a transient error followed by a deterministic one stops.
+                route = self._route_failure(executor.executor_id, error=exc)
+                delays = (
+                    route.retry_delays
+                    if route is not None
+                    else tuple(0.01 * (n + 1) for n in range(self._max_retries))
+                )
+                if attempt < len(delays):
+                    await asyncio.sleep(delays[attempt])
+                    attempt += 1
+                    continue
+                raise ExecutorFailed(f"Executor failed after {attempt + 1} attempts", route=route) from exc
+
+    def _route_failure(
+        self,
+        executor_id: str,
+        *,
+        error: BaseException | None = None,
+        telemetry: RunTelemetry | None = None,
+    ) -> FailureRoute | None:
+        ledger = self._run_ledger
+        if ledger is None:
+            return None
+        try:
+            return ledger.route_failure(executor_id, error=error, telemetry=telemetry)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("Run ledger could not classify a failure", exc_info=True)
+            return None
+
+    def _record_run(
+        self,
+        *,
+        run_id: str,
+        inbox_id: str,
+        session: SessionRef,
+        executor_id: str,
+        events: list[Event],
+        started_at: str,
+        duration_ms: int,
+        end_kind: RunEndKind,
+        outcome: RunOutcome | None,
+        error: BaseException | None,
+    ) -> None:
+        ledger = self._run_ledger
+        if ledger is None:
+            return
+        try:
+            error_kind: str | None = None
+            error_summary: str | None = None
+            telemetry = outcome.telemetry if outcome is not None else None
+            emit_status = outcome.status if isinstance(outcome, Emit) else None
+            if error is not None:
+                cause = error.__cause__ if isinstance(error, ExecutorFailed) and error.__cause__ else error
+                error_summary = str(cause) or type(cause).__name__
+                route = error.route if isinstance(error, ExecutorFailed) else None
+                route = route or self._route_failure(executor_id, error=cause)
+                error_kind = route.error_kind if route is not None else None
+            elif isinstance(outcome, Emit) and outcome.status in ("failed", "refused"):
+                route = self._route_failure(executor_id, telemetry=telemetry)
+                error_kind = route.error_kind if route is not None else None
+                error_summary = outcome.messages[0] if outcome.messages else None
+            link = _task_link(events, session)
+            ledger.record_run(
+                RunLedgerEntry(
+                    run_id=run_id,
+                    inbox_id=inbox_id,
+                    session_id=session.session_id,
+                    event_ids=tuple(evt.event_id for evt in events),
+                    executor_id=executor_id,
+                    started_at=started_at,
+                    ended_at=utc_now_iso(),
+                    duration_ms=max(0, duration_ms),
+                    outcome_kind=end_kind,
+                    emit_status=emit_status,
+                    correlation_key=self._extract_correlation_key(events, session),
+                    trace_id=link.trace_id if link is not None else None,
+                    work_key=session.work_key,
+                    parent_session_id=session.parent_session_id,
+                    replay_of_run_id=_replay_of_run_id(events),
+                    executor_session_id=outcome.executor_session_id if outcome is not None else None,
+                    error_kind=error_kind,
+                    error_summary=error_summary,
+                    telemetry=telemetry,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning("Run ledger could not record run %s", run_id, exc_info=True)
+
+    def _alert_failed_run(
+        self,
+        inbox_id: str,
+        session_id: str,
+        executor_id: str,
+        failure: ExecutorFailed,
+        event_count: int,
+        report_metadata: Mapping[str, Any],
+    ) -> None:
+        route = failure.route
+        assert route is not None
+        cause = failure.__cause__ or failure
+        summary = " ".join((str(cause) or type(cause).__name__).split())[:500]
+        run_id = report_metadata.get("run_id")
+        self._outbox.enqueue(
+            inbox_id=inbox_id,
+            content=(
+                f"[hibernaut] Run {run_id} on executor '{executor_id}' failed: {route.error_kind} "
+                f"({route.category}). {summary}\nIts {event_count} event(s) are marked failed; the worktree and run "
+                "log are kept. Replay with hibernaut_replay_event once the cause is fixed."
+            ),
+            metadata={
+                **report_metadata,
+                "kind": "run_failed",
+                "outcome_kind": "error",
+                "session_id": session_id,
+                "error_kind": route.error_kind,
+                "error_category": route.category,
+            },
+        )
 
     def _resolve_executor_binding(
         self,
