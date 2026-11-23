@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import hashlib
 import os
 import re
@@ -13,6 +14,11 @@ from typing import Callable, Final, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from runner.protocol import CredentialLease, LogRef, MAX_STDOUT_EXCERPT_BYTES
+
+_READ_CHUNK_BYTES: Final = 65_536
+_STDERR_EXCERPT_CHARS: Final = 32_768
+# Bounds the buffer behind on_stdout_line only; the log and the excerpt are not affected by it.
+MAX_STREAM_LINE_BYTES: Final = 4 * 1024 * 1024
 
 # The child gets only what a CLI needs to run (paths, locale, terminal, proxy), never the runner's own
 # credentials: external auth goes through the credential lease (RUNNER_BROKER_URL / RUNNER_LEASE_TOKEN).
@@ -196,15 +202,21 @@ class ProcessSupervisor:
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{run_id}.log"
 
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(cwd),
-            env=dict(env),
-            stdin=asyncio.subprocess.PIPE if stdin_text is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
+        # Opened before the child exists: once it does, every exit has to go through the reap below.
+        log_fp = log_path.open("wb")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(cwd),
+                env=dict(env),
+                stdin=asyncio.subprocess.PIPE if stdin_text is not None else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except BaseException:
+            log_fp.close()
+            raise
 
         hasher = hashlib.sha256()
         total_bytes = 0
@@ -215,32 +227,59 @@ class ProcessSupervisor:
         last_activity = time.monotonic()
         status = "succeeded"
         timeout_kind: str | None = None
-        log_fp = log_path.open("wb")
+        read_error: BaseException | None = None
 
         async def _pump(stream: asyncio.StreamReader | None, *, is_stdout: bool) -> None:
+            # Bounded chunks, never readline(): a line longer than the stream limit must not stop the draining, or
+            # the child blocks on a full pipe and its output is lost.
             nonlocal total_bytes, stdout_len, stderr_len, last_activity
             if stream is None:
                 return
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            line = bytearray()
+
+            def _emit_line() -> None:
+                if on_stdout_line is not None:
+                    on_stdout_line(line.decode("utf-8", errors="replace"))
+                line.clear()
+
+            def _keep_line_part(part: bytes) -> None:
+                room = MAX_STREAM_LINE_BYTES - len(line)
+                if room > 0:
+                    line.extend(part[:room])
+
             while True:
-                line = await stream.readline()
-                if not line:
+                chunk = await stream.read(_READ_CHUNK_BYTES)
+                if not chunk:
                     break
                 last_activity = time.monotonic()
-                log_fp.write(line)
+                log_fp.write(chunk)
                 log_fp.flush()
-                hasher.update(line)
-                total_bytes += len(line)
-                decoded = line.decode("utf-8", errors="replace")
+                hasher.update(chunk)
+                total_bytes += len(chunk)
+                text = decoder.decode(chunk)
                 if is_stdout:
-                    if on_stdout_line is not None:
-                        on_stdout_line(decoded)
                     if stdout_len < MAX_STDOUT_EXCERPT_BYTES:
-                        stdout_chunks.append(decoded)
-                        stdout_len += len(decoded)
-                else:
-                    if stderr_len < 32_768:
-                        stderr_chunks.append(decoded)
-                        stderr_len += len(decoded)
+                        stdout_chunks.append(text)
+                        stdout_len += len(text)
+                    if on_stdout_line is not None:
+                        pos = 0
+                        while (nl := chunk.find(b"\n", pos)) != -1:
+                            _keep_line_part(chunk[pos : nl + 1])
+                            _emit_line()
+                            pos = nl + 1
+                        _keep_line_part(chunk[pos:])
+                elif stderr_len < _STDERR_EXCERPT_CHARS:
+                    stderr_chunks.append(text)
+                    stderr_len += len(text)
+            tail = decoder.decode(b"", final=True)
+            if is_stdout:
+                if tail and stdout_len < MAX_STDOUT_EXCERPT_BYTES:
+                    stdout_chunks.append(tail)
+                if line:
+                    _emit_line()
+            elif tail and stderr_len < _STDERR_EXCERPT_CHARS:
+                stderr_chunks.append(tail)
 
         async def _feed_stdin(stream: asyncio.StreamWriter, data: bytes) -> None:
             # Its own task: a child that never reads its input must not hold up the watchdog or an interrupt.
@@ -252,8 +291,7 @@ class ProcessSupervisor:
             finally:
                 stream.close()
 
-        pump_out: asyncio.Task[None] | None = None
-        pump_err: asyncio.Task[None] | None = None
+        pumps: list[asyncio.Task[None]] = []
         feed: asyncio.Task[None] | None = None
         # Every exit from here on, cancellation included, goes through the finally: the run is not over while any
         # process of its group can still touch the worktree.
@@ -261,10 +299,16 @@ class ProcessSupervisor:
             if stdin_text is not None and proc.stdin is not None:
                 feed = asyncio.create_task(_feed_stdin(proc.stdin, stdin_text.encode("utf-8")))
 
-            pump_out = asyncio.create_task(_pump(proc.stdout, is_stdout=True))
-            pump_err = asyncio.create_task(_pump(proc.stderr, is_stdout=False))
+            pumps = [
+                asyncio.create_task(_pump(proc.stdout, is_stdout=True)),
+                asyncio.create_task(_pump(proc.stderr, is_stdout=False)),
+            ]
             start_mono = time.monotonic()
             while proc.returncode is None:
+                failed_pump = next((t for t in pumps if t.done() and not t.cancelled() and t.exception() is not None), None)
+                if failed_pump is not None:
+                    read_error = failed_pump.exception()
+                    break
                 if cancel_event.is_set():
                     status = "interrupted"
                     break
@@ -284,26 +328,32 @@ class ProcessSupervisor:
             recancelled = await reap_uncancellable(proc, grace_seconds=grace_seconds)
             if feed is not None:
                 await asyncio.gather(feed, return_exceptions=True)
-            pumps = [t for t in (pump_out, pump_err) if t is not None]
             if pumps:
                 # Pipes close once the whole group is gone; a stray inheritor cannot hold the pumps open for long.
                 _, pending = await asyncio.wait(pumps, timeout=grace_seconds)
                 for t in pending:
                     t.cancel()
-                await asyncio.gather(*pumps, return_exceptions=True)
+                for outcome in await asyncio.gather(*pumps, return_exceptions=True):
+                    if read_error is None and isinstance(outcome, Exception):
+                        read_error = outcome
             log_fp.close()
             if recancelled:
                 raise asyncio.CancelledError
 
         exit_code = proc.returncode
-        if status == "succeeded" and exit_code != 0:
+        stderr_excerpt = "".join(stderr_chunks)[:_STDERR_EXCERPT_CHARS]
+        if read_error is not None:
+            # The output is incomplete, so whatever the exit code says, this run did not produce a usable result.
+            status = "failed"
+            stderr_excerpt = f"runner output read failed: {type(read_error).__name__}: {read_error}\n{stderr_excerpt}"
+        elif status == "succeeded" and exit_code != 0:
             status = "failed"
 
         return SupervisedRunOutput(
             status=status,
             exit_code=exit_code,
             stdout_excerpt="".join(stdout_chunks)[:MAX_STDOUT_EXCERPT_BYTES],
-            stderr_excerpt="".join(stderr_chunks)[:32_768],
+            stderr_excerpt=stderr_excerpt,
             log_ref=LogRef(
                 runner_id=self._runner_id,
                 path=str(log_path),

@@ -185,7 +185,7 @@ class RunnerRelayAgent:
 
                 elif ftype == "run.interrupt":
                     ireq = InterruptRequest.from_dict(cast(Mapping[str, Any], frame["request"]))
-                    ires = await self._daemon.interrupt(ireq)
+                    ires = await self._daemon.interrupt(ireq, caller_id=str(frame.get("caller_id", "hibernaut")))
                     await _send(
                         {
                             "type": "rpc.reply",
@@ -196,7 +196,7 @@ class RunnerRelayAgent:
                         }
                     )
                 elif ftype == "run.query":
-                    qres = self._daemon.query_run(str(frame["run_id"]))
+                    qres = self._daemon.query_run(str(frame["run_id"]), caller_id=str(frame.get("caller_id", "hibernaut")))
                     await _send(
                         {
                             "type": "rpc.reply",
@@ -221,10 +221,25 @@ class RunnerRelayAgent:
                     )
         finally:
             self._connected_event.clear()
-            for t in list(bg_tasks):
-                if not t.done():
-                    t.cancel()
             try:
                 writer.close()
             except OSError:
                 pass
+            # The runs of this connection end with it, and the next hello must not be sent until they have: a run
+            # still creating its worktree would be missing from ready_work_keys, and the hub would drop its claim.
+            await _cancel_and_wait(bg_tasks)
+
+
+async def _cancel_and_wait(tasks: set[asyncio.Task[None]]) -> None:
+    pending: list[asyncio.Task[None]] = [t for t in tasks if not t.done()]
+    for t in pending:
+        t.cancel()
+    cancelled = False
+    while pending:
+        try:
+            await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
+        except asyncio.CancelledError:
+            cancelled = True
+        pending = [t for t in pending if not t.done()]
+    if cancelled:
+        raise asyncio.CancelledError

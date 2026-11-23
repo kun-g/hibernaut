@@ -605,3 +605,386 @@ def test_readonly_run_removes_its_detached_worktree_when_it_ends(tmp_path: Path)
     assert res.status == "succeeded"
     assert not ro_dir.exists()
     assert str(ro_dir) not in _git_out("worktree", "list", "--porcelain", cwd=repo)
+
+
+# ---- review round 12 ----------------------------------------------------------------------------------------------
+
+import os  # noqa: E402
+import signal  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from runner.config import NamespacePolicy  # noqa: E402
+from runner.transport.in_process import InProcessRunnerClient  # noqa: E402
+from tests.test_runner_safety import _alive, _drivers  # noqa: E402
+
+
+def _cwd_drivers() -> dict[str, TemplateCLIDriver]:
+    return {"cwd": _drivers()["cwd"]}
+
+
+def _write_run_dir(res: RunResult) -> Path:
+    assert res.status == "succeeded", res.error_summary
+    return Path(json.loads(res.stdout_excerpt)["cwd"]).resolve()
+
+
+def test_readonly_run_never_touches_a_write_workspace_whose_name_matches_its_directory(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    cfg = _config(tmp_path, repo)
+    daemon = RunnerDaemon(cfg, drivers=_cwd_drivers())
+    ro_dir = daemon.worktrees.readonly_workdir(
+        policy=cfg.namespaces["hb"], project=cfg.projects["hibernaut"], owner_scope="proj:hb", work_key="gh#1"
+    )
+    # A legal write hint that names exactly the directory the readonly run of (proj:hb, gh#1) derives.
+    hint = ro_dir.name.removeprefix("hb-")
+
+    async def scenario() -> None:
+        write = await daemon.run(
+            dataclasses.replace(_req("run_w_clash", executor_id="cwd", owner_scope="proj:x", work_key="gh#9"), name_hint=hint),
+            caller_id="hibernaut",
+        )
+        write_dir = _write_run_dir(write)
+        (write_dir / "wip.txt").write_text("uncommitted\n", encoding="utf-8")
+        ro = await daemon.run(_req("run_ro_clash", executor_id="cwd", readonly=True), caller_id="hibernaut")
+        assert ro.status == "succeeded", ro.error_summary
+        assert _write_run_dir(ro) != write_dir
+        assert (write_dir / "wip.txt").read_text(encoding="utf-8") == "uncommitted\n"
+        daemon.worktrees.assert_writable(
+            policy=cfg.namespaces["hb"], project=cfg.projects["hibernaut"], owner_scope="proj:x", work_key="gh#9", workdir=write_dir
+        )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        daemon.close()
+
+
+def test_readonly_run_refuses_a_directory_that_is_a_registered_write_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    daemon = RunnerDaemon(_config(tmp_path, repo), drivers=_cwd_drivers())
+
+    async def scenario() -> None:
+        write_dir = _write_run_dir(
+            await daemon.run(_req("run_w_owned", executor_id="cwd", owner_scope="proj:x", work_key="gh#9"), caller_id="hibernaut")
+        )
+        (write_dir / "wip.txt").write_text("uncommitted\n", encoding="utf-8")
+        monkeypatch.setattr(daemon.worktrees, "readonly_workdir", lambda **_: write_dir)
+        ro = await daemon.run(_req("run_ro_owned", executor_id="cwd", readonly=True), caller_id="hibernaut")
+        assert (ro.status, ro.error_kind) == ("refused", "permission_denied")
+        assert write_dir.is_dir()
+        assert (write_dir / "wip.txt").read_text(encoding="utf-8") == "uncommitted\n"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        daemon.close()
+
+
+def test_reconnecting_node_reports_a_workspace_it_was_still_creating(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_a, repo_b = tmp_path / "repo-a", tmp_path / "repo-b"
+    _init_repo(repo_a)
+    _init_repo(repo_b)
+    affinity = WorkspaceAffinityStore(tmp_path / "affinity.db")
+    hub = RunnerRelayHub(shared_token="tok", affinity=affinity, heartbeat_seconds=30.0)
+    daemon_a = RunnerDaemon(_config(tmp_path, repo_a, runner_id="a-1"), drivers=_count_drivers())
+    daemon_b = RunnerDaemon(_config(tmp_path, repo_b, runner_id="b-1"), drivers=_count_drivers())
+    entered, go = threading.Event(), threading.Event()
+    original_resolve = daemon_a.worktrees.resolve
+
+    def slow_resolve(**kwargs: Any) -> Any:
+        entered.set()
+        go.wait(10)
+        return original_resolve(**kwargs)
+
+    monkeypatch.setattr(daemon_a.worktrees, "resolve", slow_resolve)
+    counter = tmp_path / "count"
+
+    def bound() -> str | None:
+        return affinity.lookup(namespace="hb", project_key="hibernaut", owner_scope="proj:hb", work_key="gh#5")
+
+    async def scenario() -> None:
+        host, port = await hub.start("127.0.0.1", 0)
+        url = f"ws://{host}:{port}/ws/runner"
+        agent_a = RunnerRelayAgent(daemon=daemon_a, hub_url=url, token="tok")
+        await agent_a.start()
+        await agent_a.wait_connected()
+        agent_b = RunnerRelayAgent(daemon=daemon_b, hub_url=url, token="tok")
+        await agent_b.start()
+        await agent_b.wait_connected()
+        try:
+            first = asyncio.create_task(hub.run(_req("run_creating", executor_id="count", prompt=str(counter), work_key="gh#5")))
+            assert await asyncio.to_thread(entered.wait, 5)
+            assert bound() == "a-1"
+            hub._drop_connection(hub._conns["a-1"], "network drop")  # pyright: ignore[reportPrivateUsage]
+            with pytest.raises(RunnerConnectionLostError):
+                await asyncio.wait_for(first, 5.0)
+            await asyncio.sleep(1.0)
+            # a-1 is still creating gh#5: a hello now must not erase the claim, or the next write goes to b-1.
+            assert bound() == "a-1"
+            go.set()
+            await asyncio.sleep(0.5)
+            await agent_a.wait_connected(10.0)
+            assert bound() == "a-1"
+            second = await asyncio.wait_for(
+                hub.run(_req("run_after_drop", executor_id="count", prompt=str(counter), work_key="gh#5")), 15.0
+            )
+            assert second.runner_id == "a-1"
+        finally:
+            go.set()
+            await agent_a.stop()
+            await agent_b.stop()
+            await hub.stop()
+
+    try:
+        asyncio.run(asyncio.wait_for(scenario(), 40.0))
+    finally:
+        daemon_a.close()
+        daemon_b.close()
+        affinity.close()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"prompt": "another prompt"}, {"interactive": True}, {"executor_session_id": "sess-other"}],
+    ids=["prompt", "interactive", "executor_session_id"],
+)
+def test_daemon_refuses_a_run_id_reused_with_different_execution_fields(tmp_path: Path, change: dict[str, Any]) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    daemon = RunnerDaemon(_config(tmp_path, repo), drivers=_count_drivers())
+    counter = tmp_path / "count"
+    original = _req("run_fields", executor_id="count", prompt=str(counter))
+    changed = dataclasses.replace(original, **change)
+
+    async def scenario() -> None:
+        running = asyncio.create_task(daemon.run(original, caller_id="hibernaut"))
+        await asyncio.sleep(0.3)
+        joined = await daemon.run(changed, caller_id="hibernaut")
+        assert (joined.status, joined.error_kind) == ("refused", "permission_denied")
+        assert "run_id" in (joined.error_summary or "")
+        done = await running
+        assert done.status == "succeeded"
+        again = await daemon.run(changed, caller_id="hibernaut")
+        assert (again.status, again.error_kind) == ("refused", "permission_denied")
+        assert await daemon.run(original, caller_id="hibernaut") == done
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        daemon.close()
+    assert counter.read_text(encoding="utf-8").count("x") == 1
+
+
+def test_hub_refuses_a_run_id_reused_with_a_different_prompt_or_interactive(tmp_path: Path) -> None:
+    from runner.transport.relay_hub import RunIdConflictError
+
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    affinity = WorkspaceAffinityStore(tmp_path / "affinity.db")
+    hub = RunnerRelayHub(shared_token="tok", affinity=affinity, heartbeat_seconds=30.0)
+    daemon = RunnerDaemon(_config(tmp_path, repo, runner_id="h-1"), drivers=_count_drivers())
+    counter = tmp_path / "count"
+    original = _req("run_hub_fields", executor_id="count", prompt=str(counter))
+    variants = [dataclasses.replace(original, prompt="another prompt"), dataclasses.replace(original, interactive=True)]
+
+    async def scenario() -> None:
+        host, port = await hub.start("127.0.0.1", 0)
+        agent = RunnerRelayAgent(daemon=daemon, hub_url=f"ws://{host}:{port}/ws/runner", token="tok")
+        await agent.start()
+        await agent.wait_connected()
+        try:
+            running = asyncio.create_task(hub.run(original))
+            await asyncio.sleep(0.2)
+            for variant in variants:
+                with pytest.raises(RunIdConflictError):
+                    await asyncio.wait_for(hub.run(variant), 2.0)
+            done = await asyncio.wait_for(running, 15.0)
+            for variant in variants:
+                with pytest.raises(RunIdConflictError):
+                    await asyncio.wait_for(hub.run(variant), 2.0)
+            assert (await asyncio.wait_for(hub.run(original), 5.0)) == done
+        finally:
+            await agent.stop()
+            await hub.stop()
+
+    try:
+        asyncio.run(asyncio.wait_for(scenario(), 40.0))
+    finally:
+        daemon.close()
+        affinity.close()
+
+
+def test_run_refused_as_workspace_busy_runs_when_retried_after_the_workspace_frees(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    daemon = RunnerDaemon(_config(tmp_path, repo), drivers=_count_drivers())
+    counter = tmp_path / "count"
+
+    async def scenario() -> None:
+        holder = asyncio.create_task(daemon.run(_req("run_holder", executor_id="count", prompt=str(counter)), caller_id="hibernaut"))
+        await asyncio.sleep(0.3)
+        retried = _req("run_retried", executor_id="count", prompt=str(counter))
+        busy = await daemon.run(retried, caller_id="hibernaut")
+        assert (busy.error_summary or "").startswith("workspace_busy")
+        assert not daemon.knows_run(retried.run_id)
+        assert (await holder).status == "succeeded"
+        again = await daemon.run(retried, caller_id="hibernaut")
+        assert again.status == "succeeded", again.error_summary
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        daemon.close()
+    assert counter.read_text(encoding="utf-8").count("x") == 2
+
+
+def _shared_config(tmp_path: Path, repo: Path, runner_id: str = "shared-1") -> Any:
+    cfg = _config(tmp_path, repo, runner_id=runner_id)
+    return dataclasses.replace(
+        cfg, namespaces={"hb": NamespacePolicy(namespace="hb", prefix="hb", allowed_callers=("hibernaut", "workshop"))}
+    )
+
+
+def test_another_caller_cannot_interrupt_or_read_a_run_in_process(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    daemon = RunnerDaemon(_shared_config(tmp_path, repo), drivers=_count_drivers())
+    owner = InProcessRunnerClient(daemon, caller_id="hibernaut", bound_namespace="hb")
+    stranger = InProcessRunnerClient(daemon, caller_id="workshop", bound_namespace="hb")
+    counter = tmp_path / "count"
+    req = _req("run_owned", executor_id="count", prompt=str(counter))
+
+    async def scenario() -> None:
+        running = asyncio.create_task(owner.run(req))
+        await asyncio.sleep(0.3)
+        res = await stranger.interrupt(InterruptRequest(run_id=req.run_id, reason="user_cancel"))
+        assert (res.accepted, res.state) == (False, "not_found")
+        done = await running
+        assert done.status == "succeeded"
+        assert daemon.query_run(req.run_id, caller_id="workshop") is None
+        assert daemon.query_run(req.run_id, caller_id="hibernaut") == done
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        daemon.close()
+
+
+def test_another_caller_cannot_interrupt_or_read_a_run_through_the_relay(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    affinity = WorkspaceAffinityStore(tmp_path / "affinity.db")
+    hub = RunnerRelayHub(shared_token="tok", affinity=affinity, heartbeat_seconds=30.0)
+    daemon = RunnerDaemon(_shared_config(tmp_path, repo, runner_id="s-1"), drivers=_count_drivers())
+    counter = tmp_path / "count"
+    req = _req("run_relay_owned", executor_id="count", prompt=str(counter))
+
+    async def scenario() -> None:
+        host, port = await hub.start("127.0.0.1", 0)
+        agent = RunnerRelayAgent(daemon=daemon, hub_url=f"ws://{host}:{port}/ws/runner", token="tok")
+        await agent.start()
+        await agent.wait_connected()
+        try:
+            running = asyncio.create_task(hub.run(req, caller_id="hibernaut"))
+            await asyncio.sleep(0.4)
+            res = await hub.interrupt(InterruptRequest(run_id=req.run_id, reason="user_cancel"), caller_id="workshop")
+            assert (res.accepted, res.state) == (False, "not_found")
+            done = await asyncio.wait_for(running, 15.0)
+            assert done.status == "succeeded"
+            assert await hub.query_run("s-1", req.run_id, caller_id="workshop") is None
+            assert await hub.query_run("s-1", req.run_id, caller_id="hibernaut") == done
+        finally:
+            await agent.stop()
+            await hub.stop()
+
+    try:
+        asyncio.run(asyncio.wait_for(scenario(), 40.0))
+    finally:
+        daemon.close()
+        affinity.close()
+
+
+def test_no_process_is_left_when_the_run_log_cannot_be_opened(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    now = datetime.now(timezone.utc)
+    for day in (now, now + timedelta(days=1)):
+        (logs / day.strftime("%Y-%m-%d") / "run_nolog.log").mkdir(parents=True)  # opening it for writing fails
+    pid_file = tmp_path / "pid"
+    supervisor = ProcessSupervisor(runner_id="r", logs_dir=logs)
+
+    async def scenario() -> None:
+        with pytest.raises(OSError):
+            await supervisor.execute(
+                run_id="run_nolog",
+                argv=[PY, "-c", "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)", str(pid_file)],
+                cwd=tmp_path,
+                env={"PATH": "/usr/bin:/bin"},
+                stdin_text=None,
+                timeout_seconds=60.0,
+                idle_timeout_seconds=None,
+                cancel_event=asyncio.Event(),
+                grace_seconds=0.5,
+            )
+        await asyncio.sleep(1.0)
+
+    asyncio.run(scenario())
+    if pid_file.exists():
+        pid = int(pid_file.read_text())
+        alive = _alive(pid)
+        if alive:
+            os.kill(pid, signal.SIGKILL)
+        assert not alive, "the CLI kept running after the run failed"
+
+
+def test_output_line_longer_than_the_stream_limit_is_read_in_full(tmp_path: Path) -> None:
+    supervisor = ProcessSupervisor(runner_id="r", logs_dir=tmp_path / "logs")
+    lines: list[str] = []
+    size = 300_000
+
+    async def scenario() -> Any:
+        return await supervisor.execute(
+            run_id="run_long_line",
+            argv=[PY, "-c", f"import sys; sys.stdout.write('a' * {size} + '\\n'); sys.stdout.write('tail\\n')"],
+            cwd=tmp_path,
+            env={"PATH": "/usr/bin:/bin"},
+            stdin_text=None,
+            timeout_seconds=10.0,
+            idle_timeout_seconds=None,
+            cancel_event=asyncio.Event(),
+            grace_seconds=0.5,
+            on_stdout_line=lines.append,
+        )
+
+    out = asyncio.run(scenario())
+    assert (out.status, out.exit_code) == ("succeeded", 0)
+    assert out.log_ref.bytes == size + 1 + len("tail\n")
+    assert [len(line) for line in lines] == [size + 1, len("tail\n")]
+    assert out.stdout_excerpt.startswith("a" * 1000)
+
+
+def test_a_failed_output_reader_fails_the_run(tmp_path: Path) -> None:
+    supervisor = ProcessSupervisor(runner_id="r", logs_dir=tmp_path / "logs")
+
+    def broken(_: str) -> None:
+        raise RuntimeError("stream consumer broke")
+
+    async def scenario() -> Any:
+        return await supervisor.execute(
+            run_id="run_reader_broke",
+            argv=[PY, "-c", "print('hello')"],
+            cwd=tmp_path,
+            env={"PATH": "/usr/bin:/bin"},
+            stdin_text=None,
+            timeout_seconds=10.0,
+            idle_timeout_seconds=None,
+            cancel_event=asyncio.Event(),
+            grace_seconds=0.5,
+            on_stdout_line=broken,
+        )
+
+    out = asyncio.run(scenario())
+    assert out.status == "failed"
+    assert "output" in out.stderr_excerpt

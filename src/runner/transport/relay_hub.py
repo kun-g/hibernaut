@@ -335,22 +335,24 @@ class RunnerRelayHub:
                 if pending is not None and not pending.done():
                     pending.set_exception(err)
 
-    async def query_run(self, runner_id: str, run_id: str) -> RunResult | None:
+    async def query_run(self, runner_id: str, run_id: str, *, caller_id: str = "hibernaut") -> RunResult | None:
         conn = self._conns.get(runner_id)
         if conn is None:
             return None
-        resp = await self._rpc(conn, "run.query", {"run_id": run_id})
+        resp = await self._rpc(conn, "run.query", {"caller_id": caller_id, "run_id": run_id})
         res_raw = resp.get("result")
         return RunResult.from_dict(cast(Mapping[str, Any], res_raw)) if isinstance(res_raw, Mapping) else None
 
-    async def interrupt(self, req: InterruptRequest) -> InterruptResult:
+    async def interrupt(self, req: InterruptRequest, *, caller_id: str = "hibernaut") -> InterruptResult:
+        # Only the caller that submitted a run may stop it; the node checks the same against its own record.
+        identity = self._inflight_identity.get(req.run_id)
         runner_id = self._run_to_runner.get(req.run_id)
-        if runner_id is None:
+        if runner_id is None or identity is None or identity[0] != caller_id:
             return InterruptResult(run_id=req.run_id, accepted=False, state="not_found")
         conn = self._conns.get(runner_id)
         if conn is None:
             return InterruptResult(run_id=req.run_id, accepted=False, state="not_found")
-        resp = await self._rpc(conn, "run.interrupt", {"request": req.to_dict()})
+        resp = await self._rpc(conn, "run.interrupt", {"caller_id": caller_id, "request": req.to_dict()})
         return InterruptResult.from_dict(cast(Mapping[str, Any], resp["result"]))
 
     async def reclaim_workspace(self, req: ReclaimRequest, *, caller_id: str = "hibernaut") -> ReclaimResult:

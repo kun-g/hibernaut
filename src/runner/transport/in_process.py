@@ -34,7 +34,7 @@ class InProcessRunnerClient:
         return await self._daemon.run(enforced, caller_id=self._caller_id)
 
     async def interrupt(self, req: InterruptRequest) -> InterruptResult:
-        return await self._daemon.interrupt(req)
+        return await self._daemon.interrupt(req, caller_id=self._caller_id)
 
     async def reclaim_workspace(self, req: ReclaimRequest) -> ReclaimResult:
         enforced = replace(req, namespace=self._bound_namespace)

@@ -189,7 +189,7 @@ def test_cancelled_run_reaps_process_group_and_keeps_workspace_busy_until_reaped
         assert not _alive(leader), "cancelled run left its CLI process running"
         assert _wait_dead(grandchild), "cancelled run left a process of its group running"
         assert daemon.capabilities_sync().slots.active_runs == 0
-        cancelled = daemon.query_run("run_cancel_1")
+        cancelled = daemon.query_run("run_cancel_1", caller_id="hibernaut")
         assert cancelled is not None and cancelled.status == "interrupted"
 
         after = await daemon.run(_req("run_cancel_3", executor_id="cwd"), caller_id="hibernaut")

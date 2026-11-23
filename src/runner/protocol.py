@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -618,10 +620,27 @@ def _req_list(raw: Mapping[str, Any], key: str) -> list[Any]:
     return cast(list[Any], val)
 
 
-RunIdentity: TypeAlias = tuple[str, str, str, str, str, str, bool]
+RunIdentity: TypeAlias = tuple[str, str, str, str, str, str, bool, str]
+
+# Fields that do not change what runs: the key itself, a lease that a retry may carry refreshed, caller bookkeeping.
+_NON_EXECUTION_FIELDS: Final = frozenset({"run_id", "credential_lease", "metadata", "schema_version"})
 
 
 def run_identity(req: RunRequest, caller_id: str) -> RunIdentity:
     # run_id is an idempotency key only within one request: a retry must come from the same caller for the same
-    # workspace and executor. Hub and daemon both refuse a run_id reused for anything else.
-    return (caller_id, req.namespace, req.project_key, req.owner_scope, req.work_key, req.executor_id, req.readonly)
+    # workspace and executor, and ask for the same execution (prompt, session, interactive, schema, timeouts, ...).
+    # Hub and daemon both refuse a run_id reused for anything else.
+    execution = {k: v for k, v in req.to_dict().items() if k not in _NON_EXECUTION_FIELDS}
+    digest = hashlib.sha256(
+        json.dumps(execution, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return (
+        caller_id,
+        req.namespace,
+        req.project_key,
+        req.owner_scope,
+        req.work_key,
+        req.executor_id,
+        req.readonly,
+        digest,
+    )

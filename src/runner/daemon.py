@@ -37,7 +37,6 @@ from runner.worktree import (
     OrcaWorktreeBackend,
     WorkspaceIsolationError,
     WorktreeManager,
-    restore_readonly_worktree,
     worktree_fingerprint,
 )
 
@@ -116,7 +115,14 @@ class RunnerDaemon:
     def close(self) -> None:
         self._worktrees.close()
 
-    def query_run(self, run_id: str) -> RunResult | None:
+    def _owned_by(self, run_id: str, caller_id: str) -> bool:
+        known = self._run_identities.get(run_id)
+        return known is not None and known[0] == caller_id
+
+    def query_run(self, run_id: str, *, caller_id: str) -> RunResult | None:
+        # Another caller learns nothing about a run, not even that it exists.
+        if not self._owned_by(run_id, caller_id):
+            return None
         return self._completed_runs.get(run_id)
 
     def knows_run(self, run_id: str) -> bool:
@@ -204,7 +210,10 @@ class RunnerDaemon:
 
         try:
             result = await self._execute_slot(req, policy=policy, project=project, driver=driver, entry=entry, started_at=started_at, start_mono=start_mono)
-            self._completed_runs[req.run_id] = result
+            # A refusal (workspace_busy, isolation) ran nothing: the same request may run once the cause is gone. The
+            # hub caches the same way.
+            if result.status != "refused":
+                self._completed_runs[req.run_id] = result
             if not entry.future.done():
                 entry.future.set_result(result)
             return result
@@ -245,7 +254,9 @@ class RunnerDaemon:
             self._active_slots = max(0, self._active_slots - 1)
             self._active_runs.pop(req.run_id, None)
 
-    async def interrupt(self, req: InterruptRequest) -> InterruptResult:
+    async def interrupt(self, req: InterruptRequest, *, caller_id: str) -> InterruptResult:
+        if not self._owned_by(req.run_id, caller_id):
+            return InterruptResult(run_id=req.run_id, accepted=False, state="not_found")
         if req.run_id in self._completed_runs:
             return InterruptResult(run_id=req.run_id, accepted=False, state="already_finished")
         entry = self._active_runs.get(req.run_id)
@@ -417,7 +428,14 @@ class RunnerDaemon:
         if pre_fp is not None:
             post_fp = await asyncio.to_thread(worktree_fingerprint, resolved.workdir)
             if post_fp != pre_fp:
-                await _to_thread_to_completion(restore_readonly_worktree, resolved.workdir, resolved.ref.head_sha)
+                await _to_thread_to_completion(
+                    self._worktrees.restore_readonly,
+                    policy=policy,
+                    project=project,
+                    owner_scope=req.owner_scope,
+                    work_key=req.work_key,
+                    head_sha=resolved.ref.head_sha,
+                )
                 return RunResult(
                     run_id=req.run_id,
                     runner_id=self._config.runner_id,

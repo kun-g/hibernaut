@@ -16,6 +16,8 @@ from runner.config import NamespacePolicy, ProjectCheckout
 from runner.protocol import ReclaimResult, WorktreeRef, utc_now_iso
 
 _SAFE_HINT_RE: Final = re.compile(r"[^a-z0-9_-]+")
+# Under the worktree base dir; write directories always start with a namespace prefix, never a dot.
+_READONLY_DIR: Final = ".readonly"
 WorkspaceStatus = Literal["creating", "ready", "reclaiming"]
 
 
@@ -458,7 +460,26 @@ class WorktreeManager:
         digest = hashlib.sha256(
             "\0".join((policy.namespace, project.project_key, owner_scope, work_key)).encode("utf-8")
         ).hexdigest()[:16]
-        return self._base_dir(project.checkout_path.resolve()) / f"{policy.prefix}-ro-{digest}"
+        return self._readonly_base_dir(project.checkout_path.resolve()) / f"{policy.prefix}-ro-{digest}"
+
+    def _readonly_base_dir(self, primary: Path) -> Path:
+        # A root of its own: write directories are named "<prefix>-<hint>" directly under the base dir, and a hint may
+        # be anything, so a readonly name in that same directory could be a task's write worktree.
+        base_dir = self._base_dir(primary) / _READONLY_DIR
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return base_dir
+
+    def _assert_readonly_owned(self, primary: Path, workdir: Path) -> None:
+        # Checked before any reset, clean or delete: these wipe a directory, so it must be one only readonly runs use.
+        resolved = workdir.resolve()
+        if resolved.parent != self._readonly_base_dir(primary):
+            raise WorkspaceIsolationError(f"readonly workdir {resolved} is outside the readonly worktree root")
+        if resolved == primary:
+            raise WorkspaceIsolationError(f"readonly workdir {resolved} is the primary checkout")
+        with self._lock:
+            held = {Path(str(r[0])).resolve() for r in self._conn.execute("SELECT workdir FROM workspaces").fetchall()}
+        if resolved in held or resolved in set(_registered_worktrees(primary).values()):
+            raise WorkspaceIsolationError(f"readonly workdir {resolved} belongs to a task worktree")
 
     def _resolve_readonly(
         self, *, policy: NamespacePolicy, project: ProjectCheckout, owner_scope: str, work_key: str
@@ -477,6 +498,7 @@ class WorktreeManager:
             if target is None:
                 target = _resolve_commit(primary, project.default_base_ref)
             workdir = self.readonly_workdir(policy=policy, project=project, owner_scope=owner_scope, work_key=work_key)
+            self._assert_readonly_owned(primary, workdir)
             if workdir.resolve() in _registered_worktree_paths(primary) and workdir.exists():
                 restore_readonly_worktree(workdir, target)
             else:
@@ -494,6 +516,15 @@ class WorktreeManager:
                 ref=self._build_ref(work_key, "HEAD", workdir),
             )
 
+    def restore_readonly(
+        self, *, policy: NamespacePolicy, project: ProjectCheckout, owner_scope: str, work_key: str, head_sha: str | None
+    ) -> None:
+        primary = project.checkout_path.resolve()
+        workdir = self.readonly_workdir(policy=policy, project=project, owner_scope=owner_scope, work_key=work_key)
+        with self._lock:
+            self._assert_readonly_owned(primary, workdir)
+            restore_readonly_worktree(workdir, head_sha)
+
     def remove_readonly(self, *, policy: NamespacePolicy, project: ProjectCheckout, owner_scope: str, work_key: str) -> bool:
         return self._remove_readonly(policy=policy, project=project, owner_scope=owner_scope, work_key=work_key)
 
@@ -502,6 +533,8 @@ class WorktreeManager:
         workdir = self.readonly_workdir(policy=policy, project=project, owner_scope=owner_scope, work_key=work_key)
         if not workdir.exists():
             return False
+        with self._lock:
+            self._assert_readonly_owned(primary, workdir)
         res = _run_cmd(["git", "worktree", "remove", "--force", str(workdir)], cwd=primary)
         if res.returncode != 0:
             raise RuntimeError(f"git worktree remove failed: {res.stderr.strip() or res.stdout.strip()}")
@@ -528,6 +561,8 @@ class WorktreeManager:
             )
         except RuntimeError as exc:
             return ReclaimResult(reclaimed=False, status="error", reason=str(exc), blockers=("remove_failed",))
+        except WorkspaceIsolationError as exc:
+            return ReclaimResult(reclaimed=False, status="blocked", reason=str(exc), blockers=("readonly_not_owned",))
         with self._lock:
             rec = self.get_record(
                 namespace=policy.namespace,
