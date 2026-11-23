@@ -37,11 +37,8 @@ from agent_runtime.core.models import (
     Silent,
     Suspend,
     TaskLink,
-    explicit_trace_id,
     new_id,
     resolve_agent_id,
-    resolve_trace_id,
-    resolve_trigger_event,
     utc_now_iso,
 )
 from agent_runtime.core.ports import (
@@ -79,12 +76,15 @@ from agent_runtime.engine.forwarding import (
     return_refusal,
     returned_piece,
     returned_pieces,
+    run_lineage,
     run_spec,
     same_piece,
     settled_return,
     task_hop_count,
+    task_trace_id,
     withdrawn,
     withdrawn_forward,
+    with_lineage,
 )
 
 
@@ -219,7 +219,7 @@ def _task_link(events: list[Event], session_ref: SessionRef | None) -> TaskLink 
     for evt in reversed(events):
         task_id = evt.payload.get("task_id")
         if isinstance(task_id, str) and task_id:
-            trace_id = evt.payload.get("trace_id")
+            trace_id = task_trace_id(evt)
             hop_count = task_hop_count(evt)
             return TaskLink(
                 task_id=task_id,
@@ -229,13 +229,8 @@ def _task_link(events: list[Event], session_ref: SessionRef | None) -> TaskLink 
     return session_ref.task_link if session_ref is not None else None
 
 
-def _run_trace_id(events: list[Event], session: SessionRef | None) -> str:
-    # An approval resume carries no trace of its own; the session's Taskboard task does.
-    trigger = resolve_trigger_event(events)
-    link = _task_link(events, session)
-    if explicit_trace_id(trigger) is None and link is not None and link.trace_id:
-        return link.trace_id
-    return resolve_trace_id(trigger)
+def _run_trace_id(events: Sequence[Event], session: SessionRef | None) -> str:
+    return run_lineage(events, session)[0]
 
 
 def _task_fields(link: TaskLink, action: str, stage: str | None = None) -> dict[str, Any]:
@@ -1530,7 +1525,9 @@ class AgentWorker:
                 handed_over = forwards.hand_over(final_link)
             sent = forwards.own_returns()
             if sent:
-                known = final_spec or ForwardSpec(target_inbox=inbox_id, origin_key=final_corr)
+                known = final_spec or with_lineage(
+                    ForwardSpec(target_inbox=inbox_id, origin_key=final_corr), consumed, active_session
+                )
                 # A Run repeated after a crash sends the same pieces: one that is settled by now is not awaited again.
                 settled = {*known.cancelled_returns, *returned_pieces(consumed)}
                 final_spec = replace(known, pending_returns=tuple(dict.fromkeys(
@@ -1539,6 +1536,9 @@ class AgentWorker:
         if final_spec is not None and forwards.passes_on(final_spec):
             # From here on only the receiver owes it.
             final_spec = replace(final_spec, return_to=None, delegation_id=None, handed_on=True)
+        if isinstance(outcome, Suspend) and final_spec is None:
+            # The approval that resumes it carries no lineage of its own.
+            final_spec = with_lineage(ForwardSpec(target_inbox=inbox_id), consumed, active_session)
         awaiting = final_spec is not None and bool(final_spec.pending_returns)
         trace_id = _run_trace_id(consumed, active_session)
         report_metadata = self._report_metadata(

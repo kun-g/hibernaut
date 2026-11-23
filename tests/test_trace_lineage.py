@@ -9,21 +9,28 @@ from pathlib import Path
 from typing import Any
 
 from agent_runtime.adapters.ledger_bridge import RunLedger
-from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteInboxAdapter
+from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteInboxAdapter, SQLiteSessionStoreAdapter
 from agent_runtime.app.main import build_daemon
 from agent_runtime.core.models import (
+    FORWARD_SOURCE,
+    RETURN_CANCELLED_SOURCE,
+    RETURN_SOURCE,
     TASK_CONTEXT_KEY,
+    DeliveryOutcome,
     Emit,
     Event,
+    ForwardSpec,
     OutboxMessage,
     RunOutcome,
     SessionRef,
+    Silent,
     Suspend,
     explicit_trace_id,
     resolve_trace_id,
     resolve_trigger_event,
 )
 from agent_runtime.core.ports import InboxPort, RunCapabilities, RunLedgerPort
+from agent_runtime.engine.closing import close_session
 from agent_runtime.engine.worker import AgentWorker, ExecutorFailed, RunReport
 from tests.fakes import (
     InMemoryInbox,
@@ -35,6 +42,8 @@ from tests.fakes import (
     InMemoryTimerStore,
     RecordingChannel,
 )
+from tests.test_inbox_forwarding import DOCS, MAIN, SDE, ForwardCase
+from tests.test_inbox_forwarding import Ledger as RecordingLedger
 
 INBOX = "proj:hibernaut"
 
@@ -224,6 +233,273 @@ class TestRunTrace(unittest.IsolatedAsyncioTestCase):
                 await self._run(Emit(messages=("hi",)), events=[], inbox=inbox)
                 self.assertEqual(inbox.list_events(inbox_id=INBOX)[0].status, "done")
                 self.assertEqual(stored(), before)
+            finally:
+                db.close()
+
+
+class TestForwardLineage(ForwardCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.ledger = RecordingLedger()
+
+    def lineage(self, *sources: str) -> list[tuple[object, object]]:
+        return [(e.payload.get("trace_id"), e.payload.get("parent_event_id"))
+                for e in self.inbox.all_events() if e.source in (sources or (FORWARD_SOURCE, RETURN_SOURCE))]
+
+    def event(self, source: str) -> Event:
+        (found,) = [e for e in self.inbox.all_events() if e.source == source]
+        return found
+
+    def traces(self) -> set[object]:
+        # Every message outside and every Run in the ledger.
+        assert self.ledger is not None
+        found: set[object] = {entry.trace_id for entry in self.ledger.entries}
+        for message in self.outbox.fetch_pending(limit=1000):
+            found |= {message.metadata["_trace_id"], message.metadata[TASK_CONTEXT_KEY]["trace_id"]}
+        return found
+
+    def suspend(self, agent: str) -> None:
+        self.agents[agent].script = lambda _e, _s, _c: Suspend(request_id="r1", prompt="ok?", session_checkpoint="cp")
+
+    async def test_root_forward_and_return_form_one_chain(self) -> None:
+        self.forward("steward", SDE, "part", return_to=MAIN)
+        root = self.ingest()
+        await self.run_inbox()
+        hop = self.event(FORWARD_SOURCE)
+        self.assertEqual(
+            (hop.payload["trace_id"], hop.payload["parent_event_id"]), (root.event_id, root.event_id)
+        )
+        self.answer("sde", "part done")
+        child = await self.run_inbox(SDE)
+        back = self.event(RETURN_SOURCE)
+        self.assertEqual(
+            (back.payload["trace_id"], back.payload["parent_event_id"]), (root.event_id, hop.event_id)
+        )
+        self.answer("steward", "all done")
+        last = await self.run_inbox()
+        self.assertEqual([r.trace_id for r in child + last], [root.event_id] * 2)
+        self.assertEqual(self.traces(), {root.event_id})
+
+    async def test_external_trace_is_kept_on_every_hop(self) -> None:
+        # sde hands its piece on whole, so the reviewer returns it: three hops, the limit.
+        self.forward("steward", SDE, "part", return_to=MAIN)
+        root = self.ingest(_trace_id="trc_ext_01")
+        await self.run_inbox()
+        self.forward("sde", SDE, "check it", target_agent="code-reviewer")
+        self.answer("code-reviewer", "fine")
+        while self.queued(SDE):
+            await self.run_inbox(SDE)
+        self.answer("steward", "all done")
+        await self.run_inbox()
+        chain = [e for e in self.inbox.all_events() if e.status != "dropped"]
+        self.assertEqual([e.source for e in chain[1:]], [FORWARD_SOURCE, FORWARD_SOURCE, RETURN_SOURCE])
+        self.assertEqual({e.payload["trace_id"] for e in chain[1:]}, {"trc_ext_01"})
+        self.assertEqual([e.payload["parent_event_id"] for e in chain[1:]], [e.event_id for e in chain[:-1]])
+        self.assertEqual(chain[0].payload, root.payload)
+        self.assertEqual(len(self.sent()), 1)
+        self.assertEqual(self.traces(), {"trc_ext_01"})
+
+    async def test_direct_answer_of_the_forwarded_agent_carries_the_trace(self) -> None:
+        self.forward("steward", SDE, "all of it")
+        self.ingest(_trace_id="trc_ext_01")
+        await self.run_inbox()
+        self.answer("sde", "done")
+        await self.run_inbox(SDE)
+        self.assertEqual([m.content for m in self.sent()], ["done"])
+        self.assertEqual(self.traces(), {"trc_ext_01"})
+
+    async def test_pieces_of_one_run_share_the_trace_and_return_from_their_own_forward(self) -> None:
+        def split(_e: Sequence[Event], _s: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
+            caps.forward_to_inbox(SDE, "code", return_to=MAIN)
+            caps.forward_to_inbox(DOCS, "docs", return_to=MAIN)
+            return Silent()
+
+        self.agents["steward"].script = split
+        root = self.ingest()
+        await self.run_inbox()
+        self.assertEqual(self.lineage(), [(root.event_id, root.event_id)] * 2)
+        hops = {e.inbox_id: e.event_id for e in self.inbox.all_events() if e.source == FORWARD_SOURCE}
+        for agent, inbox_id in (("sde", SDE), ("writer", DOCS)):
+            self.answer(agent, "done")
+            await self.run_inbox(inbox_id)
+        self.assertEqual(self.lineage(RETURN_SOURCE), [(root.event_id, hops[SDE]), (root.event_id, hops[DOCS])])
+
+    async def test_a_batch_forwards_from_its_last_traced_event(self) -> None:
+        self.forward("steward", SDE, "x")
+        events = [self.ingest(trace_id="t1"), self.ingest(_trace_id="t2"), self.ingest()]
+        await self.run_inbox()
+        self.assertEqual(self.lineage(), [("t2", events[1].event_id)])
+
+    async def test_a_batch_without_a_trace_forwards_from_its_first_event(self) -> None:
+        self.forward("steward", SDE, "x")
+        first, _ = self.ingest(), self.ingest()
+        await self.run_inbox()
+        self.assertEqual(self.lineage(), [(first.event_id, first.event_id)])
+
+    async def test_the_child_returns_into_its_chain_after_an_approval(self) -> None:
+        self.forward("steward", SDE, "part", return_to=MAIN)
+        root = self.ingest()
+        await self.run_inbox()
+        self.suspend("sde")
+        await self.run_inbox(SDE)
+        self.answer("sde", "done")
+        self.ingest(SDE, key="feishu:1", approval_request_id="r1", approved=True)
+        await self.run_inbox(SDE)
+        self.assertEqual(self.lineage(RETURN_SOURCE), [(root.event_id, self.event(FORWARD_SOURCE).event_id)])
+        self.assertEqual(self.traces(), {root.event_id})
+
+    async def test_a_message_with_another_trace_does_not_move_an_owed_return(self) -> None:
+        self.forward("steward", SDE, "part", return_to=MAIN)
+        root = self.ingest()
+        await self.run_inbox()
+        self.suspend("sde")
+        await self.run_inbox(SDE)
+        self.answer("sde", "done")
+        self.ingest(SDE, approval_request_id="r1", approved=True, trace_id="trc_approval")
+        await self.run_inbox(SDE)
+        self.assertEqual(self.lineage(RETURN_SOURCE), [(root.event_id, self.event(FORWARD_SOURCE).event_id)])
+
+    async def test_a_forward_approved_later_still_descends_from_the_first_event(self) -> None:
+        for trace in (None, "trc_ext_01"):
+            with self.subTest(trace=trace), tempfile.TemporaryDirectory() as tmp:
+                self.setUp()
+                db = SQLiteDatabase(Path(tmp) / "t.db")
+                try:
+                    # The stored session is all that is left of the first Run when the approval comes.
+                    self.sessions = SQLiteSessionStoreAdapter(db)  # type: ignore[assignment]
+                    self.suspend("steward")
+                    root = self.ingest(**({"_trace_id": trace} if trace else {}))
+                    await self.run_inbox()
+                    self.forward("steward", SDE, "x", return_to=MAIN)
+                    self.ingest(approval_request_id="r1", approved=True)
+                    await self.run_inbox()
+                    self.assertEqual(self.lineage(), [(trace or root.event_id, root.event_id)])
+                    self.assertEqual(self.traces(), {trace or root.event_id})
+                finally:
+                    db.close()
+
+    async def test_a_new_message_after_the_chain_starts_its_own_trace(self) -> None:
+        self.suspend("steward")
+        self.ingest(_trace_id="trc_ext_01")
+        await self.run_inbox()
+        self.answer("steward", "done")
+        self.ingest(approval_request_id="r1", approved=True)
+        await self.run_inbox()
+        self.forward("steward", SDE, "x")
+        later = self.ingest()
+        await self.run_inbox()
+        self.assertEqual(self.lineage(), [(later.event_id, later.event_id)])
+
+    async def test_a_held_return_keeps_its_lineage(self) -> None:
+        self.forward("steward", SDE, "part", return_to=MAIN)
+        root = self.ingest()
+        await self.run_inbox()
+        self.answer("sde", "done")
+        self.gate("defer")
+        (report,) = await self.run_inbox(SDE)
+        assert isinstance(report.outcome, Suspend)
+        self.ingest(SDE, key=None, approval_request_id=report.outcome.request_id, approved=True)
+        decided = await self.run_inbox(SDE)
+        self.assertEqual(self.lineage(RETURN_SOURCE), [(root.event_id, self.event(FORWARD_SOURCE).event_id)])
+        self.assertEqual([r.trace_id for r in decided], [root.event_id])
+        self.assertEqual(self.traces(), {root.event_id})
+
+    async def test_failures_go_back_with_the_lineage(self) -> None:
+        self.forward("steward", SDE, "part", return_to=MAIN)
+        root = self.ingest()
+        await self.run_inbox()
+        self.crash("sde", "boom")
+        with self.assertRaises(ExecutorFailed):
+            await self.run_inbox(SDE)
+        self.assertEqual(self.lineage(RETURN_SOURCE), [(root.event_id, self.event(FORWARD_SOURCE).event_id)])
+
+    async def test_a_cancelled_return_names_the_chain_it_ends(self) -> None:
+        self.forward("steward", SDE, "part", return_to=MAIN)
+        root = self.ingest()
+        await self.run_inbox()
+        self.suspend("sde")
+        (report,) = await self.run_inbox(SDE)
+        session = self.sessions.get(report.session_id or "")
+        assert session is not None
+        close_session(session, self.sessions, self.inbox.append, cause="test")
+        self.assertEqual(
+            self.lineage(RETURN_CANCELLED_SOURCE), [(root.event_id, self.event(FORWARD_SOURCE).event_id)]
+        )
+        ended = await self.run_inbox()
+        self.assertEqual([r.trace_id for r in ended], [root.event_id])
+        self.assertEqual(self.traces(), {root.event_id})
+
+    async def test_a_handed_over_task_reports_its_own_trace(self) -> None:
+        # The message asking for the forward is in another trace than the task its session works on.
+        self.answer("steward", "opened", delivery=DeliveryOutcome("pr_open"))
+        self.ingest(event_type="work.ready", task_id="T1", trace_id="trc_task", hop_count=1)
+        await self.run_inbox()
+        self.forward("steward", SDE, "x")
+        self.ingest(_trace_id="trc_ext_01")
+        await self.run_inbox()
+        hop = self.event(FORWARD_SOURCE)
+        self.answer("sde", "done")
+        await self.run_inbox(SDE)
+        last = self.outbox.fetch_pending(limit=1000)[-1].metadata
+        self.assertEqual((last["task_id"], last["trace_id"], last["hop_count"]), ("T1", "trc_task", 1))
+        self.assertEqual((hop.payload["trace_id"], last["_trace_id"]), ("trc_ext_01", "trc_ext_01"))
+
+    async def test_a_task_without_a_trace_gets_none_from_the_forward(self) -> None:
+        self.forward("steward", SDE, "x")
+        root = self.ingest(event_type="work.ready", task_id="T1")
+        await self.run_inbox()
+        self.answer("sde", "done")
+        await self.run_inbox(SDE)
+        last = self.outbox.fetch_pending(limit=1000)[-1].metadata
+        self.assertEqual((last["task_id"], last.get("trace_id"), last["_trace_id"]), ("T1", None, root.event_id))
+
+    async def test_a_task_forwarded_before_the_upgrade_keeps_its_trace(self) -> None:
+        self.answer("sde", "done")
+        self.inbox.append(Event(
+            inbox_id=SDE, source=FORWARD_SOURCE, external_id="forward:old:0",
+            payload={"text": "x", "hop_count": 1, "forwarded_from": MAIN, "task_id": "T1", "trace_id": "trc_task"},
+        ))
+        await self.run_inbox(SDE)
+        self.assertEqual(self.outbox.fetch_pending(limit=1000)[-1].metadata["trace_id"], "trc_task")
+
+    async def test_forwarded_events_stay_byte_identical_in_the_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SQLiteDatabase(Path(tmp) / "t.db")
+            try:
+                self.inbox = SQLiteInboxAdapter(db)  # type: ignore[assignment]
+
+                def stored() -> dict[str, bytes]:
+                    with db.transaction() as conn:
+                        return dict(conn.execute("SELECT event_id, CAST(payload_json AS BLOB) FROM event_inbox"))
+
+                root = _event("evt_root", {"title": "标题", "n": {"b": 1, "a": [2]}}, correlation_key="feishu:1")
+                self.inbox.append(root)
+                before = stored()
+                self.forward("steward", SDE, "part", return_to=MAIN)
+                await self.run_inbox()
+                after_forward = stored()
+                self.assertEqual(len(after_forward), 2)
+                self.assertEqual(after_forward["evt_root"], before["evt_root"])
+                self.answer("sde", "done")
+                await self.run_inbox(SDE)
+                self.answer("steward", "all done")
+                await self.run_inbox()
+                final = stored()
+                self.assertEqual(len(final), 3)
+                self.assertEqual({k: final[k] for k in after_forward}, after_forward)
+            finally:
+                db.close()
+
+    def test_the_spec_keeps_its_lineage_in_the_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SQLiteDatabase(Path(tmp) / "t.db")
+            try:
+                store = SQLiteSessionStoreAdapter(db)
+                spec = ForwardSpec(target_inbox=SDE, trace_id="t", parent_event_id="e")
+                store.save(SessionRef(session_id="s", inbox_id=SDE, forward=spec))
+                saved = store.get("s")
+                assert saved is not None
+                self.assertEqual(saved.forward, spec)
             finally:
                 db.close()
 

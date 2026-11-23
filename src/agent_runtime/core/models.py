@@ -151,6 +151,10 @@ class ForwardSpec:
     hop_count: int = 0
     forwarded_from: str | None = None
     parent_session_id: str | None = None
+    # The trace of this work and the event its latest Run descends from: what the session sends on carries both, also
+    # after an approval that names neither. Empty only in a record stored before they were kept.
+    trace_id: str = ""
+    parent_event_id: str = ""
     reply_channel: str | None = None
     reply_target: str | None = None
     # Correlation key of the external conversation this work belongs to.
