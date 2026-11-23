@@ -7,6 +7,8 @@ import asyncio
 import json
 import os
 from collections.abc import Sequence
+from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 import agent_runtime.app.main as hibernaut_main
@@ -40,4 +42,12 @@ class EchoBodyLLM:
 
 if __name__ == "__main__":
     hibernaut_main.RuleBasedDemoLLM = EchoBodyLLM  # type: ignore[misc, assignment]
+    if clock_file := os.environ.get("HB_E2E_OUTBOX_CLOCK"):
+        def outbox_now() -> datetime:
+            try:
+                return datetime.fromisoformat(Path(clock_file).read_text())
+            except FileNotFoundError:
+                return datetime.now(timezone.utc)
+
+        hibernaut_main.OutboxDispatcher = partial(hibernaut_main.OutboxDispatcher, utc_clock=outbox_now)
     hibernaut_main.main()

@@ -122,6 +122,7 @@ class DualProcessEndToEndTests(unittest.TestCase):
         self.sb_db = self.root / "switchboard.db"
         self.hb_db = self.root / "hibernaut.db"
         self.gate = self.root / "gate.open"
+        self.outbox_clock = self.root / "outbox-clock"
 
         sb_config = self.root / "switchboard.toml"
         sb_config.write_text(
@@ -193,6 +194,7 @@ consumer_id = "{CONSUMER}"
                 SWITCHBOARD_RELAY_TOKEN=RELAY_TOKEN,
                 SWITCHBOARD_MCP_TOKEN=MCP_TOKEN,
                 HB_E2E_GATE=str(self.gate),
+                HB_E2E_OUTBOX_CLOCK=str(self.outbox_clock),
             ),
             self.root,
         )
@@ -305,6 +307,9 @@ consumer_id = "{CONSUMER}"
         self.wait(lambda: any(b == "echo: second while offline" for _, b in self.reports()), "backlog reported")
 
     def test_switchboard_restart_is_ridden_out_by_outbox_backoff(self) -> None:
+        tick = self.outbox_clock.with_suffix(".tmp")
+        tick.write_text("2030-01-01T00:00:00.000000+00:00")
+        tick.replace(self.outbox_clock)
         event_id = self.post_message("gate-1", "gate: report after the switchboard restarts")
         self.wait(lambda: self.delivery(event_id) == ("acked", 1), "gated event acked")
 
@@ -313,10 +318,13 @@ consumer_id = "{CONSUMER}"
         self.wait(lambda: any(attempts >= 1 for _, _, attempts, _ in self.hb_outbox()), "first failed upload")
         (_, status, attempts, next_retry_at), = self.hb_outbox()
         self.assertEqual((status, attempts), ("pending", 1))
-        self.assertIsNotNone(next_retry_at)
+        self.assertEqual(next_retry_at, "2030-01-01T00:00:05.000000+00:00")
 
         self.start_switchboard()
-        # First backoff step is 5s; allow for it plus the dispatcher's polling interval.
+        self.assertEqual(self.hb_outbox()[0][1:], ("pending", 1, next_retry_at))
+        assert next_retry_at is not None
+        tick.write_text(next_retry_at)
+        tick.replace(self.outbox_clock)
         self.wait(lambda: self.hb_outbox()[0][1] == "sent", "outbox sent after backoff", timeout=20.0)
         (_, status, attempts, next_retry_at), = self.hb_outbox()
         self.assertEqual((status, attempts, next_retry_at), ("sent", 1, None))
