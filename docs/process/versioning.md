@@ -29,7 +29,9 @@ When a change mixes kinds, report the highest one (`breaking` > `feature` > `fix
 ## Gates
 
 Before the pull request is pushed, the delivery step runs the repository gates from `AGENTS.md` in order:
-`lint-imports`, `pytest -v`, `pyright`. A failing gate pushes nothing; the task waits with the output.
+`lint-imports`, `pytest -n auto --dist worksteal -v` (the full suite, in parallel), `pyright`. A failing gate pushes
+nothing; the task waits with the output. Serial `pytest -v` is only for investigating a failure that may come from
+running in parallel.
 
 ## Merging
 

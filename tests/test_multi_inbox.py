@@ -81,6 +81,21 @@ class TestPartitionedMemoryAndWorkspace(unittest.TestCase):
         with self.assertRaises(PermissionError):
             mem_a.write("global/instructions.md", "tampered")
 
+    def test_forbids_sharing_a_directory_under_another_spelling_or_created_later(self) -> None:
+        self.registry.register("sys:a", workspace_dir=self.root / "Later")
+        for other in ("Later", "later"):
+            with self.subTest(other), self.assertRaises(ValueError):
+                self.registry.register("sys:b", workspace_dir=self.root / other)
+        (self.root / "Later").mkdir()
+        (self.root / "link").symlink_to(self.root / "Later")
+        for other in ("Later", "link"):
+            with self.subTest(other, created=True), self.assertRaises(ValueError):
+                self.registry.register("sys:b", workspace_dir=self.root / other)
+        # An inbox may change its own directory, which frees the one it had.
+        self.registry.register("sys:a", workspace_dir=self.root / "mine")
+        self.registry.register("sys:b", workspace_dir=self.root / "later2")
+        self.registry.register("sys:b", workspace_dir=self.root / "Later")
+
     def test_forbids_two_inbox_ids_mounting_same_workspace_directory(self) -> None:
         shared_repo = self.root / "shared_repo"
         shared_repo.mkdir()

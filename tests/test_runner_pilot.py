@@ -397,6 +397,34 @@ def test_the_general_runner_and_the_route_are_independent(tmp_path: Path) -> Non
         daemon.close()
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_a_workdir_binding_of_a_projectless_inbox_does_not_take_the_pilot_inbox_over(tmp_path: Path, enabled: bool) -> None:
+    raw = _raw(enabled=enabled)
+    (tmp_path / "ops").mkdir()
+    raw["projects"]["hibernaut"] |= {"checkout": str(tmp_path), "inbox_id": "proj:hibernaut"}
+    raw["runtime"] |= {
+        "db_path": str(tmp_path / "hb.db"), "memory_root": str(tmp_path / "mem"),
+        "inbox_bindings": [
+            {"pattern": "hibernaut:.*", "workdir": str(tmp_path / "ops"), "checkout_access": "readonly", "default_agent": "cli"}
+        ],
+    }
+    relay = _FakeRelay(_result)
+    daemon = build_daemon_from_config(
+        parse_config(raw, base_dir=tmp_path), runner_pilot=relay if enabled else None, channel=RecordingChannel(),  # type: ignore[arg-type]
+    )
+    try:
+        pilot, other = (daemon.pool._worker_factory(inbox, "w") for inbox in (PILOT, OTHER))
+        assert isinstance(other._executors[PROTOCOL_CHECK_EXECUTOR_ID], ClosedRouteExecutor)
+        assert set(pilot._executors) == ({PROTOCOL_CHECK_EXECUTOR_ID} if enabled else set(other._executors))
+        daemon.handler.ingest(inbox_id=PILOT, source="t", external_id="1", payload={"candidate_commit": COMMIT})
+        if enabled:
+            _process(daemon, PILOT)
+            (sent,) = _rows(daemon, "outbox", PILOT)
+            assert "Runner 协议文件校验通过" in sent["content"] and len(relay.requests) == 1
+    finally:
+        daemon.close()
+
+
 def _process(daemon: AlwaysOnDaemon, inbox_id: str, executor: Any = None) -> None:
     worker = daemon.pool._worker_factory(inbox_id, "w")
     if executor is not None:

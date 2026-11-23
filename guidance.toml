@@ -7,3 +7,8 @@ summary = "Version numbers, change kinds and how a delivery sets the version"
 activities = ["versioning", "release"]
 tags = ["version", "release"]
 paths = ["src/agent_runtime/__init__.py", "pyproject.toml"]
+
+[[docs]]
+path = "docs/inbox-conventions.md"
+summary = "How inboxes are named, when to share or split them, where dependencies go, and workdirs of inboxes outside projects"
+tags = ["inbox", "routing", "steward"]

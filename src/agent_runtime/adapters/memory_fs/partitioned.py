@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,25 @@ def check_inbox_id(inbox_id: str) -> None:
         raise ValueError("inbox_id must be a non-empty string")
     if ".." in inbox_id or "/" in inbox_id or "\\" in inbox_id:
         raise ValueError(f"Invalid inbox_id path characters: {inbox_id}")
+
+
+def directory_key(path: Path) -> tuple[object, ...]:
+    # The same directory under another spelling, link or letter case is the same one. A part that is not there yet is
+    # compared without letter case: created, both spellings name one directory on a volume that ignores it.
+    path = path.resolve()
+    missing: list[str] = []
+    for directory in (path, *path.parents):
+        try:
+            found = directory.stat()
+        except OSError:
+            missing.append(_folded(directory.name))
+            continue
+        return found.st_dev, found.st_ino, *reversed(missing)
+    return (_folded(str(path)),)
+
+
+def _folded(text: str) -> str:
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", text).casefold())
 
 
 def _sanitize_inbox_id(inbox_id: str) -> str:
@@ -87,7 +107,7 @@ class WorkspacePartitionRegistry:
             self._global_instructions.write_text("", encoding="utf-8")
 
         self._bindings: dict[str, PartitionBinding] = {}
-        self._workspace_owners: dict[Path, str] = {}
+        self._workspaces: dict[str, Path] = {}
 
     @property
     def global_instructions_path(self) -> Path:
@@ -108,18 +128,18 @@ class WorkspacePartitionRegistry:
         resolved_workspace = Path(workspace_dir).resolve() if workspace_dir is not None else None
 
         if resolved_workspace is not None:
-            owner = self._workspace_owners.get(resolved_workspace)
-            # Hard concurrency invariant: two inbox_ids must never share a local code directory.
-            if owner is not None and owner != inbox_id:
+            # Hard concurrency invariant: two inbox_ids must never share a local code directory. Keys are read anew:
+            # a directory's key changes when it is created.
+            key = directory_key(resolved_workspace)
+            owner = next((other for other, theirs in self._workspaces.items()
+                          if other != inbox_id and directory_key(theirs) == key), None)
+            if owner is not None:
                 raise ValueError(
                     f"Workspace directory '{resolved_workspace}' is already mounted by "
                     f"inbox_id '{owner}'; different inbox_ids must not share a local code "
                     "directory (use an isolated git worktree)."
                 )
-            previous = self._bindings.get(inbox_id)
-            if previous is not None and previous.workspace_dir is not None:
-                self._workspace_owners.pop(previous.workspace_dir, None)
-            self._workspace_owners[resolved_workspace] = inbox_id
+            self._workspaces[inbox_id] = resolved_workspace
 
         binding = PartitionBinding(
             inbox_id=inbox_id,

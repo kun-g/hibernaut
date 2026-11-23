@@ -46,13 +46,13 @@ class ReceiverProcessTests(unittest.TestCase):
         proc.communicate()
 
     def wait_registered(self, proc: subprocess.Popen[str], name: str = "hb") -> None:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 self.fail(f"receiver exited {proc.returncode}: {proc.communicate()}")
-            # receiver.json is written after the registration and still names the previous receiver until then.
+            # The receiver registers before it writes receiver.json.
             info = receiver_info(name, self.state)
-            if info is not None and info.pid == proc.pid and any(s.pid == proc.pid for s in discover([self.cfg])):
+            if any(s.pid == proc.pid for s in discover([self.cfg])) and info is not None and info.pid == proc.pid:
                 return
             time.sleep(0.05)
         self.fail("receiver never registered")
@@ -66,7 +66,7 @@ class ReceiverProcessTests(unittest.TestCase):
         return frame["msg_id"]
 
     def wait_records(self, inbox_log_read, count: int):  # type: ignore[no-untyped-def]
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             page = inbox_log_read()
             if len(page.records) >= count:

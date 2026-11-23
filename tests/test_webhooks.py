@@ -12,10 +12,9 @@ from pathlib import Path
 
 from agent_runtime.adapters.channels import WebhookHTTPServer, create_webhook_server
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteInboxAdapter
-from agent_runtime.app.main import build_daemon
+from agent_runtime.app.main import AlwaysOnDaemon, build_daemon
 from agent_runtime.core.models import Emit, Event, Suspend
 from agent_runtime.engine.handler import EventHandler
-from agent_runtime.engine.worker import RunReport
 from tests.fakes import InMemoryInbox, RecordingChannel
 
 
@@ -32,6 +31,13 @@ class _GatedInbox(InMemoryInbox):
         else:
             self._gate.wait(timeout=5.0)
         return super().append(event)
+
+
+async def _until_reported(daemon: AlwaysOnDaemon, kind: type[Emit] | type[Suspend]) -> None:
+    # The pool still counts as idle until a worker has picked the new event up.
+    async with asyncio.timeout(30.0):
+        while not any(isinstance(r.outcome, kind) for r in daemon.pool.reports):
+            await asyncio.sleep(0.02)
 
 
 def _post_event(port: int, external_id: str) -> tuple[int, dict[str, object]]:
@@ -139,13 +145,6 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
             except urllib.error.HTTPError as err:
                 return int(err.code), json.loads(err.read().decode("utf-8"))
 
-        async def _reported(kind: type[Suspend] | type[Emit]) -> list[RunReport]:
-            # Not wait_until_idle(): a 202 means the event is stored, its wake may not have reached the loop yet.
-            async with asyncio.timeout(10):
-                while not (found := [r for r in daemon.pool.reports if isinstance(r.outcome, kind)]):
-                    await asyncio.sleep(0.02)
-            return found
-
         try:
             # 1. Trigger a Suspend on proj:ops via generic /events route
             status, _ = await asyncio.to_thread(
@@ -165,7 +164,9 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
                 ).encode("utf-8"),
             )
             self.assertEqual(status, 202)
-            suspend_reports = await _reported(Suspend)
+            await _until_reported(daemon, Suspend)
+
+            suspend_reports = [r for r in daemon.pool.reports if isinstance(r.outcome, Suspend)]
             self.assertEqual(len(suspend_reports), 1)
             assert isinstance(suspend_reports[0].outcome, Suspend)
             req_id = suspend_reports[0].outcome.request_id
@@ -176,8 +177,10 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
             }).encode("utf-8")
             status, _ = await asyncio.to_thread(_post, "/events", approval)
             self.assertEqual(status, 202)
-            emit_reports = await _reported(Emit)
+            await _until_reported(daemon, Emit)
             await daemon.dispatcher.dispatch_once()
+
+            emit_reports = [r for r in daemon.pool.reports if isinstance(r.outcome, Emit)]
             self.assertEqual(len(emit_reports), 1)
             assert isinstance(emit_reports[0].outcome, Emit)
             self.assertIn("release@example.com", emit_reports[0].outcome.messages[0])

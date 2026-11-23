@@ -48,7 +48,8 @@ def alive(pid: int) -> bool:
     return True
 
 
-async def until(condition, seconds: float = 8.0) -> bool:
+async def until(condition, seconds: float = 30.0) -> bool:
+    # Less than the 60s the processes under test sleep, so one left behind cannot end by itself in time.
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         if condition():
@@ -76,7 +77,8 @@ class Case(unittest.IsolatedAsyncioTestCase):
         return [int(p) for p in self.pids.read_text().split()] if self.pids.exists() else []
 
     async def started(self, count: int) -> list[int]:
-        self.assertTrue(await until(lambda: len(self.recorded()) == count), "the CLI did not start")
+        # The processes can be up before `terminal create` has returned to the runner.
+        self.assertTrue(await until(lambda: self.orca.terminals and len(self.recorded()) == count), "the CLI did not start")
         return self.recorded()
 
     async def all_gone(self, pids):
