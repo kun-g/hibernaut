@@ -11,7 +11,16 @@ from typing import Any
 import pytest
 
 from agent_runtime.adapters.runner_bridge import RunnerExecutorBridge, translate_run_result
-from agent_runtime.core.models import Emit, Event, PermissionDecision, RunTelemetry, SessionRef, Silent, Suspend
+from agent_runtime.core.models import (
+    Emit,
+    Event,
+    PermissionDecision,
+    RunCancelled,
+    RunTelemetry,
+    SessionRef,
+    Silent,
+    Suspend,
+)
 from runner.cli_drivers import (
     StreamEvent,
     TemplateCLIDriver,
@@ -492,3 +501,21 @@ def test_parse_runner_config_toml(tmp_path: Path) -> None:
     assert cfg.authorize_namespace("hb", "hibernaut").prefix == "hb"
     with pytest.raises(PermissionError):
         cfg.authorize_namespace("hb", "workshop")
+
+
+def test_interrupted_result_cancels_with_the_runner_telemetry() -> None:
+    result = RunResult(
+        run_id="run_i",
+        runner_id="vps-1",
+        status="interrupted",
+        executor_id="claude",
+        started_at="2026-01-01T00:00:00Z",
+        ended_at="2026-01-01T00:00:01Z",
+        duration_ms=1000,
+        exit_code=-15,
+        error_summary="interrupted: new_event",
+    )
+    with pytest.raises(asyncio.CancelledError) as info:
+        translate_run_result(result, session_id="sess_1")
+    assert isinstance(info.value, RunCancelled)
+    assert info.value.telemetry == RunTelemetry(stderr="interrupted: new_event", exit_code=-15, runner_id="vps-1")

@@ -10,6 +10,7 @@ from agent_runtime.core.models import (
     Emit,
     EmitStatus,
     Event,
+    RunCancelled,
     RunOutcome,
     RunTelemetry,
     SessionRef,
@@ -84,6 +85,10 @@ class RunnerExecutorBridge:
             # The worker cancels execute() on interrupt or shutdown; the run must not outlive this Run, or the next
             # Run on the same work_key would start a second CLI in the same worktree.
             await _uncancellable(self._stop_run(run_task, run_id))
+            if not run_task.cancelled() and run_task.exception() is None:
+                # The runner's own result says which node ran (and stopped) the Run; the worker records it.
+                result = run_task.result()
+                raise RunCancelled(result.error_summary or "interrupted", telemetry=_run_telemetry(result)) from None
             raise
         result = run_task.result()
         return translate_run_result(result, session_id=session.session_id)
@@ -116,21 +121,24 @@ async def _uncancellable(coro: Coroutine[Any, Any, None]) -> None:
     task.result()
 
 
-def translate_run_result(result: RunResult, *, session_id: str) -> RunOutcome:
+def _run_telemetry(result: RunResult) -> RunTelemetry:
     # The worker's run ledger logs, prices and classifies a Run from its telemetry, as it does for LocalCLIExecutor.
-    telemetry = RunTelemetry(
+    return RunTelemetry(
         stdout=result.stdout_excerpt,
         stderr=result.error_summary or "",
         exit_code=result.exit_code,
         error_kind=result.error_kind,
         runner_id=result.runner_id,
     )
-    return replace(_translate_status(result, session_id=session_id), telemetry=telemetry)
+
+
+def translate_run_result(result: RunResult, *, session_id: str) -> RunOutcome:
+    return replace(_translate_status(result, session_id=session_id), telemetry=_run_telemetry(result))
 
 
 def _translate_status(result: RunResult, *, session_id: str) -> RunOutcome:
     if result.status == "interrupted":
-        raise asyncio.CancelledError(result.error_summary or "interrupted")
+        raise RunCancelled(result.error_summary or "interrupted", telemetry=_run_telemetry(result))
 
     if result.status == "refused":
         return Emit(

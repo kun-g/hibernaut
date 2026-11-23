@@ -136,3 +136,69 @@ def test_successful_runner_run_is_recorded_on_the_executing_runner(tmp_path: Pat
     assert (runs[0].outcome_kind, runs[0].emit_status, runs[0].error_kind) == ("emit", "done", None)
     assert runs[0].runner_id == "runner-test-01"
     assert runs[0].exit_code == 0
+
+
+def test_new_event_interrupt_of_a_runner_run_is_recorded_on_the_executing_runner(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_git_repo(repo, with_remote=True)
+    started = tmp_path / "started"
+    # First Run blocks until the worker interrupts it; the merged rerun finds the marker and answers at once.
+    script = (
+        "import json, pathlib, time\n"
+        f"p = pathlib.Path({str(started)!r})\n"
+        "if p.exists():\n"
+        "    print(json.dumps({'outcome': 'emit', 'message': 'merged from runner'}))\n"
+        "else:\n"
+        "    p.write_text('1')\n"
+        "    time.sleep(60)\n"
+    )
+    drivers = {
+        "claude": TemplateCLIDriver(executor_id="claude", driver_kind="custom", command=sys.executable, args=("-c", script))
+    }
+    daemon = RunnerDaemon(_make_config(tmp_path, repo), drivers=drivers)
+    client = InProcessRunnerClient(daemon, caller_id="hibernaut", bound_namespace="hb")
+    bridge = RunnerExecutorBridge(runner=client, executor_id="claude", project_key="hibernaut")
+    ledger = RunLedger(tmp_path / "ledger.db")
+    inbox, outbox = InMemoryInbox(), InMemoryOutbox()
+    first_id = _ingest(inbox)
+    worker = AgentWorker(
+        worker_id="w1",
+        inbox=inbox,
+        timers=InMemoryTimerStore(),
+        memory=InMemoryMemoryStore(),
+        permissions=InMemoryPermission(),
+        outbox=outbox,
+        lock=InMemoryLock(),
+        sessions=InMemorySessionStore(),
+        executor=bridge,
+        run_ledger=ledger.recorder,
+        new_event_policy="interrupt",
+    )
+
+    async def scenario() -> str:
+        run = asyncio.create_task(worker.process_inbox(INBOX))
+        while not started.exists():
+            await asyncio.sleep(0.02)
+        second, _ = inbox.append(
+            Event(inbox_id=INBOX, source="github", external_id="i43", payload={"text": "more"}, correlation_key=KEY)
+        )
+        await asyncio.wait_for(run, timeout=30)
+        return second.event_id
+
+    try:
+        second_id = asyncio.run(scenario())
+        runs = ledger.store.list_runs(event_id=first_id)
+    finally:
+        ledger.close()
+        daemon.close()
+
+    kinds = sorted(r.outcome_kind for r in runs)
+    assert kinds == ["emit", "interrupted"]
+    interrupted = next(r for r in runs if r.outcome_kind == "interrupted")
+    merged = next(r for r in runs if r.outcome_kind == "emit")
+    assert interrupted.runner_id == "runner-test-01"
+    # The interrupted batch went back to pending and ran again together with the new event.
+    assert set(merged.event_ids) == {first_id, second_id}
+    assert {e.event_id: e.status for e in inbox.all_events()} == {first_id: "done", second_id: "done"}
+    # Only the merged Run delivered anything.
+    assert [m.content for m in outbox.fetch_pending()] == ["merged from runner"]
