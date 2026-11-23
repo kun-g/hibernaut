@@ -1348,6 +1348,35 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         sources = [e.source for e in daemon.inbox.list_events()]
         self.assertEqual(sorted(sources), sorted(["switchboard:feishu", FORWARD_SOURCE, RETURN_SOURCE]))
 
+    async def test_a_run_retried_after_orca_was_unavailable_stays_in_its_trace(self) -> None:
+        self.set_plan([{"calls": [{"tool": "forward_to_inbox", "arguments": {"target_inbox": SDE, "text": "do it"}}]}],
+                      [{"write": {"calc.py": "x = 1\n"}}])
+
+        async def broken(*args: str, cwd: Path) -> dict[str, Any]:
+            raise RuntimeError("Orca is not running")
+
+        with patch("agent_runtime.adapters.executor_cli.orca._orca", new=broken):
+            daemon = await self.run_daemon((MAIN, "feishu:1", {"text": "x", "trace_id": "trace-1"}))
+        [card] = daemon.outbox.fetch_pending(limit=50)
+        self.assertIn("Orca is not running", card.content)
+        self.assertFalse(self.log.exists())
+        daemon.handler.ingest(
+            inbox_id=MAIN, source="switchboard:feishu", external_id="decision",
+            payload={"event_type": "approval.decided", "approved": True,
+                     "approval_request_id": card.metadata["approval_request_id"]},
+        )
+        stop = asyncio.Event()
+        pool = asyncio.create_task(daemon.pool.run_forever(stop))
+        await daemon.pool.wait_until_idle(60)
+        stop.set()
+        await pool
+        self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde"])
+        events = daemon.inbox.list_events()
+        [asked] = [e for e in events if e.external_id == "e0"]
+        [forwarded] = [e for e in events if e.source == FORWARD_SOURCE]
+        self.assertEqual((forwarded.payload["trace_id"], forwarded.payload["parent_event_id"]),
+                         ("trace-1", asked.event_id))
+
     async def test_a_deferred_return_waits_for_its_own_approval(self) -> None:
         self.set_plan(
             [

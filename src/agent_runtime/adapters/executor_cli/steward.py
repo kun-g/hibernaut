@@ -347,7 +347,7 @@ class StewardExecutor:
                     title=terminal_title(p.name, STEWARD_ROLE, tools.inbox_id), workdir=tools.checkout,
                     argv=[p.launcher.command,
                           *harness_args(p, permission_mode="dontAsk", role_args=role_args, stream=False)],
-                    env={}, stdin=_without_mentions("\n\n".join([*parts, prompt])), gate=session_gate(p), close=True,
+                    env={}, stdin=_without_mentions("\n\n".join([*parts, prompt])), gate=session_gate(p),
                     timeout_seconds=p.timeout_seconds, is_interrupted=caps.is_interrupted,
                 )
             except TerminalStartFailed as exc:

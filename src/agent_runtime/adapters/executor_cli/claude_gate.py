@@ -38,6 +38,7 @@ from agent_runtime.adapters.executor_cli.cli_terminal import (  # noqa: E402
     end_group,
     exited,
     ignore_signals,
+    one_shot_env,
     stop_on_signals,
 )
 
@@ -78,6 +79,9 @@ def _main(spec: dict[str, Any], running: list[subprocess.Popen[bytes]]) -> int:
     lease = Path(spec["lease"])
     env = {k: v for k, v in os.environ.items() if k not in spec["unset"]}
     env.update(spec["set"])
+    if once:
+        # The wrapper stripped what it inherited; the configured environment must not bring it back.
+        env = one_shot_env(env)
     p = spec["profile"]
     # A daemon started before this file was updated writes specs without the env fields.
     profile = ClaudeCodeProfile(

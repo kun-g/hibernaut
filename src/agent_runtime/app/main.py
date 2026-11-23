@@ -145,12 +145,13 @@ class AsyncWorkerPool:
         pending_inboxes: Callable[[], Iterable[str]] | None = None,
         limits: ConcurrencyLimits | None = None,
         limit_keys: Callable[[str], LimitKeys] | None = None,
+        limiter: ConcurrencyLimiter | None = None,
     ) -> None:
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be >= 1")
         self._worker_factory = worker_factory
         self._max_concurrency = max_concurrency
-        self._limiter = ConcurrencyLimiter(max_concurrency, limits)
+        self._limiter = limiter if limiter is not None else ConcurrencyLimiter(max_concurrency, limits)
         self._limit_keys = limit_keys
         self._on_run_reports = on_run_reports
         self._on_inbox_failed = on_inbox_failed
@@ -337,9 +338,11 @@ class AsyncWorkerPool:
             for idx in range(self._max_concurrency)
         ]
         stop_watch = asyncio.create_task(self._notice_stop(stop_event))
+        unsubscribe = self._limiter.subscribe(self._changed.set)
         try:
             await asyncio.gather(*tasks)
         finally:
+            unsubscribe()
             for task in (*tasks, stop_watch):
                 if not task.done():
                     task.cancel()
@@ -624,6 +627,7 @@ def build_daemon(
     project_for: Callable[[str], str | None] | None = None,
     ledger: RunLedger | None = None,
     ledger_db_path: str | Path | None = None,
+    limiter: ConcurrencyLimiter | None = None,
 ) -> AlwaysOnDaemon:
     db = database if database is not None else SQLiteDatabase(db_path)
     if ledger is None and (database is None or ledger_db_path):
@@ -775,6 +779,7 @@ def build_daemon(
         max_concurrency=max_concurrency,
         limits=resolved_limits,
         limit_keys=limit_keys,
+        limiter=limiter,
         on_run_reports=_on_reports if gdrive_writer is not None else None,
         on_inbox_failed=_on_failed if gdrive_writer is not None else None,
         # Events a stopped process accepted while draining, and Runs it detached, are picked up here.
@@ -846,6 +851,7 @@ def build_daemon_from_config(
     gdrive_client: DriveClientProtocol | None = None,
     switchboard: SwitchboardHandle | None = None,
     ledger: RunLedger | None = None,
+    limiter: ConcurrencyLimiter | None = None,
 ) -> AlwaysOnDaemon:
     # Every inbox -> project lookup goes through the router, so pattern-matched inboxes get their project's settings
     # and an inbox matching two projects raises AmbiguousProjectMatch instead of picking one.
@@ -935,6 +941,7 @@ def build_daemon_from_config(
         runs_root=Path(config.runtime.db_path).expanduser().resolve().parent / "runs",
         ledger=ledger,
         ledger_db_path=config.runtime.ledger_db_path or None,
+        limiter=limiter,
     )
 
     if has_configured_executor and not demo:
@@ -1182,6 +1189,7 @@ def build_daemon_from_config(
             max_concurrency=config.runtime.max_concurrency,
             limits=limits,
             limit_keys=limit_keys,
+            limiter=limiter,
             on_run_reports=_cli_on_reports if daemon.gdrive_result_writer is not None else None,
             on_inbox_failed=_cli_on_failed if daemon.gdrive_result_writer is not None else None,
             pending_inboxes=startup_inboxes(daemon.inbox, daemon.open_runs),
@@ -1320,6 +1328,8 @@ async def serve_configured(
     changes = config_changes(path, stop, interval=reload_interval)
 
     async with asyncio.TaskGroup() as tasks:
+        # Shared across config-reload generations so retired Runs keep occupying slots until they finish.
+        shared_limiter = daemon.pool.limiter
         generation = _Generation.start(daemon, tasks, outbox_interval_seconds=outbox_interval_seconds, halt=stop)
         # Every generation whose pool may still hold Runs: the current one and those retired by reloads.
         generations = [generation]
@@ -1359,6 +1369,7 @@ async def serve_configured(
                         demo=demo,
                         switchboard=switchboard,
                         ledger=daemon.ledger,
+                        limiter=shared_limiter,
                     )
                     handler = replacement.http_handler()
                     if address != (config.channels.host, config.channels.port):
@@ -1375,6 +1386,8 @@ async def serve_configured(
                 previous = generation
                 # Stop the old services first so two dispatchers never send the same Outbox row.
                 await previous.stop_services()
+                # Apply the new caps only after activation succeeds; retired Runs stay counted in shared_limiter.
+                shared_limiter.reconfigure(candidate.runtime.max_concurrency, concurrency_limits(candidate))
                 generation = _Generation.start(replacement, tasks, outbox_interval_seconds=outbox_interval_seconds,
                                                halt=stop)
                 generations = [g for g in generations if g.runs is not None and not g.runs.done()] + [generation]

@@ -683,15 +683,87 @@ def _read_hb_data(cfg: DashboardConfig, proc_info: dict[str, Any]) -> dict[str, 
                         }
                     )
 
+            active_runs_by_sid: dict[str, dict[str, Any]] = {
+                str(r["session_id"]): r for r in result["active_runs"]
+            }
+
             if _table_exists(conn, "event_inbox"):
                 ev_rows = conn.execute(
                     "SELECT seq, event_id, inbox_id, source, external_id, occurred_at, payload_json, session_id, "
                     "correlation_key, status, attempts, last_error "
                     "FROM event_inbox ORDER BY seq DESC LIMIT 50"
                 ).fetchall()
+
+                sessions_by_id: dict[str, dict[str, Any]] = {}
+                sessions_by_corr: dict[tuple[str, str], list[dict[str, Any]]] = {}
+                proc_ev_rows = [r for r in ev_rows if r["status"] == "processing"]
+                if proc_ev_rows and _table_exists(conn, "sessions"):
+                    sess_cols = {
+                        str(r["name"])
+                        for r in conn.execute("PRAGMA table_info(sessions)").fetchall()
+                    }
+                    parent_expr = (
+                        "parent_session_id" if "parent_session_id" in sess_cols else "NULL AS parent_session_id"
+                    )
+                    sids = sorted({str(r["session_id"]) for r in proc_ev_rows if r["session_id"]})
+                    corrs = sorted({str(r["correlation_key"]) for r in proc_ev_rows if r["correlation_key"]})
+                    clauses: list[str] = []
+                    params: list[Any] = []
+                    if sids:
+                        clauses.append(f"session_id IN ({','.join('?' for _ in sids)})")
+                        params.extend(sids)
+                    if corrs:
+                        clauses.append(f"correlation_key IN ({','.join('?' for _ in corrs)})")
+                        params.extend(corrs)
+                    if clauses:
+                        sess_rows = conn.execute(
+                            f"SELECT session_id, inbox_id, status, executor_id, work_key, correlation_key, "
+                            f"{parent_expr}, pending_request_id, updated_at "
+                            f"FROM sessions WHERE {' OR '.join(clauses)} "
+                            "ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'suspended' THEN 1 ELSE 2 END, updated_at DESC",
+                            params,
+                        ).fetchall()
+                        for sr in sess_rows:
+                            sd = dict(sr)
+                            sid_str = str(sd["session_id"])
+                            sessions_by_id[sid_str] = sd
+                            if sd.get("correlation_key"):
+                                key = (str(sd["inbox_id"]), str(sd["correlation_key"]))
+                                sessions_by_corr.setdefault(key, []).append(sd)
+
+                def _session_brief(sd: dict[str, Any], match_by: str) -> dict[str, Any]:
+                    sid_str = str(sd["session_id"])
+                    ar = active_runs_by_sid.get(sid_str)
+                    return {
+                        "session_id": sid_str,
+                        "inbox_id": sd["inbox_id"],
+                        "status": sd["status"],
+                        "executor_id": sd["executor_id"],
+                        "work_key": sd["work_key"],
+                        "correlation_key": sd["correlation_key"],
+                        "parent_session_id": sd["parent_session_id"],
+                        "pending_request_id": sd["pending_request_id"],
+                        "updated_at": sd["updated_at"],
+                        "match_by": match_by,
+                        "has_open_run": ar is not None,
+                        "open_run": (
+                            {
+                                "phase": ar["phase"],
+                                "stage": ar["stage"],
+                                "branch": ar["branch"],
+                                "elapsed_s": ar["elapsed_s"],
+                                "peer_pid": ar["peer_pid"],
+                                "peer_alive": ar["peer_alive"],
+                            }
+                            if ar is not None
+                            else None
+                        ),
+                    }
+
                 for r in ev_rows:
                     payload = _as_dict(_parse_json(r["payload_json"]))
                     subject = ""
+                    drive_file_name = ""
                     if payload:
                         subject = str(
                             payload.get("subject")
@@ -706,7 +778,25 @@ def _read_hb_data(cfg: DashboardConfig, proc_info: dict[str, Any]) -> dict[str, 
                             subject = (
                                 f"approval {payload['approval_request_id']} -> approved={payload.get('approved')}"
                             )
+                        if isinstance(payload.get("drive_file_name"), str):
+                            drive_file_name = str(payload["drive_file_name"])
                     subject = " ".join(subject.split())[:140]
+
+                    related_sessions: list[dict[str, Any]] = []
+                    if r["status"] == "processing":
+                        seen_sids: set[str] = set()
+                        ev_sid = str(r["session_id"]) if r["session_id"] else ""
+                        if ev_sid and ev_sid in sessions_by_id:
+                            related_sessions.append(_session_brief(sessions_by_id[ev_sid], "session_id"))
+                            seen_sids.add(ev_sid)
+                        ev_corr = str(r["correlation_key"]) if r["correlation_key"] else ""
+                        if ev_corr:
+                            for sd in sessions_by_corr.get((str(r["inbox_id"]), ev_corr), []):
+                                sid_str = str(sd["session_id"])
+                                if sid_str not in seen_sids:
+                                    related_sessions.append(_session_brief(sd, "correlation_key"))
+                                    seen_sids.add(sid_str)
+
                     ev: dict[str, Any] = {
                         "seq": r["seq"],
                         "event_id": r["event_id"],
@@ -720,6 +810,8 @@ def _read_hb_data(cfg: DashboardConfig, proc_info: dict[str, Any]) -> dict[str, 
                         "attempts": r["attempts"],
                         "last_error": r["last_error"],
                         "subject": subject,
+                        "drive_file_name": drive_file_name,
+                        "related_sessions": related_sessions,
                     }
                     result["events"].append(ev)
                     if str(r["source"]).startswith("sb:"):
