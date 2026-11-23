@@ -4,14 +4,16 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable, Collection, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, cast
 
 from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
 from agent_runtime.core.models import (
+    MAX_FORWARD_HOPS,
     Event,
     EventStatus,
+    ForwardSpec,
     OutboxMessage,
     OutboxStatus,
     SessionRef,
@@ -323,10 +325,13 @@ def replay_payload(
     updated = dict(payload)
     if executor_id_override:
         updated["executor_id"] = executor_id_override
+        updated.pop("agent_id", None)
     if replay_of_run_id:
         updated["_replay_of_run_id"] = replay_of_run_id
     else:
         updated.pop("_replay_of_run_id", None)
+    # Tells the replayed Run's forwards apart from the ones its first Run queued.
+    updated["_replay_id"] = new_id("rpl")
     return updated
 
 
@@ -580,6 +585,45 @@ def _task_link_from_json(raw: object) -> TaskLink | None:
     )
 
 
+def _forward_to_json(spec: ForwardSpec | None) -> str | None:
+    return json.dumps(asdict(spec), ensure_ascii=False) if spec is not None else None
+
+
+def _forward_from_json(raw: object, inbox_id: str) -> ForwardSpec | None:
+    if not raw:
+        return None
+    # An unreadable record must not hand the session a fresh hop allowance.
+    spent = ForwardSpec(target_inbox=inbox_id, hop_count=MAX_FORWARD_HOPS)
+    try:
+        data = json.loads(str(raw))
+    except json.JSONDecodeError:
+        return spent
+    if not isinstance(data, dict):
+        return spent
+    item = cast(dict[str, Any], data)
+
+    def text(key: str) -> str | None:
+        value = item.get(key)
+        return value if isinstance(value, str) and value else None
+
+    def count(key: str, fallback: int) -> int:
+        value = item.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else fallback
+
+    return ForwardSpec(
+        target_inbox=text("target_inbox") or inbox_id,
+        target_agent=text("target_agent"),
+        return_to=text("return_to"),
+        hop_count=count("hop_count", MAX_FORWARD_HOPS),
+        forwarded_from=text("forwarded_from"),
+        parent_session_id=text("parent_session_id"),
+        reply_channel=text("reply_channel"),
+        reply_target=text("reply_target"),
+        origin_key=text("origin_key"),
+        pending_returns=count("pending_returns", 0),
+    )
+
+
 class SQLiteSessionStoreAdapter:
     def __init__(self, db: SQLiteDatabase) -> None:
         self._db = db
@@ -598,6 +642,7 @@ class SQLiteSessionStoreAdapter:
             updated_at=str(row["updated_at"]),
             parent_session_id=row["parent_session_id"],
             task_link=_task_link_from_json(row["task_link"]),
+            forward=_forward_from_json(row["forward"], str(row["inbox_id"])),
         )
 
     def get(self, session_id: str) -> SessionRef | None:
@@ -605,7 +650,7 @@ class SQLiteSessionStoreAdapter:
             """
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
                    status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id,
-                   task_link
+                   task_link, forward
             FROM sessions
             WHERE session_id = ?
             """,
@@ -618,7 +663,7 @@ class SQLiteSessionStoreAdapter:
             """
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
                    status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id,
-                   task_link
+                   task_link, forward
             FROM sessions
             WHERE pending_request_id = ?
             LIMIT 1
@@ -632,7 +677,7 @@ class SQLiteSessionStoreAdapter:
             """
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
                    status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id,
-                   task_link
+                   task_link, forward
             FROM sessions
             WHERE inbox_id = ? AND correlation_key = ? AND status IN ('active', 'suspended')
             ORDER BY updated_at DESC
@@ -717,7 +762,7 @@ class SQLiteSessionStoreAdapter:
             f"""
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
                    status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id,
-                   task_link
+                   task_link, forward
             FROM sessions
             {where}
             ORDER BY updated_at DESC
@@ -746,9 +791,10 @@ class SQLiteSessionStoreAdapter:
                 """
                 INSERT INTO sessions (
                     session_id, inbox_id, correlation_key, executor_id, executor_session_id,
-                    status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id, task_link
+                    status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id, task_link,
+                    forward
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     inbox_id = excluded.inbox_id,
                     correlation_key = excluded.correlation_key,
@@ -760,7 +806,8 @@ class SQLiteSessionStoreAdapter:
                     pending_request_id = excluded.pending_request_id,
                     updated_at = excluded.updated_at,
                     parent_session_id = excluded.parent_session_id,
-                    task_link = excluded.task_link
+                    task_link = excluded.task_link,
+                    forward = excluded.forward
                 """,
                 (
                     session.session_id,
@@ -775,5 +822,6 @@ class SQLiteSessionStoreAdapter:
                     session.updated_at,
                     session.parent_session_id,
                     _task_link_to_json(session.task_link),
+                    _forward_to_json(session.forward),
                 ),
             )

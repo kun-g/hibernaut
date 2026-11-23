@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, TypeAlias
@@ -24,6 +25,12 @@ TASK_CONTEXT_KEY = "task_context"
 # Outbox kind of a message that only syncs a Taskboard task's state (claim, complete, release); channels that show
 # messages to a person skip it.
 TASK_SYNC_KIND = "task_sync"
+# Hops one external event may take between agents (forwards and returns alike) before it must be answered.
+MAX_FORWARD_HOPS = 3
+# The PermissionPort tool name every forward_to_inbox passes through.
+FORWARD_TOOL = "inbox.forward"
+FORWARD_SOURCE = "agent:forward"
+RETURN_SOURCE = "agent:return"
 
 
 def utc_now_iso() -> str:
@@ -72,6 +79,13 @@ class SessionRef:
     parent_session_id: str | None = None
     # The Taskboard task this session works on, kept across Suspend/Resume until a terminal task_action.
     task_link: TaskLink | None = None
+    # How the work in this session reached it, kept so the hop count and the owed return survive Suspend/Resume.
+    forward: ForwardSpec | None = None
+
+    @property
+    def agent_id(self) -> str | None:
+        # An agent is registered under its own executor id, so the stored executor_id names the agent.
+        return self.executor_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,13 +95,110 @@ class TaskLink:
     hop_count: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ForwardSpec:
+    target_inbox: str
+    target_agent: str | None = None
+    # Inbox that gets the result back as an agent:return event; None answers outside through the reply channel.
+    return_to: str | None = None
+    # Hops made so far, this one included: 0 for work that came from outside.
+    hop_count: int = 0
+    forwarded_from: str | None = None
+    parent_session_id: str | None = None
+    reply_channel: str | None = None
+    reply_target: str | None = None
+    # Correlation key of the external conversation this work belongs to.
+    origin_key: str | None = None
+    # Results this session still waits for from work it forwarded with a return to its own inbox.
+    pending_returns: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class InboxMatchRule:
+    agent: str
+    source: str | None = None
+    event_type: str | None = None
+    tags: tuple[str, ...] = ()
+
+    def matches(self, *, source: str | None, event_type: str | None, tags: Collection[str]) -> bool:
+        # Every condition given must hold; a rule without conditions matches nothing (default_agent is for that).
+        if self.source is None and self.event_type is None and not self.tags:
+            return False
+        if self.source is not None and self.source != source:
+            return False
+        if self.event_type is not None and self.event_type != event_type:
+            return False
+        return all(tag in tags for tag in self.tags)
+
+
+@dataclass(frozen=True, slots=True)
+class InboxBinding:
+    # The inbox rule this binding covers, as configured (an id or a pattern).
+    inbox: str
+    default_agent: str
+    # Agents the inbox may run; empty allows any declared agent.
+    agents: tuple[str, ...] = ()
+    rules: tuple[InboxMatchRule, ...] = ()
+
+    def allows(self, agent_id: str) -> bool:
+        return not self.agents or agent_id in self.agents
+
+
+@dataclass(frozen=True, slots=True)
+class InboxRoute:
+    # What routing knows of one inbox: its project, and the binding covering it when the project declares bindings.
+    project: str
+    binding: InboxBinding | None = None
+    has_bindings: bool = False
+
+
+class AgentNotAllowed(ValueError):
+    pass
+
+
+class ForwardRefused(Exception):
+    def __init__(self, reason: str, action: PermissionAction = "block") -> None:
+        super().__init__(reason)
+        # "defer" when a person may still approve the forward; "block" refuses it for good.
+        self.action: PermissionAction = action
+
+
+def resolve_agent_id(
+    event_agent_id: str | None,
+    session: SessionRef | None,
+    binding: InboxBinding | None,
+    project_default: str | None,
+    global_default: str,
+    *,
+    source: str | None = None,
+    event_type: str | None = None,
+    tags: Collection[str] = (),
+) -> str:
+    # event explicit -> open session -> inbox rules -> inbox default -> project default, then global default.
+    if event_agent_id:
+        if binding is not None and not binding.allows(event_agent_id):
+            raise AgentNotAllowed(
+                f"agent '{event_agent_id}' is not allowed in inbox binding '{binding.inbox}' "
+                f"(allowed: {', '.join(binding.agents)})"
+            )
+        return event_agent_id
+    if session is not None and session.agent_id and session.status in ("active", "suspended"):
+        return session.agent_id
+    if binding is not None:
+        for rule in binding.rules:
+            if rule.matches(source=source, event_type=event_type, tags=tags):
+                return rule.agent
+        return binding.default_agent
+    return project_default or global_default
+
+
 def resolve_executor_id(
     event_executor_id: str | None,
     session: SessionRef | None,
     project_default: str | None,
     global_default: str,
 ) -> str:
-    # 4-level sticky routing: event explicit -> existing session -> project default -> global default.
+    # Kept for callers without inbox bindings: event explicit -> existing session -> project -> global default.
     if event_executor_id:
         return event_executor_id
     if session is not None and session.executor_id:

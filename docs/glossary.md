@@ -11,10 +11,12 @@
 | **inbox_id** | 唯一标识单个逻辑 Inbox 的路由键（如 `user:main`、`proj:hibernaut`、`hibernaut:issue-42`） | 全链路一等字段 | `worker_leases` 租约锁主键；L3 据此路由项目 Memory 与仓库；与 Project 严格保持 **1 个 Project → 多个 inbox_id（1:N）** |
 | **Event** | 进入 Event Inbox 的单条不可变输入信封（经 Switchboard 转入的 GitHub 和飞书事件、Drive 轮询任务、用户消息、定时触发、审批回复） | 单次触发 | 必属某个 `inbox_id`，确定会话后即时回填 `session_id`；状态为 `pending / processing / done / failed`（去重记 `dropped`） |
 | **correlation_key** | 外部业务实体的确定性关联键（如 `github:kun-g/hibernaut#42`、`gdrive:<file_id>`、`feishu:<chat>:<thread>`），由 L3 入站适配器提取 | 隶属于某个 `inbox_id` | 通过 `SessionStorePort.find_by_correlation_key()` 映射到当前活跃/挂起 `session_id`，跨外部源自动续接并支持会话轮换 |
-| **Session / session_id** | 跨多次 Run 的逻辑会话与挂起断点上下文单元 | 隶属于某个 `inbox_id` | 显式 4 态（`active / suspended / archived / closed`）；绑定 `executor_id`、`executor_session_id`、`work_key` 与可选 `parent_session_id` |
+| **Session / session_id** | 跨多次 Run 的逻辑会话与挂起断点上下文单元 | 隶属于某个 `inbox_id` | 显式 4 态（`active / suspended / archived / closed`）；绑定 `executor_id`（即 `agent_id`，见第 3 节 Agent）、`executor_session_id`、`work_key` 与可选 `parent_session_id` |
 | **work_key** | 托管动态 `hb-*` worktree 的复用与引用计数键（默认沿用 `correlation_key`） | 单件活（Task / Issue） | 仅当某 `work_key` 下 `active / suspended` 会话引用数归零（`ref=0`）且过三关检查才允许安全回收目录 |
 | **Run** | Worker 被唤醒后执行的一轮短生命周期推理与工具循环（一次 `ExecutorPort.execute` 调用） | 单次唤醒周期 | 消费同一 `inbox_id` 的一批事件，结束时产出 `RunOutcome` 并落盘休眠 |
 | **Open Run / 脱离（detach）** | 进行中、可在进程重启后接回的 Run：`open_runs` 表里的登记加 `<state_dir>/runs/<session_id>/<run_id>/` 目录（执行器的 `state.json`）。停机时正在等 Orca 终端的 Run 被脱离：旧进程不等它、不关终端，新进程用 `resume()` 接着等结果 | 单个 Run | 正常结束时登记与目录一起删除；同一会话至多 1 个登记 |
+| **Inbox 绑定（`InboxBinding`）** | 项目配置里一条「inbox 正则 → 默认 agent、agent 白名单、选路规则」，写在 `[[projects.<name>.inbox_bindings]]`；第一个整串匹配 `inbox_id` 的生效 | 项目内 | Inbox 与 Agent 是 M:N：同一 Inbox 绑多个 Agent 时共用一把租约串行接力，同一 Agent 服务多个 Inbox 时彼此并发、worktree 隔离 |
+| **转投（forward）/ 回投（return）** | 一个 Agent 经 `RunCapabilities.forward_to_inbox` 把工作排进另一个 Inbox 的事件（`agent:forward`）/ 该工作带 `return_to` 时把结果排回指定 Inbox 的事件（`agent:return`） | 同一项目内 | `hop_count` 记这件工作在 Agent 间走过的跳数，上限 3（`MAX_FORWARD_HOPS`）；两种事件都过 `PermissionPort` |
 | **Worker / Lease** | 消费事件并拉起 Run 的无状态调度协程 / 以 `inbox_id` 为主键的限时互斥租约锁（`worker_leases`） | 每 `inbox_id` 单活 | 保证同一 `inbox_id` 同一时刻最多 1 个活跃 Run；进程崩溃后租约到期自动释放接管 |
 
 ## 2. 五大原语与运行终态
@@ -41,5 +43,9 @@
 - **ccpeer 接收端 vs. Claude Code 会话**：Claude Code 会话是 Orca 终端等处运行的交互式 `claude` 进程，在 `<配置目录>/sessions/` 登记 `messagingSocketPath`；ccpeer 接收端是以某个名字登记成 `standalone` 会话的常驻进程，只收不推理，把对方 `SendMessage(<名字>)` 的回复写进收件箱（`inbox.jsonl`，控制回执在 `control.jsonl`）。消息里的 `from-name`、`from-mode` 是发送方自称，不鉴别身份。
 - **交接方式（`handoff`）：`mcp` vs. `peer`**：Claude Code 角色会话取任务、交结果的通道，按项目配置。`mcp` 由启动器挂的 `hibernaut_handoff` MCP 服务读写 hb 进程所建的轮次目录；`peer` 把任务以 ccpeer 消息发给会话、会话 `SendMessage` 把结果 JSON 发回常驻接收端，hb 按持久化游标读收件箱。`task_id` 标识一次任务（取 Hibernaut `session_id`），`attempt_id` 标识其中一轮（首次开发、返工、跟进各一个），结果必须带上当前轮的两者才被接受。
 - **Taskboard（多源任务与 DAG 排期）**：负责归集来自多源的任务（`TaskItem`），维护任务状态与 DAG 先后依赖关系（`TaskDependency`，含环检测）；上游结案后自动解锁下游并经 Switchboard 发送 `work.ready` 事件唤醒 Hibernaut。不直接触碰 Session、Worktree 或执行器。
-- **Runner（执行面 / 执行节点）**：独立部署在本机（如 Mac）或远端 VPS 上的执行宿主服务，负责管理所在机器的磁盘工作区（Orca / `git worktree` 与三关安全回收）、子进程生命周期、日志流落盘及 `yetone/magpie` 环境对接，并在其内部托管多个具体 Executor。与 Hibernaut 控制面通过 `ExecutorPort` / `RunnerPort` 解耦，可跨项目复用。
-- **Executor vs. Runner 区分**：Runner 是「执行机器与工位（含 worktree 与运行环境，面向分布式部署，对应未来 `runner_id`）」，Executor 是「工位上干活的具体推理引擎/CLI（如 `claude` / `grok` / `cursor-agent` / `dsh`，对应 `executor_id` 与 `executor_session_id`）」。一台 Runner 节点可同时托管多个 Executor。
+- **Runner → Executor → Agent 三层边界**：Runner 是执行工位，Executor 是工位上的驱动，Agent 是用驱动干活的业务主体；**Inbox 绑定的是 Agent**，不是 Executor 或 Runner。
+  - **Runner（执行面 / 执行节点）**：独立部署在本机（如 Mac）或远端 VPS 上的执行宿主服务，负责管理所在机器的磁盘工作区（Orca / `git worktree` 与三关安全回收）、子进程生命周期、日志流落盘及 `yetone/magpie` 环境对接，并在其内部托管多个具体 Executor。与 Hibernaut 控制面通过 `ExecutorPort` / `RunnerPort` 解耦，可跨项目复用；面向分布式部署，对应未来 `runner_id`。
+  - **Executor（驱动）**：没有业务含义的底层 CLI / LLM 驱动（如 `claude`、`grok`、`cursor-agent`、`dsh`，或一个 Claude Code 启动器加计费方式），在 `[executors.<id>]` 声明。一台 Runner 可托管多个 Executor。
+  - **Agent（业务主体）**：绑定 Role 与 Skills、权限边界、记忆视角和底层 Executor，在 `[agents.<id>]` 声明，标识为 `agent_id`。同一 Executor 可供多个 Agent 使用。
+  - **`agent_id` vs. `executor_id`**：代码与存储沿用的 `executor_id`（`ExecutorPort.executor_id`、`sessions.executor_id`、事件 payload 的旧键）取值就是 `agent_id`；`[executors.<id>]` 写了 `role` 或 `command` 时同时是同名 Agent（旧写法）。
+- **Steward（项目管家）**：`role = "steward"` 的 Agent，项目主 Inbox 的前台：读事件后自己答复、转投给别的 Agent，或汇总回投的结果。在项目主检出里只读运行，不建 worktree，不能编辑文件或执行命令；可读写所在 Inbox 的 Memory、只读查询本项目的会话与事件。能路由到哪些 Inbox 和 Agent 由 Runtime 每次唤醒时现拼的路由清单（routing manifest）给出。

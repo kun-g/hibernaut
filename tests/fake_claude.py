@@ -15,6 +15,8 @@ prompt = "" if interactive else sys.stdin.read()
 schema = argv[argv.index("--json-schema") + 1] if "--json-schema" in argv else ""
 allowed = argv[argv.index("--allowedTools") + 1] if "--allowedTools" in argv else ""
 role = "reviewer" if '"verdict"' in schema or "Bash(git diff:*)" in allowed else "sde"
+if "mcp__hibernaut_steward__forward_to_inbox" in allowed:
+    role = "steward"
 if probe:
     role = "probe"
 log = os.environ.get("FAKE_CLAUDE_LOG")
@@ -85,9 +87,9 @@ HANDOFF_TOOLS = ("mcp__hibernaut_handoff__get_task", "mcp__hibernaut_handoff__su
 
 class Handoff:
     # Talks to the stdio MCP server named in --mcp-config the way Claude Code does: one JSON-RPC message per line.
-    def __init__(self):
+    def __init__(self, name="hibernaut_handoff"):
         config = json.loads(argv[argv.index("--mcp-config") + 1])
-        server = config["mcpServers"]["hibernaut_handoff"]
+        server = config["mcpServers"][name]
         self.proc = subprocess.Popen([server["command"], *server["args"]], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, text=True)
         self.next_id = 0
@@ -214,6 +216,14 @@ if role == "reviewer":
     output = step if step is not None else json.loads(
         os.environ.get("FAKE_REVIEW", '{"verdict": "pass", "summary": "ok", "blocking": []}')
     )
+elif role == "steward":
+    # A steward step calls its MCP tools; the answers go to the log.
+    step = step or {}
+    server = Handoff("hibernaut_steward")
+    answers = [server.call(call["tool"], call.get("arguments", {})) for call in step.get("calls", [])]
+    write_log(answers=answers, tools=sorted(server.tools))
+    server.proc.stdin.close()
+    output = step.get("output", {"action": "silent", "message": ""})
 else:
     step = step or {}
     apply_work(step)

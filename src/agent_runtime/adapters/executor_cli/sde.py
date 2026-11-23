@@ -32,7 +32,13 @@ from agent_runtime.adapters.executor_cli.orca import (
     terminal_title,
 )
 from agent_runtime.adapters.executor_cli.peer import PEER_TOOLS, SUBAGENT_TOOLS
-from agent_runtime.adapters.executor_cli.process import is_approval, join_text, last_text, target_events
+from agent_runtime.adapters.executor_cli.process import (
+    is_approval,
+    join_text,
+    last_text,
+    relayed_work_key,
+    target_events,
+)
 from agent_runtime.adapters.executor_cli.project_guidance import (
     ENTRY_FILE,
     GuidanceDoc,
@@ -535,7 +541,8 @@ class SDEExecutor:
         inbox_id = events[0].inbox_id
         explicit = last_text(targets, "explicit_workdir")
         work_key = (
-            events[0].correlation_key
+            relayed_work_key(targets)
+            or events[0].correlation_key
             or (session.correlation_key if session is not None else None)
             or f"task:{inbox_id}:{events[0].event_id}"
         )

@@ -16,7 +16,7 @@ from agent_runtime.adapters.channels.gdrive_attachments import (
     render_attachment_section,
     split_attachment_refs,
 )
-from agent_runtime.core.models import Emit, Event, Suspend, utc_now_iso
+from agent_runtime.core.models import FORWARD_SOURCE, Emit, Event, Suspend, utc_now_iso
 from agent_runtime.core.ports import ChannelPort, SessionStorePort
 from agent_runtime.engine.handler import EventHandler, IngestResult
 from agent_runtime.engine.worker import RunReport
@@ -68,7 +68,7 @@ class DriveClientProtocol(Protocol):
     def download(self, file_meta: DriveFileMeta) -> DriveDownload: ...
 
 
-TASK_META_KEYS = ("scope", "executor_id", "priority", "title", "activities", "tags", "base_ref", "attachments")
+TASK_META_KEYS = ("scope", "agent_id", "executor_id", "priority", "title", "activities", "tags", "base_ref", "attachments")
 # A thematic break: ---, ***, ___ (spaced or longer, such as the underscore rule a Google Doc exports as text).
 _RULE = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
 _SETEXT_EQ = re.compile(r"^\s{0,3}=+\s*$")
@@ -470,8 +470,10 @@ class DriveTaskPoller:
                 "drive_mime_type": meta.mime_type,
                 "drive_modified_time": meta.modified_time,
             }
-            if frontmatter.get("executor_id"):
-                payload["executor_id"] = frontmatter["executor_id"]
+            # executor_id is the old name of agent_id.
+            for key in ("agent_id", "executor_id"):
+                if frontmatter.get(key):
+                    payload[key] = frontmatter[key]
             # Guidance selection for role executors, as comma-separated lists.
             # attachments: Drive file IDs or names in 附件/, fetched when the Run starts; also `[a, b]`.
             for key in ("activities", "tags", "base_ref", "attachments"):
@@ -758,6 +760,12 @@ class DriveResultWriter:
             self.sweep_attachments()
 
     def _write_report(self, report: RunReport) -> bool:
+        if report.rejected is not None:
+            file_id = extract_gdrive_file_id(report.correlation_key)
+            if file_id is None:
+                return False
+            return self.write_failure(file_id, error=report.rejected, event_id=report.event_ids[0],
+                                      session_id=report.session_id, dedup_key=f"failed:{report.event_ids[0]}")
         if not report.session_id:
             return False
         session = self._sessions.get(report.session_id)
@@ -769,6 +777,9 @@ class DriveResultWriter:
             return False
         dedup = f"report:{report.session_id}:{','.join(report.event_ids)}"
         if isinstance(report.outcome, Emit):
+            if report.pending_elsewhere:
+                # Another agent goes on with the task; the Run that finishes it writes the result.
+                return False
             return self.write_emit(
                 file_id,
                 messages=report.outcome.messages,
@@ -794,7 +805,11 @@ class DriveResultWriter:
         error: str | None = None,
         attempts: int = 0,
     ) -> bool:
-        file_id = extract_gdrive_file_id(event.correlation_key)
+        if event.source == FORWARD_SOURCE and event.payload.get("return_to"):
+            # The failure went back to the agent that forwarded the work; the task goes on there.
+            return False
+        origin = event.payload.get("origin_key")
+        file_id = extract_gdrive_file_id(origin if isinstance(origin, str) else event.correlation_key)
         if not file_id:
             return False
         return self.write_failure(

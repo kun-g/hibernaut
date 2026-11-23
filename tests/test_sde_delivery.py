@@ -414,6 +414,21 @@ class TestProjectAdoption(unittest.TestCase):
         readme = (REPO / "README.md").read_text(encoding="utf-8")
         self.assertIn("executor_id: sde", readme)
 
+    def test_dispatch_templates_name_an_agent_their_inbox_allows_in_the_example_config(self):
+        cfg = parse_config(tomllib.loads((REPO / "hibernaut.example.toml").read_text(encoding="utf-8")), base_dir=REPO)
+        drive_meta, _ = parse_task_markdown((REPO / "docs/dispatch/sde-task.drive.md").read_text(encoding="utf-8"))
+        targets = [(drive_meta["scope"], drive_meta["executor_id"])]
+        for name in ("sde-task.json", "review-task.json"):
+            event = json.loads((REPO / "docs/dispatch" / name).read_text(encoding="utf-8"))
+            targets.append((event["inbox_id"], event["payload"]["executor_id"]))
+        for inbox_id, agent in targets:
+            with self.subTest(inbox_id=inbox_id, agent=agent):
+                binding = cfg.projects["hibernaut"].route(inbox_id).binding
+                assert binding is not None
+                self.assertTrue(binding.allows(agent))
+        # A review finds the developer's worktree by key inside its own inbox.
+        self.assertEqual(len({inbox_id for inbox_id, _ in targets}), 1)
+
     def test_drive_template_routes_to_sde_with_its_activities(self):
         drive = _FakeDriveClient()
         drive.add_file("f1", "sde-task.md", (REPO / "docs/dispatch/sde-task.drive.md").read_text(encoding="utf-8"))

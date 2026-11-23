@@ -162,6 +162,23 @@ class RunCapabilities(Protocol):
 
     def is_interrupted(self) -> bool: ...
 
+    # Hands work to another agent of the project through its inbox; the caller never waits for it. The worker checks
+    # the target, the hop limit and PermissionPort (tool "inbox.forward") and raises ForwardRefused; a "defer" refusal
+    # can be tried again in the Run resumed by its approval, naming that approval_request_id. The event is queued
+    # only if the Run ends with a result: an interrupted or failed Run forwards nothing. With return_to the result
+    # comes back to that inbox as an agent:return event instead of going to the reply channel.
+    def forward_to_inbox(
+        self,
+        target_inbox: str,
+        text: str,
+        *,
+        title: str = "",
+        tags: Sequence[str] = (),
+        target_agent: str | None = None,
+        return_to: str | None = None,
+        approved_request_id: str | None = None,
+    ) -> Event: ...
+
 
 class ExecutorPort(Protocol):
     @property

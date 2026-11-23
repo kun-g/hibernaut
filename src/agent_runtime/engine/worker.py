@@ -9,10 +9,16 @@ from dataclasses import dataclass, replace
 from typing import Any, Never, assert_never, cast
 
 from agent_runtime.core.models import (
+    FORWARD_SOURCE,
+    FORWARD_TOOL,
+    MAX_FORWARD_HOPS,
+    AgentNotAllowed,
     DeliveryOutcome,
     Emit,
     Event,
     FailureRoute,
+    ForwardSpec,
+    InboxRoute,
     NewEventPolicy,
     OpenRun,
     RunDetached,
@@ -27,7 +33,7 @@ from agent_runtime.core.models import (
     Suspend,
     TaskLink,
     new_id,
-    resolve_executor_id,
+    resolve_agent_id,
     utc_now_iso,
 )
 from agent_runtime.core.ports import (
@@ -45,6 +51,16 @@ from agent_runtime.core.ports import (
     SessionStorePort,
     TimerPort,
 )
+from agent_runtime.engine.forwarding import (
+    ForwardStage,
+    carries_forwards,
+    event_agent_id,
+    event_tags,
+    event_type,
+    return_event,
+    run_spec,
+    task_hop_count,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,12 +70,29 @@ class _ScopedCapabilities:
     permissions: PermissionPort
     _poll_folded: Callable[[], list[Event]]
     _is_interrupted: Callable[[], bool]
+    _forwards: ForwardStage
 
     def poll_folded_events(self) -> list[Event]:
         return self._poll_folded()
 
     def is_interrupted(self) -> bool:
         return self._is_interrupted()
+
+    def forward_to_inbox(
+        self,
+        target_inbox: str,
+        text: str,
+        *,
+        title: str = "",
+        tags: Sequence[str] = (),
+        target_agent: str | None = None,
+        return_to: str | None = None,
+        approved_request_id: str | None = None,
+    ) -> Event:
+        return self._forwards.forward(
+            target_inbox, text, title=title, tags=tags, target_agent=target_agent, return_to=return_to,
+            approved_request_id=approved_request_id,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +103,10 @@ class RunReport:
     outcome: RunOutcome
     # Kept on the report: a session closed after its Run no longer carries it.
     correlation_key: str | None = None
+    # The batch never ran: routing refused the agent its events named.
+    rejected: str | None = None
+    # The Run handed the work to another agent or sent its result back to one: the external task is not finished.
+    pending_elsewhere: bool = False
 
 
 class ExecutorFailed(RuntimeError):
@@ -141,9 +178,9 @@ class _BatchEnd:
     detached: bool = False
 
 
-# Payload keys that pick where/how an executor runs (e.g. LocalCLIExecutor's workdir and CLI
-# template). Events that disagree on them must not share a Run.
-_TARGET_PAYLOAD_KEYS = ("executor_id", "explicit_workdir", "executor")
+# Payload keys that, with the agent an event names, pick where/how an executor runs (e.g. LocalCLIExecutor's workdir
+# and CLI template). Events that disagree on them must not share a Run.
+_TARGET_PAYLOAD_KEYS = ("explicit_workdir", "executor")
 _REPLY_PAYLOAD_KEYS = ("reply_channel", "reply_target")
 
 
@@ -154,7 +191,7 @@ def _task_link(events: list[Event], session_ref: SessionRef | None) -> TaskLink 
         task_id = evt.payload.get("task_id")
         if isinstance(task_id, str) and task_id:
             trace_id = evt.payload.get("trace_id")
-            hop_count = evt.payload.get("hop_count")
+            hop_count = task_hop_count(evt)
             return TaskLink(
                 task_id=task_id,
                 trace_id=trace_id if isinstance(trace_id, str) and trace_id else None,
@@ -252,6 +289,10 @@ class AgentWorker:
         executors: Mapping[str, ExecutorPort] | None = None,
         project_default_executor: str | None = None,
         global_default_executor: str | None = None,
+        # inbox_id -> its project and binding; None runs without inbox bindings.
+        routes: Callable[[str], InboxRoute | None] | None = None,
+        # Called with each inbox this worker queued an event into.
+        on_forward: Callable[[str], object] | None = None,
         on_worktree_reclaim: Callable[[str], object] | None = None,
         hold: Callable[[Event], str | None] | None = None,
         run_start_listener: RunStartListener | None = None,
@@ -284,6 +325,8 @@ class AgentWorker:
         self._executors = registry
         self._project_default_executor = project_default_executor
         self._global_default_executor = resolved_global
+        self._routes = routes
+        self._on_forward = on_forward
         self._on_worktree_reclaim = on_worktree_reclaim
         self._hold = hold
         self._run_start_listener = run_start_listener
@@ -414,7 +457,11 @@ class AgentWorker:
                             continue
 
                         try:
-                            selected_executor = self._select_executor(batch, session_ref)
+                            selected_executor = self._select_executor(inbox_id, batch, session_ref)
+                        except AgentNotAllowed as exc:
+                            completed_or_failed_ids.update(batch_ids)
+                            reports.append(self._refuse_batch(inbox_id, batch, session_ref, exc))
+                            continue
                         except ExecutorFailed:
                             # Missing/unregistered executor for a suspended checkpoint: requeue
                             # pending so operator recovery can resume it cleanly.
@@ -446,6 +493,7 @@ class AgentWorker:
                             work_key=batch_work_key,
                             executor_id=selected_executor.executor_id,
                             parent_session_id=batch_parent_sid,
+                            forward=run_spec(batch, session_ref),
                         )
                         self._inbox.bind_session(batch_ids, active_session.session_id)
 
@@ -579,6 +627,7 @@ class AgentWorker:
         work_key: str | None,
         executor_id: str,
         parent_session_id: str | None,
+        forward: ForwardSpec | None,
     ) -> SessionRef:
         if session_ref is not None:
             return session_ref
@@ -592,6 +641,7 @@ class AgentWorker:
             work_key=work_key,
             updated_at=utc_now_iso(),
             parent_session_id=parent_session_id,
+            forward=forward,
         )
         self._sessions.save(new_session)
         return new_session
@@ -621,7 +671,22 @@ class AgentWorker:
         if target is None:
             return None
         self._close_and_reclaim(target)
+        # Work forwarded to other inboxes closes with it, each child under its own inbox's lease.
+        for child in self._sessions.list_sessions(parent_session_id=target.session_id):
+            if child.inbox_id != target.inbox_id and child.status in ("active", "suspended"):
+                self._queue_event(Event(
+                    inbox_id=child.inbox_id,
+                    source="session:close",
+                    external_id=f"close:{batch[0].event_id}:{child.session_id}",
+                    payload={"action": "close_session"},
+                    session_id=child.session_id,
+                ))
         return target.session_id
+
+    def _queue_event(self, event: Event) -> None:
+        _, duplicate = self._inbox.append(event)
+        if not duplicate and self._on_forward is not None:
+            self._on_forward(event.inbox_id)
 
     def _close_and_reclaim(self, target: SessionRef) -> None:
         self._sessions.close_session(target.session_id)
@@ -641,8 +706,12 @@ class AgentWorker:
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).exception("Closing finished session %s failed", session_id)
 
+    def _route(self, inbox_id: str) -> InboxRoute | None:
+        return self._routes(inbox_id) if self._routes is not None else None
+
     def _select_executor(
         self,
+        inbox_id: str,
         batch: list[Event],
         session_ref: SessionRef | None,
     ) -> ExecutorPort:
@@ -661,24 +730,103 @@ class AgentWorker:
                 )
             return held
 
-        event_executor_id: str | None = None
         target_events = [e for e in batch if not self._is_approval_decision(e)] or batch
-        for evt in reversed(target_events):
-            raw = evt.payload.get("executor_id")
-            if isinstance(raw, str) and raw.strip():
-                event_executor_id = raw.strip()
-                break
-
-        target_id = resolve_executor_id(
-            event_executor_id,
-            session_ref,
-            self._project_default_executor,
-            self._global_default_executor,
-        )
+        named = next((agent for evt in reversed(target_events) if (agent := event_agent_id(evt))), None)
+        target_id = self._agent_for(inbox_id, target_events[0], named, session_ref)
         selected = self._executors.get(target_id)
         if selected is None:
             raise ExecutorFailed(f"Executor '{target_id}' is not registered")
         return selected
+
+    def _agent_for(
+        self, inbox_id: str, event: Event, named: str | None, session_ref: SessionRef | None
+    ) -> str:
+        route = self._route(inbox_id)
+        return resolve_agent_id(
+            named,
+            session_ref,
+            route.binding if route is not None else None,
+            self._project_default_executor,
+            self._global_default_executor,
+            source=event.source,
+            event_type=event_type(event),
+            tags=event_tags(event),
+        )
+
+    def _refuse_batch(
+        self, inbox_id: str, batch: list[Event], session_ref: SessionRef | None, refusal: AgentNotAllowed
+    ) -> RunReport:
+        # Refused before any session, executor or workspace exists for it, and never rerouted to another agent.
+        reason = str(refusal)
+        ids = [evt.event_id for evt in batch]
+        self._inbox.mark_failed(ids, reason)
+        spec = run_spec(batch, session_ref)
+        key = self._reported_key(self._extract_correlation_key(batch, session_ref), spec)
+        metadata = self._with_status(self._report_metadata(batch, key, "", new_id("run"), spec), "refused")
+        if session_ref is not None:
+            metadata["session_id"] = session_ref.session_id
+        self._outbox.enqueue(
+            inbox_id=inbox_id,
+            content=f"[hibernaut] Refused {len(ids)} event(s) in inbox {inbox_id}: {reason}.",
+            metadata={**metadata, "kind": "agent_refused", "outcome_kind": "error"},
+        )
+        if spec is not None:
+            self._send_return(inbox_id, "", session_ref, spec, batch, text=reason, status="refused")
+        return RunReport(
+            inbox_id=inbox_id,
+            session_id=session_ref.session_id if session_ref is not None else None,
+            event_ids=tuple(ids),
+            outcome=Emit(messages=(reason,), status="refused"),
+            correlation_key=key,
+            rejected=reason,
+        )
+
+    @staticmethod
+    def _reported_key(correlation_key: str | None, spec: ForwardSpec | None) -> str | None:
+        # Channels answer the conversation the work came from, not the session key a forward gave its child.
+        return (spec.origin_key if spec is not None else None) or correlation_key
+
+    def _send_return(
+        self,
+        inbox_id: str,
+        agent_id: str,
+        session_ref: SessionRef | None,
+        spec: ForwardSpec,
+        events: list[Event],
+        *,
+        text: str,
+        status: str,
+        delivery: DeliveryOutcome | None = None,
+    ) -> bool:
+        # False when the result cannot go back (hop limit, inbox gone, permission); the caller answers outside then.
+        if spec.return_to is None or spec.hop_count >= MAX_FORWARD_HOPS:
+            return False
+        if self._routes is not None:
+            here, there = self._route(inbox_id), self._route(spec.return_to)
+            if here is None or there is None or here.project != there.project:
+                return False
+        decision = self._permissions.check(FORWARD_TOOL, {
+            "inbox_id": inbox_id,
+            "agent_id": agent_id,
+            "target_inbox": spec.return_to,
+            "target_agent": None,
+            "return_to": None,
+            "hop_count": spec.hop_count + 1,
+            "text": text,
+            "status": status,
+        })
+        if decision.action != "allow":
+            logging.getLogger(__name__).warning(
+                "Result of inbox %s is not returned to %s: %s", inbox_id, spec.return_to, decision.reason
+            )
+            return False
+        self._queue_event(return_event(
+            inbox_id=inbox_id, agent_id=agent_id,
+            session_id=session_ref.session_id if session_ref is not None else None,
+            spec=spec, events=events, sessions=self._sessions, text=text, status=status,
+            title=_task_title(events), delivery=delivery,
+        ))
+        return True
 
     async def _resume_open_run(
         self, inbox_id: str, open_run: OpenRun, wake_signal: asyncio.Event, interrupt_restarts: int
@@ -795,16 +943,33 @@ class AgentWorker:
                     registry.add_events(registered.session_id, new_ids)
             return newly_folded
 
+        batch_correlation_key = self._extract_correlation_key(batch, active_session)
+        forwards = ForwardStage(
+            inbox_id=inbox_id,
+            agent_id=executor.executor_id,
+            session=active_session,
+            correlation_key=batch_correlation_key,
+            work_key=active_session.work_key,
+            permissions=self._permissions,
+            sessions=self._sessions,
+            registered=self._executors.keys(),
+            default_agent=self._default_agent,
+            routes=self._routes,
+            events=lambda: batch + folded_events,
+            approval=lambda request_id: self._approved(request_id, batch, active_session),
+        )
         caps: RunCapabilities = _ScopedCapabilities(
             memory=self._memory,
             timers=self._timers,
             permissions=self._permissions,
             _poll_folded=_poll_folded,
             _is_interrupted=interrupted_flag.is_set,
+            _forwards=forwards,
         )
         handle = _RunHandle(registered.run_dir, self._is_detaching) if registered is not None else None
-        batch_correlation_key = self._extract_correlation_key(batch, active_session)
         run_id = new_id("run")
+        start_spec = run_spec(batch, active_session)
+        start_key = self._reported_key(batch_correlation_key, start_spec)
         previous_link = active_session.task_link
         start_link = _task_link(batch, active_session)
         # An interruptible Run may be thrown away, and an interrupted Run writes nothing to the Outbox, so it releases
@@ -815,7 +980,7 @@ class AgentWorker:
             superseded = _superseded([previous_link], claimed_link, released)
             released.update(link.task_id for link in superseded)
             if not resuming:
-                extra = self._report_metadata(batch, batch_correlation_key, executor.executor_id, run_id)
+                extra = self._report_metadata(batch, start_key, executor.executor_id, run_id, start_spec)
                 self._sync_task_switch(inbox_id, extra, active_session.session_id, superseded, claimed_link)
 
         def _drop_registration() -> None:
@@ -845,6 +1010,7 @@ class AgentWorker:
                     allow_interrupt=allow_interrupt,
                     handle=handle,
                     resume=resuming,
+                    on_attempt=forwards.reset,
                 )
             end_kind, ledger_outcome = _end_kind(outcome), outcome
         except _RunInterrupted:
@@ -861,22 +1027,33 @@ class AgentWorker:
             all_failed_ids = batch_ids + [e.event_id for e in folded_events]
             self._inbox.mark_failed(all_failed_ids, str(exc.__cause__ or exc))
             _drop_registration()
+            failed_spec = run_spec(batch + folded_events, active_session)
+            failed_metadata = self._report_metadata(
+                batch + folded_events, self._reported_key(batch_correlation_key, failed_spec), executor.executor_id,
+                run_id, failed_spec,
+            )
             if exc.route is not None:
                 self._alert_failed_run(
-                    inbox_id,
-                    active_session.session_id,
-                    executor.executor_id,
-                    exc,
-                    len(all_failed_ids),
-                    self._report_metadata(batch + folded_events, batch_correlation_key, executor.executor_id, run_id),
+                    inbox_id, active_session.session_id, executor.executor_id, exc, len(all_failed_ids),
+                    failed_metadata,
                 )
+            if failed_spec is not None:
+                cause = exc.__cause__ or exc
+                if self._send_return(
+                    inbox_id, executor.executor_id, active_session, failed_spec, batch + folded_events,
+                    text=f"{executor.executor_id} failed: {str(cause) or type(cause).__name__}", status="failed",
+                ):
+                    failed_spec = replace(failed_spec, return_to=None)
+                current = self._sessions.get(active_session.session_id)
+                if current is not None and current.forward != failed_spec:
+                    self._sessions.save(replace(current, forward=failed_spec, updated_at=utc_now_iso()))
             if claimed_link is not None:
                 # Otherwise the task would stay in_progress on Taskboard with nothing working on it.
                 self._release_failed_task(
                     inbox_id,
                     active_session.session_id,
                     claimed_link,
-                    self._report_metadata(batch + folded_events, batch_correlation_key, executor.executor_id, run_id),
+                    failed_metadata,
                 )
             raise
         except BaseException as exc:
@@ -906,14 +1083,41 @@ class AgentWorker:
 
         # Resolved once from what the Run actually consumed (a folded work.ready can name a new task); this link is
         # both reported and saved on the session.
-        final_link = _task_link(batch + folded_events, active_session)
-        final_corr = self._extract_correlation_key(batch + folded_events, active_session)
+        consumed = batch + folded_events
+        final_link = _task_link(consumed, active_session)
+        final_corr = self._extract_correlation_key(consumed, active_session)
         final_work_key = self._extract_work_key(
-            batch + folded_events,
+            consumed,
             active_session,
             final_corr,
             active_session.parent_session_id,
         )
+        final_spec = run_spec(consumed, active_session)
+        final_key = self._reported_key(final_corr, final_spec)
+        handed_over = False
+        if not carries_forwards(outcome):
+            forwards.reset()
+        elif forwards.staged:
+            if final_link is not None and not isinstance(outcome, Suspend):
+                handed_over = forwards.hand_over(final_link)
+            waiting = forwards.own_returns()
+            if waiting:
+                final_spec = replace(
+                    final_spec or ForwardSpec(target_inbox=inbox_id, origin_key=final_corr),
+                    pending_returns=waiting + (final_spec.pending_returns if final_spec is not None else 0),
+                )
+        returned = False
+        if isinstance(outcome, Emit) and final_spec is not None and final_spec.return_to is not None:
+            returned = self._send_return(
+                inbox_id, executor.executor_id, active_session, final_spec, consumed,
+                text="\n\n".join(outcome.messages), status=outcome.status, delivery=outcome.delivery,
+            )
+            # Returned or answered outside: either way this result is no longer owed.
+            final_spec = replace(final_spec, return_to=None)
+        # Before the result is written, so a crash in between repeats the Run and its deduplicated forwards.
+        for event in forwards.staged:
+            self._queue_event(event)
+        pending_returns = final_spec.pending_returns if final_spec is not None else 0
         final_session_id = self._apply_outcome(
             inbox_id,
             active_session,
@@ -921,11 +1125,15 @@ class AgentWorker:
             final_corr,
             final_work_key,
             executor,
-            report_metadata=self._report_metadata(batch + folded_events, final_corr, executor.executor_id, run_id),
+            report_metadata=self._report_metadata(consumed, final_key, executor.executor_id, run_id, final_spec),
             task_link=final_link,
             superseded=_superseded([previous_link, claimed_link], final_link, released),
             claim_with_result=final_link is not None
             and (claimed_link is None or claimed_link.task_id != final_link.task_id),
+            forward=final_spec,
+            handed_over=handed_over,
+            awaiting_returns=pending_returns > 0,
+            returned=returned,
         )
         all_done_ids = batch_ids + [evt.event_id for evt in folded_events]
         if final_session_id is not None and final_session_id != active_session.session_id:
@@ -940,7 +1148,8 @@ class AgentWorker:
             session_id=final_session_id,
             event_ids=tuple(all_done_ids),
             outcome=outcome,
-            correlation_key=final_corr,
+            correlation_key=final_key,
+            pending_elsewhere=bool(forwards.staged) or pending_returns > 0 or returned,
         )
         if isinstance(outcome, Emit) and outcome.close_session and final_session_id is not None:
             # After the result and its events are written, so the reclaim gates no longer see them.
@@ -962,13 +1171,16 @@ class AgentWorker:
         allow_interrupt: bool,
         handle: _RunHandle | None = None,
         resume: bool = False,
+        on_attempt: Callable[[], None],
     ) -> RunOutcome:
         if not allow_interrupt and handle is None:
-            return await self._execute_with_retry(executor, batch, session_ref, caps)
+            return await self._execute_with_retry(executor, batch, session_ref, caps, on_attempt=on_attempt)
 
         # A resumable Run gets its own task, so a stop can cancel it without cancelling this worker.
         exec_task = asyncio.create_task(
-            self._execute_with_retry(executor, batch, session_ref, caps, handle=handle, resume=resume)
+            self._execute_with_retry(
+                executor, batch, session_ref, caps, handle=handle, resume=resume, on_attempt=on_attempt
+            )
         )
         if handle is not None:
             handle.bind(exec_task)
@@ -1065,13 +1277,23 @@ class AgentWorker:
 
     @classmethod
     def _report_metadata(
-        cls, events: list[Event], correlation_key: str | None, executor_id: str, run_id: str
+        cls,
+        events: list[Event],
+        correlation_key: str | None,
+        executor_id: str,
+        run_id: str,
+        spec: ForwardSpec | None = None,
     ) -> dict[str, Any]:
         # Routing hints a channel needs to answer where the work came from; extra keys are ignored by
         # channels that do not read them.
         meta: dict[str, Any] = {"run_id": run_id}
         if correlation_key:
             meta["correlation_key"] = correlation_key
+        if spec is not None:
+            # A forwarded task answers where the chain started unless its own events say otherwise.
+            for key, saved in zip(_REPLY_PAYLOAD_KEYS, (spec.reply_channel, spec.reply_target)):
+                if saved:
+                    meta[key] = saved
         for key in _REPLY_PAYLOAD_KEYS:
             for evt in reversed(events):
                 value = evt.payload.get(key)
@@ -1113,9 +1335,11 @@ class AgentWorker:
         if session_ref is not None and session_ref.work_key:
             return session_ref.work_key
         if parent_session_id is not None:
-            # A delegated child reuses the parent's worktree instead of opening its own.
+            # A delegated child reuses the parent's worktree instead of opening its own; a child in another inbox
+            # must not share it.
             parent = self._sessions.get(parent_session_id)
-            if parent is not None and parent.work_key:
+            inbox_id = events[0].inbox_id if events else None
+            if parent is not None and parent.work_key and parent.inbox_id == inbox_id:
                 return parent.work_key
         return correlation_key
 
@@ -1154,7 +1378,7 @@ class AgentWorker:
                 batches.append((resolved_session, [event]))
                 continue
             holder = decision_holders.get(resolved_key) if resolved_key is not None else None
-            routed_to = self._routed_executor_id(event)
+            routed_to = event_agent_id(event)
             if holder is not None and routed_to is not None and routed_to != holder:
                 continue
             open_batch = open_batches.get(resolved_key)
@@ -1190,19 +1414,30 @@ class AgentWorker:
             return session_ref.executor_id
         for evt in batch:
             if evt.payload.get("approval_request_id") == session_ref.pending_request_id:
-                named = self._routed_executor_id(evt)
+                named = event_agent_id(evt)
                 if named is not None:
                     return named
         return None
 
-    @staticmethod
-    def _routed_executor_id(event: Event) -> str | None:
-        raw = event.payload.get("executor_id")
-        return raw.strip() if isinstance(raw, str) and raw.strip() else None
+    def _execution_target(self, event: Event) -> tuple[object, ...]:
+        agent = event_agent_id(event)
+        if agent is None and event.session_id is None and event.correlation_key is None:
+            # Such events share a Run only under interrupt; the rules may send them to different agents.
+            agent = self._agent_for(event.inbox_id, event, None, None)
+        return (agent, *(event.payload.get(key) for key in _TARGET_PAYLOAD_KEYS))
 
-    @staticmethod
-    def _execution_target(event: Event) -> tuple[object, ...]:
-        return tuple(event.payload.get(key) for key in _TARGET_PAYLOAD_KEYS)
+    def _default_agent(self, inbox_id: str, tags: Sequence[str]) -> str:
+        route = self._route(inbox_id)
+        return resolve_agent_id(
+            None, None, route.binding if route is not None else None, self._project_default_executor,
+            self._global_default_executor, source=FORWARD_SOURCE, tags=tags,
+        )
+
+    def _approved(self, request_id: str, batch: list[Event], session_ref: SessionRef) -> bool:
+        if session_ref.pending_request_id != request_id:
+            return False
+        answers = [evt for evt in batch if evt.payload.get("approval_request_id") == request_id]
+        return bool(answers) and answers[-1].payload.get("approved") is True
 
     def _batch_target(self, batch: list[Event]) -> tuple[object, ...] | None:
         for evt in batch:
@@ -1249,10 +1484,12 @@ class AgentWorker:
         *,
         handle: _RunHandle | None = None,
         resume: bool = False,
+        on_attempt: Callable[[], None],
     ) -> RunOutcome:
         resumable = self._resumable(executor) if handle is not None else None
         attempt = 0
         while True:
+            on_attempt()
             try:
                 if resumable is not None and handle is not None:
                     if resume:
@@ -1464,8 +1701,14 @@ class AgentWorker:
         task_link: TaskLink | None = None,
         superseded: Sequence[TaskLink] = (),
         claim_with_result: bool = False,
+        forward: ForwardSpec | None = None,
+        handed_over: bool = False,
+        awaiting_returns: bool = False,
+        returned: bool = False,
     ) -> str | None:
         extra: dict[str, Any] = dict(report_metadata or {})
+        # Set while the task goes on with other agents: it moves to that stage instead of being completed.
+        elsewhere = "forwarded" if handed_over else "awaiting_return" if awaiting_returns else None
         self._sync_task_switch(
             inbox_id, extra, session_ref.session_id, superseded, task_link if claim_with_result else None
         )
@@ -1489,12 +1732,16 @@ class AgentWorker:
                         pending_request_id=None,
                         updated_at=utc_now_iso(),
                         parent_session_id=session_ref.parent_session_id,
+                        task_link=task_link if elsewhere == "awaiting_return" else None,
+                        forward=forward,
                     )
                 )
                 if task_link is not None:
-                    self._enqueue_task_sync(
-                        inbox_id, extra, session_ref.session_id, _task_fields(task_link, "complete")
+                    fields = (
+                        _task_fields(task_link, "update_stage", elsewhere) if elsewhere
+                        else _task_fields(task_link, "complete")
                     )
+                    self._enqueue_task_sync(inbox_id, extra, session_ref.session_id, fields)
                 return session_ref.session_id
             case Emit(
                 messages=messages,
@@ -1510,9 +1757,13 @@ class AgentWorker:
                 )
                 target_sid = emit_session_id or session_ref.session_id
                 task_fields = _emit_task_fields(task_link, outcome) if task_link is not None else {}
-                for index, text in enumerate(messages):
+                if task_link is not None and elsewhere and emit_status == "done":
+                    task_fields = _task_fields(task_link, "update_stage", elsewhere)
+                # A returned result went to the inbox that asked for it, not to the channel.
+                shown = () if returned else messages
+                for index, text in enumerate(shown):
                     # The task action rides on the last message, so Taskboard sees it once.
-                    last = index == len(messages) - 1
+                    last = index == len(shown) - 1
                     self._outbox.enqueue(
                         inbox_id=inbox_id,
                         content=text,
@@ -1524,10 +1775,11 @@ class AgentWorker:
                             "session_id": target_sid,
                         },
                     )
-                if task_fields and not messages:
+                if task_fields and not shown:
                     failed = task_fields["task_action"] == "release"
                     self._enqueue_task_sync(inbox_id, extra, target_sid, task_fields, "error" if failed else "done")
-                emit_link = task_link if task_fields.get("task_action") == "update_stage" else None
+                keeps_link = task_fields.get("task_action") == "update_stage" and not handed_over
+                emit_link = task_link if keeps_link else None
                 if target_sid != session_ref.session_id:
                     # Session rotation: archive old session while new session inherits correlation_key & work_key.
                     self._sessions.archive_session(session_ref.session_id)
@@ -1545,6 +1797,7 @@ class AgentWorker:
                         updated_at=utc_now_iso(),
                         parent_session_id=session_ref.parent_session_id,
                         task_link=emit_link,
+                        forward=forward,
                     )
                 )
                 return target_sid
@@ -1579,6 +1832,7 @@ class AgentWorker:
                         updated_at=utc_now_iso(),
                         parent_session_id=session_ref.parent_session_id,
                         task_link=task_link,
+                        forward=forward,
                     )
                 )
                 if repeated:

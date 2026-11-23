@@ -1,5 +1,5 @@
 ---
-scope: proj:hibernaut
+scope: proj:hibernaut:sde
 executor_id: sde
 title: Short title used for the pull request
 activities: development

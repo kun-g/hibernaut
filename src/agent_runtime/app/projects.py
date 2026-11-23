@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Generic, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeVar, cast
 
-from agent_runtime.core.models import Event
+from agent_runtime.core.models import Event, InboxBinding, InboxMatchRule
 from agent_runtime.core.ports import SessionStorePort
 from agent_runtime.engine.worker import ExecutorFailed
 
@@ -103,6 +103,192 @@ def parse_inbox_rules(project: str, raw: object) -> tuple[InboxRule, ...]:
             "'\\.'); the first one is the primary inbox for this project"
         )
     return tuple(rules)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentConfig:
+    name: str
+    # The [executors.<id>] driver; a legacy role executor is its own driver.
+    executor: str
+    role: str | None = None
+    model: str = ""
+    effort: str = ""
+    checkout_access: str = ""
+    description: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectBinding:
+    rule: InboxRule
+    binding: InboxBinding
+
+
+_BINDING_KEYS = frozenset({"pattern", "default_agent", "agents", "rules"})
+_MATCH_KEYS = frozenset({"source", "event_type", "tags", "agent"})
+
+
+def _text(where: str, item: Mapping[str, Any], key: str, *, required: bool = False) -> str | None:
+    value = item.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{where}: {key} must be a non-empty string")
+    return value.strip()
+
+
+def _texts(where: str, item: Mapping[str, Any], key: str) -> tuple[str, ...]:
+    if key not in item:
+        return ()
+    value = item[key]
+    listed = cast(list[object], value) if isinstance(value, list) else []
+    if not listed or not all(isinstance(v, str) and v.strip() for v in listed):
+        raise ValueError(f"{where}: {key} must be a non-empty array of strings")
+    found = tuple(str(v).strip() for v in listed)
+    twice = sorted({v for v in found if found.count(v) > 1})
+    if twice:
+        raise ValueError(f"{where}: {key} lists {', '.join(twice)} twice")
+    return found
+
+
+def _tables(where: str, raw: object) -> list[Mapping[str, Any]]:
+    listed = cast(list[object], raw) if isinstance(raw, list) else None
+    if listed is None or not all(isinstance(item, Mapping) for item in listed):
+        raise ValueError(f"{where} must be an array of tables")
+    return cast(list[Mapping[str, Any]], listed)
+
+
+def _only(where: str, item: Mapping[str, Any], allowed: frozenset[str]) -> None:
+    unknown = sorted(set(item) - allowed)
+    if unknown:
+        raise ValueError(f"{where}: {', '.join(unknown)} not supported")
+
+
+def parse_inbox_bindings(
+    project: str, raw: object, *, inbox_rules: Sequence[InboxRule], declared: Collection[str]
+) -> tuple[ProjectBinding, ...]:
+    if raw is None:
+        return ()
+    bindings: list[ProjectBinding] = []
+    for index, item in enumerate(_tables(f"projects.{project}.inbox_bindings", raw)):
+        where = f"projects.{project}.inbox_bindings[{index}]"
+        _only(where, item, _BINDING_KEYS)
+        pattern = _text(where, item, "pattern", required=True) or ""
+        try:
+            rule = InboxRule.parse(pattern)
+        except re.error as exc:
+            raise ValueError(f"{where}: invalid pattern {pattern!r}: {exc}") from exc
+        if any(b.rule.pattern == rule.pattern for b in bindings):
+            raise ValueError(f"{where}: pattern {pattern!r} is listed twice")
+        if rule.literal is not None and not any(r.matches(rule.literal) for r in inbox_rules):
+            raise ValueError(f"{where}: {pattern!r} is not an inbox of projects.{project} (see its inbox_id)")
+        agents = _texts(where, item, "agents")
+
+        def check(at: str, key: str, agent: str, agents: tuple[str, ...] = agents) -> str:
+            if agent not in declared:
+                raise ValueError(f"{at}: {key} '{agent}' is not declared in [agents] (declared: "
+                                 f"{', '.join(sorted(declared)) or 'none'})")
+            if agents and agent not in agents:
+                raise ValueError(f"{at}: {key} '{agent}' is not in agents ({', '.join(agents)})")
+            return agent
+
+        for agent in agents:
+            check(where, "agents entry", agent)
+        rules: list[InboxMatchRule] = []
+        for position, entry in enumerate(_tables(f"{where}.rules", item.get("rules", []))):
+            at = f"{where}.rules[{position}]"
+            _only(at, entry, _MATCH_KEYS)
+            match = InboxMatchRule(
+                agent=check(at, "agent", _text(at, entry, "agent", required=True) or ""),
+                source=_text(at, entry, "source"),
+                event_type=_text(at, entry, "event_type"),
+                tags=_texts(at, entry, "tags"),
+            )
+            if match.source is None and match.event_type is None and not match.tags:
+                raise ValueError(f"{at}: needs source, event_type or tags (default_agent takes everything else)")
+            rules.append(match)
+        bindings.append(ProjectBinding(rule=rule, binding=InboxBinding(
+            inbox=pattern,
+            default_agent=check(where, "default_agent", _text(where, item, "default_agent", required=True) or ""),
+            agents=agents,
+            rules=tuple(rules),
+        )))
+    return tuple(bindings)
+
+
+class _Bound(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def inbox_rules(self) -> tuple[InboxRule, ...]: ...
+
+    @property
+    def inbox_bindings(self) -> tuple[ProjectBinding, ...]: ...
+
+    @property
+    def default_agent(self) -> str | None: ...
+
+    @property
+    def agents(self) -> tuple[AgentConfig, ...]: ...
+
+
+def validate_project_bindings(projects: Iterable[_Bound]) -> None:
+    # An inbox belongs to one project, so a binding that also matches another project's inbox is a mistake: it would
+    # never apply there.
+    listed = list(projects)
+    for proj in listed:
+        for bound in proj.inbox_bindings:
+            for other in listed:
+                if other.name == proj.name:
+                    continue
+                for rule in other.inbox_rules:
+                    if rule.literal is not None and bound.rule.matches(rule.literal):
+                        raise ValueError(
+                            f"projects.{proj.name}.inbox_bindings pattern {bound.binding.inbox!r} also matches "
+                            f"inbox_id {rule.literal!r} of projects.{other.name}"
+                        )
+
+
+def _agent_line(agent: AgentConfig) -> str:
+    facts = [f"role {agent.role}" if agent.role else "no role", f"executor {agent.executor}"]
+    if agent.model:
+        facts.append(f"model {agent.model}" + (f" ({agent.effort})" if agent.effort else ""))
+    if agent.checkout_access:
+        facts.append(f"checkout {agent.checkout_access}")
+    line = f"- `{agent.name}`: {', '.join(facts)}"
+    return f"{line}. {agent.description}" if agent.description else line
+
+
+def _rule_line(rule: InboxMatchRule) -> str:
+    conditions = [f"{key} = {value}" for key, value in (("source", rule.source), ("event_type", rule.event_type)) if value]
+    if rule.tags:
+        conditions.append(f"tags include {', '.join(rule.tags)}")
+    return f"{' and '.join(conditions)} -> `{rule.agent}`"
+
+
+def build_routing_manifest(project: _Bound) -> str:
+    # What a Steward needs to route work, rendered from the loaded config on every wake.
+    used = {name for b in project.inbox_bindings for name in (*b.binding.agents, b.binding.default_agent)}
+    if any(not b.binding.agents for b in project.inbox_bindings) or not project.inbox_bindings:
+        used = {a.name for a in project.agents}
+    default = f"`{project.default_agent}`" if project.default_agent else "the runtime's default agent"
+    parts = [f"Project `{project.name}`. Its default agent is {default}.", "", "Agents:"]
+    parts += [_agent_line(a) for a in project.agents if a.name in used]
+    parts += ["", "Inboxes (the first that matches an inbox id applies):"]
+    if not project.inbox_bindings:
+        parts += [f"- {_inbox_text(rule)}: default agent {default}" for rule in project.inbox_rules]
+    for bound in project.inbox_bindings:
+        binding = bound.binding
+        allowed = ", ".join(f"`{a}`" for a in binding.agents) or "any declared agent"
+        parts.append(f"- {_inbox_text(bound.rule)}: default agent `{binding.default_agent}`; agents: {allowed}")
+        parts += [f"  - rule {n}: {_rule_line(rule)}" for n, rule in enumerate(binding.rules, 1)]
+    return "\n".join(parts)
+
+
+def _inbox_text(rule: InboxRule) -> str:
+    if rule.literal is not None:
+        return f"`{rule.literal}`"
+    return f"`{rule.pattern}` (a pattern: any inbox id it matches in full)"
 
 
 class _Routable(Protocol):
