@@ -39,6 +39,7 @@
     },
     "error_summary": { "type": ["string", "null"] },
     "stdout_excerpt": { "type": "string", "maxLength": 262144 },
+    "final_text": { "type": ["string", "null"] },
     "structured_output": { "type": ["object", "null"] },
     "log_ref": {
       "type": ["object", "null"],

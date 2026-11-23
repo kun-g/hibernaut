@@ -5,10 +5,12 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Final, Literal, Mapping, Protocol, TypeAlias, cast
+from typing import Any, Awaitable, Callable, Final, Literal, Mapping, Protocol, TypeAlias, cast
 
 SCHEMA_VERSION: Final = "runner.v1"
 MAX_STDOUT_EXCERPT_BYTES: Final = 262_144
+# Sent beside the excerpt; both have to fit the relay's 1 MiB message.
+MAX_FINAL_TEXT_CHARS: Final = 65_536
 
 RunStatus: TypeAlias = Literal["succeeded", "failed", "interrupted", "timed_out", "refused"]
 ErrorKind: TypeAlias = Literal[
@@ -28,6 +30,7 @@ InteractiveSurfaceKind: TypeAlias = Literal["orca", "none"]
 InterruptReason: TypeAlias = Literal["new_event", "user_cancel", "shutdown", "timeout"]
 InterruptState: TypeAlias = Literal["cancelling", "already_finished", "not_found"]
 ReclaimStatus: TypeAlias = Literal["reclaimed", "blocked", "not_found", "error"]
+ToolAction: TypeAlias = Literal["allow", "block", "defer"]
 
 _RUN_ID_RE: Final = re.compile(r"^run_[A-Za-z0-9_-]+$")
 _NAMESPACE_RE: Final = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
@@ -48,6 +51,7 @@ _VALID_ERROR_KINDS: Final = frozenset(
 )
 _VALID_INTERRUPT_REASONS: Final = frozenset({"new_event", "user_cancel", "shutdown", "timeout"})
 _VALID_INTERRUPT_STATES: Final = frozenset({"cancelling", "already_finished", "not_found"})
+_VALID_TOOL_ACTIONS: Final = frozenset({"allow", "block", "defer"})
 _VALID_RECLAIM_STATUSES: Final = frozenset({"reclaimed", "blocked", "not_found", "error"})
 
 
@@ -74,6 +78,9 @@ class ExecutorCapability:
     supports_resume: bool
     supports_stream_json: bool
     interactive_surface: InteractiveSurfaceKind = "none"
+    # Every tool call of this executor can be held until the caller's ToolAuthorizer answers. A node that does not
+    # say so (an older one included) is never given a run that needs it.
+    tool_authorization: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -82,6 +89,7 @@ class ExecutorCapability:
             "supports_resume": self.supports_resume,
             "supports_stream_json": self.supports_stream_json,
             "interactive_surface": self.interactive_surface,
+            "tool_authorization": self.tool_authorization,
         }
 
     @classmethod
@@ -95,6 +103,7 @@ class ExecutorCapability:
                 InteractiveSurfaceKind,
                 raw.get("interactive_surface", "none"),
             ),
+            tool_authorization=raw.get("tool_authorization") is True,
         )
 
 
@@ -217,6 +226,8 @@ class RunRequest:
     output_schema: dict[str, Any] | None = None
     idle_timeout_seconds: float | None = None
     credential_lease: CredentialLease | None = None
+    # The run may start only where each of its tool calls is first put to the caller's ToolAuthorizer.
+    authorize_tools: bool = False
     metadata: dict[str, Any] = field(default_factory=_empty_any_dict)
     schema_version: str = SCHEMA_VERSION
 
@@ -254,6 +265,7 @@ class RunRequest:
             "timeout_seconds": self.timeout_seconds,
             "idle_timeout_seconds": self.idle_timeout_seconds,
             "credential_lease": self.credential_lease.to_dict() if self.credential_lease else None,
+            "authorize_tools": self.authorize_tools,
             "metadata": dict(self.metadata),
         }
 
@@ -286,6 +298,7 @@ class RunRequest:
             timeout_seconds=_req_float(raw, "timeout_seconds"),
             idle_timeout_seconds=float(idle_raw) if isinstance(idle_raw, (int, float)) and not isinstance(idle_raw, bool) else None,
             credential_lease=lease,
+            authorize_tools=_opt_bool(raw, "authorize_tools"),
             metadata=dict(cast(Mapping[str, Any], meta)),
         )
 
@@ -355,6 +368,8 @@ class RunResult:
     error_kind: ErrorKind | None = None
     error_summary: str | None = None
     stdout_excerpt: str = ""
+    # The executor's reply as text, when its output wraps it (stream-json); None means stdout_excerpt is the reply.
+    final_text: str | None = None
     structured_output: dict[str, Any] | None = None
     log_ref: LogRef | None = None
     worktree_ref: WorktreeRef | None = None
@@ -382,6 +397,7 @@ class RunResult:
             "error_kind": self.error_kind,
             "error_summary": self.error_summary,
             "stdout_excerpt": self.stdout_excerpt[:MAX_STDOUT_EXCERPT_BYTES],
+            "final_text": self.final_text,
             "structured_output": self.structured_output,
             "log_ref": self.log_ref.to_dict() if self.log_ref else None,
             "worktree_ref": self.worktree_ref.to_dict() if self.worktree_ref else None,
@@ -408,6 +424,7 @@ class RunResult:
             error_kind=cast(ErrorKind | None, _opt_str(raw, "error_kind")),
             error_summary=_opt_str(raw, "error_summary"),
             stdout_excerpt=str(raw.get("stdout_excerpt", "")),
+            final_text=_opt_str(raw, "final_text"),
             structured_output=dict(cast(Mapping[str, Any], so_raw)) if isinstance(so_raw, Mapping) else None,
             log_ref=LogRef.from_dict(cast(Mapping[str, Any], log_raw)) if isinstance(log_raw, Mapping) else None,
             worktree_ref=WorktreeRef.from_dict(cast(Mapping[str, Any], wt_raw)) if isinstance(wt_raw, Mapping) else None,
@@ -561,10 +578,68 @@ class ReclaimResult:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    run_id: str
+    call_id: str
+    tool_name: str
+    args: dict[str, Any]
+    schema_version: str = SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "call_id": self.call_id,
+            "tool_name": self.tool_name,
+            "args": dict(self.args),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> ToolCall:
+        _check_schema_version(raw)
+        args = raw.get("args")
+        if not isinstance(args, Mapping):
+            raise ProtocolValidationError("args must be an object")
+        return cls(
+            run_id=_req_str(raw, "run_id"),
+            call_id=_req_str(raw, "call_id"),
+            tool_name=_req_str(raw, "tool_name"),
+            args=dict(cast(Mapping[str, Any], args)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDecision:
+    action: ToolAction
+    reason: str = ""
+    schema_version: str = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.action not in _VALID_TOOL_ACTIONS:
+            raise ProtocolValidationError(f"invalid tool action: {self.action}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"schema_version": self.schema_version, "action": self.action, "reason": self.reason}
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> ToolDecision:
+        _check_schema_version(raw)
+        return cls(
+            action=cast(ToolAction, _req_str(raw, "action")),
+            reason=_req_str(raw, "reason", allow_empty=True),
+        )
+
+
+# Asked once per tool call, before it runs. "block" refuses the call and tells the executor why; "defer" stops the run
+# (RunResult.status = "interrupted") so the caller can ask a person. A failure to answer counts as "block".
+ToolAuthorizer: TypeAlias = Callable[[ToolCall], Awaitable[ToolDecision]]
+
+
 class RunnerPort(Protocol):
     async def capabilities(self) -> RunnerCapabilities: ...
 
-    async def run(self, req: RunRequest) -> RunResult: ...
+    async def run(self, req: RunRequest, *, authorizer: ToolAuthorizer | None = None) -> RunResult: ...
 
     async def interrupt(self, req: InterruptRequest) -> InterruptResult: ...
 
@@ -594,6 +669,15 @@ def _opt_str(raw: Mapping[str, Any], key: str) -> str | None:
 
 def _req_bool(raw: Mapping[str, Any], key: str) -> bool:
     val = raw.get(key)
+    if not isinstance(val, bool):
+        raise ProtocolValidationError(f"field {key!r} must be boolean")
+    return val
+
+
+def _opt_bool(raw: Mapping[str, Any], key: str) -> bool:
+    val = raw.get(key)
+    if val is None:
+        return False
     if not isinstance(val, bool):
         raise ProtocolValidationError(f"field {key!r} must be boolean")
     return val

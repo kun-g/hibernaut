@@ -378,9 +378,9 @@ class TestPeerTurnSurvivesDetach(PeerCase):
         recorder = Recorder()
         task = asyncio.ensure_future(self.converse_with(self.runner, TurnSlot(run, None, recorder)))
         run.task = task
-        # Never the list itself: one that is empty here may have its message by the time until() looks at it.
-        session = await until(lambda: self.orca.session() if self.orca.terminals and self.orca.session().received else None,
-                              what="the task")
+        # bool(): the live list can fill after the check returned it empty, and `until` would return the list itself.
+        await until(lambda: bool(self.orca.terminals) and bool(self.orca.session().received), what="the task")
+        session = self.orca.session()
         await until(lambda: recorder.turn and recorder.turn["sent"] and run.parked, what="the parked wait")
         run.stop()
         with self.assertRaises(asyncio.CancelledError):
