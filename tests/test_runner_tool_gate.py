@@ -16,7 +16,7 @@ from runner.cli_drivers import TemplateCLIDriver, default_cli_drivers
 from runner.config import RunnerConfig
 from runner.daemon import RunnerDaemon
 from runner import tool_hook
-from runner.protocol import ExecutorCapability, RunRequest, RunResult, ToolCall, ToolDecision, run_identity
+from runner.protocol import ExecutorCapability, RunRequest, RunResult, ToolAuthorizer, ToolCall, ToolDecision, run_identity
 from runner.registry import WorkspaceAffinityStore
 from runner.tool_gate import MAX_TOOL_CALL_BYTES, ToolGate, ToolGateBinding
 from runner.transport.in_process import InProcessRunnerClient
@@ -262,10 +262,37 @@ def test_native_session_of_a_stopped_run_is_known_even_if_the_cli_printed_nothin
     assert "--resume" in node.entries("start")[-1]["argv"]
 
 
-def test_approval_covers_one_call_with_the_same_arguments(tmp_path: Path) -> None:
-    node, policy = Node(tmp_path), Policy({"Bash": "defer"})
-    body = plan(("Bash", {**CLEANUP, "description": "first wording"}))
-    bridge, first = deferred_run(node, body, policy)
+class ApprovalRunner:
+    def __init__(self):
+        self.allowed = []
+
+    async def run(self, req: RunRequest, *, authorizer: ToolAuthorizer) -> RunResult:
+        assert req.authorize_tools
+        calls = next(json.loads(line.removeprefix("PLAN: ")) for line in req.prompt.splitlines() if line.startswith("PLAN: "))
+        status = "succeeded"
+        for i, spec in enumerate(calls):
+            call = ToolCall(req.run_id, str(i), spec["tool"], spec["args"])
+            decision = await authorizer(call)
+            if decision.action == "defer":
+                status = "interrupted"
+                break
+            if decision.action == "allow":
+                self.allowed.append(call)
+        return RunResult(run_id=req.run_id, runner_id="runner-gate", status=status, executor_id=req.executor_id,
+                         executor_session_id="claude:native-1", started_at="t", ended_at="t", duration_ms=1,
+                         final_text="all done")
+
+
+def approval_scenario(body=plan(("Bash", CLEANUP))):
+    runner, policy = ApprovalRunner(), Policy({"Bash": "defer"})
+    bridge = bridge_to(runner)
+    first = execute(bridge, [event(body)], session(), Caps(policy))
+    assert isinstance(first, Suspend) and not runner.allowed
+    return runner, policy, bridge, first
+
+
+def test_approval_covers_one_call_with_the_same_arguments() -> None:
+    runner, policy, bridge, first = approval_scenario(plan(("Bash", {**CLEANUP, "description": "first wording"})))
     again = plan(("Bash", {**CLEANUP, "description": "second wording"}), ("Bash", CLEANUP))
     state = json.loads(first.session_checkpoint)
     state["prompt"] = again
@@ -273,19 +300,18 @@ def test_approval_covers_one_call_with_the_same_arguments(tmp_path: Path) -> Non
         bridge, [answer(first, True)], dataclasses.replace(suspended(first), checkpoint=json.dumps(state)), Caps(policy)
     )
     assert isinstance(second, Suspend) and second.request_id != first.request_id
-    assert len(node.entries("ran")) == 1
+    assert len(runner.allowed) == 1
 
 
-def test_changed_arguments_are_asked_about_again_and_the_unused_approval_is_kept(tmp_path: Path) -> None:
-    node, policy = Node(tmp_path), Policy({"Bash": "defer"})
-    bridge, first = deferred_run(node, plan(("Bash", CLEANUP)), policy)
+def test_changed_arguments_are_asked_about_again_and_the_unused_approval_is_kept() -> None:
+    runner, policy, bridge, first = approval_scenario()
     state = json.loads(first.session_checkpoint)
     state["prompt"] = plan(("Bash", {"command": "deploy --everywhere"}))
     second = execute(
         bridge, [answer(first, True)], dataclasses.replace(suspended(first), checkpoint=json.dumps(state)), Caps(policy)
     )
     assert isinstance(second, Suspend) and "everywhere" in second.prompt
-    assert node.entries("ran") == []
+    assert runner.allowed == []
     assert [g["request_id"] for g in json.loads(second.session_checkpoint)["grants"]] == [first.request_id]
 
 
@@ -298,21 +324,19 @@ def test_rejected_call_is_refused_with_the_comment_and_the_run_goes_on(tmp_path:
     assert "not today" in node.entries("denied")[-1]["reason"]
 
 
-def test_block_outranks_an_approval(tmp_path: Path) -> None:
-    node, policy = Node(tmp_path), Policy({"Bash": "defer"})
-    bridge, first = deferred_run(node, plan(("Bash", CLEANUP)), policy)
+def test_block_outranks_an_approval() -> None:
+    runner, policy, bridge, first = approval_scenario()
     policy.decisions["Bash"] = "block"
     execute(bridge, [answer(first, True)], suspended(first), Caps(policy))
-    assert node.entries("ran") == []
+    assert runner.allowed == []
 
 
-def test_retry_of_the_resumed_run_does_not_use_the_approval_twice(tmp_path: Path) -> None:
-    node, policy = Node(tmp_path), Policy({"Bash": "defer"})
-    bridge, first = deferred_run(node, plan(("Bash", CLEANUP)), policy)
+def test_retry_of_the_resumed_run_does_not_use_the_approval_twice() -> None:
+    runner, policy, bridge, first = approval_scenario()
     events, sess = [answer(first, True)], suspended(first)
     execute(bridge, events, sess, Caps(policy))
     assert isinstance(execute(bridge, events, sess, Caps(policy)), Suspend)
-    assert len(node.entries("ran")) == 1
+    assert len(runner.allowed) == 1
 
 
 def test_resumed_run_keeps_the_readonly_bound_of_the_deferred_one(tmp_path: Path) -> None:
@@ -322,9 +346,8 @@ def test_resumed_run_keeps_the_readonly_bound_of_the_deferred_one(tmp_path: Path
     assert isinstance(outcome, Emit) and outcome.status == "failed" and "readonly" in outcome.messages[0]
 
 
-def test_same_call_deferred_again_before_the_answer_keeps_the_open_request(tmp_path: Path) -> None:
-    node, policy = Node(tmp_path), Policy({"Bash": "defer"})
-    bridge, first = deferred_run(node, plan(("Bash", CLEANUP)), policy)
+def test_same_call_deferred_again_before_the_answer_keeps_the_open_request() -> None:
+    _, policy, bridge, first = approval_scenario()
     second = execute(bridge, [event(plan(("Bash", CLEANUP)))], suspended(first), Caps(policy))
     assert isinstance(second, Suspend) and second.request_id == first.request_id
 

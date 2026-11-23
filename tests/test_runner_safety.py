@@ -43,15 +43,18 @@ from runner.worktree import CommandOutput, CreatedWorktree, GitWorktreeBackend, 
 
 PY = sys.executable
 
-# Leader writes "<leader_pid> <grandchild_pid>" to the path in argv[1]; the grandchild ignores SIGTERM.
+# Publish both PIDs only once the grandchild ignores TERM. The cancellation matrix covers descendants
+# that do and don't keep the leader's output pipes open.
 _SPAWN_SCRIPT = (
-    "import os, subprocess, sys, time\n"
-    "child = subprocess.Popen([sys.executable, '-c', "
-    "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])\n"
-    "time.sleep(0.2)\n"
-    "open(sys.argv[1] + '.tmp', 'w').write(f'{os.getpid()} {child.pid}')\n"
-    "os.replace(sys.argv[1] + '.tmp', sys.argv[1])\n"
-    "time.sleep(60)\n"
+    "import os, signal, sys\n"
+    "leader = os.getpid()\n"
+    "if os.fork() == 0:\n"
+    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "    if '--hold-pipes' not in sys.argv: os.close(1); os.close(2)\n"
+    "    with open(sys.argv[1] + '.tmp', 'w') as f: f.write(f'{leader} {os.getpid()}')\n"
+    "    os.replace(sys.argv[1] + '.tmp', sys.argv[1])\n"
+    "signal.alarm(60)\n"
+    "signal.pause()\n"
 )
 
 
@@ -189,10 +192,15 @@ def _kill_quietly(*pids: int) -> None:
             pass
 
 
-def test_cancelled_run_reaps_process_group_and_keeps_workspace_busy_until_reaped(tmp_path: Path) -> None:
+@pytest.mark.parametrize("hold_pipes", [False, True], ids=["detached-output", "inherited-output"])
+def test_cancelled_run_reaps_process_group_and_keeps_workspace_busy_until_reaped(tmp_path: Path, hold_pipes: bool) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
-    daemon = RunnerDaemon(_config(tmp_path, repo), drivers=_drivers())
+    drivers = _drivers()
+    if hold_pipes:
+        spawn = drivers["spawn"]
+        drivers["spawn"] = dataclasses.replace(spawn, args=(*spawn.args, "--hold-pipes"))
+    daemon = RunnerDaemon(_config(tmp_path, repo), drivers=drivers)
     pidfile = tmp_path / "pids-cancel"
     pids: list[int] = []
 

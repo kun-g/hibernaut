@@ -3,7 +3,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 
@@ -94,15 +93,15 @@ def run(command, *, env, cwd):
         head = branch_head(pr["head"])
         if opt(argv, "--match-head-commit") != head:
             return result(code=1, stderr="fake gh: head commit does not match\n")
-        with tempfile.TemporaryDirectory() as tmp:
-            git("clone", "-q", "--branch", pr["base"], state["bare"], tmp)
-            squash = git("merge", "--squash", f"origin/{pr['head']}", directory=tmp, check=False)
-            if squash.returncode != 0:
-                return result(code=1, stderr=f"fake gh: Pull request is not mergeable: {squash.stdout}{squash.stderr}\n")
-            git("-c", "user.email=gh@example.invalid", "-c", "user.name=gh", "commit", "-qm",
-                f"{pr['title']} (#{pr['number']})", directory=tmp)
-            git("push", "-q", "origin", pr["base"], directory=tmp)
-            sha = git("rev-parse", "HEAD", directory=tmp).stdout.strip()
+        bare = state["bare"]
+        base = branch_head(pr["base"])
+        tree = git("merge-tree", "--write-tree", base, head, directory=bare, check=False)
+        if tree.returncode:
+            return result(code=1, stderr=f"fake gh: Pull request is not mergeable: {tree.stdout}{tree.stderr}\n")
+        # A squash on the remote advances the base to the merged tree with one parent.
+        sha = git("-c", "user.email=gh@example.invalid", "-c", "user.name=gh", "commit-tree", tree.stdout.strip(),
+                  "-p", base, "-m", f"{pr['title']} (#{pr['number']})", directory=bare).stdout.strip()
+        git("update-ref", f"refs/heads/{pr['base']}", sha, base, directory=bare)
         pr.update(state="MERGED", merge_sha=sha, merged_head=head, method=[a for a in argv if a in ("--squash", "--merge", "--rebase")])
         save()
         return result()
