@@ -3,11 +3,12 @@ from __future__ import annotations
 import hmac
 import json
 from collections.abc import Callable, Mapping
-from typing import Any, TextIO
+from typing import Any, TextIO, cast, get_args
 
 from agent_runtime import __version__
 from agent_runtime.adapters.channels.http_types import WebhookResponse
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
+from agent_runtime.adapters.ledger_bridge import RunLedger
 from agent_runtime.adapters.storage_sqlite.stores import (
     SQLiteInboxAdapter,
     SQLiteSessionStoreAdapter,
@@ -16,6 +17,7 @@ from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStor
 from agent_runtime.core.models import explicit_trace_id, new_id
 from agent_runtime.core.ports import OutboxPort
 from agent_runtime.engine.handler import EventHandler
+from ledger import ErrorKind, ServiceName, Severity
 
 _PROTOCOL_VERSION = "2024-11-05"
 
@@ -107,7 +109,96 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["session_id"],
         },
     },
+    {
+        "name": "hibernaut_list_runs",
+        "description": "Read-only: list Runs from the run ledger (newest first), filtered by inbox, correlation key, "
+        "trace, session, event, executor or error kind.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "inbox_id": {"type": "string"},
+                "correlation_key": {"type": "string"},
+                "trace_id": {"type": "string"},
+                "session_id": {"type": "string"},
+                "event_id": {"type": "string"},
+                "executor_id": {"type": "string"},
+                "error_kind": {"type": "string", "enum": list(get_args(ErrorKind))},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+            },
+        },
+    },
+    {
+        "name": "hibernaut_get_run_log",
+        "description": "Read-only: the tail of one Run's executor log, or its stored error summary when the log is gone.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "tail_lines": {"type": "integer", "minimum": 1},
+                "max_bytes": {"type": "integer", "minimum": 1},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "hibernaut_list_audits",
+        "description": "Read-only: list audit records (Switchboard and Hibernaut side-channel events) from the ledger.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "correlation_key": {"type": "string"},
+                "trace_id": {"type": "string"},
+                "scope": {"type": "string"},
+                "service": {"type": "string", "enum": list(get_args(ServiceName))},
+                "stage": {"type": "string"},
+                "severity": {"type": "string", "enum": list(get_args(Severity))},
+                "run_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+            },
+        },
+    },
+    {
+        "name": "hibernaut_executor_stats",
+        "description": "Read-only: success rate, latency, tokens, cost and error kinds per executor from the ledger.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "inbox_id": {"type": "string"},
+                "since_iso": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "hibernaut_replay_event",
+        "description": "Requeue a failed event as pending (attempts reset), optionally on another executor. It waits "
+        "for the inbox like any new event and never takes a Run in progress.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string"},
+                "executor_id": {"type": "string"},
+                "force": {"type": "boolean", "description": "Also replay an event that is done."},
+            },
+            "required": ["event_id"],
+        },
+    },
 ]
+
+_LEDGER_READ_TOOLS = frozenset(
+    {"hibernaut_list_runs", "hibernaut_get_run_log", "hibernaut_list_audits", "hibernaut_executor_stats"}
+)
+
+
+def _opt_str(args: Mapping[str, Any], key: str) -> str | None:
+    value = args.get(key)
+    return str(value) if value is not None else None
+
+
+def _opt_choice(args: Mapping[str, Any], key: str, choices: tuple[str, ...]) -> str | None:
+    value = _opt_str(args, key)
+    if value is not None and value not in choices:
+        raise ValueError(f"Unsupported {key}: {value}")
+    return value
 
 
 class MCPServerAdapter:
@@ -122,8 +213,10 @@ class MCPServerAdapter:
         outbox: OutboxPort | None = None,
         bearer_token: str | None = None,
         worktree_manager_for: Callable[[str | None, str], OrcaWorktreeManager | None] | None = None,
+        ledger: RunLedger | None = None,
     ) -> None:
         self._handler = handler
+        self._ledger = ledger
         # (inbox_id or None, work_key) -> the manager of the project that owns that workspace, if any.
         self._worktree_manager_for = worktree_manager_for
         self._sessions = sessions
@@ -403,7 +496,74 @@ class MCPServerAdapter:
                 "reclaim": reclaim_payload,
             }
 
+        if tool_name in _LEDGER_READ_TOOLS:
+            return self._ledger_read(tool_name, args)
+
+        if tool_name == "hibernaut_replay_event":
+            return self._replay_event(args)
+
         raise KeyError(tool_name)
+
+    def _ledger_read(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._ledger is None:
+            raise ValueError("run ledger is not attached to MCPServerAdapter")
+        tools = self._ledger.read_tools
+        if tool_name == "hibernaut_list_runs":
+            return tools.hibernaut_list_runs(
+                inbox_id=_opt_str(args, "inbox_id"),
+                correlation_key=_opt_str(args, "correlation_key"),
+                trace_id=_opt_str(args, "trace_id"),
+                session_id=_opt_str(args, "session_id"),
+                event_id=_opt_str(args, "event_id"),
+                executor_id=_opt_str(args, "executor_id"),
+                error_kind=cast(ErrorKind | None, _opt_choice(args, "error_kind", get_args(ErrorKind))),
+                limit=int(args.get("limit", 50)),
+            )
+        if tool_name == "hibernaut_get_run_log":
+            return tools.hibernaut_get_run_log(
+                run_id=str(args["run_id"]),
+                tail_lines=int(args.get("tail_lines", 120)),
+                max_bytes=int(args.get("max_bytes", 65536)),
+            )
+        if tool_name == "hibernaut_list_audits":
+            return tools.hibernaut_list_audits(
+                correlation_key=_opt_str(args, "correlation_key"),
+                trace_id=_opt_str(args, "trace_id"),
+                scope=_opt_str(args, "scope"),
+                service=cast(ServiceName | None, _opt_choice(args, "service", get_args(ServiceName))),
+                stage=_opt_str(args, "stage"),
+                severity=cast(Severity | None, _opt_choice(args, "severity", get_args(Severity))),
+                run_id=_opt_str(args, "run_id"),
+                limit=int(args.get("limit", 50)),
+            )
+        return tools.hibernaut_executor_stats(
+            inbox_id=_opt_str(args, "inbox_id"),
+            since_iso=_opt_str(args, "since_iso"),
+        )
+
+    def _replay_event(self, args: dict[str, Any]) -> dict[str, Any]:
+        # Hibernaut control plane, not the ledger: the ledger only names the failed Run being replayed.
+        if self._inbox is None:
+            raise ValueError("event inbox is not attached to MCPServerAdapter")
+        event_id = str(args["event_id"])
+        executor_id = _opt_str(args, "executor_id") or None
+        force = bool(args.get("force", False))
+        replay_of = self._ledger.latest_failed_run_id(event_id) if self._ledger is not None else None
+        event = self._inbox.replay(
+            event_id, executor_id_override=executor_id, force=force, replay_of_run_id=replay_of
+        )
+        self._handler.wake(event.inbox_id)
+        if self._ledger is not None:
+            self._ledger.record_replay(
+                event, replay_of_run_id=replay_of, executor_id_override=executor_id, force=force, actor="mcp"
+            )
+        return {
+            "event_id": event.event_id,
+            "inbox_id": event.inbox_id,
+            "status": event.status,
+            "executor_id": executor_id,
+            "replay_of_run_id": replay_of,
+        }
 
     def _manager_for(self, inbox_id: str | None, work_key: str) -> OrcaWorktreeManager:
         chosen = self._worktree_manager_for(inbox_id, work_key) if self._worktree_manager_for is not None else None

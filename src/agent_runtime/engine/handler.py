@@ -51,5 +51,10 @@ class EventHandler:
             duplicate=is_duplicate,
         )
 
+    def wake(self, inbox_id: str) -> None:
+        # For events that become pending without an append, such as a control-plane replay.
+        if self._on_wake is not None:
+            self._on_wake(inbox_id)
+
     def has_open_event(self, *, inbox_id: str, source: str, external_id: str) -> bool:
         return self._inbox.has_open_event(inbox_id, source, external_id)

@@ -4,7 +4,8 @@
     "src/agent_runtime/engine",
     "src/switchboard",
     "src/ccpeer",
-    "src/taskboard"
+    "src/taskboard",
+    "src/ledger"
   ],
   "extraPaths": [
     "src"
