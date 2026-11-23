@@ -129,6 +129,41 @@ class TestLimiter(unittest.TestCase):
         self.assertFalse(lim.try_acquire("i1", project_key=None, executor_key=None))
         self.assertEqual(lim.active, 1)
 
+    def test_reconfigure_keeps_held_slots_and_notifies_listeners(self):
+        from agent_runtime.app.concurrency import ConcurrencyLimits
+
+        lim = self.limiter(3, {"a": 2}, {"sde": 2})
+        events = []
+        unsub = lim.subscribe(lambda: events.append("changed"))
+        self.assertTrue(lim.try_acquire("i1", project_key="a", executor_key="sde"))
+        self.assertTrue(lim.try_acquire("i2", project_key="a", executor_key="sde"))
+        # Lowering global cap below active count saturates until held slots drop below the new cap.
+        lim.reconfigure(1, ConcurrencyLimits(projects={"a": 1}, executors={"sde": 1}))
+        self.assertEqual(len(events), 1)
+        self.assertTrue(lim.saturated())
+        self.assertFalse(lim.available("i3", project_key="b", executor_key=None))
+        lim.release("i1")
+        self.assertEqual(len(events), 2)
+        self.assertTrue(lim.saturated())
+        lim.release("i2")
+        self.assertEqual(len(events), 3)
+        self.assertFalse(lim.saturated())
+        self.assertTrue(lim.try_acquire("i3", project_key="a", executor_key="sde"))
+        unsub()
+        lim.release("i3")
+        self.assertEqual(len(events), 3)
+
+    def test_reconfigure_counts_agents_held_under_the_old_limits(self):
+        from agent_runtime.app.concurrency import ConcurrencyLimits
+
+        lim = self.limiter(4)
+        self.assertTrue(lim.try_acquire("i1", project_key=None, executor_key="cc", agent_key="sde"))
+        lim.reconfigure(4, ConcurrencyLimits(agents={"sde": 1}))
+        self.assertFalse(lim.try_acquire("i2", project_key=None, executor_key="cc", agent_key="sde"))
+        self.assertTrue(lim.try_acquire("i3", project_key=None, executor_key="cc", agent_key="steward"))
+        lim.release("i1")
+        self.assertTrue(lim.try_acquire("i2", project_key=None, executor_key="cc", agent_key="sde"))
+
 
 class Probe:
     # Stands in for every configured CLI executor of the daemon under test; runs on text "block..." wait for release().
@@ -808,10 +843,15 @@ class TestReload(PoolCase):
                 await self.settle()
                 self.assertEqual(self.probe.active_texts(), ["block-0"])
                 self.write(projects={"a": {**TASKS, "max_concurrency": 2}})
-                # block-0 finishes under the old generation; the new one runs two of the three handed over.
-                await self.until(lambda: len(self.probe.active) == 3)
+                # block-0 still occupies one project slot under the old generation, so the new one admits only block-1.
+                await self.until(lambda: len(self.probe.active) == 2)
                 await self.settle()
-                self.assertEqual(self.probe.active_texts(), ["block-0", "block-1", "block-2"])
+                self.assertEqual(self.probe.active_texts(), ["block-0", "block-1"])
+                # Releasing the old generation's run frees its slot and wakes the new generation for block-2.
+                self.probe.release("block-0")
+                await self.until(lambda: self.probe.active_texts() == ["block-1", "block-2"])
+                await self.settle()
+                self.assertEqual(self.probe.active_texts(), ["block-1", "block-2"])
                 # An unusable limit keeps the current generation.
                 self.write(projects={"a": {**TASKS, "max_concurrency": 0}})
                 await self.until(lambda: "projects.a.max_concurrency must be a positive integer" in stderr.getvalue())
@@ -822,6 +862,152 @@ class TestReload(PoolCase):
                 stop.set()
                 await asyncio.wait_for(serving, 10)
         self.assertEqual(Counter(self.probe.finished), Counter(f"block-{n}" for n in range(4)))
+        self.assertEqual(self.probe.peak("project", "proj:a"), 2)
+
+    async def test_a_reload_never_exceeds_global_max_concurrency(self):
+        self.path = self.root / "hibernaut.toml"
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.port = sock.getsockname()[1]
+        stderr = io.StringIO()
+        self._seq = 0
+        self.write(max_concurrency=2, projects={"a": TASKS})
+        config = load_config(self.path)
+        daemon = build_daemon_from_config(config)
+        self.addCleanup(daemon.close)
+        stop = asyncio.Event()
+        with contextlib.redirect_stderr(stderr):
+            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02,
+                                                           outbox_interval_seconds=0.02))
+            try:
+                self.post(daemon, "proj:a:issue-0", "block-0")
+                self.post(daemon, "proj:a:issue-1", "block-1")
+                await self.until(lambda: len(self.probe.active) == 2)
+                # Trigger an unrelated config reload while global concurrency is full (2/2).
+                self.write(max_concurrency=2, projects={"a": TASKS, "b": {"inbox_id": "proj:b"}})
+                await self.until(lambda: "[config] Reloaded" in stderr.getvalue())
+                # New work arriving after reload must wait for an old-generation slot instead of running 3/2.
+                self.post(daemon, "proj:b", "block-2")
+                await self.settle()
+                self.assertEqual(self.probe.active_texts(), ["block-0", "block-1"])
+                self.probe.release("block-0")
+                await self.until(lambda: self.probe.active_texts() == ["block-1", "block-2"])
+                self.probe.release("block-1", "block-2")
+                await self.until(lambda: len(self.probe.finished) == 3)
+            finally:
+                self.probe.release(*self.probe.gates)
+                stop.set()
+                await asyncio.wait_for(serving, 10)
+        self.assertEqual(self.probe.peak("all", ""), 2)
+
+    async def test_a_reload_counts_an_agents_old_runs_against_its_new_limit(self):
+        self.path = self.root / "hibernaut.toml"
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.port = sock.getsockname()[1]
+        stderr = io.StringIO()
+        self._seq = 0
+        base = self.raw
+        self.raw = lambda writer, **limits: {**base(**limits), "agents": {
+            "writer": {"executor": "sde", "max_concurrency": writer}, "other": {"executor": "sde"}}}
+        self.write(writer=1, projects={"a": TASKS})
+        config = load_config(self.path)
+        daemon = build_daemon_from_config(config)
+        self.addCleanup(daemon.close)
+        stop = asyncio.Event()
+        with contextlib.redirect_stderr(stderr):
+            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02,
+                                                           outbox_interval_seconds=0.02))
+            try:
+                for n in range(3):
+                    self.post(daemon, f"proj:a:{n}", f"block-{n}", executor="writer")
+                await self.until(lambda: self.probe.active_texts() == ["block-0"])
+                self.write(writer=2, projects={"a": TASKS})
+                await self.until(lambda: len(self.probe.active) == 2)
+                await self.settle()
+                self.assertEqual(self.probe.active_texts(), ["block-0", "block-1"])
+                # Another agent of the same driver has a slot, and the old Run's goes to the writer's next inbox.
+                self.post(daemon, "proj:a:9", "other", executor="other")
+                await self.until(lambda: "other" in self.probe.finished)
+                self.probe.release("block-0")
+                await self.until(lambda: self.probe.active_texts() == ["block-1", "block-2"])
+            finally:
+                self.probe.release(*self.probe.gates)
+                stop.set()
+                await asyncio.wait_for(serving, 10)
+
+    async def test_lowering_global_limit_on_reload_waits_for_old_runs_to_drain(self):
+        self.path = self.root / "hibernaut.toml"
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.port = sock.getsockname()[1]
+        stderr = io.StringIO()
+        self._seq = 0
+        self.write(max_concurrency=3, projects={"a": TASKS})
+        config = load_config(self.path)
+        daemon = build_daemon_from_config(config)
+        self.addCleanup(daemon.close)
+        stop = asyncio.Event()
+        with contextlib.redirect_stderr(stderr):
+            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02,
+                                                           outbox_interval_seconds=0.02))
+            try:
+                for n in range(3):
+                    self.post(daemon, f"proj:a:issue-{n}", f"block-{n}")
+                await self.until(lambda: len(self.probe.active) == 3)
+                self.write(max_concurrency=1, projects={"a": TASKS})
+                await self.until(lambda: "[config] Reloaded" in stderr.getvalue())
+                self.post(daemon, "proj:a:issue-3", "block-3")
+                self.probe.release("block-0", "block-1")
+                await self.until(lambda: self.probe.active_texts() == ["block-2"])
+                await self.settle()
+                # Still 1 active (block-2 >= new limit 1), so block-3 must keep waiting.
+                self.assertEqual(self.probe.active_texts(), ["block-2"])
+                self.probe.release("block-2")
+                await self.until(lambda: self.probe.active_texts() == ["block-3"])
+                self.probe.release("block-3")
+                await self.until(lambda: len(self.probe.finished) == 4)
+            finally:
+                self.probe.release(*self.probe.gates)
+                stop.set()
+                await asyncio.wait_for(serving, 10)
+
+    async def test_a_failed_reload_keeps_the_current_limiter_limits(self):
+        self.path = self.root / "hibernaut.toml"
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.port = sock.getsockname()[1]
+        stderr = io.StringIO()
+        self._seq = 0
+        self.write(max_concurrency=1, projects={"a": TASKS})
+        config = load_config(self.path)
+        daemon = build_daemon_from_config(config)
+        self.addCleanup(daemon.close)
+        stop = asyncio.Event()
+        with contextlib.redirect_stderr(stderr), socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02,
+                                                           outbox_interval_seconds=0.02))
+            try:
+                self.post(daemon, "proj:a:issue-0", "block-0")
+                self.post(daemon, "proj:a:issue-1", "block-1")
+                await self.until(lambda: self.probe.active_texts() == ["block-0"])
+                old_port = self.port
+                self.port = occupied.getsockname()[1]
+                self.write(max_concurrency=4, projects={"a": TASKS})
+                await self.until(lambda: "Cannot activate settings" in stderr.getvalue())
+                self.port = old_port
+                await self.settle()
+                # Limit stayed at 1 because the reload failed to bind the new port.
+                self.assertEqual(self.probe.active_texts(), ["block-0"])
+                self.probe.release("block-0", "block-1")
+                await self.until(lambda: len(self.probe.finished) == 2)
+            finally:
+                self.probe.release(*self.probe.gates)
+                stop.set()
+                await asyncio.wait_for(serving, 10)
+        self.assertEqual(self.probe.peak("all", ""), 1)
 
 
 class TestBuildDaemon(PoolCase):
