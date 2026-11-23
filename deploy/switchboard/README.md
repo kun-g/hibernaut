@@ -49,15 +49,34 @@ chmod 600 .env
    | `SWITCHBOARD_FEISHU_WEBHOOK_SECRET` | 飞书事件订阅的 Verification Token |
    | `SWITCHBOARD_FEISHU_APP_ID`、`SWITCHBOARD_FEISHU_APP_SECRET` | 飞书应用凭证，Switchboard 自己换取并刷新 tenant access token；不接飞书可留空 |
 
-4. 构建并启动：
+4. 校验配置，再构建并启动：
 
    ```bash
+   docker compose build switchboard
+   docker compose run --rm --no-deps switchboard --check   # 退出码 0 才继续
    docker compose up -d --build
    docker compose ps          # switchboard 显示 healthy 后 caddy 才启动
    docker compose logs -f     # 出现 "[switchboard] relay endpoint ... (transport=hybrid)"
    ```
 
-改 `switchboard.toml` 或 `.env` 后执行 `docker compose up -d --force-recreate switchboard`（Switchboard 不热加载）。改 `Caddyfile` 后执行 `docker compose restart caddy`。
+改 `switchboard.toml` 或 `.env` 后先跑一次上面的 `--check`，再执行 `docker compose up -d --force-recreate switchboard`（Switchboard 不热加载）。改 `Caddyfile` 后执行 `docker compose restart caddy`。
+
+### 配置校验 `--check`
+
+`python -m switchboard.app --config switchboard.toml --check` 解析并校验整个配置文件，以及当前环境变量里的 GitHub App、飞书应用凭据能否解析、是否成对。它不建目录和数据库、不监听端口、不访问网络，所以可以在旧实例还在运行时执行。
+
+- 通过：stdout 输出监听地址、路由规则数、已启用渠道，退出码 0。渠道按环境变量里有没有凭据判断，只显示名字。
+- 失败：stderr 每行一个问题，含配置路径和字段名，退出码 1。
+- 启动时会静默忽略的半截配置只有 `--check` 会报：死信告警只填了渠道或目标、`notify_channel` 没有 `notify_target`、`[relay] listen_host` 没有 `listen_port`、App ID 与私钥（Secret）只填了一个。
+- 同样只有 `--check` 会报：启用了 Relay 但环境变量里没有 `SWITCHBOARD_RELAY_WEBHOOK_SECRET`；Relay 与 HTTP 同端口且地址重叠（`0.0.0.0` 与任何地址重叠；主机名不解析）；监听地址是 IPv6、写错的 IPv4 或不合法的主机名。因此要带着服务的环境变量执行。
+
+### 停机
+
+收到 SIGTERM 或 SIGINT（`docker stop`、`systemd`、`launchd`、Ctrl+C）后：立即关闭监听，已收到的请求处理完并返回；投递、出站和 Relay 不再领取新任务，等在途的写库、投递和发送完成；给 Relay 连接发 Close 1001 并等对端回 Close，关闭 SQLite，退出码 0。没领取的事件和消息留在库里，重启后继续。
+
+等待上限是 `switchboard.toml` 顶层的 `shutdown_timeout_seconds`（默认 10 秒，正数，必须写在第一个 `[表]` 之前）。超时会记一条 `WARNING`，列出没结束的部分（包括不回 Close 的 Relay 连接）并强制收尾（最多再约 2 秒），仍以 0 退出：没处理完的 HTTP 连接被切断；没收到 ACK 的 Relay 推送记回 `pending`、不计次数；平台已收到但没来得及记录的出站消息，重启后会重发一次。停机中再发一次信号立即退出，退出码 130（SIGINT）或 143（SIGTERM）。
+
+监督方的强杀时限要比它长。Compose 模板已设 `stop_grace_period: 20s`（Docker 默认 10 秒）；`docker stop` 手动停时加 `-t 20`。调大 `shutdown_timeout_seconds` 时同步调大它。
 
 ## 已有反向代理（如 Dokploy / Traefik）
 
@@ -80,6 +99,7 @@ chmod 600 .env
          context: https://github.com/kun-g/hibernaut.git#<commit>
          dockerfile: deploy/switchboard/Dockerfile
        restart: unless-stopped
+       stop_grace_period: 20s
        environment:
          SWITCHBOARD_RELAY_WEBHOOK_SECRET: ${SWITCHBOARD_RELAY_WEBHOOK_SECRET}
          SWITCHBOARD_MCP_WEBHOOK_SECRET: ${SWITCHBOARD_MCP_WEBHOOK_SECRET}

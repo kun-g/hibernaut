@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from typing import Any, Protocol, cast
 
+from switchboard.feishu_rate_limit import is_rate_limited, reset_seconds
 from switchboard.http_client import HttpClient
 
 _REFRESH_MARGIN_SECONDS = 600
@@ -20,9 +21,10 @@ class FeishuTokenSource(Protocol):
 
 
 class FeishuAuthError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool = True) -> None:
+    def __init__(self, message: str, *, retryable: bool = True, retry_after_seconds: float | None = None) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
 
 
 class FeishuTenantTokenSource:
@@ -68,8 +70,10 @@ class FeishuTenantTokenSource:
         if response.status == 200 and data.get("code") == 0 and isinstance(token, str) and token:
             expire = data.get("expire")
             return token, issued + (float(expire) if isinstance(expire, int | float) else 7200.0)
-        # A 4xx or a non-zero code is a wrong app id/secret, which retrying cannot fix.
+        limited = is_rate_limited(response.status, data.get("code"))
+        # Any other 4xx or non-zero code is a wrong app id/secret, which retrying cannot fix.
         raise FeishuAuthError(
             f"feishu tenant_access_token HTTP {response.status} code={data.get('code')} msg={data.get('msg')}",
-            retryable=response.status == 429 or response.status >= 500,
+            retryable=limited or response.status >= 500,
+            retry_after_seconds=reset_seconds(response) if limited else None,
         )

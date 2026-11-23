@@ -25,8 +25,10 @@ from agent_runtime.adapters.runner_pilot import (
     RunnerPilotRelay,
 )
 from agent_runtime.app.config import RunnerPilotConfig, load_config, parse_config
-from agent_runtime.app.main import build_daemon_from_config
-from agent_runtime.core.models import Emit, Event, PermissionDecision, RunCancelled, SessionRef
+from agent_runtime.app.main import AlwaysOnDaemon, build_daemon_from_config
+from agent_runtime.core.models import Emit, Event, ForwardRefused, PermissionDecision, RunCancelled, SessionRef, Silent
+from agent_runtime.core.ports import RunCapabilities
+from agent_runtime.engine.closing import close_session
 from runner.protocol import InterruptRequest, InterruptResult, LogRef, RunnerCapabilities, RunRequest, RunResult
 from runner.protocol_check import (
     CHECK_SCHEMA,
@@ -37,7 +39,7 @@ from runner.protocol_check import (
 )
 from runner.registry import NoEligibleRunnerError
 from runner.transport.relay_hub import RunnerConnectionLostError
-from tests.fakes import InMemoryPermission
+from tests.fakes import InMemoryPermission, RecordingChannel
 from tests.runner_pilot_support import (
     ROOT,
     RUNNER_ID,
@@ -120,7 +122,22 @@ def test_the_pilot_inbox_must_be_its_own_and_the_executor_name_is_reserved() -> 
         parse_config(raw)
     raw = _raw()
     raw["runtime"]["default_executor"] = "missing"
-    with pytest.raises(ValueError, match="default_executor"):
+    with pytest.raises(ValueError, match="default_agent"):
+        parse_config(raw)
+
+
+@pytest.mark.parametrize(
+    ("table", "entry"),
+    [
+        ("agents", {"executor": "claude", "role": "code-reviewer", "model": "m", "launcher": "l"}),
+        ("agents", {"executor": "cli"}),
+        ("executors", {}),
+    ],
+)
+def test_neither_an_agent_nor_a_driver_may_take_the_executor_name(table: str, entry: dict[str, Any]) -> None:
+    raw = _raw(enabled=False)
+    raw.setdefault(table, {})[PROTOCOL_CHECK_EXECUTOR_ID] = entry
+    with pytest.raises(ValueError, match=rf"{table}\.{PROTOCOL_CHECK_EXECUTOR_ID}: the name is reserved"):
         parse_config(raw)
 
 
@@ -303,6 +320,153 @@ def test_the_closed_route_runs_nothing() -> None:
     session = SessionRef(session_id="s", inbox_id=OTHER)
     outcome = asyncio.run(ClosedRouteExecutor().execute([], session, _Caps()))
     assert isinstance(outcome, Emit) and (outcome.status, outcome.close_session) == ("failed", True)
+
+
+# --- routing next to inbox bindings and forwards
+
+
+class _FakeRelay(_FakeRunner):
+    listening = True
+
+
+def _daemon(tmp_path: Path, relay: _FakeRelay, *, enabled: bool = True) -> AlwaysOnDaemon:
+    # The bindings send every task inbox, the pilot's included, to "cli" and allow nothing else there.
+    raw = _raw(enabled=enabled)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir(exist_ok=True)
+    raw["runtime"] |= {"db_path": str(tmp_path / "hb.db"), "memory_root": str(tmp_path / "mem")}
+    raw["executors"]["other"] = {"command": "true"}
+    raw["projects"]["hibernaut"] |= {
+        "checkout": str(checkout),
+        "inbox_bindings": [
+            {"pattern": "hibernaut:.*", "agents": ["cli"], "default_agent": "cli",
+             "rules": [{"source": "github", "agent": "cli"}]},
+            {"pattern": "proj:hibernaut", "default_agent": "cli"},
+        ],
+    }
+    return build_daemon_from_config(
+        parse_config(raw, base_dir=tmp_path), runner_pilot=relay if enabled else None, channel=RecordingChannel(),  # type: ignore[arg-type]
+    )
+
+
+def _process(daemon: AlwaysOnDaemon, inbox_id: str, executor: Any = None) -> None:
+    worker = daemon.pool._worker_factory(inbox_id, "w")
+    if executor is not None:
+        worker._executors[executor.executor_id] = executor
+    asyncio.run(worker.process_inbox(inbox_id))
+
+
+def _rows(daemon: AlwaysOnDaemon, table: str, inbox_id: str) -> list[sqlite3.Row]:
+    return daemon.db.fetchall(f"SELECT * FROM {table} WHERE inbox_id = ? ORDER BY rowid", (inbox_id,))
+
+
+class _Forwarder:
+    executor_id = "cli"
+
+    def __init__(self, **kwargs: Any) -> None:
+        self._kwargs = kwargs
+        self.refused: str | None = None
+        self.seen: list[Event] = []
+
+    async def execute(self, events: Any, session: SessionRef, caps: RunCapabilities) -> Silent:
+        self.seen += events
+        try:
+            caps.forward_to_inbox(PILOT, "核验候选提交", return_to=OTHER, **self._kwargs)
+        except ForwardRefused as exc:
+            self.refused = str(exc)
+        return Silent()
+
+
+@pytest.mark.parametrize("key", ["agent_id", "executor_id"])
+def test_inbox_bindings_neither_take_the_pilot_inbox_over_nor_refuse_its_executor(tmp_path: Path, key: str) -> None:
+    relay = _FakeRelay(_result)
+    daemon = _daemon(tmp_path, relay)
+    daemon.handler.ingest(inbox_id=PILOT, source="github", external_id="1", payload={key: "cli"}, correlation_key="c1")
+    daemon.handler.ingest(
+        inbox_id=PILOT, source="github", external_id="2", payload={"candidate_commit": COMMIT}, correlation_key="c2"
+    )
+    daemon.handler.ingest(
+        inbox_id=PILOT, source="github", external_id="3", correlation_key="c3",
+        payload={"candidate_commit": COMMIT, key: PROTOCOL_CHECK_EXECUTOR_ID},
+    )
+    _process(daemon, PILOT)
+    assert [row["status"] for row in _rows(daemon, "event_inbox", PILOT)] == ["pending", "done", "done"]
+    assert len(relay.requests) == 2
+    daemon.close()
+
+
+def test_work_is_forwarded_to_the_pilot_inbox_only_for_its_own_executor(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path, _FakeRelay(_result))
+    daemon.handler.ingest(inbox_id=OTHER, source="github", external_id="1", payload={"text": "go"}, correlation_key="c1")
+    asked = _Forwarder(target_agent="cli")
+    _process(daemon, OTHER, asked)
+    assert asked.refused is not None and "'cli' is not allowed" in asked.refused
+    assert _rows(daemon, "event_inbox", PILOT) == []
+    daemon.close()
+
+
+def test_the_pilot_hands_its_result_back_to_the_inbox_that_asked_for_it(tmp_path: Path) -> None:
+    # A forward carries no candidate commit, so the result is a refusal to check; what counts is that it comes back.
+    relay = _FakeRelay(_result)
+    daemon = _daemon(tmp_path, relay)
+    daemon.handler.ingest(inbox_id=OTHER, source="github", external_id="1", payload={"text": "go"}, correlation_key="c1")
+    asked = _Forwarder()
+    _process(daemon, OTHER, asked)
+    assert asked.refused is None
+    woken: list[str] = []
+    daemon.pool.wake = woken.append  # type: ignore[method-assign]
+    _process(daemon, PILOT)
+    assert relay.requests == []
+    [task] = _rows(daemon, "event_inbox", PILOT)
+    assert task["status"] == "done"
+    _, back = _rows(daemon, "event_inbox", OTHER)
+    payload = json.loads(back["payload_json"])
+    assert (back["source"], payload["status"], payload["forwarded_by"]) == (
+        "agent:return", "failed", PROTOCOL_CHECK_EXECUTOR_ID
+    )
+    assert "candidate_commit" in payload["text"]
+    assert woken == [OTHER]
+    daemon.close()
+
+
+def test_work_withdrawn_from_another_executor_does_not_stop_the_checks(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path, _FakeRelay(_result), enabled=False)
+    daemon.handler.ingest(inbox_id=PILOT, source="github", external_id="0", payload={"text": "hi"}, correlation_key="c1")
+    _process(daemon, PILOT, _Forwarder(target_agent="other"))
+    daemon.handler.ingest(inbox_id=OTHER, source="github", external_id="1", payload={"text": "go"}, correlation_key="c1")
+    asked = _Forwarder()
+    _process(daemon, OTHER, asked)
+    assert asked.refused is None
+    [parent] = daemon.sessions.list_sessions(inbox_id=OTHER)
+    close_session(parent, daemon.sessions, daemon.handler.queue, cause="test")
+    daemon.close()
+    relay = _FakeRelay(_result)
+    daemon = _daemon(tmp_path, relay)
+    daemon.handler.ingest(
+        inbox_id=PILOT, source="github", external_id="2", payload={"candidate_commit": COMMIT}, correlation_key="c2"
+    )
+    _process(daemon, PILOT)
+    assert [row["status"] for row in _rows(daemon, "event_inbox", PILOT)] == ["done", "done", "done"]
+    assert len(relay.requests) == 1
+    daemon.close()
+
+
+def test_with_the_route_off_the_bindings_apply_to_the_pilot_inbox_again(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path, _FakeRelay(_result), enabled=False)
+    daemon.handler.ingest(inbox_id=OTHER, source="github", external_id="1", payload={"text": "go"}, correlation_key="c1")
+    asked = _Forwarder(target_agent="cli")
+    _process(daemon, OTHER, asked)
+    assert asked.refused is None
+    daemon.handler.ingest(
+        inbox_id=PILOT, source="github", external_id="2", correlation_key="c2",
+        payload={"agent_id": PROTOCOL_CHECK_EXECUTOR_ID, "candidate_commit": COMMIT},
+    )
+    done = _Forwarder(target_agent="cli")
+    _process(daemon, PILOT, done)
+    forwarded, addressed = _rows(daemon, "event_inbox", PILOT)
+    assert forwarded["status"] == "done" and [e.event_id for e in done.seen] == [forwarded["event_id"]]
+    assert addressed["status"] == "failed" and "not allowed" in addressed["last_error"]
+    daemon.close()
 
 
 # --- relay admission and waiting

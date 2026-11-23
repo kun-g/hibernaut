@@ -3,6 +3,7 @@ from agent_runtime.adapters.memory_fs.partitioned import (
     PartitionBinding,
     PartitionedMemoryAdapter,
     WorkspacePartitionRegistry,
+    check_inbox_id,
 )
 
 __all__ = [
@@ -10,4 +11,5 @@ __all__ = [
     "PartitionBinding",
     "PartitionedMemoryAdapter",
     "WorkspacePartitionRegistry",
+    "check_inbox_id",
 ]

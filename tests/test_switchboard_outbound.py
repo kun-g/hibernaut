@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
+from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from switchboard.config import OutboundConfig
-from switchboard.envelope import CanonicalEvent
-from switchboard.http_client import HttpResponse
+from switchboard.envelope import CanonicalEvent, parse_utc
+from switchboard.feishu_auth import FeishuTenantTokenSource
+from switchboard.http_client import HttpResponse, UrllibHttpClient
 from switchboard.outbound.feishu_adapter import FeishuOutboundAdapter
 from switchboard.outbound.gateway import OutboundGateway
 from switchboard.addressing import GITHUB_OUTBOUND_MARKER
 from switchboard.outbound.github_adapter import GitHubOutboundAdapter
-from switchboard.ports import OutboundMessage
+from switchboard.ports import OutboundMessage, SendResult
 from switchboard.store_sqlite import SwitchboardStore
 from tests.switchboard_support import FakeClock, FakeHttpClient, StaticCredentials
 
@@ -184,6 +188,191 @@ class GatewayTests(unittest.TestCase):
             **base,  # type: ignore[arg-type]
         )
         self.assertIsNone(gateway.message_for_report(orphan))
+
+
+def rejected(status: int, code: int, reset: str | None = None, *, header: str = "x-ogw-ratelimit-reset") -> HttpResponse:
+    headers = {} if reset is None else {header: reset}
+    return HttpResponse(status, json.dumps({"code": code, "msg": "frequency limit"}).encode(), headers)
+
+
+class FeishuRateLimitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = SwitchboardStore(str(Path(self.tmp.name) / "sb.db"))
+        self.clock = FakeClock()
+        self.http = FakeHttpClient()
+        self.gateway = self.make_gateway(FeishuOutboundAdapter(self.http, StaticCredentials()))
+        self.sequence = 0
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self.tmp.cleanup()
+
+    def make_gateway(self, adapter: object) -> OutboundGateway:
+        return OutboundGateway(self.store, {"feishu": adapter}, config=OutboundConfig(), clock=self.clock)  # type: ignore[dict-item]
+
+    def send(self, *responses: HttpResponse) -> str:
+        self.sequence += 1
+        msg_id = f"m{self.sequence}"
+        self.http.calls.clear()
+        self.http.responses = list(responses)
+        self.gateway.deliver(text_msg(msg_id, chat_id=f"oc_{msg_id}"))
+        self.gateway.run_once()
+        return msg_id
+
+    def state(self, msg_id: str) -> tuple[str, int]:
+        row = self.store.get_outbound(msg_id)
+        assert row is not None
+        return row.status, row.attempts
+
+    def assert_resent_once_after(self, msg_id: str, seconds: float) -> None:
+        self.assertEqual(self.state(msg_id), ("pending", 1))
+        self.clock.advance(seconds - 0.001)
+        self.assertEqual(self.gateway.run_once(), 0)
+        self.assertEqual(len(self.http.calls), 1)
+        self.clock.advance(0.001)
+        self.assertEqual(self.gateway.run_once(), 1)
+        self.clock.advance(3600)
+        self.assertEqual(self.gateway.run_once(), 0)
+        self.assertEqual(self.state(msg_id), ("sent", 2))
+        self.assertEqual([call["json"]["uuid"] for call in self.http.calls], [msg_id, msg_id])
+        self.assertEqual(self.http.calls[0], self.http.calls[1])
+
+    def test_rate_limit_codes_wait_for_the_backoff_then_resend_with_the_same_uuid(self) -> None:
+        for status, code in ((400, 230020), (400, 99991400), (429, 230020), (429, 99991400)):
+            with self.subTest(status=status, code=code):
+                self.assert_resent_once_after(self.send(rejected(status, code)), 5)
+
+    def test_reply_and_approval_card_are_resent_with_the_same_uuid(self) -> None:
+        reply = replace(text_msg("r1"), target={"reply_to_message_id": "om_root"})
+        card = replace(text_msg("c1"), kind="approval_card", card_payload={"elements": []})
+        for msg in (reply, card):
+            with self.subTest(msg.msg_id):
+                self.http.calls.clear()
+                self.http.responses = [rejected(400, 230020)]
+                self.gateway.deliver(msg)
+                self.gateway.run_once()
+                self.assert_resent_once_after(msg.msg_id, 5)
+
+    def test_reset_header_longer_than_the_backoff_decides_the_wait(self) -> None:
+        for status, code in ((429, 99991400), (429, 230020), (400, 99991400), (400, 230020)):
+            with self.subTest(status=status, code=code):
+                self.assert_resent_once_after(self.send(rejected(status, code, "42")), 42)
+
+    def test_reset_header_name_is_case_insensitive(self) -> None:
+        limited = rejected(429, 99991400, "42", header="X-Ogw-Ratelimit-Reset")
+        self.assert_resent_once_after(self.send(limited), 42)
+
+    def test_reset_header_shorter_than_the_backoff_keeps_the_backoff(self) -> None:
+        self.assert_resent_once_after(self.send(rejected(429, 99991400, "2")), 5)
+
+    def test_the_reset_is_compared_with_the_backoff_step_of_each_attempt(self) -> None:
+        msg_id = self.send(*[rejected(400, 230020, "20")] * 3)
+        for expected_attempts, wait in ((1, 20), (2, 20), (3, 45)):
+            self.assertEqual(self.state(msg_id), ("pending", expected_attempts))
+            row = self.store.get_outbound(msg_id)
+            assert row is not None
+            self.assertEqual(parse_utc(row.next_retry_at), self.clock.now + timedelta(seconds=wait))
+            self.clock.advance(wait)
+            self.gateway.run_once()
+        self.assertEqual(self.state(msg_id), ("sent", 4))
+        self.assertEqual({call["json"]["uuid"] for call in self.http.calls}, {msg_id})
+
+    def test_an_invalid_reset_header_falls_back_to_the_backoff(self) -> None:
+        # 1e300 is a number but no date that far ahead exists; it must not break the retry either.
+        for value in ("", "soon", "0", "-30", "nan", "inf", "1e300", "999999999999"):
+            with self.subTest(value):
+                self.assert_resent_once_after(self.send(rejected(429, 99991400, value)), 5)
+
+    def test_the_reset_counts_from_the_response_not_from_the_start_of_the_request(self) -> None:
+        class SlowAdapter:
+            def send(_, msg: OutboundMessage) -> SendResult:
+                self.clock.advance(8)
+                return FeishuOutboundAdapter(self.http, StaticCredentials()).send(msg)
+
+        self.gateway = self.make_gateway(SlowAdapter())
+        msg_id = self.send(rejected(429, 99991400, "42"))
+        row = self.store.get_outbound(msg_id)
+        assert row is not None
+        self.assertEqual(parse_utc(row.next_retry_at), self.clock.now + timedelta(seconds=42))
+
+    def test_exhausted_attempts_fail_with_the_feishu_code_and_msg(self) -> None:
+        for code in (230020, 99991400):
+            with self.subTest(code):
+                msg_id = self.send(*[rejected(400, code)] * 5)
+                for wait in (5, 15, 45, 135):
+                    self.assertEqual(self.state(msg_id)[0], "pending")
+                    self.clock.advance(wait)
+                    self.gateway.run_once()
+                self.assertEqual(self.state(msg_id), ("failed", 5))
+                row = self.store.get_outbound(msg_id)
+                assert row is not None
+                self.assertIn(f"code={code} msg=frequency limit", row.last_error or "")
+                self.assertEqual([call["json"]["uuid"] for call in self.http.calls], [msg_id] * 5)
+                self.clock.advance(3600)
+                self.gateway.run_once()
+                self.assertEqual(len(self.http.calls), 5)
+
+    def test_other_client_errors_still_fail_at_once_even_with_a_reset_header(self) -> None:
+        for status, code in ((400, 230001), (403, 230020), (200, 230020)):
+            with self.subTest(status=status, code=code):
+                msg_id = self.send(rejected(status, code, "42"))
+                self.assertEqual(self.state(msg_id), ("failed", 1))
+
+    def test_a_rate_limited_token_exchange_waits_then_sends_the_message(self) -> None:
+        for limited, wait in (
+            (rejected(400, 99991400), 5),
+            (rejected(400, 99991400, "42"), 42),
+            (rejected(429, 99991400, "42"), 42),
+            (rejected(400, 99991400, "soon"), 5),
+        ):
+            with self.subTest(status=limited.status, headers=limited.headers):
+                tokens = FeishuTenantTokenSource(self.http, app_id="cli_1", app_secret="s3cret")
+                self.gateway = self.make_gateway(FeishuOutboundAdapter(self.http, StaticCredentials(), tokens=tokens))
+                granted = HttpResponse(200, b'{"code":0,"tenant_access_token":"t-one","expire":7200}')
+                msg_id = self.send(limited, granted)
+                row = self.store.get_outbound(msg_id)
+                assert row is not None
+                self.assertEqual(self.state(msg_id), ("pending", 1))
+                self.assertIn("code=99991400 msg=frequency limit", row.last_error or "")
+                self.clock.advance(wait - 0.001)
+                self.assertEqual(self.gateway.run_once(), 0)
+                self.clock.advance(0.001)
+                self.assertEqual(self.gateway.run_once(), 1)
+                posts = [call for call in self.http.calls if "/im/v1/messages" in call["url"]]
+                self.assertEqual([call["json"]["uuid"] for call in posts], [msg_id])
+
+    def test_the_reset_header_survives_the_real_http_client(self) -> None:
+        class Limited(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers["Content-Length"]))
+                body = b'{"code":99991400,"msg":"request trigger frequency limit"}'
+                self.send_response(429)
+                self.send_header("X-Ogw-Ratelimit-Reset", "42")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Limited)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            adapter = FeishuOutboundAdapter(
+                UrllibHttpClient(), StaticCredentials(), api_base=f"http://127.0.0.1:{server.server_address[1]}"
+            )
+            self.gateway = self.make_gateway(adapter)
+            msg_id = self.send()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        row = self.store.get_outbound(msg_id)
+        assert row is not None
+        self.assertEqual((row.status, row.attempts), ("pending", 1))
+        self.assertEqual(parse_utc(row.next_retry_at), self.clock.now + timedelta(seconds=42))
 
 
 class TaskboardReportTests(unittest.TestCase):

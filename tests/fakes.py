@@ -34,6 +34,7 @@ class InMemoryInbox:
 
     def append(self, event: Event) -> tuple[Event, bool]:
         dedup_key = (event.inbox_id, event.source, event.external_id)
+        event = replace(event, seq=len(self._events) + 1)
         if dedup_key in self._seen_keys:
             dropped = replace(event, status="dropped")
             self._events.append(dropped)

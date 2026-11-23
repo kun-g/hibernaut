@@ -16,6 +16,8 @@ services:
       dockerfile: deploy/switchboard/Dockerfile
     image: hibernaut-switchboard:${SWITCHBOARD_REF:?set SWITCHBOARD_REF}
     restart: unless-stopped
+    # Longer than shutdown_timeout_seconds plus the forced close; Docker's default of 10s would SIGKILL the drain.
+    stop_grace_period: 20s
     # A list, not a mapping: Dokploy only injects its Traefik labels into list-form labels.
     labels: ["switchboard.config-sha=${SWITCHBOARD_CONFIG_SHA:?run scripts/prepare_taskboard_deploy.py render --switchboard-toml}"]
     env_file: ["../switchboard/.env"]

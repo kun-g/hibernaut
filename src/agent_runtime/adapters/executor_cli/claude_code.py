@@ -117,6 +117,12 @@ class ClaudeCodeProfile:
                         )
 
 
+# Keys a pure [executors.<id>] (no role, no command) may set; an agent picks its own model, effort and skills.
+EXECUTOR_KEYS = PROFILE_KEYS - {"skills"}
+# What an [agents.<id>] may set on top of its executor's profile.
+AGENT_PROFILE_KEYS = frozenset({"model", "effort", "skills"})
+
+
 def parse_launchers(raw: Mapping[str, Any]) -> dict[str, ClaudeCodeLauncher]:
     launchers = dict(BUILTIN_LAUNCHERS)
     for name, item in raw.items():

@@ -210,16 +210,28 @@ class OutboundGateway:
         self._thread = threading.Thread(target=self._loop, name="switchboard-outbound", daemon=True)
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    # From here on no message is claimed; a send in flight still records its result.
+    def request_stop(self) -> None:
         self._stop.set()
         self._wake.set()
+
+    def join(self, timeout: float) -> bool:
         if self._thread is not None:
             self._thread.join(timeout)
+            if self._thread.is_alive():
+                return False
             self._thread = None
+        return True
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        self.request_stop()
+        return self.join(timeout)
 
     def run_once(self) -> int:
         sent = 0
         for row in self._store.due_outbound(self._clock()):
+            if self._stop.is_set():
+                break
             if self._send(row):
                 sent += 1
         return sent
@@ -230,6 +242,9 @@ class OutboundGateway:
                 self.run_once()
             except Exception as exc:  # noqa: BLE001
                 print(f"[switchboard] outbound loop error: {exc!r}", file=sys.stderr)
+            # A forced shutdown has closed the store by now.
+            if self._stop.is_set():
+                return
             self._wake.wait(self._sleep_seconds())
             self._wake.clear()
 
@@ -296,7 +311,14 @@ class OutboundGateway:
 
         schedule = self._config.retry_backoff_seconds
         delay = float(schedule[min(attempts - 1, len(schedule) - 1)])
-        self._reschedule(row, now + timedelta(seconds=delay), attempts, result.error, now)
+        when = now + timedelta(seconds=delay)
+        if result.retry_after_seconds is not None:
+            try:
+                # The clock is read again: the wait starts at the response, not when the request began.
+                when = max(when, self._clock() + timedelta(seconds=result.retry_after_seconds))
+            except OverflowError:
+                pass  # No such date; keep the backoff, or the row would be resent on every pass.
+        self._reschedule(row, when, attempts, result.error, now)
         return False
 
     def _reschedule(

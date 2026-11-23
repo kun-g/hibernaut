@@ -11,9 +11,20 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_runtime.app.config import load_config, parse_config
-from agent_runtime.app.main import build_daemon, build_daemon_from_config, serve_configured
+from agent_runtime.app.main import build_daemon, build_daemon_from_config, concurrency_limits, serve_configured
 from agent_runtime.app.projects import AmbiguousProjectMatch
-from agent_runtime.core.models import Emit
+from agent_runtime.core.models import (
+    CLOSE_SOURCE,
+    FORWARD_SOURCE,
+    RETURN_CANCELLED_SOURCE,
+    Emit,
+    Event,
+    ForwardSpec,
+    HeldReturn,
+    SessionRef,
+    Silent,
+)
+from agent_runtime.engine import AgentWorker
 
 MAIN_LOGGER = "agent_runtime.app.main"
 
@@ -618,6 +629,8 @@ class TestFailuresReturnQuota(PoolCase):
         self.assertEqual(self.probe.finished, ["good", "again"])
 
     async def test_an_ambiguous_inbox_is_still_refused_and_returns_its_slot(self):
+        # Loading rejects these patterns; dispatch still checks on its own.
+        self.enterContext(patch("agent_runtime.app.projects._validate_disjoint_patterns"))
         async with self.daemon(max_concurrency=1, executors={"claude": {"max_concurrency": 1}}, projects={
             "a": {"inbox_id": ["proj:a", "shared:.*"], "max_concurrency": 1},
             "b": {"inbox_id": ["proj:b", ".*:x"], "max_concurrency": 1},
@@ -878,6 +891,161 @@ class TestLimitKeys(PoolCase):
             self.post(daemon, "proj:a:1", "close", key="task:1", action="close_session")
             await self.until(lambda: len(daemon.inbox.list_events(inbox_id="proj:a:1", status="done", limit=5)) == 2)
             self.assertEqual(self.probe.active_texts(), ["block-2"])
+
+
+class TestAgents(PoolCase):
+    # A limit belongs to the [executors.<id>]; agents are picked by the inbox bindings and counted for their executor.
+    BINDINGS = [
+        {"pattern": "proj:a", "default_agent": "claude"},
+        {"pattern": "proj:a:.+", "default_agent": "writer", "agents": ["writer", "fixer", "claude"],
+         "rules": [{"tags": ["fix"], "agent": "fixer"}]},
+    ]
+
+    def raw(self, **limits):
+        raw = super().raw(executors={"sde": {"max_concurrency": 1}},
+                          projects={"a": {**TASKS, "inbox_bindings": self.BINDINGS}}, **limits)
+        raw["agents"] = {"writer": {"executor": "sde"}, "fixer": {"executor": "sde"}}
+        return raw
+
+    async def test_agents_on_one_executor_share_its_limit(self):
+        async with self.daemon() as daemon:
+            # One by the binding's default, one by its rules, one by name.
+            self.post(daemon, "proj:a:1", "block-1")
+            self.post(daemon, "proj:a:2", "block-2", tags=["fix"])
+            self.post(daemon, "proj:a:3", "block-3", executor="writer")
+            self.post(daemon, "proj:a", "main")
+            self.post(daemon, "proj:a:4", "other", executor="claude")
+            await self.until(lambda: {"main", "other"} <= set(self.probe.finished))
+            for n, agent in ((1, "writer"), (2, "fixer"), (3, "writer")):
+                await self.until(lambda: self.probe.active == [(agent, f"block-{n}")])
+                await self.settle()
+                self.assertEqual(self.probe.active, [(agent, f"block-{n}")])
+                self.probe.release(f"block-{n}")
+            await self.idle(daemon)
+
+    async def test_a_refused_agent_needs_no_slot(self):
+        async with self.daemon() as daemon:
+            self.post(daemon, "proj:a:1", "block-1")
+            await self.until(lambda: self.probe.active_texts() == ["block-1"])
+            self.post(daemon, "proj:a:2", "refused", executor="sde")
+            await self.until(lambda: daemon.inbox.list_events(inbox_id="proj:a:2", status="failed", limit=5))
+            self.assertEqual(self.probe.active_texts(), ["block-1"])
+            self.assertEqual(self.probe.started, ["block-1"])
+
+    async def test_work_handed_on_inside_an_inbox_waits_for_the_next_agents_executor(self):
+        probe = self.probe
+
+        class _Forwarding:
+            executor_id = "claude"
+
+            async def execute(self, events, session, caps):
+                probe.started.append(events[-1].payload["text"])
+                caps.forward_to_inbox(events[0].inbox_id, "block-relayed", target_agent="writer")
+                return Silent()
+
+        self.enterContext(patch(
+            "agent_runtime.app.main.LocalCLIExecutor",
+            lambda *, default_executor, **_: (
+                _Forwarding() if default_executor == "claude" else probe.executor(default_executor)
+            ),
+        ))
+        async with self.daemon() as daemon:
+            self.post(daemon, "proj:a:1", "block-1")
+            await self.until(lambda: self.probe.active_texts() == ["block-1"])
+            self.post(daemon, "proj:a:2", "relay", executor="claude", key="task:2")
+            await self.until(lambda: "relay" in self.probe.started)
+            await self.settle()
+            self.assertEqual(self.probe.active, [("writer", "block-1")])
+            self.probe.release("block-1")
+            await self.until(lambda: self.probe.active == [("writer", "block-relayed")])
+            self.probe.release("block-relayed")
+            await self.idle(daemon)
+        self.assertEqual(self.probe.finished, ["block-1", "block-relayed"])
+
+    async def test_a_detached_run_counts_for_its_agents_executor(self):
+        daemon = build_daemon_from_config(parse_config(self.raw()))
+        self.addCleanup(daemon.close)
+        assert daemon.open_runs is not None
+        daemon.open_runs.open(session_id="s", inbox_id="proj:a:1", executor_id="fixer", event_ids=[], code_version="")
+        keys = daemon.pool._limit_keys("proj:a:1")
+        self.assertEqual((keys.project, keys.executor), ("a", "sde"))
+
+    async def test_role_agents_count_for_the_executor_they_share(self):
+        raw = super().raw(projects={"a": {"inbox_id": ["proj:a", "proj:a:.+"], "inbox_bindings": [
+            {"pattern": "proj:a", "default_agent": "steward"}, {"pattern": "proj:a:.+", "default_agent": "dev"},
+        ]}})
+        raw["executors"]["claude-code"] = {"harness": "claude-code", "max_concurrency": 1}
+        raw["agents"] = {"steward": {"role": "steward", "executor": "claude-code"},
+                         "dev": {"role": "sde", "executor": "claude-code", "review": False}}
+        daemon = build_daemon_from_config(parse_config(raw))
+        self.addCleanup(daemon.close)
+        self._seq = 0
+        for inbox_id in ("proj:a", "proj:a:1"):
+            self.post(daemon, inbox_id, "t")
+            keys = daemon.pool._limit_keys(inbox_id)
+            self.assertEqual((keys.project, keys.executor), ("a", "claude-code"))
+        limiter = daemon.pool.limiter
+        self.assertTrue(limiter.try_acquire("proj:a", project_key="a", executor_key="claude-code"))
+        self.assertFalse(limiter.available("proj:a:1", project_key="a", executor_key="claude-code"))
+
+    async def test_events_that_run_no_agent_need_no_slot(self):
+        daemon = build_daemon_from_config(parse_config(self.raw()))
+        self.addCleanup(daemon.close)
+        sessions = daemon.sessions
+        sessions.save(SessionRef(session_id="s", inbox_id="proj:a:1", executor_id="writer", status="active"))
+        sessions.save(SessionRef(
+            session_id="held:1", inbox_id="proj:a:1", executor_id="writer", status="suspended",
+            pending_request_id="req", forward=ForwardSpec(target_inbox="proj:a:1", held=HeldReturn(
+                agent_id="writer", external_id="r", payload={}, reason="no")),
+        ))
+
+        def expected(source, session_id, **payload):
+            event = Event(inbox_id="proj:a:1", source=source, external_id="x", payload=payload, session_id=session_id)
+            return AgentWorker.expected_executor_id(event, sessions, project_default=None, global_default="claude")
+
+        self.assertEqual(expected("test", "s"), "writer")
+        self.assertIsNone(expected(RETURN_CANCELLED_SOURCE, "s", delegation_id="d"))
+        self.assertIsNone(expected(CLOSE_SOURCE, "s"))
+        self.assertIsNone(expected("test", None, approval_request_id="req", approved=True))
+
+    async def test_a_second_piece_is_routed_as_the_task_of_its_own_it_becomes(self):
+        daemon = build_daemon_from_config(parse_config(self.raw()))
+        self.addCleanup(daemon.close)
+        daemon.sessions.save(SessionRef(
+            session_id="s", inbox_id="proj:a:1", executor_id="claude", status="active", correlation_key="task:1",
+            forward=ForwardSpec(target_inbox="proj:a:1", return_to="proj:a", delegation_id="one"),
+        ))
+        self._seq = 0
+        piece = Event(inbox_id="proj:a:1", source=FORWARD_SOURCE, external_id="two", correlation_key="task:1",
+                      payload={"text": "t", "return_to": "proj:a", "delegation_id": "two", "hop_count": 1})
+        self.assertEqual(AgentWorker.expected_executor_id(
+            piece, daemon.sessions, project_default="writer", global_default="claude"), "writer")
+
+
+class TestAgentLimitConfig(unittest.TestCase):
+    def config(self, limit, **runtime):
+        return parse_config({
+            "runtime": runtime,
+            "executors": {"cli": {"command": "x", "max_concurrency": limit},
+                          "claude-code": {"harness": "claude-code", "max_concurrency": limit}},
+            "agents": {"a": {"executor": "cli"}, "b": {"executor": "cli"},
+                       "steward": {"role": "steward", "executor": "claude-code"}},
+        })
+
+    def test_only_executors_carry_a_limit(self):
+        self.assertEqual(concurrency_limits(self.config(2)).executors, {"cli": 2, "claude-code": 2})
+
+    def test_a_limit_above_the_global_one_warns_once_for_each_executor(self):
+        with self.assertLogs("agent_runtime.app.config", level="WARNING") as logs:
+            self.config(3, max_concurrency=2)
+        messages = [r.getMessage().split(" = ")[0] for r in logs.records]
+        self.assertEqual(sorted(messages), ["executors.claude-code.max_concurrency", "executors.cli.max_concurrency"])
+
+    def test_an_invalid_limit_of_a_pure_executor_is_rejected(self):
+        for bad in (0, True, "2"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(
+                    ValueError, "^executors.claude-code.max_concurrency must be a positive integer"):
+                parse_config({"executors": {"claude-code": {"harness": "claude-code", "max_concurrency": bad}}})
 
 
 if __name__ == "__main__":

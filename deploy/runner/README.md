@@ -77,13 +77,13 @@ curl -sS http://127.0.0.1:8080/events -H 'Content-Type: application/json' -d '{
    - Outbox 只有最终一条结果，两个事件都是 `done`。
 
    同一 `correlation_key` 的事件合成一批，`candidate_commit` 必须相同，`hold_seconds` 以最后一条为准。
-5. **原路径**：给其他 Inbox 发普通任务，仍由原执行器处理；给试点 Inbox 发 `executor_id` 为其他执行器的事件，保持 `pending`（不执行）。
+5. **原路径**：给其他 Inbox 发普通任务，仍由原执行器处理；给试点 Inbox 发 `agent_id`（旧键 `executor_id`）为其他执行器的事件，保持 `pending`（不执行）。
 
 ## 回退
 
 1. `hibernaut.toml` 改 `enabled = false`（或删掉该表）并保存。在途校验照常跑完并写出结果；结束后 Relay 关闭，日志出现 `[runner_pilot] Relay closed.`，`lsof` 查不到 8791。想立刻结束在途校验，先发一条同 `correlation_key` 的新事件（受控中断）再改配置。
 2. 试点 Inbox 按原路由执行：发一条普通任务确认走原执行器。
-3. 仍指向 `runner-protocol-check` 的遗留事件（被强制停止留下的、显式写了该 `executor_id` 的）以「试点路由未对本 Inbox 开放，未执行」结束并关闭会话，不会改由其他执行器跑；重新启用后用 `hibernaut_replay_event(force=true)` 重放。
+3. 仍指向 `runner-protocol-check` 的遗留事件（被强制停止留下的、显式写了该 `agent_id` 的）以「试点路由未对本 Inbox 开放，未执行」结束并关闭会话（显式指名、而该 Inbox 的绑定白名单没有它的，按白名单拒绝），不会改由其他执行器跑；重新启用后用 `hibernaut_replay_event(force=true)` 重放。
 4. 停服务：`launchctl bootout gui/$(id -u)/com.hibernaut.runner`。SIGTERM 会先结束在途校验的进程组、删掉其只读 worktree 再退出。
 5. 恢复：看到 `Relay closed.` 后再改回 `enabled = true`（端口未放开时这次热加载会被拒绝，届时再保存一次改动）。运行中改 `[runner_pilot]` 其他项会被拒绝并提示先关闭。
 

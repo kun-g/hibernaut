@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import os
 import signal
 import sys
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Final
 
+from switchboard.check import config_problems, config_summary
 from switchboard.config import ConfigError, SwitchboardConfig, load_config
 from switchboard.credentials import EnvCredentialBroker, feishu_app_credentials, github_app_credentials
 from switchboard.envelope import utc_now
@@ -42,6 +47,12 @@ from switchboard.rs256 import load_private_key
 from switchboard.store_sqlite import SwitchboardStore
 
 __all__ = ["EnvCredentialBroker", "Switchboard", "build_switchboard", "main"]
+
+_log = logging.getLogger(__name__)
+# After a timeout: for pushes cut with their connection to record "offline", and for a statement to finish.
+_SETTLE_SEC: Final = 0.5
+# On the wakeup pipe, where every other byte is a signal number.
+_DRAINED: Final = b"\0"
 
 
 @dataclass(slots=True)
@@ -80,16 +91,43 @@ class Switchboard:
         if self.relay_http is not None:
             self.relay_http.start()
 
-    def stop(self) -> None:
-        # The hub first: open relay connections hold HTTP handler threads and in-flight pushes.
+    # Every intake closes before anything is waited for, so the drain only ever gets shorter. Relay connections
+    # outlive the delivery drain: the acks of pushes in flight arrive on them. False: cut off at the timeout.
+    def stop(self, timeout: float | None = None) -> bool:
+        limit = self.config.shutdown_timeout_seconds if timeout is None else timeout
+        deadline = time.monotonic() + limit
+
+        def left() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        servers = [server for server in (self.http, self.relay_http) if server is not None]
+        for server in servers:
+            server.stop_accepting()
+        self.worker.request_stop()
+        self.gateway.request_stop()
         if self.relay is not None:
-            self.relay.stop()
-        if self.relay_http is not None:
-            self.relay_http.stop()
-        self.http.stop()
-        self.worker.stop()
-        self.gateway.stop()
-        self.store.close()
+            self.relay.drain()
+
+        blocked: list[str] = []
+        # A list, not a generator: every server must refuse late requests, also after the first one timed out.
+        if not all([server.drain(deadline, self.store.refuse_intake) for server in servers]):
+            blocked.append("HTTP requests")
+        if not self.worker.join(left()):
+            blocked.append("deliveries")
+        if not self.gateway.join(left()):
+            blocked.append("outbound sends")
+
+        if self.relay is not None and not self.relay.stop(left()):
+            blocked.append("relay connections")
+        if blocked:
+            self.worker.join(_SETTLE_SEC)
+        if not self.store.close(max(_SETTLE_SEC, left())):
+            blocked.append("SQLite write")
+        if blocked:
+            _log.warning(
+                "[switchboard] shutdown timed out after %gs, forced with unfinished: %s", limit, ", ".join(blocked)
+            )
+        return not blocked
 
 
 def build_switchboard(
@@ -196,7 +234,7 @@ def build_switchboard(
     )
 
 
-def _github_app_tokens(config: SwitchboardConfig) -> GitHubTokenSource | None:
+def _github_app_tokens(config: SwitchboardConfig, *, announce: bool) -> GitHubTokenSource | None:
     app = github_app_credentials()
     if app is None:
         return None
@@ -204,45 +242,77 @@ def _github_app_tokens(config: SwitchboardConfig) -> GitHubTokenSource | None:
     if not owners:
         raise ConfigError("SWITCHBOARD_GITHUB_APP_ID is set but [outbound] github_app_owners is empty")
     app_id, pem = app
-    print(f"[switchboard] GitHub comments as App {app_id} for {', '.join(owners)}", file=sys.stderr)
+    try:
+        key = load_private_key(pem)
+    except ValueError as exc:
+        raise ConfigError(f"SWITCHBOARD_GITHUB_APP_PRIVATE_KEY: {exc}") from exc
+    if announce:
+        print(f"[switchboard] GitHub comments as App {app_id} for {', '.join(owners)}", file=sys.stderr)
     return GitHubAppTokenSource(
         UrllibHttpClient(),
         app_id=app_id,
-        key=load_private_key(pem),
+        key=key,
         allowed_owners=owners,
         api_base=config.outbound.github_api_base,
     )
 
 
-def _feishu_tokens(config: SwitchboardConfig) -> FeishuTokenSource | None:
+def _feishu_tokens(config: SwitchboardConfig, *, announce: bool) -> FeishuTokenSource | None:
     app = feishu_app_credentials()
     if app is None:
         return None
     app_id, app_secret = app
-    print(f"[switchboard] Feishu messages as app {app_id}", file=sys.stderr)
+    if announce:
+        print(f"[switchboard] Feishu messages as app {app_id}", file=sys.stderr)
     return FeishuTenantTokenSource(
         UrllibHttpClient(), app_id=app_id, app_secret=app_secret, api_base=config.feishu.api_base
     )
 
 
+def _config_error(path: str, problems: Sequence[str]) -> int:
+    for problem in problems:
+        print(f"[switchboard] invalid config {path}: {problem}", file=sys.stderr)
+    return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="switchboard")
     parser.add_argument("--config", required=True)
-    args = parser.parse_args(argv)
-    config = load_config(args.config)
-    board = build_switchboard(
-        config,
-        credentials=EnvCredentialBroker(),
-        github_tokens=_github_app_tokens(config),
-        feishu_tokens=_feishu_tokens(config),
+    parser.add_argument(
+        "--check", action="store_true", help="validate the config and the credentials in the environment, then exit"
     )
-    stopped = threading.Event()
+    args = parser.parse_args(argv)
+    try:
+        config = load_config(args.config)
+        github_tokens = _github_app_tokens(config, announce=not args.check)
+        feishu_tokens = _feishu_tokens(config, announce=not args.check)
+    except (OSError, ValueError) as exc:
+        return _config_error(args.config, [str(exc)])
+    if args.check:
+        problems = config_problems(config)
+        if problems:
+            return _config_error(args.config, problems)
+        print("\n  ".join([f"[switchboard] config ok: {args.config}", *config_summary(config)]))
+        return 0
 
-    def _stop(signum: int, frame: object) -> None:
-        stopped.set()
+    logging.basicConfig(format="%(levelname)s %(message)s")
+    # The kernel may hand a signal to any thread (on Linux, to one that is just creating another), but Python handlers
+    # run on the main thread only, and nothing would wake it from a lock or queue. The wakeup pipe is written by the
+    # C handler, on whichever thread that runs. The drain runs on its own thread and reports through the same pipe,
+    # which keeps the main thread free for a second signal. That one is handled here because PID 1 of a container
+    # ignores signals left at their default action.
+    wakeup_read, wakeup_write = os.pipe()
+    os.set_blocking(wakeup_write, False)
+    signal.set_wakeup_fd(wakeup_write)
 
-    signal.signal(signal.SIGINT, _stop)
-    signal.signal(signal.SIGTERM, _stop)
+    def _on_signal(signum: int, frame: object) -> None:
+        pass
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+    board = build_switchboard(
+        config, credentials=EnvCredentialBroker(), github_tokens=github_tokens, feishu_tokens=feishu_tokens
+    )
     board.start()
     prefix = f" (also under {config.http.base_path})" if config.http.base_path else ""
     print(f"[switchboard] listening on {board.http.base_url}{prefix}", file=sys.stderr)
@@ -251,8 +321,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"[switchboard] relay endpoint {board.relay_url} (transport={board.config.relay.transport})",
             file=sys.stderr,
         )
-    stopped.wait()
-    board.stop()
+    os.read(wakeup_read, 1)
+    print(
+        f"[switchboard] stopping, waiting up to {config.shutdown_timeout_seconds:g}s for work in flight; "
+        "a second signal exits at once",
+        file=sys.stderr,
+    )
+
+    def _drain() -> None:
+        try:
+            board.stop()
+        finally:
+            os.write(wakeup_write, _DRAINED)
+
+    threading.Thread(target=_drain, name="switchboard-shutdown", daemon=True).start()
+    again = os.read(wakeup_read, 1)
+    if again != _DRAINED:
+        sys.stderr.flush()
+        os._exit(128 + again[0])
     return 0
 
 

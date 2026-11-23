@@ -22,6 +22,17 @@ class AutoModePermissionAdapter:
             "code_reviewer.launch",
             "sde.launch",
             "runner.protocol_check.launch",
+            "steward.launch",
+            # The worker limits forwards by project, whitelist and hop count whatever this says; move it to the defer
+            # list to also ask a person every time.
+            "inbox.forward",
+            # The Steward's read-only queries.
+            "list_sessions",
+            "list_events",
+            "git_read",
+            "read_file",
+            "search_files",
+            "list_files",
             # Each is granted per project in [projects.<name>.delivery] (open_pr, auto_merge); move one to the
             # defer list to also ask a person every time.
             "delivery.open_pr",

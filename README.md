@@ -10,8 +10,9 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | :--- | :--- |
 | 多入口接单 | `POST /events`、经 Switchboard 转入的 GitHub 和飞书事件、审批卡片回调、MCP、Google Drive 任务队列、定时器；重复事件只执行一次 |
 | 按 Inbox 并发 | 每个 `inbox_id` 一条串行队列，不同 Inbox 并行；同一个 Issue、Drive 文件或飞书话题的事件接着同一会话和 worktree 做 |
-| 多执行器 | claude / cursor-agent / grok / dsh 等 CLI 和角色执行器；按事件、会话、项目、全局四级选择，会话粘在首次选定的执行器上 |
-| SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `executor_id = "sde"`（Drive 任务 frontmatter 写 `executor_id: sde`），项目也可设为默认执行器；GitHub Issue 以 `# 标题` + 正文为需求、标题为 PR 标题 |
+| 多 Agent 选路 | Agent（角色、Skill、模型、权限边界）与底层执行器（claude / cursor-agent / grok / dsh 等 CLI、Claude Code 启动器）分开配置；Inbox 与 Agent 多对多绑定，按事件指定、会话、Inbox 规则、Inbox 默认、项目与全局默认五级选择；事件指定的 Agent 不在 Inbox 白名单里就明确拒绝 |
+| Steward 与转投 | 项目前台 `steward`：在主检出里只读运行，自己答复或用 `forward_to_inbox` 转投给别的 Agent（同项目、最多 3 跳、逐次过权限门禁）；单步活由接手的 Agent 直接回复来源，多步活的结果回投给 Steward 汇总 |
+| SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `agent_id = "sde"`（Drive 任务 frontmatter 写 `agent_id: sde`，旧键 `executor_id: sde` 仍可用），项目或 Inbox 也可设为默认 Agent；GitHub Issue 以 `# 标题` + 正文为需求、标题为 PR 标题 |
 | 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok，模板写 `terminal = "orca"` 可在 Orca 终端里旁观评审）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested`；SDE 内置评审第 1 轮通审，第 2 轮起只做增量复核：只有上一轮没修好的项和之后改动引入的新问题能打回，其余由程序降为跟进，交付时列在 PR 正文「跟进」小节和完成消息里 |
 | PR 交付 | SDE 完成后由 Hibernaut 合入主干、按改动类型定版本号、跑检查、推分支、开 PR，可选在评审通过且 CI 绿后自动合并；合入主干冲突（版本号以外）或合入后检查失败时交回同一开发会话解决，已通过评审且只解了冲突的（逐块核对解法只由两侧内容组成）直接重跑检查续交付，另有改动的只评审开发者自己的增量（不含主干带进来的改动），超过次数上限才挂起等人；合并后删除源分支并结案；与任务来源无关 |
 | 可见终端 | 运行在 Orca 终端里打开，人可以旁观、回答提问，后续事件回到同一对话；项目设 `handoff = "peer"` 时任务、返工与结果经 ccpeer 消息往来，结果落在 launchd 常驻接收端的收件箱，hb 重启不丢 |
@@ -21,7 +22,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 安全 | agent 进程不持有真实密钥（运营者在 `env` 里显式写的除外）：API key 由外置代理注入，Drive 密钥由独立系统用户保管，GitHub 走宿主机凭据 |
 | 运维 | 配置热加载、跟随 `origin/main` 自动更新；Outbox 上报失败按 5/15/45/135/405 秒持久化退避，重启不丢进度 |
 | 执行账本 | 同仓的独立包 `src/ledger/`：每个 Run 记一条档案（结局、执行器、耗时、错误类别、日志、token 与费用），同进程 Switchboard 的审计也记入，存在独立的 `ledger.db`；执行器失败按类别分流（瞬时故障 5/15/45 秒退避重试，配置或权限错误第 1 次即停，执行故障不重试），最终失败发告警；MCP 只读工具查询 Run、日志、审计与执行器统计，`hibernaut_replay_event` 重放失败事件。设计见 [`docs/observability-ledger-design.md`](docs/observability-ledger-design.md) |
-| Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard |
+| Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard；`--check` 在发版前无副作用地校验配置，停机时先结清在途请求、投递和发送 |
 | Taskboard | 同仓的独立包：多来源任务归集（一个任务可挂多个来源）、5 态状态机、DAG 依赖与环检测、上游完成后自动解锁下游，经 Switchboard 发 `work.ready` 或给人发待办通知；SQLite 存储。独立常驻服务 `python -m taskboard.app` 经 Relay 消费 Switchboard 事件、经 Switchboard `/mcp` 上行，并以 HTTP `/mcp`（可挂同域子路径，如 `/taskboard/mcp`）或 `--mcp-stdio` 提供 7 个 `tb_*` MCP 工具；Hibernaut 接 `work.ready` 执行，并以 `execution.reported` 回报 `claim` / `update_stage` / `complete` / `release`（审批挂起后恢复仍回写同一任务）。设计见 [`docs/taskboard.md`](docs/taskboard.md) |
 | Runner | 同仓的独立包，只依赖标准库：代码执行宿主，负责 worktree 隔离与安全回收、子进程监管（硬超时与静默看门狗）、多 CLI 驱动与会话续接；本机同进程直调，或经反向 WebSocket 由控制面按工作区亲和调度多个节点。`agent_runtime.adapters.runner_bridge.RunnerExecutorBridge` 把它适配为 `ExecutorPort`；组装根只有一条默认关闭的只读试点路由（`[runner_pilot]`）经它把一个任务级 Inbox 交给本机独立的 Runner 服务（`python -m runner.service`），其余执行器与路由不变，启用与回退见 [`deploy/runner/README.md`](deploy/runner/README.md)。设计见 [`docs/runner.md`](docs/runner.md) |
 | Dashboard | 同仓的独立包 `src/dashboard/`：只读本地 Web 看板，用于实时查看 Hibernaut、Taskboard 与 Switchboard 运转状态（拓扑与延迟、活跃 Run、挂起/异常告警、事件队列、PR 交付与 worktree、Taskboard 任务、Switchboard 路由与流量、执行账本、`ccpeer` 与 Outbox 报告）。运行 `PYTHONPATH=src python3 -m dashboard --config hibernaut.toml` 访问 `http://127.0.0.1:8877` |
@@ -33,11 +34,12 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | Event Inbox | 全局唯一的事件表（SQLite），所有入口的事件都写进这里 |
 | Inbox / `inbox_id` | 逻辑队列。同一 `inbox_id` 同时只有一个 Run，不同 `inbox_id` 并行。常见粒度：`user:main`、`proj:<name>`、`<project>:<issue>` |
 | `correlation_key` | 外部业务实体的稳定键，如 `github:kun-g/hibernaut#42`、`gdrive:<file_id>`；同键事件进入同一会话 |
-| Session | 跨多次 Run 的对话与断点，记录绑定的执行器和 worktree |
+| Session | 跨多次 Run 的对话与断点，记录绑定的 Agent 和 worktree |
 | Run | 一次唤醒执行：处理一批事件，返回 `Silent` / `Emit` / `Suspend` |
-| Executor | 干活的引擎：CLI（`claude`、`grok` 等）或角色执行器（`sde`、`code-reviewer`） |
+| Agent | 干活的业务主体（`sde`、`code-reviewer`、`steward`，或一个普通 CLI）；Inbox 绑定的是 Agent |
+| Executor | Agent 用的底层驱动：CLI（`claude`、`grok` 等）或 Claude Code 启动器，没有业务含义 |
 
-一轮 Run：事件写入 Event Inbox 并立即 ACK → 找到或新建会话、选定执行器 → 执行，每次工具调用先过权限门禁 → 写回状态与结果，释放租约后休眠。术语定义见 [`docs/glossary.md`](docs/glossary.md)。
+一轮 Run：事件写入 Event Inbox 并立即 ACK → 找到或新建会话、选定 Agent → 执行，每次工具调用先过权限门禁 → 写回状态与结果，释放租约后休眠。术语定义见 [`docs/glossary.md`](docs/glossary.md)。
 
 ## 快速开始
 
@@ -61,6 +63,8 @@ PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
 curl -s localhost:8080/events -H 'Content-Type: application/json' -d @docs/dispatch/sde-task.json
 ```
 
+`source` 不能用 `agent:forward`、`agent:return`、`agent:return_cancelled`、`agent:close`：这些由 Hibernaut 自己入队，外部提交返回 400。
+
 在 Claude Code 等客户端里接入 MCP：`python3 -m agent_runtime.app.main --mcp-stdio --config <hibernaut.toml>`；远程接入设 `mcp_enabled = true`，用 `Authorization: Bearer <HIBERNAUT_MCP_TOKEN>` 访问 `POST /mcp`。
 
 ## 配置
@@ -69,11 +73,13 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 
 | 配置段 | 管什么 |
 | :--- | :--- |
-| `[runtime]` | 数据库与记忆目录、全局并发上限 `max_concurrency`、新事件策略（`defer` / `fold` / `interrupt`）、全局默认执行器；`ledger_db_path` 是执行账本的独立数据库（默认 `db_path` 同目录的 `ledger.db`，运行日志在它旁边的 `logs/runs/`） |
+| `[runtime]` | 数据库与记忆目录、全局并发上限 `max_concurrency`、新事件策略（`defer` / `fold` / `interrupt`）、全局默认 Agent（`default_agent`，旧键 `default_executor`）；`ledger_db_path` 是执行账本的独立数据库（默认 `db_path` 同目录的 `ledger.db`，运行日志在它旁边的 `logs/runs/`） |
 | `[channels]` | HTTP 端口、MCP 的密钥环境变量名；`outbox_dir` 设置后每条 Outbox 消息另存为该目录下一个带任务上下文的 Markdown 文件；配置了 `auto_merge` 却停在 PR 未合并时，状态为「待合并」并写明 PR 链接与未合并原因 |
-| `[executors.<id>]` | CLI 模板；写 `role = "sde"` 或 `role = "code-reviewer"` 则是角色执行器。SDE 的 `review`、`reviewer` 决定评审开关和评审者；可选 `max_concurrency` 限制同时跑该执行器的 Inbox 数（跨项目合计） |
-| `[launchers.<name>]`、`[credential_proxy]` | Claude Code 启动命令；`billing = "api"` 时经外置凭据代理。启动器与角色执行器的 `env` 原样传给 Claude Code，`model` 可写任意模型名，例如经本机网关跑非 Claude 模型（示例见模板里的 `gpt-reviewer`） |
-| `[projects.<name>]` | 仓库、检出路径、服务的 `inbox_id`（字符串或正则数组）、默认 `executor`、worktree 与终端后端；可选 `max_concurrency` 限制本项目同时在跑的 Inbox 数 |
+| `[executors.<id>]` | 底层驱动：CLI 模板（写 `command`），或供 Agent 引用的 Claude Code 启动器与计费（都不写）。旧写法仍可用：写 `role` 或 `command` 即同时是同名 Agent。可选 `max_concurrency` 限制同时跑该执行器的 Inbox 数（跨项目、跨引用它的 Agent 合计） |
+| `[agents.<id>]` | Agent：`executor` 指向驱动，`role` 为 `sde` / `code-reviewer` / `steward`，另有 `model`、`effort`、`skills`、`description`。SDE 的 `review`、`reviewer` 决定评审开关和评审者；`steward` 只有 `checkout_access = "readonly"` |
+| `[launchers.<name>]`、`[credential_proxy]` | Claude Code 启动命令；`billing = "api"` 时经外置凭据代理。启动器与执行器的 `env` 原样传给 Claude Code，`model` 可写任意模型名，例如经本机网关跑非 Claude 模型（示例见模板里的 `gpt-reviewer`） |
+| `[projects.<name>]` | 仓库、检出路径、服务的 `inbox_id`（字符串或正则数组；两个项目的范围有交集时拒绝加载，正则只用可比较的语法，见 `docs/architecture.md`）、`default_agent`（旧键 `executor`）、worktree 与终端后端；可选 `max_concurrency` 限制本项目同时在跑的 Inbox 数 |
+| `[[projects.<name>.inbox_bindings]]` | Inbox 与 Agent 的绑定：`pattern`（整串匹配的正则）、`default_agent`、`agents` 白名单、`rules`（按 `source` / `event_type` / `tags` 选 Agent；具名定时器的来源是 `timer:<timer_name>`）。写了绑定的项目，转投只能到有绑定覆盖的 Inbox |
 | `[projects.<name>.delivery]` | PR 交付：开 PR、自动合并、版本文件、检查命令、是否要求评审和 CI、冲突与检查失败交回开发的次数上限（`max_handbacks`）、合并后是否删除源分支（`delete_branch`）、来自 GitHub Issue 的任务在 PR 正文里怎么写这个 Issue（`issue_link`：`closes` 合并后关闭 / `refs` 只关联，默认 / `none` 不写） |
 | `[gdrive]` | Drive 任务队列，部署见 [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md)。任务可引用队列根下 `附件/` 里的文件（frontmatter `attachments` 写文件 ID 或原名，逗号分隔、`[a, b]` 或逐行 `- a` 均可，或正文里写该文件的 Drive ID），Run 开始时下载到 `attachments_dir`（默认数据库旁的 `attachments/`，在 worktree 之外），任务正文末尾附上路径、大小和 sha256，会话结案后删除。上传 `.md` 任务文件时关掉 Drive「将上传的文件转换为 Google 文档格式」 |
 | `[switchboard]` | 同进程运行 Switchboard 或经 Relay 连接远程 Switchboard；公网 VPS 容器部署见 [`deploy/switchboard/`](deploy/switchboard/README.md)，与 Taskboard 同域部署见 [`deploy/taskboard/`](deploy/taskboard/README.md) |
@@ -82,7 +88,7 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 
 GitHub 入站只经 Switchboard。把 GitHub Webhook 指向 Switchboard 的 `/webhooks/github`，在 `switchboard.toml` 里设置 `[github] require_label` 和仓库路由，使路由目标匹配 Hibernaut 项目的 `inbox_id`，再启用同进程桥接或 Relay。未部署 Taskboard 时，按 `switchboard.example.toml` 的 `[routing.event_consumers]` 示例把 `work.opened`、`work.updated`、`work.closed` 路由到 Hibernaut。部署 Taskboard 时保持默认路由，按 [`taskboard.example.toml`](taskboard.example.toml) 写 `taskboard.toml`，设置 `SWITCHBOARD_RELAY_TOKEN`、`SWITCHBOARD_MCP_TOKEN`、`TASKBOARD_MCP_TOKEN` 后运行 `python -m taskboard.app --config taskboard.toml`；`[intake] auto_ready_sources`（默认 `["github"]`）来源的 Issue / PR（包括后贴触发标签的旧 Issue）直接进入 `ready`，由 Taskboard 发 `work.ready` 给 Hibernaut，Hibernaut 执行时把状态回写 Taskboard（这些内部同步不发评论）。人工待办与依赖异常通知没有可回复的来源时发往 `switchboard.toml` 的 `[outbound] notify_target`，未设置则发往 `approval_target`。Switchboard 与 Taskboard 共用一个域名时，`[http] base_path`（如 `/switchboard`）让 Switchboard 在带前缀和不带前缀的路径上都可访问。升级前使用本机 Issue 轮询或 daemon Webhook 的部署需要先切换入口。
 
-飞书事件订阅和卡片回调都指向 Switchboard 的 `/webhooks/feishu`。在 `switchboard.toml` 设置聊天路由和应用凭据环境变量名。要为无来源会话发审批卡，请配置 `[outbound]` 的 `approval_channel = "feishu"` 和 `approval_target`（接收卡片的聊天 ID）。
+飞书事件订阅和卡片回调都指向 Switchboard 的 `/webhooks/feishu`。在 `switchboard.toml` 设置聊天路由和应用凭据环境变量名。要为无来源会话发审批卡，请配置 `[outbound]` 的 `approval_channel = "feishu"` 和 `approval_target`（接收卡片的聊天 ID）。发往飞书的消息遇到限频（`230020`、`99991400`）会等待后自动重发，不早于飞书给出的恢复时间；次数用完才记 `failed`。
 
 旧 `hibernaut.toml` 仍可加载。以下键各自触发 `UserWarning` 并被忽略，可从对应配置段删除：
 
@@ -93,6 +99,8 @@ GitHub 入站只经 Switchboard。把 GitHub Webhook 指向 Switchboard 的 `/we
 | `[projects.<name>]` | `github_poll`、`poll_labels`、`feishu_chat_id` |
 
 `[gdrive] poll_interval_seconds` 继续控制 Drive 任务队列的轮询周期。
+
+Switchboard 自己的配置在 `switchboard.toml`（模板 [`switchboard.example.toml`](switchboard.example.toml)）。发版或重启前先校验：`PYTHONPATH=src python3 -m switchboard.app --config switchboard.toml --check`，不建目录和数据库、不监听端口、不访问网络；通过时退出码 0，否则在 stderr 给出配置路径和字段名并以 1 退出。顶层 `shutdown_timeout_seconds`（默认 10 秒，正数，写在第一个 `[表]` 之前）是停机等待在途工作的上限，`docker stop`、systemd 等的强杀时限要比它长。细节见 [`deploy/switchboard/`](deploy/switchboard/README.md)。
 
 ## 运行
 
@@ -106,7 +114,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 
 停机（SIGINT / SIGTERM，自动更新也走这条路）分两步：先只停止认领新事件，进行中的 Run 照常跑完并写回结果（正在等 Orca 终端里 agent 结果的 Run 例外：旧进程不等它、不关终端，登记和 `runs/` 下的状态目录留给新进程接着等，agent 不会收到重复任务），期间 HTTP 入口（`/events`、`/mcp`）照常接收入库并返回 202、留给下一个进程处理，Outbox 投递、定时器和 Drive 轮询照常运行（worktree 回收清扫不再开始新一轮）；Run 全部结束后才关闭 HTTP（等已接收的请求写完）、停后台服务并退出。新进程启动后先接回这些 Run，再处理同一 Inbox 的新事件。
 
-经 `run_updating.py` 重启时 HTTP 入口不拒绝连接：旧 daemon 停止接收后把监听 socket 交还监督进程，监督进程带着它快进、`execv`，再交给新 daemon 直接使用；这段时间到达的连接在内核 backlog（128）里排队，新 daemon 开始监听后按序处理。实测排队最长约 0.3 秒（不跑 Run 的测试实例；生产上取决于新进程的导入与组装耗时），客户端超时须长于这段时间。Switchboard 中继（`mode = "relay"`）在旧 daemon 退出前主动断开，新 daemon 组装时立即重连（实测断开约 0.3 秒），断开期间的事件由 Switchboard 暂存，重连后立即重投。不经监督进程直接运行 daemon、或第一次启动时，daemon 照旧自己绑定端口；进程内 Switchboard（`mode = "in_process"`）自己的 HTTP 端口不在交接范围内，重启期间仍会拒绝连接。
+经 `run_updating.py` 重启时 HTTP 入口不拒绝连接：旧 daemon 停止接收后把监听 socket 交还监督进程，监督进程带着它快进、`execv`，再交给新 daemon 直接使用；这段时间到达的连接在内核 backlog（128）里排队，新 daemon 开始监听后按序处理。实测排队最长约 0.3 秒（不跑 Run 的测试实例；生产上取决于新进程的导入与组装耗时），客户端超时须长于这段时间。Switchboard 中继（`mode = "relay"`）在旧 daemon 退出前主动断开，新 daemon 组装时立即重连（实测断开约 0.3 秒），断开期间的事件由 Switchboard 暂存，重连后立即重投。不经监督进程直接运行 daemon、或第一次启动时，daemon 照旧自己绑定端口；进程内 Switchboard（`mode = "in_process"`）自己的 HTTP 端口不在交接范围内，重启期间仍会拒绝连接；它在 daemon 停机的最后排空在途工作（上限 `shutdown_timeout_seconds`）再关闭。
 
 再发一次 SIGINT / SIGTERM（直接发给 daemon，或发给 `run_updating.py`，它会转给 daemon）则不再等待：进行中的 Run 按中断处理，不写半成品，事件回到 `pending`，由下一个进程重跑。
 

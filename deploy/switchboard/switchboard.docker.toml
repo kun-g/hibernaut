@@ -2,6 +2,9 @@
 # Secrets never go here: they come from .env (SWITCHBOARD_* variables, see .env.example).
 # Paths are inside the container; /data is the switchboard_data volume.
 
+# Drain limit on SIGTERM; stop_grace_period in docker-compose.yml must be longer. Keep it above the first [table].
+shutdown_timeout_seconds = 10.0
+
 [http]
 host = "0.0.0.0"  # reachable only on the compose network; Caddy is the public entry
 port = 8790
