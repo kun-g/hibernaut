@@ -73,6 +73,7 @@ RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/taskboard/test_m6_switchboard_contract.py",
             "tests/taskboard/test_m7_service.py",
             "tests/test_taskboard_dual_process_e2e.py",
+            "tests/test_taskboard_hibernaut_loop.py",
         ),
     ),
     ("docs/dispatch/**", ("tests/test_sde_delivery.py",)),

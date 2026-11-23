@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     checkpoint TEXT,
     pending_request_id TEXT,
     updated_at TEXT NOT NULL,
-    parent_session_id TEXT
+    parent_session_id TEXT,
+    task_link TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_request
@@ -322,7 +323,7 @@ class SQLiteDatabase:
         }
         if "correlation_key" not in session_cols:
             conn.execute("ALTER TABLE sessions ADD COLUMN correlation_key TEXT")
-        for col in ("executor_id", "executor_session_id", "work_key", "parent_session_id"):
+        for col in ("executor_id", "executor_session_id", "work_key", "parent_session_id", "task_link"):
             if col not in session_cols:
                 conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
         if "status" not in session_cols:

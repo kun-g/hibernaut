@@ -156,6 +156,7 @@ def build_switchboard(
                 port=config.relay.listen_port,
                 max_body_bytes=config.http.max_body_bytes,
                 upgrades={config.relay.path: relay.serve},
+                base_path=config.http.base_path,
             )
     scopes = ScopeResolver(config.routing)
     routes: dict[str, InboundAdapter] = {
@@ -179,6 +180,7 @@ def build_switchboard(
         port=config.http.port if port is None else port,
         max_body_bytes=config.http.max_body_bytes,
         upgrades=upgrades,
+        base_path=config.http.base_path,
     )
     return Switchboard(
         config=config,
@@ -242,7 +244,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
     board.start()
-    print(f"[switchboard] listening on {board.http.base_url}", file=sys.stderr)
+    prefix = f" (also under {config.http.base_path})" if config.http.base_path else ""
+    print(f"[switchboard] listening on {board.http.base_url}{prefix}", file=sys.stderr)
     if board.relay is not None:
         print(
             f"[switchboard] relay endpoint {board.relay_url} (transport={board.config.relay.transport})",

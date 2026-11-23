@@ -24,6 +24,19 @@ from switchboard.ports import (
 )
 from switchboard.store_sqlite import OutboundRow, SwitchboardStore
 
+# Taskboard task actions that only sync state; reported without a result (outcome_kind other than emit) they are
+# internal and never posted to a person.
+_SYNC_TASK_ACTIONS = frozenset({"claim", "update_stage", "release"})
+
+
+def is_internal_task_sync(meta: Mapping[str, Any]) -> bool:
+    # done: a state sync with nothing to tell a person. emit: a real result that also carries a task action (e.g.
+    # a failed Emit releasing its task), still delivered. suspend: the approval card, always delivered.
+    outcome = meta.get("outcome_kind")
+    if outcome == "done":
+        return True
+    return outcome not in ("emit", "suspend") and meta.get("task_action") in _SYNC_TASK_ACTIONS
+
 
 class TokenBucket:
     def __init__(self, rate_per_minute: int) -> None:
@@ -98,6 +111,8 @@ class OutboundGateway:
         outcome = str(meta.get("outcome_kind", ""))
         key = event.correlation_key
         idempotency_key = f"report:{event.event_id}"
+        if is_internal_task_sync(meta):
+            return None
 
         if outcome == "suspend":
             channel = str(meta.get("approval_channel") or self._config.approval_channel)
@@ -145,6 +160,8 @@ class OutboundGateway:
             target = address_target(channel, str(override_address))
         else:
             origin = self._origin(key)
+            if origin is None and event.source == "taskboard" and meta.get("notify_kind"):
+                origin = self._notify_fallback()
             if origin is None:
                 return None
             channel, target = origin
@@ -163,6 +180,17 @@ class OutboundGateway:
             title=event.subject,
             body_md=event.body,
         )
+
+    def _notify_fallback(self) -> tuple[str, dict[str, Any]] | None:
+        # A Taskboard notice with no reply target and no origin that takes replies (e.g. a GitHub issue) still
+        # has to reach a person: [outbound] notify_*, else the approval target.
+        config = self._config
+        if config.notify_target:
+            channel = config.notify_channel or config.approval_channel
+            return channel, address_target(channel, config.notify_target)
+        if config.approval_target:
+            return config.approval_channel, address_target(config.approval_channel, config.approval_target)
+        return None
 
     def _origin(self, key: str | None) -> tuple[str, dict[str, Any]] | None:
         origin = reply_target(key)
