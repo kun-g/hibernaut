@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import dataclasses
 import functools
 import http.client
 import json
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -37,6 +39,8 @@ from tests.fakes import InMemoryPermission
 FAKE_CLAUDE = Path(__file__).with_name("fake_claude.py")
 FAKE_LAUNCHER = Path(__file__).with_name("fake_launcher.sh")
 PROXY_URL = "http://127.0.0.1:9/proxy/anthropic"
+GATEWAY_ENV = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:3425", "ANTHROPIC_AUTH_TOKEN": "magpie"}
+GATEWAY_MODEL = "codex/gpt-6.2-astra"
 CHANGES_REQUESTED = {
     "verdict": "changes_requested",
     "summary": "division is unguarded",
@@ -142,10 +146,9 @@ class TestReviewerProfile(unittest.TestCase):
             "unsupported harness 'cursor-agent'": {"harness": "cursor-agent"},
             "unsupported billing 'free'": {"billing": "free"},
             "unsupported effort 'ultra'": {"effort": "ultra"},
-            "model 'gpt-5' is not a Claude model": {"model": "gpt-5"},
-            "env.ANTHROPIC_API_KEY looks like a credential": {"env": {"ANTHROPIC_API_KEY": "x"}},
-            "env.CLAUDE_CODE_USE_BEDROCK looks like a credential": {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}},
-            "env.ANTHROPIC_BASE_URL looks like a credential": {"env": {"ANTHROPIC_BASE_URL": "http://x"}},
+            "executors.coder-reviewer: model must be a non-empty string": {"model": ""},
+            "coder-reviewer: model must be a non-empty string": {"model": "  "},
+            "model must be a non-empty string": {"model": 5},
             "args, orca_agent not supported": {"args": ["-p"], "orca_agent": "claude"},
             "command not supported": {"command": "/bin/claude"},
             "unknown launcher 'nope'": {"launcher": "nope"},
@@ -157,7 +160,6 @@ class TestReviewerProfile(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported role 'qa'"):
             parse_config({"executors": {"qa": {"role": "qa"}}})
         launcher_cases = {
-            "launchers.sg: env.CLAUDE_CODE_OAUTH_TOKEN looks like a credential": {"command": "x", "env": {"CLAUDE_CODE_OAUTH_TOKEN": "t"}},
             "launchers.sg: unsupported harness 'codex'": {"command": "x", "harness": "codex"},
             "launchers.sg: command is required": {},
             "launchers.sg: model not supported": {"command": "x", "model": "opus"},
@@ -167,6 +169,54 @@ class TestReviewerProfile(unittest.TestCase):
                 parse_config({"launchers": {"sg": launcher}})
         with self.assertRaisesRegex(ValueError, "credential_proxy.url must be an http"):
             parse_config({"credential_proxy": {"url": "file:///tmp/x"}})
+
+    def test_gateway_env_and_non_claude_model_load_as_written(self):
+        cfg = parse_config(tomllib.loads("""
+            [executors.gpt-reviewer]
+            role = "code-reviewer"
+            billing = "subscription"
+            model = "codex/gpt-6.2-astra"
+            [executors.gpt-reviewer.env]
+            ANTHROPIC_BASE_URL = "http://127.0.0.1:3425"
+            ANTHROPIC_AUTH_TOKEN = "magpie"
+        """))
+        profile = cfg.roles["gpt-reviewer"].profile
+        self.assertEqual((profile.billing, profile.model, profile.env), ("subscription", GATEWAY_MODEL, GATEWAY_ENV))
+        example = Path(__file__).resolve().parents[1] / "hibernaut.example.toml"
+        documented = parse_config(tomllib.loads(example.read_text(encoding="utf-8"))).roles["gpt-reviewer"].profile
+        self.assertEqual((documented.billing, documented.model, documented.env), ("subscription", GATEWAY_MODEL, GATEWAY_ENV))
+
+    def test_env_key_names_are_not_restricted(self):
+        env = {"ANTHROPIC_API_KEY": "k", "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_OAUTH_TOKEN": "t",
+               "MY_PASSWORD": "p", "SOME_SECRET": "s", **GATEWAY_ENV}
+        cfg = parse_config({
+            "launchers": {"sg": {"command": "claude-sg", "env": env}},
+            "executors": {"r": {"role": "code-reviewer", "launcher": "sg", "env": env}},
+        })
+        self.assertEqual((cfg.roles["r"].profile.launcher.env, cfg.roles["r"].profile.env), (env, env))
+
+    def test_api_billing_conflicts_with_a_route_written_in_env(self):
+        proxy = {"url": "http://127.0.0.1:9000"}
+        for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
+            for where, role, launcher in (
+                ("executors.r", {"env": {key: "v-secret"}}, {}),
+                ("launchers.sg", {}, {"env": {key: "v-secret"}}),
+            ):
+                message = f"executors.r: billing 'api' .*conflicts with {where}.env.{key}"
+                with self.subTest(message), self.assertRaisesRegex(ValueError, message) as raised:
+                    parse_config({
+                        "credential_proxy": proxy,
+                        "launchers": {"sg": {"command": "claude-sg", **launcher}},
+                        "executors": {"r": {"role": "code-reviewer", "launcher": "sg", "billing": "api", **role}},
+                    })
+                self.assertNotIn("v-secret", str(raised.exception))
+        # Anything that does not choose the route still passes through.
+        cfg = parse_config({
+            "credential_proxy": proxy,
+            "executors": {"r": {"role": "code-reviewer", "billing": "api", "env": {"MY_TOKEN": "t"}}},
+        })
+        self.assertEqual(cfg.roles["r"].profile.env, {"MY_TOKEN": "t"})
 
     def test_reviewer_alone_is_enough_to_leave_ingest_only(self):
         cfg = parse_config({
@@ -260,6 +310,42 @@ class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
         call = self.calls()[0]
         self.assertEqual((call["paid_env"], call["base_url"]), ([], None))
 
+    async def test_configured_gateway_and_model_reach_the_harness_while_inherited_credentials_are_stripped(self):
+        inherited = {"ANTHROPIC_API_KEY": "sk-daemon", "ANTHROPIC_AUTH_TOKEN": "daemon-token",
+                     "ANTHROPIC_BASE_URL": "http://daemon-gw", "CLAUDE_CODE_OAUTH_TOKEN": "daemon-oauth",
+                     "CLAUDE_CODE_USE_BEDROCK": "1"}
+        launcher = ClaudeCodeLauncher(name="fake", command=fake_command(self.root))
+        for where, profile in (
+            ("executor", {"launcher": launcher, "env": GATEWAY_ENV}),
+            ("launcher", {"launcher": dataclasses.replace(launcher, env=GATEWAY_ENV)}),
+        ):
+            with self.subTest(where), patch.dict(os.environ, inherited):
+                self.log.unlink(missing_ok=True)
+                outcome = await self.executor(model=GATEWAY_MODEL, **profile).execute(
+                    [event(self.payload())], None, self.caps
+                )
+                assert isinstance(outcome, Emit)
+                self.assertIn("verdict=pass", outcome.messages[0])
+                (call,) = self.calls()
+                self.assertEqual((call["base_url"], call["auth_token"]), ("http://127.0.0.1:3425", "magpie"))
+                self.assertEqual(call["paid_env"], ["ANTHROPIC_AUTH_TOKEN"])
+                self.assertEqual(call["argv"][call["argv"].index("--model") + 1], GATEWAY_MODEL)
+
+    async def test_subscription_accepts_only_the_credential_source_written_in_the_config(self):
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-daemon"}):
+            outcome = await self.executor(env={"ANTHROPIC_API_KEY": "configured"}).execute(
+                [event(self.payload())], None, self.caps
+            )
+        assert isinstance(outcome, Emit)
+        self.assertIn("verdict=pass", outcome.messages[0])
+        self.assertEqual(self.calls()[0]["api_key"], "configured")
+        # A source the config did not name still stops the session.
+        for source in ("ANTHROPIC_API_KEY", "apiKeyHelper"):
+            with self.subTest(source), patch.dict(os.environ, {"FAKE_API_KEY_SOURCE": source}):
+                outcome = await self.executor(env=GATEWAY_ENV).execute([event(self.payload())], None, self.caps)
+                assert isinstance(outcome, Emit)
+                self.assertIn("review failed: billing is 'subscription'", outcome.messages[0])
+
     async def test_api_billing_goes_through_the_credential_proxy_without_the_real_key(self):
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-real-secret", "ANTHROPIC_AUTH_TOKEN": "real-token"}):
             outcome = await self.executor(billing="api", credential_proxy_url=PROXY_URL).execute(
@@ -298,6 +384,13 @@ class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
         profile = ClaudeCodeProfile(name="r", launcher=launcher, env={"B": "role"})
         env = child_env(profile, {"PATH": "/bin", "ANTHROPIC_API_KEY": "sk"})
         self.assertEqual(env, {"PATH": "/bin", "A": "launcher", "B": "role"})
+
+    def test_child_env_sets_configured_keys_after_stripping_inherited_ones(self):
+        launcher = ClaudeCodeLauncher(name="l", command="x", env={"ANTHROPIC_BASE_URL": "http://l", "CLAUDE_CODE_OAUTH_TOKEN": "l"})
+        profile = ClaudeCodeProfile(name="r", launcher=launcher, env=GATEWAY_ENV)
+        env = child_env(profile, {"ANTHROPIC_API_KEY": "sk", "ANTHROPIC_AUTH_TOKEN": "d", "ANTHROPIC_BASE_URL": "http://d",
+                                  "CLAUDE_CODE_OAUTH_TOKEN": "d", "CLAUDE_CODE_USE_VERTEX": "1"})
+        self.assertEqual(env, {**GATEWAY_ENV, "CLAUDE_CODE_OAUTH_TOKEN": "l"})
 
     async def test_model_mismatch_is_reported(self):
         with patch.dict(os.environ, {"FAKE_MODEL": "claude-haiku-5-5"}):

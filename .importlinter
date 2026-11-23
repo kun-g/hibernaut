@@ -6,6 +6,7 @@ root_packages =
     taskboard
     runner
     ledger
+    dashboard
 include_external_packages = True
 
 [importlinter:contract:clean-layers]
@@ -116,3 +117,17 @@ forbidden_modules =
     workshop
     memory_hub
     ledger
+
+[importlinter:contract:dashboard-zero-business-deps]
+name = Dashboard has zero business package dependencies
+type = forbidden
+source_modules =
+    dashboard
+forbidden_modules =
+    agent_runtime
+    switchboard
+    taskboard
+    ccpeer
+    ledger
+    runner
+    memory_hub

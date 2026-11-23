@@ -30,8 +30,9 @@ version = {attr = "agent_runtime.__version__"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-# Built-in role skills ship with the package (role_skills.BUILTIN_SKILLS_DIR).
+# Built-in role skills and dashboard static assets ship with the package.
 "agent_runtime.adapters.executor_cli" = ["skills/*/*"]
+"dashboard" = ["static/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

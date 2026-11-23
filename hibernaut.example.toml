@@ -40,7 +40,8 @@ timeout_seconds = 300.0
 # ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
 
 # Claude Code 启动器：只能在本部署文件里声明，事件无法指定。内置 claude（command = "claude"）。
-# 启动器自管配置目录、账号、网关或代理，并原样转交模型、effort 与角色参数。env 不得包含凭据或计费开关。
+# 启动器自管配置目录、账号、网关或代理，并原样转交模型、effort 与角色参数。
+# env 原样传给 Claude Code，写什么网关、token 由运营者决定；daemon 自身环境里的付费凭据与路由变量先剥离，再叠加启动器、执行器的 env。
 # [launchers.claude-sg]
 # harness = "claude-code"
 # command = "claude-sg"         # 部署机 PATH 上的命令名或绝对路径
@@ -48,6 +49,8 @@ timeout_seconds = 300.0
 # HTTPS_PROXY = "http://127.0.0.1:7890"
 
 # billing = "api" 必填：付费调用全部发往外置凭据代理，harness 只拿到占位 key，真实 key 由代理注入。
+# 此时启动器或执行器 env 里再写 ANTHROPIC_BASE_URL、ANTHROPIC_API_KEY、ANTHROPIC_AUTH_TOKEN、CLAUDE_CODE_OAUTH_TOKEN
+# 或 CLAUDE_CODE_USE_* 云厂商开关，会按配置冲突报错。
 # [credential_proxy]
 # url = "http://127.0.0.1:9000"   # Claude Code 请求 <url>/proxy/<anthropic_service>/v1/messages
 # anthropic_service = "anthropic"
@@ -59,8 +62,8 @@ timeout_seconds = 300.0
 role = "code-reviewer"
 harness = "claude-code"         # 目前仅支持 claude-code
 launcher = "claude"             # [launchers.<name>] 之一
-billing = "subscription"        # subscription（用启动器自己的登录，剥离付费凭据，发现付费来源即中止）| api（经 [credential_proxy]）
-model = "claude-opus-5-5"       # Claude 模型全名或别名 opus / sonnet / haiku / fable
+billing = "subscription"        # subscription（用启动器自己的登录，剥离继承来的付费凭据，发现 env 没写明的付费来源即中止）| api（经 [credential_proxy]）
+model = "claude-opus-5-5"       # 任意非空字符串，原样经 --model 传给 harness：Claude 模型全名、别名 opus / sonnet / haiku / fable，或网关认识的模型名
 effort = "high"                 # low | medium | high | xhigh | max
 timeout_seconds = 1800.0        # 交互模式下含等人回答的时间
 interactive = true              # 需要人可接入的交互会话，由项目的 terminal_backend 打开；缺后端则报告原因、不改走后台。false 走非交互。旧名 visible 仍可读，不可与 interactive 同写
@@ -68,6 +71,15 @@ interactive = true              # 需要人可接入的交互会话，由项目�
 # 省略时用安装包内置的 "builtin:code-reviewer"；写了则只用所列各项，可把 "builtin:code-reviewer" 列进去再追加。
 # 正文与资源目录经 --append-system-prompt 传给评审者；只读权限、结论 schema 与契约由程序控制，Skill 改不了。
 # skills = ["builtin:code-reviewer", "./skills/team-review"]
+
+# 经本机模型网关跑非 Claude 模型：env 写网关地址与 token，billing 仍用 subscription（不经 [credential_proxy]）。SDE 同样可写。
+[executors.gpt-reviewer]
+role = "code-reviewer"
+billing = "subscription"
+model = "codex/gpt-6.2-astra"
+[executors.gpt-reviewer.env]
+ANTHROPIC_BASE_URL = "http://127.0.0.1:3425"
+ANTHROPIC_AUTH_TOKEN = "magpie"   # 网关占位 token，真凭据在网关里
 
 # SDE 执行器：派单时设 payload.executor_id = "sde"。在任务 worktree 内按测试先行开发，交付实现、红绿测试证据与仓库检查结果。
 # harness / launcher / billing / model / effort 与评审者各自独立配置；review 为运行时开关，保存后下一次执行即使用新值。
