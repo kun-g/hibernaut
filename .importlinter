@@ -85,6 +85,7 @@ forbidden_modules =
 name = Taskboard Clean Architecture L3 -> L2 -> L1 -> L0 unidirectional layers
 type = layers
 layers =
+    taskboard.app
     taskboard.adapters
     taskboard.engine
     taskboard.ports

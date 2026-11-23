@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import configparser
 import json
 from pathlib import Path
 from typing import Any
@@ -165,10 +166,25 @@ def test_taskboard_ast_architecture_boundaries() -> None:
             assert top not in {"sqlite3", "switchboard"}, f"L0 core imported {mod}"
             assert not mod.startswith(("taskboard.adapters", "taskboard.engine", "taskboard.ports"))
 
-    # taskboard.app (composition root) sits above every layer. This is an AST check rather than an
-    # import-linter layer: the delivery checks may resolve `taskboard` from another checkout.
+    # Also an import-linter layer, but lint-imports may resolve `taskboard` from another checkout
+    # (shared virtualenv); this AST check always reads the files of this checkout.
     for py_file in TASKBOARD_SRC.rglob("*.py"):
         if (TASKBOARD_SRC / "app") in py_file.parents:
             continue
         for mod in _extract_imported_modules(py_file):
             assert not mod.startswith("taskboard.app"), f"{py_file} imported the composition root {mod}"
+
+
+def test_import_linter_layers_include_app_on_top() -> None:
+    config = configparser.ConfigParser()
+    config.read(REPO_ROOT / ".importlinter", encoding="utf-8")
+    contract = config["importlinter:contract:taskboard-clean-layers"]
+    assert contract["type"] == "layers"
+    assert contract["layers"].split() == [
+        "taskboard.app",
+        "taskboard.adapters",
+        "taskboard.engine",
+        "taskboard.ports",
+        "taskboard.core",
+    ]
+    assert "ignore_imports" not in contract

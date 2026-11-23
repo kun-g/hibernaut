@@ -167,14 +167,15 @@ auto_ready_sources = ["github"]
         [opened] = self._sb_events("github", "work.opened")
 
         self._wait(lambda: self._task_by_ref("github:kun-g/hibernaut#42") is not None, "taskboard to store the issue")
-        task = self._task_by_ref("github:kun-g/hibernaut#42")
-        assert task is not None
-        task_id, task_status, dispatch_seq = task
-        self.assertEqual((task_status, dispatch_seq), ("ready", 1))
+        stored = self._task_by_ref("github:kun-g/hibernaut#42")
+        assert stored is not None
+        task_id = stored[0]
 
         self._wait(lambda: self._ready_for(task_id) is not None, "work.ready to reach switchboard")
         ready = self._ready_for(task_id)
         assert ready is not None
+        # Creating the task and claiming dispatch_seq are separate transactions; the claim commits before work.ready is published.
+        self.assertEqual(self._task_by_ref("github:kun-g/hibernaut#42"), (task_id, "ready", 1))
         self.assertEqual(ready["external_id"], f"tb:{task_id}:d1")
         self.assertEqual((ready["scope"], ready["correlation_key"], ready["actor"]), (SCOPE, "github:kun-g/hibernaut#42", "taskboard"))
         self.assertEqual(ready["metadata"]["trace_id"], opened["event_id"])
