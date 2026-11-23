@@ -425,6 +425,7 @@ def test_the_pilot_hands_its_result_back_to_the_inbox_that_asked_for_it(tmp_path
         "agent:return", "failed", PROTOCOL_CHECK_EXECUTOR_ID
     )
     assert "candidate_commit" in payload["text"]
+    assert payload["trace_id"] == json.loads(task["payload_json"])["trace_id"]
     assert woken == [OTHER]
     daemon.close()
 
