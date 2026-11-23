@@ -17,6 +17,8 @@ venv/
 *.db
 *.db-wal
 *.db-shm
+# Run logs the ledger writes beside ledger.db (logs/runs/YYYY-MM-DD/<run_id>.log)
+/logs/
 agent_memory/
 outbox/
 # Drive task attachments (gdrive.attachments_dir defaults next to the database)
