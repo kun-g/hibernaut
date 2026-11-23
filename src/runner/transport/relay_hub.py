@@ -34,6 +34,10 @@ from runner.transport.ws_protocol import (
 )
 
 
+class RunnerConnectionLostError(ConnectionError):
+    pass
+
+
 @dataclass(slots=True)
 class _RunnerConn:
     runner_id: str
@@ -69,6 +73,8 @@ class RunnerRelayHub:
         self._server: asyncio.AbstractServer | None = None
         self._conns: dict[str, _RunnerConn] = {}
         self._run_to_runner: dict[str, str] = {}
+        # Connection epoch each in-flight run was submitted on; a run belongs to that connection only.
+        self._run_epoch: dict[str, int] = {}
         self._pending_ack: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._pending_result: dict[str, asyncio.Future[RunResult]] = {}
         self._pending_rpc: dict[str, asyncio.Future[dict[str, Any]]] = {}
@@ -129,6 +135,7 @@ class RunnerRelayHub:
             self._pending_ack[req.run_id] = ack_fut
             self._pending_result[req.run_id] = res_fut
             self._run_to_runner[req.run_id] = runner_id
+            self._run_epoch[req.run_id] = conn.conn_epoch
 
             try:
                 await self._send(
@@ -142,16 +149,14 @@ class RunnerRelayHub:
                     },
                 )
                 ack = await asyncio.wait_for(ack_fut, timeout=self._ack_timeout)
-            except Exception:
+            except BaseException:
                 self._pending_ack.pop(req.run_id, None)
-                self._pending_result.pop(req.run_id, None)
-                self._run_to_runner.pop(req.run_id, None)
+                self._forget_run(req.run_id)
                 self._registry.release_slot(runner_id)
                 raise
 
             if not ack.get("accepted"):
-                self._pending_result.pop(req.run_id, None)
-                self._run_to_runner.pop(req.run_id, None)
+                self._forget_run(req.run_id)
                 self._registry.release_slot(runner_id)
                 if ack.get("reason") == "slots_full":
                     excluded.add(runner_id)
@@ -170,9 +175,24 @@ class RunnerRelayHub:
             try:
                 return await res_fut
             finally:
-                self._pending_result.pop(req.run_id, None)
-                self._run_to_runner.pop(req.run_id, None)
+                self._forget_run(req.run_id)
                 self._registry.release_slot(runner_id)
+
+    def _forget_run(self, run_id: str) -> None:
+        self._pending_result.pop(run_id, None)
+        self._run_to_runner.pop(run_id, None)
+        self._run_epoch.pop(run_id, None)
+
+    def _fail_runs_of(self, conn: _RunnerConn, reason: str) -> None:
+        # The runner side cancels (and reaps) runs whose connection is gone, and a new connection does not adopt
+        # them, so their callers get a terminal error and may retry under a new run_id.
+        for rid, rnode in list(self._run_to_runner.items()):
+            if rnode != conn.runner_id or self._run_epoch.get(rid) != conn.conn_epoch:
+                continue
+            err = RunnerConnectionLostError(f"runner {conn.runner_id!r} {reason}; run {rid} was not completed")
+            for pending in (self._pending_ack.pop(rid, None), self._pending_result.get(rid)):
+                if pending is not None and not pending.done():
+                    pending.set_exception(err)
 
     async def query_run(self, runner_id: str, run_id: str) -> RunResult | None:
         conn = self._conns.get(runner_id)
@@ -270,6 +290,7 @@ class RunnerRelayHub:
 
             old = self._conns.get(runner_id)
             if old is not None:
+                self._fail_runs_of(old, "connection superseded")
                 await send_close(old.writer, CLOSE_SUPERSEDED, "superseded by new connection", mask=False)
 
             conn = _RunnerConn(
@@ -304,14 +325,11 @@ class RunnerRelayHub:
         except (WSConnectionClosed, WSProtocolError, asyncio.TimeoutError, KeyError, ValueError, OSError):
             pass
         finally:
-            if conn is not None and self._conns.get(conn.runner_id) is conn:
-                self._conns.pop(conn.runner_id, None)
-                self._registry.mark_offline(conn.runner_id, conn.conn_epoch)
-                for rid, rnode in list(self._run_to_runner.items()):
-                    if rnode == conn.runner_id:
-                        fut = self._pending_result.get(rid)
-                        if fut is not None and not fut.done():
-                            fut.set_exception(ConnectionError(f"runner {conn.runner_id!r} disconnected"))
+            if conn is not None:
+                self._fail_runs_of(conn, "disconnected")
+                if self._conns.get(conn.runner_id) is conn:
+                    self._conns.pop(conn.runner_id, None)
+                    self._registry.mark_offline(conn.runner_id, conn.conn_epoch)
             try:
                 writer.close()
             except OSError:

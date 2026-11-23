@@ -59,29 +59,50 @@ class SupervisedRunOutput:
     timeout_kind: str | None = None  # "hard" | "idle" | None
 
 
-async def terminate_process_group(proc: asyncio.subprocess.Process, *, grace_seconds: float = 2.0) -> None:
-    if proc.returncode is not None:
-        return
+def _signal_group(pgid: int, sig: signal.Signals) -> bool:
     try:
-        pgid = os.getpgid(proc.pid)
-        os.killpg(pgid, signal.SIGTERM)
+        os.killpg(pgid, sig)
     except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            return
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
-    except asyncio.TimeoutError:
-        try:
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
+
+
+async def terminate_process_group(proc: asyncio.subprocess.Process, *, grace_seconds: float = 2.0) -> None:
+    # The child runs with start_new_session=True, so its pid is the process group id of everything it started.
+    pgid = proc.pid
+    if proc.returncode is None:
+        if not _signal_group(pgid, signal.SIGTERM):
             try:
-                proc.kill()
+                proc.terminate()
             except ProcessLookupError:
-                return
-        await proc.wait()
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
+        except asyncio.TimeoutError:
+            if not _signal_group(pgid, signal.SIGKILL):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+    # Descendants that outlived (or ignored SIGTERM from) the leader would keep writing the worktree.
+    deadline = time.monotonic() + max(grace_seconds, 1.0)
+    while _signal_group(pgid, signal.SIGKILL) and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+
+
+async def reap_uncancellable(proc: asyncio.subprocess.Process, *, grace_seconds: float) -> bool:
+    # Finishes the reap even if the caller is cancelled again meanwhile; returns True when that happened so the
+    # caller can re-raise the cancellation afterwards.
+    reap = asyncio.ensure_future(terminate_process_group(proc, grace_seconds=grace_seconds))
+    cancelled = False
+    while not reap.done():
+        try:
+            await asyncio.shield(reap)
+        except asyncio.CancelledError:
+            cancelled = True
+    reap.result()
+    return cancelled
 
 
 class ProcessSupervisor:
@@ -118,11 +139,6 @@ class ProcessSupervisor:
             start_new_session=True,
         )
 
-        if stdin_text is not None and proc.stdin is not None:
-            proc.stdin.write(stdin_text.encode("utf-8"))
-            await proc.stdin.drain()
-            proc.stdin.close()
-
         hasher = hashlib.sha256()
         total_bytes = 0
         stdout_chunks: list[str] = []
@@ -130,7 +146,8 @@ class ProcessSupervisor:
         stdout_len = 0
         stderr_len = 0
         last_activity = time.monotonic()
-
+        status = "succeeded"
+        timeout_kind: str | None = None
         log_fp = log_path.open("wb")
 
         async def _pump(stream: asyncio.StreamReader | None, *, is_stdout: bool) -> None:
@@ -158,37 +175,45 @@ class ProcessSupervisor:
                         stderr_chunks.append(decoded)
                         stderr_len += len(decoded)
 
-        pump_out = asyncio.create_task(_pump(proc.stdout, is_stdout=True))
-        pump_err = asyncio.create_task(_pump(proc.stderr, is_stdout=False))
-        wait_task = asyncio.create_task(proc.wait())
-
-        start_mono = time.monotonic()
-        status = "succeeded"
-        timeout_kind: str | None = None
-
+        pump_out: asyncio.Task[None] | None = None
+        pump_err: asyncio.Task[None] | None = None
+        # Every exit from here on, cancellation included, goes through the finally: the run is not over while any
+        # process of its group can still touch the worktree.
         try:
-            while not wait_task.done():
+            if stdin_text is not None and proc.stdin is not None:
+                proc.stdin.write(stdin_text.encode("utf-8"))
+                await proc.stdin.drain()
+                proc.stdin.close()
+
+            pump_out = asyncio.create_task(_pump(proc.stdout, is_stdout=True))
+            pump_err = asyncio.create_task(_pump(proc.stderr, is_stdout=False))
+            start_mono = time.monotonic()
+            while proc.returncode is None:
                 if cancel_event.is_set():
                     status = "interrupted"
-                    await terminate_process_group(proc, grace_seconds=grace_seconds)
                     break
                 now = time.monotonic()
                 if now - start_mono >= timeout_seconds:
                     status = "timed_out"
                     timeout_kind = "hard"
-                    await terminate_process_group(proc, grace_seconds=grace_seconds)
                     break
                 if idle_timeout_seconds is not None and (now - last_activity) >= idle_timeout_seconds:
                     status = "timed_out"
                     timeout_kind = "idle"
-                    await terminate_process_group(proc, grace_seconds=grace_seconds)
                     break
                 await asyncio.sleep(0.05)
-            await asyncio.gather(pump_out, pump_err, return_exceptions=True)
-            if not wait_task.done():
-                await wait_task
         finally:
+            recancelled = await reap_uncancellable(proc, grace_seconds=grace_seconds)
+            pumps = [t for t in (pump_out, pump_err) if t is not None]
+            if pumps:
+                # Pipes close once the whole group is gone; a stray inheritor cannot hold the pumps open for long.
+                _, pending = await asyncio.wait(pumps, timeout=grace_seconds)
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pumps, return_exceptions=True)
             log_fp.close()
+            if recancelled:
+                raise asyncio.CancelledError
 
         exit_code = proc.returncode
         if status == "succeeded" and exit_code != 0:

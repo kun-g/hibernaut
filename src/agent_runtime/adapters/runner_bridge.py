@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Coroutine, Sequence
+from typing import Any
 
 from agent_runtime.core.models import (
     Emit,
@@ -15,7 +16,7 @@ from agent_runtime.core.models import (
     new_id,
 )
 from agent_runtime.core.ports import RunCapabilities
-from runner.protocol import InterruptRequest, RunRequest, RunResult, RunnerPort
+from runner.protocol import InterruptReason, InterruptRequest, RunRequest, RunResult, RunnerPort
 
 
 class RunnerExecutorBridge:
@@ -71,14 +72,46 @@ class RunnerExecutorBridge:
         )
 
         run_task = asyncio.create_task(self._runner.run(req))
-        sent_interrupt = False
-        while not run_task.done():
-            if not sent_interrupt and caps.is_interrupted():
-                sent_interrupt = True
-                await self._runner.interrupt(InterruptRequest(run_id=run_id, reason="new_event"))
-            await asyncio.sleep(self._interrupt_poll_interval)
-        result = await run_task
+        interrupt_accepted = False
+        try:
+            while not run_task.done():
+                if not interrupt_accepted and caps.is_interrupted():
+                    interrupt_accepted = await self._try_interrupt(run_id, "new_event")
+                await asyncio.wait({run_task}, timeout=self._interrupt_poll_interval)
+        except asyncio.CancelledError:
+            # The worker cancels execute() on interrupt or shutdown; the run must not outlive this Run, or the next
+            # Run on the same work_key would start a second CLI in the same worktree.
+            await _uncancellable(self._stop_run(run_task, run_id))
+            raise
+        result = run_task.result()
         return translate_run_result(result, session_id=session.session_id)
+
+    async def _try_interrupt(self, run_id: str, reason: InterruptReason) -> bool:
+        try:
+            res = await self._runner.interrupt(InterruptRequest(run_id=run_id, reason=reason))
+        except Exception:
+            return False
+        # not_found: the runner has not registered the run yet, so ask again on the next poll.
+        return res.accepted or res.state == "already_finished"
+
+    async def _stop_run(self, run_task: asyncio.Task[RunResult], run_id: str) -> None:
+        accepted = False
+        while not run_task.done():
+            if not accepted:
+                accepted = await self._try_interrupt(run_id, "shutdown")
+            await asyncio.wait({run_task}, timeout=self._interrupt_poll_interval)
+        if not run_task.cancelled():
+            run_task.exception()
+
+
+async def _uncancellable(coro: Coroutine[Any, Any, None]) -> None:
+    task = asyncio.ensure_future(coro)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            pass
+    task.result()
 
 
 def translate_run_result(result: RunResult, *, session_id: str) -> RunOutcome:

@@ -14,7 +14,7 @@ from runner.cli_drivers import (
     StreamPipe,
     default_cli_drivers,
 )
-from runner.config import RunnerConfig
+from runner.config import NamespacePolicy, ProjectCheckout, RunnerConfig
 from runner.protocol import (
     ErrorKind,
     InterruptRequest,
@@ -34,6 +34,7 @@ from runner.worktree import (
     OrcaWorktreeBackend,
     WorkspaceIsolationError,
     WorktreeManager,
+    restore_readonly_worktree,
     worktree_fingerprint,
 )
 
@@ -70,6 +71,8 @@ class RunnerDaemon:
         self._active_runs: dict[str, _InFlightRun] = {}
         self._completed_runs: dict[str, RunResult] = {}
         self._active_slots = 0
+        # One process tree per workspace: an entry stays until its run's process group has been reaped.
+        self._busy_workspaces: dict[tuple[str, str, str, str, bool], str] = {}
 
     @property
     def config(self) -> RunnerConfig:
@@ -169,6 +172,23 @@ class RunnerDaemon:
             if not entry.future.done():
                 entry.future.set_result(err_result)
             return err_result
+        except BaseException:
+            # Cancelled (e.g. the relay connection that carried the run went away). The supervisor has already
+            # reaped the process group; callers joined on this run_id still get a terminal result.
+            cancelled = RunResult(
+                run_id=req.run_id,
+                runner_id=self._config.runner_id,
+                status="interrupted",
+                executor_id=req.executor_id,
+                error_summary="run cancelled before completion",
+                started_at=started_at,
+                ended_at=utc_now_iso(),
+                duration_ms=max(0, int((time.monotonic() - start_mono) * 1000)),
+            )
+            self._completed_runs[req.run_id] = cancelled
+            if not entry.future.done():
+                entry.future.set_result(cancelled)
+            raise
         finally:
             self._active_slots = max(0, self._active_slots - 1)
             self._active_runs.pop(req.run_id, None)
@@ -201,6 +221,18 @@ class RunnerDaemon:
                 reason=f"unknown project_key: {req.project_key}",
                 blockers=("unknown_project",),
             )
+        active = [
+            run_id
+            for (ns, pk, owner, wk, _), run_id in self._busy_workspaces.items()
+            if (ns, pk, owner, wk) == (req.namespace, req.project_key, req.owner_scope, req.work_key)
+        ]
+        if active:
+            return ReclaimResult(
+                reclaimed=False,
+                status="blocked",
+                reason=f"runs still active on this workspace: {', '.join(sorted(active))}",
+                blockers=("run_active",),
+            )
         return self._worktrees.reclaim(
             policy=policy,
             project=project,
@@ -213,18 +245,40 @@ class RunnerDaemon:
         self,
         req: RunRequest,
         *,
-        policy: object,
-        project: object,
+        policy: NamespacePolicy,
+        project: ProjectCheckout,
         driver: CLIDriver,
         entry: _InFlightRun,
         started_at: str,
         start_mono: float,
     ) -> RunResult:
-        from runner.config import NamespacePolicy, ProjectCheckout
+        # Each key maps to exactly one directory (the task's worktree, or its readonly worktree); resolve() may
+        # reset that directory, so the claim comes first.
+        busy_key = (req.namespace, req.project_key, req.owner_scope, req.work_key, req.readonly)
+        holder = self._busy_workspaces.get(busy_key)
+        if holder is not None:
+            return self._refused(
+                req, started_at, start_mono, "rate_limit", f"workspace_busy: work_key {req.work_key!r} is in use by run {holder}"
+            )
+        self._busy_workspaces[busy_key] = req.run_id
+        try:
+            return await self._execute_claimed(
+                req, policy=policy, project=project, driver=driver, entry=entry, started_at=started_at, start_mono=start_mono
+            )
+        finally:
+            self._busy_workspaces.pop(busy_key, None)
 
-        assert isinstance(policy, NamespacePolicy)
-        assert isinstance(project, ProjectCheckout)
-
+    async def _execute_claimed(
+        self,
+        req: RunRequest,
+        *,
+        policy: NamespacePolicy,
+        project: ProjectCheckout,
+        driver: CLIDriver,
+        entry: _InFlightRun,
+        started_at: str,
+        start_mono: float,
+    ) -> RunResult:
         try:
             resolved = self._worktrees.resolve(
                 policy=policy,
@@ -284,6 +338,7 @@ class RunnerDaemon:
         if pre_fp is not None:
             post_fp = worktree_fingerprint(resolved.workdir)
             if post_fp != pre_fp:
+                restore_readonly_worktree(resolved.workdir, resolved.ref.head_sha)
                 return RunResult(
                     run_id=req.run_id,
                     runner_id=self._config.runner_id,

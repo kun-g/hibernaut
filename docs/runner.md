@@ -33,8 +33,17 @@
 - **原生续接防呆（4B 方案 A）**：回传 `<driver>:<native_id>`，驱动自检 `supports_resume` 与前缀匹配才走 `resume_args`，切执行器自动新开。
 - **流式扩展口（4C 方案 A）**：Phase 1 保持单轮 `RunResult` 并内置 `StreamPipe` 扩展口；Phase 2 沿同一条反向 WebSocket 增量扩展 `run.chunk` / `run.stdin` 帧。
 
-## 6. 架构门禁
+## 6. 执行安全不变量
+
+- **进程组随 Run 结束**：`ProcessSupervisor.execute` 不论正常退出、超时、`interrupt` 还是协程被取消，都先对子进程所在进程组（`start_new_session=True`，组号即子进程 pid）发 `SIGTERM`，超过 `grace_seconds` 再 `SIGKILL`，并在首进程退出后对整组补发 `SIGKILL`，直到组内没有进程才返回或继续抛出取消。被取消的 Run 记为 `interrupted`，以同一 `run_id` 等待它的调用方也拿到这个终态。
+- **一个工作区同时只有一个 Run**：`RunnerDaemon` 按 `(namespace, project_key, owner_scope, work_key, readonly)` 占位，占位在 worktree 解析之前取得，并保持到进程组回收完毕；第二个 `run_id` 落到同一工作区时返回 `refused`（`error_kind = "rate_limit"`，`error_summary` 以 `workspace_busy` 开头）。仍有 Run 占用时 `reclaim_workspace` 返回 `blocked`（`run_active`）。
+- **只读 Run 不挂主检出**：`readonly=True` 的 Run 使用按上述四元组派生的独立 detached worktree（`<prefix>-ro-<hash>`，不进 `workspaces` 表，也不上报为亲和），每次运行前重置到任务 worktree 已提交的 `HEAD`（没有任务 worktree 时为 `default_base_ref`）。运行后指纹变化即 `checkout --force` + `clean -ffdx` 还原，再返回 `failed`（`permission_denied`）。回收该四元组时一并删除。
+- **HB 适配层**：`RunnerExecutorBridge.execute` 被 Worker 取消（`interrupt` 策略或停机）时，向 Runner 发 `interrupt` 并等到 Run 出终态再继续抛出取消；Runner 尚未登记该 `run_id`（`not_found`）时按轮询间隔重发。
+- **反向 WebSocket 换连接**：Hub 按提交时的 `conn_epoch` 记录每个在途 Run。同一 `runner_id` 的新连接顶替旧连接（Close 4009）或旧连接断开时，旧连接上的在途 Run 以 `RunnerConnectionLostError`（`ConnectionError` 子类）结束并释放预扣槽位；Runner 侧随连接取消这些 Run 并回收进程组，调用方换新 `run_id` 重试，进程组回收前会收到 `workspace_busy`。
+- **Orca 后端**：`orca worktree create` 带 `--repo path:<主检出>`、`--base-branch <解析后的提交>`、`--no-parent`、`--setup skip`、`--json`，以回执里的绝对路径与分支（须为请求的分支或其 `-N` 后缀）为准登记，回收时按该路径 `orca worktree rm`。
+
+## 7. 架构门禁
 
 - `.importlinter` 契约 `runner-zero-business-deps` 禁止 `runner` 导入 `agent_runtime`、`taskboard`、`switchboard`、`workshop`、`memory_hub`；
 - `pyrightconfig.json` 将 `src/runner` 纳入 strict 类型检查；
-- `tests/test_runner_stage1.py` 与 `tests/test_runner_stage2.py` 覆盖协议、AST 隔离、Worktree 三道保险、看门狗、跨网反向 WS 调度与 `conn_epoch` 防脑裂。
+- `tests/test_runner_stage1.py` 与 `tests/test_runner_stage2.py` 覆盖协议、AST 隔离、Worktree 三道保险、看门狗、跨网反向 WS 调度与 `conn_epoch` 防脑裂；`tests/test_runner_safety.py` 覆盖第 6 节的不变量：取消后进程组（含忽略 `SIGTERM` 的孙进程）被回收、`workspace_busy`、Bridge 被取消时中断并等待、只读 Run 的独立 worktree 与还原、顶替连接时在途 Run 失败并释放槽位、Orca 回执路径与非法回执。

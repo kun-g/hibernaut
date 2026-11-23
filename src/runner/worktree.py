@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -9,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal, Protocol, Sequence
+from typing import Any, Callable, Final, Literal, Protocol, Sequence, cast
 
 from runner.config import NamespacePolicy, ProjectCheckout
 from runner.protocol import ReclaimResult, WorktreeRef, utc_now_iso
@@ -43,6 +44,12 @@ class WorkspaceRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class CreatedWorktree:
+    path: Path
+    branch: str
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedWorktree:
     workdir: Path
     branch: str
@@ -51,12 +58,15 @@ class ResolvedWorktree:
 
 
 class WorktreeBackend(Protocol):
-    def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> Path: ...
+    def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> CreatedWorktree: ...
 
     def remove(self, *, primary_checkout: Path, workdir: Path) -> None: ...
 
 
-def _run_cmd(cmd: Sequence[str], *, cwd: Path) -> CommandOutput:
+CommandRunner = Callable[[Sequence[str], Path], CommandOutput]
+
+
+def _run_cmd(cmd: Sequence[str], cwd: Path) -> CommandOutput:
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     env["GIT_TERMINAL_PROMPT"] = "0"
     proc = subprocess.run(
@@ -70,19 +80,24 @@ def _run_cmd(cmd: Sequence[str], *, cwd: Path) -> CommandOutput:
     return CommandOutput(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
 
+def _resolve_commit(primary_checkout: Path, base_ref: str, run_cmd: CommandRunner = _run_cmd) -> str:
+    for ref in (base_ref, "HEAD"):
+        res = run_cmd(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], primary_checkout)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    raise RuntimeError(f"cannot resolve {base_ref!r} or HEAD in {primary_checkout}")
+
+
 class GitWorktreeBackend:
-    def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> Path:
-        ref = base_ref
-        check = _run_cmd(["git", "rev-parse", "--verify", ref], cwd=primary_checkout)
-        if check.returncode != 0:
-            ref = "HEAD"
+    def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> CreatedWorktree:
+        commit = _resolve_commit(primary_checkout, base_ref)
         res = _run_cmd(
-            ["git", "worktree", "add", "-b", branch, str(workdir), ref],
+            ["git", "worktree", "add", "-b", branch, str(workdir), commit],
             cwd=primary_checkout,
         )
         if res.returncode != 0:
             raise RuntimeError(f"git worktree add failed: {res.stderr.strip() or res.stdout.strip()}")
-        return workdir.resolve()
+        return CreatedWorktree(path=workdir.resolve(), branch=branch)
 
     def remove(self, *, primary_checkout: Path, workdir: Path) -> None:
         res = _run_cmd(["git", "worktree", "remove", str(workdir)], cwd=primary_checkout)
@@ -91,20 +106,50 @@ class GitWorktreeBackend:
 
 
 class OrcaWorktreeBackend:
-    def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> Path:
-        del base_ref
-        res = _run_cmd(
-            ["orca", "worktree", "create", "--name", workdir.name, "--branch", branch, "--json"],
-            cwd=primary_checkout,
+    def __init__(self, *, run_cmd: CommandRunner = _run_cmd) -> None:
+        self._run_cmd = run_cmd
+
+    def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> CreatedWorktree:
+        commit = _resolve_commit(primary_checkout, base_ref, self._run_cmd)
+        res = self._run_cmd(
+            [
+                "orca",
+                "worktree",
+                "create",
+                "--repo",
+                f"path:{primary_checkout}",
+                "--name",
+                workdir.name,
+                "--base-branch",
+                commit,
+                "--branch",
+                branch,
+                "--no-parent",
+                "--setup",
+                "skip",
+                "--json",
+            ],
+            primary_checkout,
         )
         if res.returncode != 0:
             raise RuntimeError(f"orca worktree create failed: {res.stderr.strip() or res.stdout.strip()}")
-        return workdir.resolve()
+        # Orca decides where the worktree lives (and may suffix the branch); only its receipt says where.
+        try:
+            worktree = cast(dict[str, Any], json.loads(res.stdout)["result"]["worktree"])
+            ref, path = worktree["branch"], worktree["path"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError("invalid Orca worktree creation receipt") from exc
+        if not isinstance(ref, str) or not isinstance(path, str) or not Path(path).is_absolute():
+            raise RuntimeError("invalid branch or path in Orca worktree creation receipt")
+        actual_branch = ref.removeprefix("refs/heads/")
+        if not re.fullmatch(re.escape(branch) + r"(?:-\d+)?", actual_branch):
+            raise RuntimeError(f"Orca returned unrelated branch {actual_branch!r} for {branch!r}")
+        return CreatedWorktree(path=Path(path).resolve(), branch=actual_branch)
 
     def remove(self, *, primary_checkout: Path, workdir: Path) -> None:
-        res = _run_cmd(
+        res = self._run_cmd(
             ["orca", "worktree", "rm", "--worktree", f"path:{workdir}"],
-            cwd=primary_checkout,
+            primary_checkout,
         )
         if res.returncode != 0:
             raise RuntimeError(f"orca worktree rm failed: {res.stderr.strip() or res.stdout.strip()}")
@@ -137,6 +182,24 @@ def worktree_fingerprint(workdir: Path) -> str:
             hasher.update(fpath.read_bytes())
         hasher.update(b"\x01")
     return hasher.hexdigest()
+
+
+def restore_readonly_worktree(workdir: Path, head_sha: str | None) -> None:
+    # Only for runner-owned readonly worktrees, which hold no work of their own.
+    target = head_sha or "HEAD"
+    for cmd in (["git", "checkout", "--force", "--detach", target], ["git", "clean", "-ffdx"]):
+        res = _run_cmd(cmd, cwd=workdir)
+        if res.returncode != 0:
+            raise RuntimeError(f"{' '.join(cmd)} failed in {workdir}: {res.stderr.strip()}")
+
+
+def _registered_worktree_paths(primary_checkout: Path) -> set[Path]:
+    res = _run_cmd(["git", "worktree", "list", "--porcelain"], cwd=primary_checkout)
+    return {
+        Path(line[len("worktree ") :].strip()).resolve()
+        for line in res.stdout.splitlines()
+        if line.startswith("worktree ")
+    }
 
 
 def _registered_worktrees(primary_checkout: Path) -> dict[str, Path]:
@@ -288,6 +351,8 @@ class WorktreeManager:
         name_hint: str | None = None,
     ) -> ResolvedWorktree:
         primary = project.checkout_path.resolve()
+        if readonly:
+            return self._resolve_readonly(policy=policy, project=project, owner_scope=owner_scope, work_key=work_key)
         with self._lock:
             existing = self.get_record(
                 namespace=policy.namespace,
@@ -327,16 +392,7 @@ class WorktreeManager:
                         )
                     self._delete_record(policy.namespace, project.project_key, owner_scope, work_key)
 
-            if readonly:
-                return ResolvedWorktree(
-                    workdir=primary,
-                    branch=project.default_base_ref,
-                    created=False,
-                    ref=self._build_ref(work_key, project.default_base_ref, primary),
-                )
-
-            base_dir = (self._worktree_root or (primary.parent / f".{primary.name}-worktrees")).resolve()
-            base_dir.mkdir(parents=True, exist_ok=True)
+            base_dir = self._base_dir(primary)
             hint = sanitize_name_hint(work_key, name_hint)
             existing_branches = _local_branches(primary) | set(registered.keys())
             dir_name, branch = self._allocate_names(policy.prefix, hint, base_dir, existing_branches)
@@ -355,7 +411,7 @@ class WorktreeManager:
             self._conn.commit()
 
         try:
-            actual_dir = self._backend.create(
+            created = self._backend.create(
                 primary_checkout=primary,
                 workdir=target_dir,
                 branch=branch,
@@ -371,19 +427,82 @@ class WorktreeManager:
             self._conn.execute(
                 """
                 UPDATE workspaces
-                SET workdir = ?, status = 'ready', updated_at = ?
+                SET workdir = ?, branch = ?, status = 'ready', updated_at = ?
                 WHERE namespace = ? AND project_key = ? AND owner_scope = ? AND work_key = ?
                 """,
-                (str(actual_dir), utc_now_iso(), policy.namespace, project.project_key, owner_scope, work_key),
+                (
+                    str(created.path),
+                    created.branch,
+                    utc_now_iso(),
+                    policy.namespace,
+                    project.project_key,
+                    owner_scope,
+                    work_key,
+                ),
             )
             self._conn.commit()
 
         return ResolvedWorktree(
-            workdir=actual_dir,
-            branch=branch,
+            workdir=created.path,
+            branch=created.branch,
             created=True,
-            ref=self._build_ref(work_key, branch, actual_dir),
+            ref=self._build_ref(work_key, created.branch, created.path),
         )
+
+    def readonly_workdir(self, *, policy: NamespacePolicy, project: ProjectCheckout, owner_scope: str, work_key: str) -> Path:
+        digest = hashlib.sha256(
+            "\0".join((policy.namespace, project.project_key, owner_scope, work_key)).encode("utf-8")
+        ).hexdigest()[:16]
+        return self._base_dir(project.checkout_path.resolve()) / f"{policy.prefix}-ro-{digest}"
+
+    def _resolve_readonly(
+        self, *, policy: NamespacePolicy, project: ProjectCheckout, owner_scope: str, work_key: str
+    ) -> ResolvedWorktree:
+        # A readonly run never mounts the primary checkout or another task's worktree: it gets a detached,
+        # runner-owned worktree per (namespace, project, owner_scope, work_key), reset before every run. It shows the
+        # task worktree's committed HEAD when there is one, otherwise the project's base ref.
+        primary = project.checkout_path.resolve()
+        with self._lock:
+            rec = self.get_record(
+                namespace=policy.namespace, project_key=project.project_key, owner_scope=owner_scope, work_key=work_key
+            )
+            target: str | None = None
+            if rec is not None and rec.status == "ready" and rec.workdir.exists():
+                target = _git_head_sha(rec.workdir)
+            if target is None:
+                target = _resolve_commit(primary, project.default_base_ref)
+            workdir = self.readonly_workdir(policy=policy, project=project, owner_scope=owner_scope, work_key=work_key)
+            if workdir.resolve() in _registered_worktree_paths(primary) and workdir.exists():
+                restore_readonly_worktree(workdir, target)
+            else:
+                _run_cmd(["git", "worktree", "prune"], cwd=primary)
+                if workdir.exists():
+                    raise WorkspaceIsolationError(f"readonly workdir {workdir} exists but is not a worktree of {primary}")
+                res = _run_cmd(["git", "worktree", "add", "--detach", str(workdir), target], cwd=primary)
+                if res.returncode != 0:
+                    raise RuntimeError(f"git worktree add --detach failed: {res.stderr.strip() or res.stdout.strip()}")
+            workdir = workdir.resolve()
+            return ResolvedWorktree(
+                workdir=workdir,
+                branch="HEAD",
+                created=False,
+                ref=self._build_ref(work_key, "HEAD", workdir),
+            )
+
+    def _remove_readonly(self, *, policy: NamespacePolicy, project: ProjectCheckout, owner_scope: str, work_key: str) -> bool:
+        primary = project.checkout_path.resolve()
+        workdir = self.readonly_workdir(policy=policy, project=project, owner_scope=owner_scope, work_key=work_key)
+        if not workdir.exists():
+            return False
+        res = _run_cmd(["git", "worktree", "remove", "--force", str(workdir)], cwd=primary)
+        if res.returncode != 0:
+            raise RuntimeError(f"git worktree remove failed: {res.stderr.strip() or res.stdout.strip()}")
+        return True
+
+    def _base_dir(self, primary: Path) -> Path:
+        base_dir = (self._worktree_root or (primary.parent / f".{primary.name}-worktrees")).resolve()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return base_dir
 
     def reclaim(
         self,
@@ -395,6 +514,12 @@ class WorktreeManager:
         merged_head_sha: str | None = None,
     ) -> ReclaimResult:
         primary = project.checkout_path.resolve()
+        try:
+            removed_readonly = self._remove_readonly(
+                policy=policy, project=project, owner_scope=owner_scope, work_key=work_key
+            )
+        except RuntimeError as exc:
+            return ReclaimResult(reclaimed=False, status="error", reason=str(exc), blockers=("remove_failed",))
         with self._lock:
             rec = self.get_record(
                 namespace=policy.namespace,
@@ -403,6 +528,14 @@ class WorktreeManager:
                 work_key=work_key,
             )
             if rec is None:
+                if removed_readonly:
+                    return ReclaimResult(
+                        reclaimed=True,
+                        status="reclaimed",
+                        reason="readonly worktree removed; no task worktree recorded",
+                        blockers=(),
+                        branch_kept=None,
+                    )
                 return ReclaimResult(
                     reclaimed=False,
                     status="not_found",
