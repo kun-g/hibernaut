@@ -21,7 +21,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
 )
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, terminal_title
 from agent_runtime.adapters.executor_cli.peer import PEER_TOOLS, DeveloperPeerResolver, PeerLookup
-from agent_runtime.adapters.executor_cli.process import join_text, last_text, target_events
+from agent_runtime.adapters.executor_cli.process import join_text, last_text, relayed_work_key, target_events
 from agent_runtime.adapters.executor_cli.review_scope import BASES, INTRODUCED, UNFIXED, ReviewScope
 from agent_runtime.adapters.executor_cli.run_state import TurnSlot
 from agent_runtime.adapters.executor_cli.project_guidance import (
@@ -381,6 +381,7 @@ class CoderReviewerExecutor:
         explicit = last_text(target, "explicit_workdir")
         work_key = (
             last_text(target, "review_of")
+            or relayed_work_key(target, session)
             or target[0].correlation_key
             or (session.correlation_key if session is not None else None)
         )

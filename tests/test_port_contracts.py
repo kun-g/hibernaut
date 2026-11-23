@@ -52,6 +52,19 @@ class InboxContractMixin:
         remaining = inbox.fetch_pending("u1")
         self.assertEqual([e.event_id for e in remaining], [stored2.event_id])
 
+    def test_events_carry_their_place_in_the_queue(self) -> None:
+        inbox = self.make_inbox()
+        stored = [inbox.append(Event(inbox_id="u1", source="s", external_id=f"e{n}", payload={}, occurred_at="t"))[0]
+                  for n in range(3)]
+        places = [e.seq for e in stored]
+        self.assertNotIn(None, places)
+        self.assertEqual(places, sorted(set(places)))
+        self.assertEqual([e.seq for e in inbox.fetch_pending("u1")], places)
+        self.assertEqual([e.seq for e in inbox.claim_pending("u1", [stored[1].event_id])], [places[1]])
+        self.assertEqual([e.seq for e in inbox.fetch_processing("u1")], [places[1]])
+        inbox.requeue_processing([stored[1].event_id])
+        self.assertEqual([e.seq for e in inbox.fetch_pending("u1")], places)
+
     def test_has_open_event_is_true_only_while_pending_or_processing(self) -> None:
         inbox = self.make_inbox()
         self.assertFalse(inbox.has_open_event("u3", "drive", "f:1"))

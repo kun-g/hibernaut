@@ -9,11 +9,15 @@ from agent_runtime.adapters.memory_fs.fs_memory import FileSystemMemoryAdapter
 _SAFE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def _sanitize_inbox_id(inbox_id: str) -> str:
+def check_inbox_id(inbox_id: str) -> None:
     if not inbox_id or not inbox_id.strip():
         raise ValueError("inbox_id must be a non-empty string")
     if ".." in inbox_id or "/" in inbox_id or "\\" in inbox_id:
         raise ValueError(f"Invalid inbox_id path characters: {inbox_id}")
+
+
+def _sanitize_inbox_id(inbox_id: str) -> str:
+    check_inbox_id(inbox_id)
     return _SAFE_SEGMENT_RE.sub("__", inbox_id.strip())
 
 

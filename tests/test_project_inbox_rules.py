@@ -8,7 +8,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from agent_runtime.adapters.executor_cli import OrcaWorktreeManager, WorkspaceIsolationError
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
@@ -190,6 +190,43 @@ class TestInboxIdConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "'proj:a:x' is assigned to both projects.a and projects.b"):
             self.parse(a={"inbox_id": ["proj:a", "proj:a\\:x"]}, b={"inbox_id": ["proj:b", "proj:a:x"]})
 
+    def test_patterns_of_two_projects_that_overlap_are_rejected(self):
+        for a, b in (
+            ("shared:.+", "shared:.+"), ("shared:.+", "re:shared:.+"), ("shared:.*", ".*:x"), ("shared:.+", "shared:[a-z]+"),
+            ("proj:(a|b):.+", "proj:(b|c):.+"), ("t:\\d+", "t:[0-9]{3}"), ("t:\\w+", "t:é.*"), ("t:\\S{2,}", "t:(?:ab)+"),
+            ("^t:.+$", "t:x.*"), ("t:[^a]", "t:[^b]"), ("t:a{2,4}", "t:a{4,}"), ("t:(x:)?y", "t:x:y+"), ("t:a*?b", "t:ab?"),
+        ):
+            with self.subTest(a=a, b=b):
+                message = r"pattern .* of projects\.(a|b) and pattern .* of projects\.(a|b) both match"
+                with self.assertRaisesRegex(ValueError, message):
+                    self.parse(a={"inbox_id": ["proj:a", a]}, b={"inbox_id": ["proj:b", b]})
+
+    def test_patterns_of_two_projects_that_never_meet_load(self):
+        for a, b in (
+            ("proj:a:.+", "proj:b:.+"), ("t:\\d+", "t:[a-z]+"), ("t:a{2,3}", "t:a{4,}"), ("t:[^a]", "t:a"), ("t:a+", "t:b*a?b"),
+            ("t:(x|y):.*", "t:(z|w):.*"), ("^t:a.*$", "^t:b.*$"), ("t:\\w", "t:\\W"), ("t:.", "t:\\n"), ("t:é", "t:[a-z]"),
+        ):
+            with self.subTest(a=a, b=b):
+                self.parse(a={"inbox_id": ["proj:a", a]}, b={"inbox_id": ["proj:b", b]})
+        # Two patterns of one project may overlap.
+        self.parse(a={"inbox_id": ["proj:a", "t:.+", "t:x.*"]})
+
+    def test_a_pattern_whose_overlap_cannot_be_told_is_rejected_next_to_another_projects(self):
+        for pattern in ("t:(?!x).+", "t:(?<=:)x", "t:(a)\\1", "(?i)t:x", "t:\\bx", "t:[à-ÿ]", "t:(?>a+)", "t:a{3000}", "t:x$y"):
+            with self.subTest(pattern), self.assertRaisesRegex(ValueError, r"projects\.a pattern .* cannot be compared"):
+                self.parse(a={"inbox_id": ["proj:a", pattern]}, b={"inbox_id": ["proj:b", "proj:b:.+"]})
+            # Alone, or beside exact ids, it needs no comparing.
+            self.parse(a={"inbox_id": ["proj:a", pattern]}, b={"inbox_id": ["proj:b", "proj:b:x"]})
+
+    def test_a_file_with_an_overlap_does_not_load(self):
+        # A reload that fails to load keeps the config in force (test_config_reload).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            path.write_text(project_table("a", ["proj:a", "shared:.+"], tmp)
+                            + project_table("b", ["proj:b", "shared:.+"], tmp))
+            with self.assertRaisesRegex(ValueError, "both match"):
+                load_config(path)
+
     def test_disjoint_direct_patterns_of_two_projects_load(self):
         cfg = self.parse(a={"inbox_id": ["proj:a", "proj:a:.+"]}, b={"inbox_id": ["proj:b", "proj:b:.+"]})
         router = ProjectRouter(cfg.projects.values())
@@ -329,6 +366,8 @@ class TestProjectDispatch(_DispatchCase):
             project_table("a", ["proj:a", "shared:.*"], self.repo)
             + project_table("b", ["proj:b", ".*:x"], other)
         )
+        # Load rejects this config; dispatch still refuses the inbox for one built another way.
+        self.enterContext(patch("agent_runtime.app.projects._validate_disjoint_patterns"))
         with self.assertLogs("agent_runtime.app.main", level="ERROR") as logs:
             await self.dispatch(path, [("shared:x", {"text": "amb"}, "task:amb")])
         (record,) = logs.records
