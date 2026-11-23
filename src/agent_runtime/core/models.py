@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, TypeAlias
@@ -19,13 +19,16 @@ EmitStatus: TypeAlias = Literal["done", "failed", "stopped", "refused"]
 EMIT_STATUSES: tuple[EmitStatus, ...] = ("done", "failed", "stopped", "refused")
 DeliveryState: TypeAlias = Literal["local", "pr_open", "merged"]
 MergeHold: TypeAlias = Literal["", "review", "ci", "other"]
-# Outbox metadata key the worker fills with {title, source, executor_id, status, delivery}; status is an EmitStatus
+# Outbox metadata key the worker fills with {title, source, executor_id, trace_id, status, delivery}; status is an EmitStatus
 # or "awaiting_approval", delivery the Emit's DeliveryOutcome as a dict when it has one. Nested so channels that pass
 # top-level keys on are unaffected.
 TASK_CONTEXT_KEY = "task_context"
 # Outbox kind of a message that only syncs a Taskboard task's state (claim, complete, release); channels that show
 # messages to a person skip it.
 TASK_SYNC_KIND = "task_sync"
+# Outbox metadata key of the Run's trace. Not the top-level "trace_id", which is the Taskboard task's trace that
+# channels report back.
+TRACE_METADATA_KEY = "_trace_id"
 # Hops one external event may take between agents (forwards and returns alike) before it must be answered.
 MAX_FORWARD_HOPS = 3
 # The PermissionPort tool name every forward_to_inbox passes through.
@@ -71,6 +74,28 @@ class Event:
     status: EventStatus = "pending"
     # Place in the Event Inbox, set by the store: which of two events came first, whatever their clocks said.
     seq: int | None = field(default=None, compare=False)
+
+
+def explicit_trace_id(event: Event) -> str | None:
+    for key in ("trace_id", "_trace_id"):
+        value = event.payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def resolve_trace_id(event: Event) -> str:
+    return explicit_trace_id(event) or event.event_id
+
+
+def resolve_trigger_event(events: Sequence[Event]) -> Event:
+    # The one event a batch descends from: the last that carries a trace, else the first (its event_id is the trace).
+    if not events:
+        raise ValueError("a trigger event needs at least one event")
+    for event in reversed(events):
+        if explicit_trace_id(event) is not None:
+            return event
+    return events[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +151,10 @@ class ForwardSpec:
     hop_count: int = 0
     forwarded_from: str | None = None
     parent_session_id: str | None = None
+    # The trace of this work and the event its latest Run descends from: what the session sends on carries both, also
+    # after an approval that names neither. Empty only in a record stored before they were kept.
+    trace_id: str = ""
+    parent_event_id: str = ""
     reply_channel: str | None = None
     reply_target: str | None = None
     # Correlation key of the external conversation this work belongs to.
