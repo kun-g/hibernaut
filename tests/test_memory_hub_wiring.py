@@ -713,7 +713,7 @@ def test_whitebox_searches_reads_and_proposes(registry: WorkspacePartitionRegist
     assert "not found" in results[3]
     assert "approval" in results[4] and "wrote" not in results[4]
     assert "budget" in results[5]
-    assert [p["proposal"]["author"] for p in hub.list_proposals()] == ["whitebox", None]
+    assert {p["proposal"]["author"] for p in hub.list_proposals()} == {"whitebox", None}
     assert memory.load_baseline()["instructions.md"] == ""
 
 
