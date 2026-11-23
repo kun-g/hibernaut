@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import signal
 import time
 from dataclasses import dataclass
@@ -12,35 +13,68 @@ from typing import Callable, Final, Mapping, Sequence
 
 from runner.protocol import CredentialLease, LogRef, MAX_STDOUT_EXCERPT_BYTES
 
-STRIPPED_SECRET_ENV_KEYS: Final = frozenset(
+# The child gets only what a CLI needs to run (paths, locale, terminal, proxy), never the runner's own
+# credentials: external auth goes through the credential lease (RUNNER_BROKER_URL / RUNNER_LEASE_TOKEN).
+CHILD_ENV_ALLOWLIST: Final = frozenset(
     {
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_ENTERPRISE_TOKEN",
-        "GITHUB_ENTERPRISE_TOKEN",
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "OPENAI_API_KEY",
-        "XAI_API_KEY",
-        "FEISHU_APP_SECRET",
-        "SWITCHBOARD_RELAY_TOKEN",
-        "SWITCHBOARD_MCP_TOKEN",
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "TZ",
+        "LANG",
+        "LANGUAGE",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
     }
+)
+CHILD_ENV_ALLOWED_PREFIXES: Final = ("LC_",)
+_LEASE_ENV_KEYS: Final = frozenset({"RUNNER_BROKER_URL", "RUNNER_LEASE_TOKEN", "RUNNER_LEASE_EXPIRES_AT"})
+# Driver env is configured, not inherited, so it may set anything except a credential.
+_CREDENTIAL_NAME_RE: Final = re.compile(
+    r"(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|AUTH|COOKIE|SESSION_?KEY)",
+    re.IGNORECASE,
 )
 
 
-def strip_long_lived_secrets(
+def is_credential_env_name(name: str) -> bool:
+    return bool(_CREDENTIAL_NAME_RE.search(name))
+
+
+def build_child_env(
     base_env: Mapping[str, str],
     *,
     extra_env: Mapping[str, str] | None = None,
     credential_lease: CredentialLease | None = None,
 ) -> dict[str, str]:
-    env = {k: v for k, v in base_env.items() if k not in STRIPPED_SECRET_ENV_KEYS}
+    env = {
+        k: v
+        for k, v in base_env.items()
+        if (k in CHILD_ENV_ALLOWLIST or k.startswith(CHILD_ENV_ALLOWED_PREFIXES)) and not is_credential_env_name(k)
+    }
     env["GIT_TERMINAL_PROMPT"] = "0"
     if extra_env:
         for k, v in extra_env.items():
-            if k in STRIPPED_SECRET_ENV_KEYS:
-                raise PermissionError(f"refusing to inject long-lived secret key {k!r} into child env")
+            if is_credential_env_name(k) or k in _LEASE_ENV_KEYS:
+                raise PermissionError(f"refusing to inject credential-like key {k!r} into child env")
             env[k] = v
     if credential_lease is not None:
         env["RUNNER_BROKER_URL"] = credential_lease.broker_url
@@ -175,15 +209,24 @@ class ProcessSupervisor:
                         stderr_chunks.append(decoded)
                         stderr_len += len(decoded)
 
+        async def _feed_stdin(stream: asyncio.StreamWriter, data: bytes) -> None:
+            # Its own task: a child that never reads its input must not hold up the watchdog or an interrupt.
+            try:
+                stream.write(data)
+                await stream.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                stream.close()
+
         pump_out: asyncio.Task[None] | None = None
         pump_err: asyncio.Task[None] | None = None
+        feed: asyncio.Task[None] | None = None
         # Every exit from here on, cancellation included, goes through the finally: the run is not over while any
         # process of its group can still touch the worktree.
         try:
             if stdin_text is not None and proc.stdin is not None:
-                proc.stdin.write(stdin_text.encode("utf-8"))
-                await proc.stdin.drain()
-                proc.stdin.close()
+                feed = asyncio.create_task(_feed_stdin(proc.stdin, stdin_text.encode("utf-8")))
 
             pump_out = asyncio.create_task(_pump(proc.stdout, is_stdout=True))
             pump_err = asyncio.create_task(_pump(proc.stderr, is_stdout=False))
@@ -203,7 +246,11 @@ class ProcessSupervisor:
                     break
                 await asyncio.sleep(0.05)
         finally:
+            if feed is not None and not feed.done():
+                feed.cancel()
             recancelled = await reap_uncancellable(proc, grace_seconds=grace_seconds)
+            if feed is not None:
+                await asyncio.gather(feed, return_exceptions=True)
             pumps = [t for t in (pump_out, pump_err) if t is not None]
             if pumps:
                 # Pipes close once the whole group is gone; a stray inheritor cannot hold the pumps open for long.

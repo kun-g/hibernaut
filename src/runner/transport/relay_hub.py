@@ -147,6 +147,10 @@ class RunnerRelayHub:
                 excluded.add(runner_id)
                 continue
 
+            # Claimed in the same loop step that selected the node, before the first await: a concurrent submit for
+            # this workspace sees the binding and goes to the same node instead of building a second copy.
+            claimed = not req.readonly and self._claim_workspace(req, runner_id)
+
             ack_fut: asyncio.Future[dict[str, Any]] = loop.create_future()
             res_fut: asyncio.Future[RunResult] = loop.create_future()
             self._pending_ack[req.run_id] = ack_fut
@@ -177,6 +181,15 @@ class RunnerRelayHub:
             if not ack.get("accepted"):
                 self._forget_run(req.run_id)
                 self._registry.release_slot(runner_id)
+                if claimed:
+                    # The node said no, so it never ran this: the workspace is free for any node again. Without such
+                    # an answer (a lost connection) the claim stays until the node's hello reconciles it.
+                    self._affinity.unbind(
+                        namespace=req.namespace,
+                        project_key=req.project_key,
+                        owner_scope=req.owner_scope,
+                        work_key=req.work_key,
+                    )
                 if ack.get("reason") == "slots_full":
                     excluded.add(runner_id)
                     continue
@@ -196,6 +209,33 @@ class RunnerRelayHub:
             finally:
                 self._forget_run(req.run_id)
                 self._registry.release_slot(runner_id)
+
+    def _claim_workspace(self, req: RunRequest, runner_id: str) -> bool:
+        if self._affinity.lookup(
+            namespace=req.namespace,
+            project_key=req.project_key,
+            owner_scope=req.owner_scope,
+            work_key=req.work_key,
+        ) is not None:
+            return False
+        self._affinity.bind(
+            namespace=req.namespace,
+            project_key=req.project_key,
+            owner_scope=req.owner_scope,
+            work_key=req.work_key,
+            runner_id=runner_id,
+        )
+        return True
+
+    def _drop_connection(self, conn: _RunnerConn, reason: str) -> None:
+        self._fail_runs_of(conn, reason)
+        if self._conns.get(conn.runner_id) is conn:
+            self._conns.pop(conn.runner_id, None)
+            self._registry.mark_offline(conn.runner_id, conn.conn_epoch)
+        try:
+            conn.writer.close()
+        except OSError:
+            pass
 
     def _forget_run(self, run_id: str) -> None:
         self._pending_result.pop(run_id, None)
@@ -345,14 +385,12 @@ class RunnerRelayHub:
             pass
         finally:
             if conn is not None:
-                self._fail_runs_of(conn, "disconnected")
-                if self._conns.get(conn.runner_id) is conn:
-                    self._conns.pop(conn.runner_id, None)
-                    self._registry.mark_offline(conn.runner_id, conn.conn_epoch)
-            try:
-                writer.close()
-            except OSError:
-                pass
+                self._drop_connection(conn, "disconnected")
+            else:
+                try:
+                    writer.close()
+                except OSError:
+                    pass
 
     def _dispatch_inbound(self, runner_id: str, epoch: int, frame: dict[str, Any]) -> None:
         ftype = frame.get("type")
@@ -381,7 +419,12 @@ class RunnerRelayHub:
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self._heartbeat_seconds)
-            self._registry.sweep_stale(stale_after_seconds=self._heartbeat_seconds * 2.0)
+            for runner_id in self._registry.sweep_stale(stale_after_seconds=self._heartbeat_seconds * 2.0):
+                # A node that stopped answering but keeps its socket open would otherwise hold its runs' waiters
+                # forever; closing it ends them the same way a disconnect does.
+                stale = self._conns.get(runner_id)
+                if stale is not None:
+                    self._drop_connection(stale, "stopped answering heartbeats")
             for conn in list(self._conns.values()):
                 try:
                     await self._send(

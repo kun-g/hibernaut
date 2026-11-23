@@ -38,7 +38,7 @@ from runner.protocol import (
     RunResult,
     RunnerCapabilities,
 )
-from runner.supervisor import STRIPPED_SECRET_ENV_KEYS, strip_long_lived_secrets
+from runner.supervisor import build_child_env
 from runner.transport.in_process import InProcessRunnerClient
 from runner.worktree import GitWorktreeBackend, WorkspaceIsolationError, WorktreeManager
 
@@ -193,13 +193,10 @@ def test_worktree_prefix_isolation_collision_and_local_reclaim(tmp_path: Path) -
 
 
 def test_secret_stripping_and_driver_resume_self_check() -> None:
-    dirty_env = {k: "secret-val" for k in STRIPPED_SECRET_ENV_KEYS}
-    dirty_env["SAFE_VAR"] = "ok"
-    cleaned = strip_long_lived_secrets(dirty_env)
-    for k in STRIPPED_SECRET_ENV_KEYS:
-        assert k not in cleaned
-    assert cleaned["SAFE_VAR"] == "ok"
-    assert cleaned["GIT_TERMINAL_PROMPT"] == "0"
+    dirty_env = {k: "secret-val" for k in ("GH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY")}
+    dirty_env.update({"SAFE_VAR": "unlisted", "PATH": "/usr/bin", "LC_ALL": "C"})
+    cleaned = build_child_env(dirty_env)
+    assert cleaned == {"PATH": "/usr/bin", "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0"}
 
     assert format_prefixed_session_id("claude", "abc-123") == "claude:abc-123"
     assert extract_matching_native_session_id("claude", "claude:abc-123") == "abc-123"

@@ -28,7 +28,7 @@ from runner.protocol import (
     SlotSnapshot,
     utc_now_iso,
 )
-from runner.supervisor import ProcessSupervisor, strip_long_lived_secrets
+from runner.supervisor import ProcessSupervisor, build_child_env
 from runner.worktree import (
     GitWorktreeBackend,
     OrcaWorktreeBackend,
@@ -143,6 +143,16 @@ class RunnerDaemon:
                 start_mono,
                 "config_error",
                 f"interactive=true requested but runner {self._config.runner_id!r} has interactive_surface={self._config.interactive_surface!r}",
+            )
+
+        if req.interactive and driver.capability(interactive_surface=self._config.interactive_surface).interactive_surface != "orca":
+            # Never a silent headless fallback (docs/runner.md §4): the driver must launch the CLI in an Orca terminal.
+            return self._refused(
+                req,
+                started_at,
+                start_mono,
+                "config_error",
+                f"interactive=true requested but executor {req.executor_id!r} cannot launch an Orca terminal",
             )
 
         if self._active_slots >= self._config.max_concurrent:
@@ -309,7 +319,7 @@ class RunnerDaemon:
         pre_fp = await asyncio.to_thread(worktree_fingerprint, resolved.workdir) if req.readonly else None
         spec = driver.build_command(req, resolved.workdir)
         try:
-            child_env = strip_long_lived_secrets(
+            child_env = build_child_env(
                 os.environ,
                 extra_env=spec.env,
                 credential_lease=req.credential_lease,

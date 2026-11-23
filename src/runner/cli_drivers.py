@@ -99,12 +99,15 @@ class TemplateCLIDriver:
     pass_prompt_via_stdin: bool = False
 
     def capability(self, *, interactive_surface: InteractiveSurfaceKind = "none") -> ExecutorCapability:
+        # A template driver only starts a headless subprocess with pipes; whatever the node offers, it cannot hand
+        # an operator an Orca terminal, so it never claims one.
+        del interactive_surface
         return ExecutorCapability(
             executor_id=self.executor_id,
             driver=self.driver_kind,
             supports_resume=bool(self.resume_args),
             supports_stream_json=self.supports_stream_json,
-            interactive_surface=interactive_surface,
+            interactive_surface="none",
         )
 
     def build_command(self, req: RunRequest, workdir: Path) -> CommandSpec:

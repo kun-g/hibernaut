@@ -289,8 +289,9 @@ class RunnerRouter:
             return False
         if req.project_key not in caps.projects:
             return False
-        if not any(e.executor_id == req.executor_id for e in caps.executors):
+        executor = next((e for e in caps.executors if e.executor_id == req.executor_id), None)
+        if executor is None:
             return False
-        if req.interactive and caps.interactive_surface != "orca":
+        if req.interactive and (caps.interactive_surface != "orca" or executor.interactive_surface != "orca"):
             return False
         return True
