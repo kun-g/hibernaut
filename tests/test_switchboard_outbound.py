@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from switchboard.config import OutboundConfig
@@ -168,7 +169,7 @@ class GatewayTests(unittest.TestCase):
         thread = CanonicalEvent(
             external_id="r3",
             correlation_key="feishu:thread:om_root",
-            metadata={"run_id": "r3", "session_id": "s", "outcome_kind": "done"},
+            metadata={"run_id": "r3", "session_id": "s", "outcome_kind": "emit"},
             **base,  # type: ignore[arg-type]
         )
         gateway.consume_event(thread)
@@ -183,6 +184,119 @@ class GatewayTests(unittest.TestCase):
             **base,  # type: ignore[arg-type]
         )
         self.assertIsNone(gateway.message_for_report(orphan))
+
+
+class TaskboardReportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = SwitchboardStore(str(Path(self.tmp.name) / "sb.db"))
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self.tmp.cleanup()
+
+    def gateway(self, **config: object) -> OutboundGateway:
+        return OutboundGateway(self.store, {}, config=OutboundConfig(**config))  # type: ignore[arg-type]
+
+    def report(
+        self, *, source: str = "hibernaut", correlation_key: str | None = "feishu:thread:om_root", **metadata: object
+    ) -> CanonicalEvent:
+        return CanonicalEvent(
+            source=source,
+            event_type="execution.reported",
+            external_id=f"r:{sorted(metadata.items())}",
+            scope="proj:hibernaut",
+            correlation_key=correlation_key,
+            subject="s",
+            body="b",
+            metadata={"run_id": "r1", "session_id": "s1", "outcome_kind": "emit", **metadata},
+        )
+
+    def test_internal_task_sync_reports_never_reach_a_person(self) -> None:
+        gateway = self.gateway()
+        silenced = [
+            {"outcome_kind": "done"},
+            {"outcome_kind": "done", "task_action": "complete", "task_id": "t1"},
+            {"outcome_kind": "done", "task_action": "claim", "task_id": "t1"},
+            {"outcome_kind": "error", "task_action": "release", "stage": "failed", "task_id": "t1"},
+            {"outcome_kind": "error", "task_action": "claim", "task_id": "t1"},
+            {"outcome_kind": "error", "task_action": "update_stage", "task_id": "t1"},
+            {"outcome_kind": "done", "reply_channel": "feishu", "reply_target": "oc_ops"},
+        ]
+        for metadata in silenced:
+            with self.subTest(metadata):
+                self.assertIsNone(gateway.message_for_report(self.report(**metadata)))
+
+    def test_results_that_carry_a_task_action_are_still_delivered(self) -> None:
+        gateway = self.gateway()
+        delivered = [
+            {"outcome_kind": "emit", "task_action": "complete", "task_id": "t1"},
+            {"outcome_kind": "emit", "task_action": "release", "stage": "failed", "task_id": "t1"},
+            {"outcome_kind": "emit", "task_action": "update_stage", "stage": "waiting_pr_merge", "task_id": "t1"},
+            {"outcome_kind": "error"},
+        ]
+        for metadata in delivered:
+            with self.subTest(metadata):
+                msg = gateway.message_for_report(self.report(**metadata))
+                assert msg is not None
+                self.assertEqual((msg.channel, dict(msg.target)), ("feishu", {"reply_to_message_id": "om_root"}))
+
+    def test_suspend_with_a_task_action_still_sends_the_approval_card(self) -> None:
+        msg = self.gateway(approval_target="oc_approvals").message_for_report(self.report(
+            outcome_kind="suspend", approval_request_id="apr_1", task_action="update_stage",
+            stage="awaiting_approval", task_id="t1",
+        ))
+        assert msg is not None
+        self.assertEqual(msg.kind, "approval_card")
+
+    def notice(self, correlation_key: str | None, **metadata: object) -> CanonicalEvent:
+        return self.report(
+            source="taskboard", correlation_key=correlation_key, notify_kind="human_todo", task_id="t1",
+            target_assignee="human:kun", reason="ready", trace_id="tr", hop_count=1, **metadata,
+        )
+
+    def target(self, gateway: OutboundGateway, event: CanonicalEvent) -> tuple[str, dict[str, object]] | None:
+        msg = gateway.message_for_report(event)
+        return None if msg is None else (msg.channel, dict(msg.target))
+
+    def test_taskboard_notices_route_explicit_then_origin_then_notify_then_approval_target(self) -> None:
+        full = self.gateway(notify_channel="feishu", notify_target="oc_todo", approval_target="oc_approvals")
+        github_key = "github:kun-g/hibernaut#42"
+        self.assertEqual(
+            self.target(full, self.notice(github_key, reply_channel="feishu", reply_target="oc_explicit")),
+            ("feishu", {"chat_id": "oc_explicit"}),
+        )
+        self.assertEqual(
+            self.target(full, self.notice("feishu:thread:om_root")), ("feishu", {"reply_to_message_id": "om_root"})
+        )
+        # A GitHub origin is not a reply target by default, so the notice falls through to notify_target.
+        self.assertEqual(self.target(full, self.notice(github_key)), ("feishu", {"chat_id": "oc_todo"}))
+        self.assertEqual(self.target(full, self.notice(None)), ("feishu", {"chat_id": "oc_todo"}))
+        approvals_only = self.gateway(approval_target="oc_approvals")
+        self.assertEqual(self.target(approvals_only, self.notice(github_key)), ("feishu", {"chat_id": "oc_approvals"}))
+        self.assertIsNone(self.target(self.gateway(), self.notice(github_key)))
+
+    def test_every_taskboard_notice_kind_is_routed(self) -> None:
+        gateway = self.gateway(notify_target="oc_todo")
+        for kind in ("human_todo", "upstream_cancelled", "dependency_invalidated"):
+            with self.subTest(kind):
+                event = self.notice("taskboard:t1")
+                event = replace(event, metadata={**event.metadata, "notify_kind": kind})
+                self.assertEqual(self.target(gateway, event), ("feishu", {"chat_id": "oc_todo"}))
+
+    def test_notify_target_does_not_reroute_ordinary_reports(self) -> None:
+        gateway = self.gateway(notify_target="oc_todo", approval_target="oc_approvals")
+        self.assertIsNone(gateway.message_for_report(self.report(correlation_key="github:kun-g/hibernaut#42")))
+        untagged = self.report(source="taskboard", correlation_key="github:kun-g/hibernaut#42")
+        self.assertIsNone(gateway.message_for_report(untagged))
+
+    def test_notify_settings_parse_from_the_outbound_section(self) -> None:
+        from switchboard.config import parse_config
+
+        parsed = parse_config({"outbound": {"notify_channel": "feishu", "notify_target": "oc_todo"}}).outbound
+        self.assertEqual((parsed.notify_channel, parsed.notify_target), ("feishu", "oc_todo"))
+        defaults = parse_config({}).outbound
+        self.assertEqual((defaults.notify_channel, defaults.notify_target), (None, None))
 
 
 if __name__ == "__main__":

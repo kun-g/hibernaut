@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from switchboard.envelope import EVENT_TYPES
 UnmatchedPolicy = Literal["fallback", "reject"]
 TransportMode = Literal["in_process", "relay", "hybrid"]
 TRANSPORT_MODES: tuple[TransportMode, ...] = ("in_process", "relay", "hybrid")
+_BAD_PATH_CHARS = re.compile(r"[\s?#]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +20,9 @@ class HttpConfig:
     host: str = "127.0.0.1"
     port: int = 8790
     max_body_bytes: int = 1_048_576
+    # Every route also answers under this prefix (e.g. "/switchboard"), so a proxy that keeps the path prefix
+    # needs no StripPrefix; "" means no prefix.
+    base_path: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +92,10 @@ class OutboundConfig:
     reply_to_origin: tuple[str, ...] = ("feishu",)
     # Accounts the GitHub App may mint comment tokens for; only used when the App credentials are set.
     github_app_owners: tuple[str, ...] = ()
+    # Where Taskboard notices (human_todo, upstream_cancelled, dependency_invalidated) go when they name no
+    # reply target and their origin takes no replies; unset falls back to approval_channel/approval_target.
+    notify_channel: str | None = None
+    notify_target: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +150,7 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
             host=str(http.get("host", _HTTP.host)),
             port=int(http.get("port", _HTTP.port)),
             max_body_bytes=int(http.get("max_body_bytes", _HTTP.max_body_bytes)),
+            base_path=normalize_base_path(http.get("base_path", _HTTP.base_path)),
         ),
         sqlite=SqliteConfig(
             path=str(sqlite.get("path", _SQLITE.path)),
@@ -179,9 +189,25 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
             github_api_base=str(outbound.get("github_api_base", _OUTBOUND.github_api_base)),
             github_app_owners=_strings(outbound, "github_app_owners"),
             reply_to_origin=_strings(outbound, "reply_to_origin") if "reply_to_origin" in outbound else _OUTBOUND.reply_to_origin,
+            notify_channel=_optional(outbound.get("notify_channel")),
+            notify_target=_optional(outbound.get("notify_target")),
         ),
         relay=_relay(_section(raw, "relay")),
     )
+
+
+def normalize_base_path(value: object) -> str:
+    # Same rules as Taskboard's [http] base_path, so both services can share one host under sub-paths.
+    if not isinstance(value, str):
+        raise ConfigError(f"http.base_path {value!r} must be a string such as '/switchboard'")
+    path = value.strip().rstrip("/")
+    if not path:
+        return ""
+    if not path.startswith("/"):
+        path = "/" + path
+    if _BAD_PATH_CHARS.search(path) or "//" in path:
+        raise ConfigError(f"http.base_path {value!r} must be a plain path such as '/switchboard'")
+    return path
 
 
 def _strings(section: Mapping[str, Any], name: str) -> tuple[str, ...]:

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
-from agent_runtime.core.models import TASK_CONTEXT_KEY
+from agent_runtime.core.models import TASK_CONTEXT_KEY, TASK_SYNC_KIND
 from agent_runtime.core.ports import ChannelPort
 
 _log = logging.getLogger(__name__)
@@ -271,6 +271,10 @@ class FileOutboxChannel:
         return self._dir
 
     async def send(self, inbox_id: str, content: str, metadata: dict[str, Any]) -> None:
+        if metadata.get("kind") == TASK_SYNC_KIND:
+            # Taskboard state sync is for the inner channel only; a person has nothing to read in it.
+            await self._inner.send(inbox_id, content, metadata)
+            return
         key = _message_key(inbox_id, content, metadata)
         if key not in self._written:
             ctx = outbox_context(inbox_id, metadata)

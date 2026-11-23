@@ -21,6 +21,9 @@ MergeHold: TypeAlias = Literal["", "review", "ci", "other"]
 # or "awaiting_approval", delivery the Emit's DeliveryOutcome as a dict when it has one. Nested so channels that pass
 # top-level keys on are unaffected.
 TASK_CONTEXT_KEY = "task_context"
+# Outbox kind of a message that only syncs a Taskboard task's state (claim, complete, release); channels that show
+# messages to a person skip it.
+TASK_SYNC_KIND = "task_sync"
 
 
 def utc_now_iso() -> str:
@@ -67,6 +70,15 @@ class SessionRef:
     updated_at: str = field(default_factory=utc_now_iso)
     # Set on a delegated child session; the child shares the parent's work_key so the worktree stays referenced.
     parent_session_id: str | None = None
+    # The Taskboard task this session works on, kept across Suspend/Resume until a terminal task_action.
+    task_link: TaskLink | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskLink:
+    task_id: str
+    trace_id: str | None = None
+    hop_count: int | None = None
 
 
 def resolve_executor_id(

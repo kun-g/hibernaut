@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from switchboard.envelope import CanonicalEvent
 from switchboard.ports import DeliverStatus
 
+from agent_runtime.core.models import TASK_SYNC_KIND
 from agent_runtime.core.ports import ChannelPort
 
 SWITCHBOARD_SOURCE_PREFIX = "sb:"
@@ -22,6 +23,14 @@ _LIFTED_METADATA_KEYS = (
     "work_key",
     "reply_channel",
     "reply_target",
+    # Taskboard work.ready fields; the worker reads task_id, trace_id and hop_count to report back.
+    "task_id",
+    "trace_id",
+    "hop_count",
+    "dispatch_seq",
+    "assignee",
+    "task_type",
+    "priority",
 )
 
 _PASSTHROUGH_REPORT_KEYS = (
@@ -34,12 +43,17 @@ _PASSTHROUGH_REPORT_KEYS = (
     "notify_channels",
     "approval_channel",
     "approval_target",
+    "task_action",
+    "stage",
+    "trace_id",
+    "hop_count",
 )
 
 _OUTCOME_BY_KIND: Mapping[str, str] = {
     "emit": "emit",
     "approval_request": "suspend",
     "silent": "silent",
+    TASK_SYNC_KIND: "done",
 }
 
 
@@ -78,6 +92,9 @@ def canonical_to_payload(event: CanonicalEvent) -> dict[str, Any]:
         if decision not in ("approve", "reject"):
             raise ValueError("approval.decided needs an approve or reject decision")
         payload["approved"] = decision == "approve"
+    preferred = metadata.get("preferred_executor")
+    if isinstance(preferred, str) and preferred:
+        payload.setdefault("executor_id", preferred)
     if event.source == "github" and "labels" in metadata:
         payload["labels"] = metadata["labels"]
     if event.event_type == "work.closed":
@@ -164,6 +181,10 @@ class SwitchboardChannelAdapter:
             value = metadata.get(key)
             if value is not None and value != "":
                 report[key] = value
+        if "task_id" in report:
+            # Taskboard's execution.reported schema requires both; a Run that lost them still reports a valid trace.
+            report.setdefault("trace_id", report["run_id"])
+            report.setdefault("hop_count", 1)
         legacy_request_id = metadata.get("request_id")
         if outcome == "suspend" and "approval_request_id" not in report and legacy_request_id:
             # Outbox rows written before the worker added approval_request_id carry only request_id.

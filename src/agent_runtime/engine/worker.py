@@ -16,9 +16,11 @@ from agent_runtime.core.models import (
     RunDetached,
     RunOutcome,
     TASK_CONTEXT_KEY,
+    TASK_SYNC_KIND,
     SessionRef,
     Silent,
     Suspend,
+    TaskLink,
     new_id,
     resolve_executor_id,
     utc_now_iso,
@@ -134,6 +136,43 @@ class _BatchEnd:
 # template). Events that disagree on them must not share a Run.
 _TARGET_PAYLOAD_KEYS = ("executor_id", "explicit_workdir", "executor")
 _REPLY_PAYLOAD_KEYS = ("reply_channel", "reply_target")
+
+
+def _task_link(events: list[Event], session_ref: SessionRef | None) -> TaskLink | None:
+    # A work.ready in the batch names the task (a new dispatch replaces the old link); otherwise the session keeps
+    # the task it was dispatched for, e.g. across an approval.decided resume, which carries no task_id.
+    for evt in reversed(events):
+        task_id = evt.payload.get("task_id")
+        if isinstance(task_id, str) and task_id:
+            trace_id = evt.payload.get("trace_id")
+            hop_count = evt.payload.get("hop_count")
+            return TaskLink(
+                task_id=task_id,
+                trace_id=trace_id if isinstance(trace_id, str) and trace_id else None,
+                hop_count=hop_count if isinstance(hop_count, int) and not isinstance(hop_count, bool) else None,
+            )
+    return session_ref.task_link if session_ref is not None else None
+
+
+def _task_fields(link: TaskLink, action: str, stage: str | None = None) -> dict[str, Any]:
+    fields: dict[str, Any] = {"task_id": link.task_id, "task_action": action}
+    if stage:
+        fields["stage"] = stage
+    if link.trace_id:
+        fields["trace_id"] = link.trace_id
+    if link.hop_count is not None:
+        fields["hop_count"] = link.hop_count
+    return fields
+
+
+def _emit_task_fields(link: TaskLink, emit: Emit) -> dict[str, Any]:
+    if emit.status == "failed":
+        # release returns the task to ready without a new dispatch, so a failing task does not loop.
+        return _task_fields(link, "release", "failed")
+    if emit.delivery is not None and emit.delivery.state == "pr_open":
+        # Still in progress until the PR is merged; the issue or PR closing (work.closed) marks it done.
+        return _task_fields(link, "update_stage", "waiting_pr_merge")
+    return _task_fields(link, "complete")
 
 
 def _task_title(events: list[Event]) -> str:
@@ -718,6 +757,20 @@ class AgentWorker:
         )
         handle = _RunHandle(registered.run_dir, self._is_detaching) if registered is not None else None
         batch_correlation_key = self._extract_correlation_key(batch, active_session)
+        run_id = new_id("run")
+        task_link = _task_link(batch, active_session)
+        # An interruptible Run may be thrown away, and an interrupted Run writes nothing to the Outbox, so it claims
+        # together with its result. A resumed Run was claimed by the process that started it.
+        claim_with_result = task_link is not None and allow_interrupt
+        claimed = task_link is not None and not allow_interrupt
+        if claimed and not resuming:
+            assert task_link is not None
+            self._enqueue_task_sync(
+                inbox_id,
+                self._report_metadata(batch, batch_correlation_key, executor.executor_id, run_id),
+                active_session.session_id,
+                _task_fields(task_link, "claim", "running"),
+            )
 
         def _drop_registration() -> None:
             if registered is not None and registry is not None:
@@ -752,6 +805,15 @@ class AgentWorker:
             all_failed_ids = batch_ids + [e.event_id for e in folded_events]
             self._inbox.mark_failed(all_failed_ids, str(exc.__cause__ or exc))
             _drop_registration()
+            if claimed:
+                assert task_link is not None
+                # Otherwise the task would stay in_progress on Taskboard with nothing working on it.
+                self._release_failed_task(
+                    inbox_id,
+                    active_session.session_id,
+                    task_link,
+                    self._report_metadata(batch + folded_events, batch_correlation_key, executor.executor_id, run_id),
+                )
             raise
         except BaseException:
             _drop_registration()
@@ -774,7 +836,9 @@ class AgentWorker:
             final_corr,
             final_work_key,
             executor,
-            report_metadata=self._report_metadata(batch + folded_events, final_corr, executor.executor_id),
+            report_metadata=self._report_metadata(batch + folded_events, final_corr, executor.executor_id, run_id),
+            task_link=_task_link(batch + folded_events, active_session),
+            claim_with_result=claim_with_result,
         )
         all_done_ids = batch_ids + [evt.event_id for evt in folded_events]
         if final_session_id is not None and final_session_id != active_session.session_id:
@@ -914,11 +978,11 @@ class AgentWorker:
 
     @classmethod
     def _report_metadata(
-        cls, events: list[Event], correlation_key: str | None, executor_id: str
+        cls, events: list[Event], correlation_key: str | None, executor_id: str, run_id: str
     ) -> dict[str, Any]:
         # Routing hints a channel needs to answer where the work came from; extra keys are ignored by
         # channels that do not read them.
-        meta: dict[str, Any] = {"run_id": new_id("run")}
+        meta: dict[str, Any] = {"run_id": run_id}
         if correlation_key:
             meta["correlation_key"] = correlation_key
         for key in _REPLY_PAYLOAD_KEYS:
@@ -1143,6 +1207,35 @@ class AgentWorker:
             }
         return {**extra, TASK_CONTEXT_KEY: updated}
 
+    def _enqueue_task_sync(
+        self,
+        inbox_id: str,
+        extra: Mapping[str, Any],
+        session_id: str,
+        fields: Mapping[str, Any],
+        outcome_kind: str = "done",
+    ) -> None:
+        stage = f" ({fields['stage']})" if fields.get("stage") else ""
+        self._outbox.enqueue(
+            inbox_id=inbox_id,
+            content=f"Taskboard task {fields['task_id']}: {fields['task_action']}{stage}",
+            metadata={
+                **extra,
+                **fields,
+                "kind": TASK_SYNC_KIND,
+                "outcome_kind": outcome_kind,
+                "session_id": session_id,
+            },
+        )
+
+    def _release_failed_task(
+        self, inbox_id: str, session_id: str, link: TaskLink, extra: Mapping[str, Any]
+    ) -> None:
+        self._enqueue_task_sync(inbox_id, extra, session_id, _task_fields(link, "release", "failed"), "error")
+        current = self._sessions.get(session_id)
+        if current is not None and current.task_link is not None:
+            self._sessions.save(replace(current, task_link=None, updated_at=utc_now_iso()))
+
     def _apply_outcome(
         self,
         inbox_id: str,
@@ -1153,8 +1246,14 @@ class AgentWorker:
         selected_executor: ExecutorPort,
         *,
         report_metadata: Mapping[str, Any] | None = None,
+        task_link: TaskLink | None = None,
+        claim_with_result: bool = False,
     ) -> str | None:
         extra: dict[str, Any] = dict(report_metadata or {})
+        if task_link is not None and claim_with_result:
+            self._enqueue_task_sync(
+                inbox_id, extra, session_ref.session_id, _task_fields(task_link, "claim", "running")
+            )
         match outcome:
             case Silent(executor_session_id=exec_sid):
                 exec_id, bound_exec_sid = self._resolve_executor_binding(
@@ -1177,6 +1276,10 @@ class AgentWorker:
                         parent_session_id=session_ref.parent_session_id,
                     )
                 )
+                if task_link is not None:
+                    self._enqueue_task_sync(
+                        inbox_id, extra, session_ref.session_id, _task_fields(task_link, "complete")
+                    )
                 return session_ref.session_id
             case Emit(
                 messages=messages,
@@ -1191,17 +1294,25 @@ class AgentWorker:
                     exec_sid,
                 )
                 target_sid = emit_session_id or session_ref.session_id
-                for text in messages:
+                task_fields = _emit_task_fields(task_link, outcome) if task_link is not None else {}
+                for index, text in enumerate(messages):
+                    # The task action rides on the last message, so Taskboard sees it once.
+                    last = index == len(messages) - 1
                     self._outbox.enqueue(
                         inbox_id=inbox_id,
                         content=text,
                         metadata={
                             **self._with_status(extra, emit_status, delivery),
+                            **(task_fields if last else {}),
                             "kind": "emit",
                             "outcome_kind": "emit",
                             "session_id": target_sid,
                         },
                     )
+                if task_fields and not messages:
+                    failed = task_fields["task_action"] == "release"
+                    self._enqueue_task_sync(inbox_id, extra, target_sid, task_fields, "error" if failed else "done")
+                emit_link = task_link if task_fields.get("task_action") == "update_stage" else None
                 if target_sid != session_ref.session_id:
                     # Session rotation: archive old session while new session inherits correlation_key & work_key.
                     self._sessions.archive_session(session_ref.session_id)
@@ -1218,6 +1329,7 @@ class AgentWorker:
                         pending_request_id=None,
                         updated_at=utc_now_iso(),
                         parent_session_id=session_ref.parent_session_id,
+                        task_link=emit_link,
                     )
                 )
                 return target_sid
@@ -1251,6 +1363,7 @@ class AgentWorker:
                         pending_request_id=request_id,
                         updated_at=utc_now_iso(),
                         parent_session_id=session_ref.parent_session_id,
+                        task_link=task_link,
                     )
                 )
                 if repeated:
@@ -1265,6 +1378,8 @@ class AgentWorker:
                         "session_id": target_sid,
                         "outcome_kind": "suspend",
                         "approval_request_id": request_id,
+                        # Waiting for a person keeps the task in_progress (no release).
+                        **(_task_fields(task_link, "update_stage", "awaiting_approval") if task_link else {}),
                     },
                 )
                 return target_sid
