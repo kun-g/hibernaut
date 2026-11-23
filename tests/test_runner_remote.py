@@ -716,7 +716,8 @@ def test_without_a_node_only_its_own_runs_fail(remote: RemoteDeployment) -> None
     asked = remote.ask(("Read", {"file_path": "README.md"}))
     remote.finished(remote.check())
     remote.assert_original_path(OTHER)
-    remote.until(lambda: remote.status(asked) == "failed")
+    # A failed Run's events are marked before its ledger row is written (a done Run's only after it).
+    remote.until(lambda: remote.status(asked) == "failed" and remote.runs(INBOX))
     (run,) = remote.runs(INBOX)
     # Nothing ran: the ledger's runner_id is its default for a Run no node answered for, as docs/runner.md §10 says.
     assert (run["outcome_kind"], run["runner_id"]) == ("error", "local")
