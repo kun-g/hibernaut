@@ -261,12 +261,14 @@ class TestLeaseHeldThroughLongRun(unittest.IsolatedAsyncioTestCase):
         worker = AgentWorker(
             worker_id="old-pool-worker-0", inbox=inbox, timers=SQLiteTimerAdapter(db), memory=InMemoryMemoryStore(),
             permissions=InMemoryPermission(), outbox=SQLiteOutboxAdapter(db), lock=lock,
-            sessions=SQLiteSessionStoreAdapter(db), executor=executor, lease_ttl_seconds=0.15,
+            sessions=SQLiteSessionStoreAdapter(db), executor=executor,
+            # Long enough for a renewal that a busy machine runs late.
+            lease_ttl_seconds=1.0,
         )
         EventHandler(inbox=inbox).ingest(inbox_id="i", source="t", external_id="e1", payload={"text": "x"})
         run = asyncio.create_task(worker.process_inbox("i"))
         await asyncio.wait_for(executor.started.wait(), timeout=5)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(2.5)
         self.assertFalse(lock.acquire("i", "new-pool-worker-0", 0.15))
         executor.release.set()
         reports = await run

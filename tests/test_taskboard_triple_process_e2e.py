@@ -258,6 +258,8 @@ consumer_id = "hibernaut"
         self._wait(lambda: task_id() is not None, "Taskboard to create the issue's task")
         tid = task_id()
         assert tid is not None
+        # The task is stored before its work.ready is published.
+        self._wait(lambda: any(e["metadata"]["task_id"] == tid for e in self._ready_events()), "the task's work.ready")
         [ready] = [e for e in self._ready_events() if e["metadata"]["task_id"] == tid]
         self._wait(lambda: self._delivery(ready["event_id"], "hibernaut") == "acked", "work.ready acked by Hibernaut")
         self._wait(lambda: self._status(tid) == "done", "the task to be done")
