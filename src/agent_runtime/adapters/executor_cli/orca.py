@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -58,6 +59,7 @@ PEER_HANDOFF_TOOLS = ("SendMessage",)
 PEER_UNSET_ENV = ("CLAUDE_CONFIG_DIR",)
 _EXIT_TIMEOUT_SECONDS = 30.0
 _PROBE_TIMEOUT_SECONDS = 120
+_REPO_LIST_TIMEOUT_SECONDS = 30
 _WRAPPER_DEADLINE_MARGIN_SECONDS = 60
 # One lease file per gate terminal: the gate ends its agent once the file is gone, and Hibernaut removes it whenever it
 # closes that terminal, so a close Orca reports but never delivers still ends the agent.
@@ -83,6 +85,45 @@ async def _orca(*args: str, cwd: Path) -> dict[str, Any]:
     if not reply.get("ok") or not isinstance(reply.get("result"), dict):
         raise ValueError("Missing Orca command result")
     return reply["result"]
+
+
+def registered_repos() -> list[dict[str, Any]]:
+    # Synchronous: read while the configuration is parsed, not on the event loop.
+    try:
+        done = subprocess.run(["orca", "repo", "list", "--json"], stdin=subprocess.DEVNULL, capture_output=True,
+                              timeout=_REPO_LIST_TIMEOUT_SECONDS)
+        if done.returncode:
+            raise RuntimeError((done.stderr or done.stdout).decode(errors="replace").strip()[:2000])
+        repos: object = json.loads(done.stdout)["result"]["repos"]
+        if not isinstance(repos, list):
+            raise ValueError("no list of repositories")
+    except (OSError, subprocess.TimeoutExpired, ValueError, RuntimeError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"orca repo list: {type(exc).__name__} {exc}") from exc
+    return [cast(dict[str, Any], r) for r in cast(list[object], repos) if isinstance(r, dict)]
+
+
+def registered_checkout(repo: str) -> str:
+    # The main checkout of the one repository Orca has registered for this remote (owner/name, with or without host).
+    try:
+        repos = registered_repos()
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    wanted = repo.strip().lower()
+
+    def key(entry: Mapping[str, Any]) -> str:
+        identity: object = entry.get("gitRemoteIdentity")
+        found = cast(dict[str, Any], identity).get("canonicalKey") if isinstance(identity, dict) else None
+        return found.lower() if isinstance(found, str) else ""
+
+    paths = sorted({str(r["path"]) for r in repos
+                    if r.get("path") and wanted and wanted in (key(r), key(r).partition("/")[2])})
+    if not paths:
+        raise ValueError(f"no repository {repo} is registered in Orca")
+    if len(paths) > 1:
+        raise ValueError(f"more than one repository {repo} is registered in Orca ({', '.join(paths)})")
+    if not Path(paths[0]).is_dir():
+        raise ValueError(f"the checkout of {repo} registered in Orca is not a directory here: {paths[0]}")
+    return paths[0]
 
 
 def _result(path: Path, session_id: str) -> RunOutcome | None:
@@ -245,6 +286,28 @@ class TerminalUnavailable:
 def terminal_title(executor_id: str, role: str, subject: str) -> str:
     who = executor_id if executor_id == role else f"{executor_id} ({role})"
     return f"{who} · {subject}"
+
+
+def session_gate(profile: ClaudeCodeProfile, *, unset_extra: Sequence[str] = ()) -> dict[str, Any]:
+    # What claude_gate.py needs to set the environment and check the session the launcher would open.
+    launcher = profile.launcher
+    unset, values = env_overrides(profile)
+    return {
+        "profile": {"name": profile.name, "launcher": launcher.name, "launcher_command": launcher.command,
+                    "launcher_env": launcher.env, "env": profile.env,
+                    "billing": profile.billing, "model": profile.model, "effort": profile.effort,
+                    "credential_proxy_url": profile.credential_proxy_url},
+        "unset": [*unset, *(k for k in unset_extra if k not in unset)],
+        "set": values,
+        "probe": [launcher.command, *harness_args(profile, permission_mode="dontAsk", role_args=PROBE_ROLE_ARGS)],
+        "probe_timeout": _PROBE_TIMEOUT_SECONDS,
+    }
+
+
+def _write_private(path: Path, text: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(text)
 
 
 class OrcaVisibleRunner:
@@ -692,31 +755,19 @@ class OrcaVisibleRunner:
         self, profile: ClaudeCodeProfile, title: str, workdir: Path, turn: Path, args: Sequence[str],
         instruction: str | None, *, unset_extra: Sequence[str] = (),
     ) -> tuple[str, str | None]:
-        launcher = profile.launcher
-        unset, values = env_overrides(profile)
-        unset = (*unset, *(k for k in unset_extra if k not in unset))
         spec = {
+            **session_gate(profile, unset_extra=unset_extra),
             "title": title,
-            "profile": {"name": profile.name, "launcher": launcher.name, "launcher_command": launcher.command,
-                        "launcher_env": launcher.env, "env": profile.env,
-                        "billing": profile.billing, "model": profile.model, "effort": profile.effort,
-                        "credential_proxy_url": profile.credential_proxy_url},
-            "unset": list(unset),
-            "set": values,
-            "probe": [launcher.command, *harness_args(profile, permission_mode="dontAsk", role_args=PROBE_ROLE_ARGS)],
-            "probe_timeout": _PROBE_TIMEOUT_SECONDS,
             # `--` ends the options: --allowedTools and --mcp-config take several values and would swallow it.
             # Without an instruction the session starts idle and gets its task as a peer message.
-            "exec": [launcher.command, *interactive_args(profile, permission_mode="dontAsk", role_args=args),
+            "exec": [profile.launcher.command, *interactive_args(profile, permission_mode="dontAsk", role_args=args),
                      *(("--", instruction) if instruction is not None else ())],
             "status": str(turn / "gate-status.json"),
         }
         lease = _new_lease()
         spec["lease"] = str(lease)
         spec_path = turn / "gate.json"
-        fd = os.open(spec_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(spec, stream)
+        _write_private(spec_path, json.dumps(spec))
         # The gate exits with the agent, and `exec` ends the terminal with it, so an exited agent is a closed terminal.
         command = shlex.join(["exec", sys.executable, "-I", str(GATE_SCRIPT), str(spec_path)])
         try:
@@ -1154,23 +1205,35 @@ class OrcaCommandTerminal:
         slot: TurnSlot | None = None,
         slot_label: str = "cli",
         slot_extra: Mapping[str, Any] | None = None,
+        stdin: str | None = None,
+        gate: Mapping[str, Any] | None = None,
+        close: bool = False,
     ) -> TerminalRun:
         # Raises TerminalStartFailed when no terminal opened (nothing ran), ProcessTimeout on the deadline,
         # TerminalRunFailed when the terminal ended early or Orca failed, CancelledError on interrupt.
+        # A gate (session_gate()) sets the environment and checks the Claude Code session before argv runs. With close
+        # the terminal is closed after a finished run too, not only after one that did not finish.
         # With a slot the run directory lives in the Run's directory and survives a detach with its terminal.
         workdir = Path(os.path.realpath(workdir))
         root = slot.turns_dir if slot is not None else self._root
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=root))
         files = {name: str(run_dir / name) for name in ("stdout", "stderr", "exit.json")}
+        spec_path = run_dir / "spec.json"
+        command_argv = list(argv)
+        if gate is not None:
+            gate_path = run_dir / "gate.json"
+            _write_private(gate_path, json.dumps({**gate, "title": title, "once": True, "exec": command_argv,
+                                                  "lease": str(spec_path)}))
+            command_argv = [sys.executable, "-I", str(GATE_SCRIPT), str(gate_path)]
         # The argv holds the prompt; it reaches the wrapper through this private file, not the command line.
         # The wrapper's own deadline outlasts this one, so it only fires when Hibernaut is no longer waiting.
-        spec = {"title": title, "cwd": str(workdir), "argv": list(argv), "env": dict(env),
+        spec = {"title": title, "cwd": str(workdir), "argv": command_argv, "env": dict(env),
                 "timeout_seconds": timeout_seconds + _WRAPPER_DEADLINE_MARGIN_SECONDS, **files}
-        spec_path = run_dir / "spec.json"
-        fd = os.open(spec_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(spec, stream)
+        if stdin is not None:
+            spec["stdin"] = str(run_dir / "stdin")
+            _write_private(run_dir / "stdin", stdin)
+        _write_private(spec_path, json.dumps(spec))
         command = shlex.join(["exec", sys.executable, "-I", str(CLI_TERMINAL_SCRIPT), str(spec_path)])
         handle: str | None = None
         finished = False
@@ -1188,7 +1251,7 @@ class OrcaCommandTerminal:
             return run
         finally:
             if not detached(slot):
-                if handle and not finished:
+                if handle and (close or not finished):
                     await _close_quietly(handle, workdir)
                 shutil.rmtree(run_dir, ignore_errors=True)
 

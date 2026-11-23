@@ -24,6 +24,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     parse_profile,
 )
 from agent_runtime.adapters.executor_cli.executor import CLI_TERMINALS, DEFAULT_CLI_TEMPLATES, CLITemplate
+from agent_runtime.adapters.executor_cli.orca import registered_checkout
 from agent_runtime.adapters.executor_cli.peer_handoff import PeerHandoffConfig
 from agent_runtime.adapters.executor_cli.reviewer import CODE_REVIEWER_ROLE
 from agent_runtime.adapters.executor_cli.role_skills import ROLE_ALIASES, canonical_role
@@ -144,6 +145,9 @@ class RoleConfig:
     interactive: bool = True
     # "readonly": the role works in the main checkout, writes nothing there and never gets a worktree.
     checkout_access: str = ""
+    # Steward only: where it runs instead of the project's checkout, and the branch that directory has to be on.
+    workdir: str = ""
+    branch: str = ""
     max_concurrency: int | None = None
 
 
@@ -156,11 +160,20 @@ def _max_concurrency(where: str, item: Mapping[str, Any]) -> int | None:
     return value
 
 
+def _optional_text(where: str, item: Mapping[str, Any], key: str) -> str:
+    value = item.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{where}: {key} must be a non-empty string")
+    return value.strip()
+
+
 def _role_options(role: str) -> frozenset[str]:
     if role == SDE_ROLE:
         return SDE_OPTION_KEYS | ROLE_DEPLOYMENT_KEYS
     if role == STEWARD_ROLE:
-        return ROLE_DEPLOYMENT_KEYS | {"checkout_access"}
+        return ROLE_DEPLOYMENT_KEYS | {"checkout_access", "workdir", "branch"}
     return ROLE_DEPLOYMENT_KEYS
 
 
@@ -182,7 +195,10 @@ def _parse_role(
             raise ValueError(f"executors.{name}: checkout_access must be \"{READONLY_CHECKOUT}\" for role '{role}'")
         if _interactive(name, {"interactive": False, **item} if "visible" not in item else item):
             raise ValueError(f"executors.{name}: interactive is not supported for role '{role}'; leave it out")
+        workdir = _optional_text(f"executors.{name}", item, "workdir")
         return RoleConfig(role=role, profile=profile, interactive=False, checkout_access=access,
+                          workdir=_resolve_path(workdir, base_dir) if workdir else "",
+                          branch=_optional_text(f"executors.{name}", item, "branch"),
                           max_concurrency=_max_concurrency(f"executors.{name}", item))
     return RoleConfig(role=role, profile=profile, sde=_sde_options(name, item) if role == SDE_ROLE else None,
                       interactive=_interactive(name, item),
@@ -366,6 +382,16 @@ def _resolve_path(raw: str, base_dir: Path | None) -> str:
     return str(resolved)
 
 
+def _project_checkout(name: str, item: Mapping[str, Any], repo: str) -> str:
+    checkout = str(item.get("checkout") or "").strip()
+    if checkout:
+        return checkout
+    try:
+        return registered_checkout(repo)
+    except ValueError as exc:
+        raise ValueError(f"projects.{name}: checkout is not set, and Orca has none for it: {exc}") from exc
+
+
 def _outbox_dir(raw: Any, base_dir: Path | None) -> str:
     if raw is None:
         return ""
@@ -513,7 +539,8 @@ async def config_changes(
             raw = tomllib.loads(contents.decode("utf-8"))
             if not raw:
                 raise ValueError("empty configuration")
-            config = parse_config(raw, base_dir=path.resolve().parent)
+            # Off the event loop: a project without a checkout is looked up through the Orca command.
+            config = await asyncio.to_thread(parse_config, raw, base_dir=path.resolve().parent)
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
             detail = f": {exc}" if type(exc) is ValueError else ""
             print(
@@ -703,7 +730,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             inbox_id=primary,
             rules=rules,
             repo=repo,
-            checkout=str(item["checkout"]),
+            checkout=_project_checkout(str(name), item, repo),
             worktree_backend=cast(Literal["orca", "git"], backend),
             terminal_backend=terminal,
             orca_create_terminal=bool(item.get("orca_create_terminal", False)),

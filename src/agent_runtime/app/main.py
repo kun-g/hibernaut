@@ -964,7 +964,9 @@ def build_daemon_from_config(
         deliveries = SQLiteDeliveryStore(daemon.db)
         usage = SQLiteWorkUsage(daemon.db)
 
-        def _steward(role: RoleConfig, project: ProjectConfig | None) -> StewardExecutor:
+        def _steward(
+            role: RoleConfig, project: ProjectConfig | None, no_terminal: str | None
+        ) -> StewardExecutor:
             def in_project(inbox_id: str) -> bool:
                 try:
                     return project is not None and router.resolve(inbox_id) is project
@@ -978,6 +980,9 @@ def build_daemon_from_config(
                 events=daemon.inbox,
                 manifest=lambda: build_routing_manifest(project) if project is not None else "",
                 in_project=in_project,
+                terminal=cli_terminal if no_terminal is None else TerminalUnavailable(no_terminal),
+                workdir=role.workdir,
+                branch=role.branch,
             )
 
         def _role_executors(
@@ -1016,7 +1021,7 @@ def build_daemon_from_config(
             built: dict[str, ExecutorPort] = dict(reviewers)
             for name, role in config.roles.items():
                 if role.role == STEWARD_ROLE:
-                    built[name] = _steward(role, project)
+                    built[name] = _steward(role, project, no_terminal)
                 if role.sde is None:
                     continue
                 built[name] = SDEExecutor(

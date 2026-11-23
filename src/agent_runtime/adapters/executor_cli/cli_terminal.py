@@ -24,6 +24,10 @@ from typing import IO, Any
 POLL_SECONDS = 0.25
 GRACE_SECONDS = 3.0
 STOP_SIGNALS = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+# An agent CLI's hooks report its session to Orca through these. A one-off command must not be registered: Orca takes
+# its exit for an interruption and reopens the session, interactively, in a new tab.
+_HOOK_ENV = frozenset({"ORCA_PANE_KEY", "ORCA_AGENT_PANE", "ORCA_TAB_ID"})
+_HOOK_ENV_PREFIXES = ("ORCA_AGENT_HOOK_", "ORCA_AGENT_LAUNCH")
 
 
 class Stopped(Exception):
@@ -85,6 +89,11 @@ def end_group(proc: subprocess.Popen[bytes], grace: float | None = None) -> None
         proc.wait()
 
 
+def command_env(extra: dict[str, str]) -> dict[str, str]:
+    return {k: v for k, v in {**os.environ, **extra}.items()
+            if k not in _HOOK_ENV and not k.startswith(_HOOK_ENV_PREFIXES)}
+
+
 def _write_atomic(path: Path, body: dict[str, Any]) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(body), encoding="utf-8")
@@ -121,12 +130,14 @@ def _run(spec_path: Path, running: list[subprocess.Popen[bytes]]) -> int:
     argv: list[str] = spec["argv"]
     exit_path = Path(spec["exit.json"])
     deadline = time.monotonic() + float(spec["timeout_seconds"])
+    stdin_path: str | None = spec.get("stdin")
     print(f"[hibernaut] {spec['title']}: running {argv[0]} in {spec['cwd']}", flush=True)
     try:
         # A session of its own: the group can be ended as a whole, and a CLI that opens /dev/tty fails instead of
         # stopping in the background.
-        proc = subprocess.Popen(argv, cwd=spec["cwd"], env={**os.environ, **spec["env"]}, start_new_session=True,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with open(stdin_path or os.devnull, "rb") as stdin:
+            proc = subprocess.Popen(argv, cwd=spec["cwd"], env=command_env(spec["env"]), start_new_session=True,
+                                    stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as exc:
         _write_atomic(exit_path, {"exit": None, "error": f"cannot start '{argv[0]}': {exc.strerror or exc}"})
         print(f"[hibernaut] cannot start {argv[0]}: {exc.strerror or exc}", file=sys.stderr, flush=True)

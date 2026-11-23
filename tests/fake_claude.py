@@ -38,6 +38,8 @@ def write_log(**extra):
             "base_url": os.environ.get("ANTHROPIC_BASE_URL"),
             "launcher": os.environ.get("FAKE_LAUNCHER"),
             "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"),
+            "orca_env": sorted(k for k in os.environ if k.startswith("ORCA_")),
+            "mark": os.environ.get("FAKE_MARK"),
             **extra,
         }
         stream.write(json.dumps(record) + "\n")
@@ -47,8 +49,18 @@ if not interactive:
     write_log()
 
 
+# --output-format json prints the result message alone; with --verbose it is an array of every message.
+single = "--output-format" in argv and argv[argv.index("--output-format") + 1] == "json"
+collected = []
+
+
 def emit(message):
-    print(json.dumps(message), flush=True)
+    if not single:
+        print(json.dumps(message), flush=True)
+        return
+    collected.append(message)
+    if message["type"] == "result":
+        print(json.dumps(collected if os.environ.get("FAKE_VERBOSE") else message), flush=True)
 
 
 def next_step(name):
@@ -221,9 +233,16 @@ elif role == "steward":
     # A steward step calls its MCP tools; the answers go to the log.
     step = step or {}
     server = Handoff("hibernaut_steward")
+    if step.get("pidfile"):
+        park(step["pidfile"])
     answers = [server.call(call["tool"], call.get("arguments", {})) for call in step.get("calls", [])]
     write_log(answers=answers, tools=sorted(server.tools))
     server.proc.stdin.close()
+    if step.get("exit"):
+        print("crashed", file=sys.stderr, flush=True)
+        sys.exit(step["exit"])
+    if step.get("calls") and step.get("pidfile_after"):
+        park(step["pidfile_after"])
     output = step.get("output", {"action": "silent", "message": ""})
 else:
     step = step or {}

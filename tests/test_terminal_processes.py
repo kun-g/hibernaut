@@ -19,6 +19,7 @@ from agent_runtime.adapters.executor_cli.orca import (
     TerminalRunFailed,
     _close_quietly,  # pyright: ignore[reportPrivateUsage]
     close_terminals,
+    session_gate,
 )
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore, TerminalBinding
@@ -127,6 +128,32 @@ class TestCLITerminalProcesses(Case):
         await self.all_gone(pids)
 
 
+    async def test_orca_hook_variables_never_reach_the_cli(self):
+        # With them Orca would register the CLI's session and reopen it in a new tab once this process ends.
+        hooks = {"ORCA_AGENT_HOOK_ENDPOINT": "e", "ORCA_AGENT_HOOK_PORT": "1", "ORCA_AGENT_HOOK_TOKEN": "t",
+                 "ORCA_AGENT_HOOK_VERSION": "1", "ORCA_PANE_KEY": "p", "ORCA_AGENT_PANE": "p", "ORCA_AGENT_LAUNCH": "l",
+                 "ORCA_AGENT_LAUNCH_ID": "l", "ORCA_TAB_ID": "t"}
+        kept = {"ORCA_WORKTREE_ID": "w", "ORCA_TERMINAL_HANDLE": "h", "ORCA_AGENT_OTHER": "o", "PLAIN": "x"}
+        with patch.dict(os.environ, {**hooks, **kept}):
+            run = await self.terminal.run(
+                title="t", workdir=self.repo, argv=[sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"],
+                env={"FROM_SPEC": "s", "ORCA_TAB_ID": "again"}, timeout_seconds=20, is_interrupted=lambda: False)
+        seen = json.loads(run.stdout)
+        self.assertEqual([k for k in hooks if k in seen], [])
+        self.assertEqual({k: seen.get(k) for k in kept}, kept)
+        self.assertEqual(seen["FROM_SPEC"], "s")
+
+    async def test_input_reaches_the_cli_and_the_terminal_closes_when_asked(self):
+        text = "a prompt, é\n" * 30_000
+        run = await self.terminal.run(title="t", workdir=self.repo, argv=["/bin/cat"], env={}, timeout_seconds=20,
+                                      is_interrupted=lambda: False, stdin=text, close=True)
+        self.assertEqual((run.exit_code, run.stdout.decode()), (0, text))
+        handle, wrapper = self.wrapper()
+        self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
+        self.assertIsNotNone(wrapper.returncode)
+        self.assertEqual(list((self.root / "runs").iterdir()), [])
+
+
 class TestCLITerminalScript(unittest.IsolatedAsyncioTestCase):
     # The wrapper on its own, without Hibernaut watching: its deadline and the signals of a closing terminal.
     def setUp(self):
@@ -167,6 +194,53 @@ class TestCLITerminalScript(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await until(lambda: proc.poll() is not None))
                 self.assertEqual(proc.returncode, 128 + sig)
                 self.assertTrue(await until(lambda: not any(alive(p) for p in pids)))
+
+
+class TestSessionCheckBeforeACommand(Case):
+    # A one-off Claude Code command: the gate checks the session first and then becomes the command, so the wrapper
+    # ends it like any other.
+    def setUp(self):
+        super().setUp()
+        self.terminal = OrcaCommandTerminal(root=self.root / "runs", poll_interval=0.02, liveness_interval=0.2)
+        self.interrupted = False
+
+    def run_checked(self, argv, env):
+        profile = ClaudeCodeProfile(name="steward", env=env,
+                                    launcher=ClaudeCodeLauncher(name="fake", command=fake_command(self.root)))
+        return self.terminal.run(title="t", workdir=self.repo, argv=argv, env={}, timeout_seconds=20,
+                                 is_interrupted=lambda: self.interrupted, gate=session_gate(profile), close=True)
+
+    async def test_stopping_during_the_session_check_ends_the_probe(self):
+        for lose in (False, True):
+            with self.subTest(lose_closes=lose):
+                self.pids.unlink(missing_ok=True)
+                self.orca.lose_closes, self.interrupted = lose, False
+                task = asyncio.create_task(self.run_checked(["/bin/echo", "ran"], {"FAKE_PROBE_PIDFILE": str(self.pids)}))
+                pids = await self.started(2)
+                self.interrupted = True
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                await self.all_gone(pids)
+
+    async def test_the_command_takes_the_gates_place_and_ends_with_its_terminal(self):
+        task = asyncio.create_task(self.run_checked(self.busy_cli(), {}))
+        pids = await self.started(2)
+        self.interrupted = True
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self.all_gone(pids)
+
+    async def test_a_failed_check_never_starts_the_command(self):
+        run = await self.run_checked(["/bin/sh", "-c", f"touch {self.root}/ran"],
+                                     {"FAKE_API_KEY_SOURCE": "ANTHROPIC_API_KEY"})
+        self.assertNotEqual(run.exit_code, 0)
+        self.assertIn(b"billing is 'subscription'", run.stderr)
+        self.assertEqual(run.stdout, b"")
+        self.assertFalse((self.root / "ran").exists())
+
+    async def test_only_the_commands_own_output_is_returned(self):
+        run = await self.run_checked(["/bin/sh", "-c", "echo out; echo err >&2; exit 5"], {})
+        self.assertEqual((run.exit_code, run.stdout, run.stderr), (5, b"out\n", b"err\n"))
 
 
 class TestCLIGroupSignals(unittest.TestCase):
@@ -284,6 +358,19 @@ class TestGateProcesses(Case):
         self.assertEqual(await self.runner.release("s1", self.repo), f"closed {handle}")
         self.assertEqual(await asyncio.wait_for(gate.wait(), 8), 1)
         await self.all_gone(pids)
+
+    async def test_an_interactive_session_stays_known_to_orca(self):
+        # Only one-off commands hide from Orca's hooks; a conversation a person can join keeps reporting to it.
+        fake, seen = fake_command(self.root), self.root / "seen-env"
+        launcher = self.root / "launcher"
+        launcher.write_text(f'#!/bin/sh\n[ "$1" = "-p" ] && exec {fake} "$@"\nenv > {seen}\n')
+        launcher.chmod(0o700)
+        profile = ClaudeCodeProfile(name="sde", launcher=ClaudeCodeLauncher(name="l", command=str(launcher)))
+        with patch.dict(os.environ, {"ORCA_PANE_KEY": "pane", "ORCA_AGENT_HOOK_PORT": "1"}):
+            handle, _ = await self.runner._start(  # pyright: ignore[reportPrivateUsage]
+                profile, "sde · task:1", self.repo, self.turn, (), "go")
+        self.assertEqual(await asyncio.wait_for(self.orca.terminals[handle]["proc"].wait(), 8), 0)
+        self.assertLessEqual({"ORCA_PANE_KEY=pane", "ORCA_AGENT_HOOK_PORT=1"}, set(seen.read_text().splitlines()))
 
     async def test_an_agent_that_exits_ends_the_gate_with_its_code(self):
         # --add-dir makes the fake agent stop at a trust dialog and exit with code 4.
