@@ -269,6 +269,28 @@ class TestDispatch(_DispatchCase):
         self.assertLessEqual({"same", "spelled", "review"}, {r["text"] for r in runs})
         self.assertEqual(self.rows("SELECT status FROM sessions WHERE session_id = 's1'"), [("closed",)])
 
+    async def test_another_spelling_of_the_workdir_is_the_workdir(self):
+        (self.root / "link").symlink_to(self.root)
+        gone = self.root / "caf\u00e9"
+        spellings = ["CAF\u00c9", "cafe\u0301", "link/Caf\u00e9"]
+        path = self.write_config(self.project + binding_table(OPS, gone))
+        with self.assertLogs(HOLD_LOGGER, level="WARNING") as logs:
+            await self.dispatch(path, [(OPS, {"text": name.replace("/", "_"), "explicit_workdir": str(self.root / name)}, f"task:{name}")
+                                       for name in spellings])
+        self.assertEqual(self.statuses(OPS), [("pending", 0)] * len(spellings))
+        self.assertEqual(len(logs.records), len(spellings))
+        self.assertEqual(self.outbox(), {})
+
+        gone.mkdir()
+        # Where letter case does matter, the other spelling is another directory once this one is there.
+        same = [name for name in spellings if (self.root / name).is_dir()]
+        await self.dispatch(path, [])
+        self.assertEqual([status for status, _ in self.statuses(OPS)], ["done"] * len(spellings))
+        self.assertEqual(sorted(r["text"] for r in self.cli_runs()), sorted(n.replace("/", "_") for n in same))
+        self.assertTrue(all(Path(r["cwd"]).samefile(gone) for r in self.cli_runs()))
+        self.assertEqual(len([c for (c,) in self.rows("SELECT content FROM outbox") if "refused" in c]),
+                         len(spellings) - len(same))
+
     async def test_a_directory_name_no_path_can_have_is_refused(self):
         for workdir in (self.ops, self.root / "gone"):
             with self.subTest(exists=workdir.is_dir()):
