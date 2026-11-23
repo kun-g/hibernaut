@@ -39,15 +39,41 @@ class FetchedAttachment:
     error: str = ""
 
 
+def _split_items(text: str) -> list[str]:
+    # Commas split, except inside an item that opens with a quote and closes it; an unclosed quote is not special.
+    parts: list[str] = []
+    pos = 0
+    while pos <= len(text):
+        lead = len(text) - len(text[pos:].lstrip())
+        end = text.find(",", pos)
+        if lead < len(text) and text[lead] in "'\"":
+            close = text.find(text[lead], lead + 1)
+            if close != -1:
+                end = text.find(",", close + 1)
+        end = len(text) if end == -1 else end
+        parts.append(text[pos:end])
+        pos = end + 1
+    return parts
+
+
 def split_attachment_refs(raw: object) -> list[str]:
+    # `a, b`, `[a, "b"]`, and a block list, which parse_task_markdown hands over in the bracketed form. Anything else
+    # (an unclosed `[`) is split on commas as written, so the odd part fails with its raw text.
     if not isinstance(raw, str):
         return []
+    text = raw.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
     refs: list[str] = []
-    for part in raw.split(","):
+    for part in _split_items(text):
         ref = part.strip().strip("'\"").strip()
         if ref and ref not in refs:
             refs.append(ref)
     return refs
+
+
+def _bare(ref: str) -> str:
+    return ref.strip("[]'\" \t")
 
 
 def _mentions(body: str, file_id: str) -> bool:
@@ -73,7 +99,10 @@ def select_attachments(
                 continue
             meta = named[0] if named else None
         if meta is None:
-            failed.append(FetchedAttachment(ref=ref, error=f"不在 {ATTACHMENTS_FOLDER_NAME}/ 目录"))
+            error = f"不在 {ATTACHMENTS_FOLDER_NAME}/ 目录"
+            if _bare(ref) != ref:
+                error += f"（引用原文 `{ref}`；attachments 写法：`a, b`、`[a, b]` 或逐行 `- a`）"
+            failed.append(FetchedAttachment(ref=ref, error=error))
         elif meta.file_id not in seen:
             seen.add(meta.file_id)
             chosen.append((ref, meta))
@@ -81,7 +110,9 @@ def select_attachments(
         if meta.file_id not in seen and _mentions(body, meta.file_id):
             seen.add(meta.file_id)
             chosen.append((meta.file_id, meta))
-    return chosen, failed
+    # A stray spelling of a file that is fetched anyway (`[<ID>` beside the same ID in the body) is no failure.
+    got = {key for _, meta in chosen for key in (meta.file_id, meta.name)}
+    return chosen, [f for f in failed if _bare(f.ref) not in got]
 
 
 def _safe_name(name: str, fallback: str, export_mime_type: str) -> str:
