@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from functools import cache
@@ -193,7 +194,9 @@ def _kill_quietly(*pids: int) -> None:
 
 
 @pytest.mark.parametrize("hold_pipes", [False, True], ids=["detached-output", "inherited-output"])
-def test_cancelled_run_reaps_process_group_and_keeps_workspace_busy_until_reaped(tmp_path: Path, hold_pipes: bool) -> None:
+def test_cancelled_run_reaps_process_group_and_keeps_workspace_busy_until_reaped(
+    tmp_path: Path, hold_pipes: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
     drivers = _drivers()
@@ -203,17 +206,32 @@ def test_cancelled_run_reaps_process_group_and_keeps_workspace_busy_until_reaped
     daemon = RunnerDaemon(_config(tmp_path, repo), drivers=drivers)
     pidfile = tmp_path / "pids-cancel"
     pids: list[int] = []
+    reaping, release = asyncio.Event(), asyncio.Event()
+    terminate = supervisor_module.terminate_process_group
+
+    async def controlled_reap(proc, *, grace_seconds):
+        if proc.pid in pids:
+            reaping.set()
+            await release.wait()
+            grace_seconds = 0.05
+        await terminate(proc, grace_seconds=grace_seconds)
+
+    monkeypatch.setattr(supervisor_module, "terminate_process_group", controlled_reap)
 
     async def _scenario() -> None:
         task = asyncio.create_task(daemon.run(_req("run_cancel_1", executor_id="spawn", prompt=str(pidfile)), caller_id="hibernaut"))
-        pids.extend(await _wait_pids(pidfile))
-
-        # While run_cancel_1 owns the worktree, a second run_id for the same workspace must not start a second writer.
-        busy = await daemon.run(_req("run_cancel_2", executor_id="cwd"), caller_id="hibernaut")
-        assert busy.status == "refused"
-        assert busy.error_summary is not None and "workspace_busy" in busy.error_summary
-
-        task.cancel()
+        try:
+            pids.extend(await _wait_pids(pidfile))
+            # The claim covers both the running CLI and cleanup of its descendants.
+            busy = await daemon.run(_req("run_cancel_2", executor_id="cwd"), caller_id="hibernaut")
+            assert busy.status == "refused" and "workspace_busy" in (busy.error_summary or "")
+            task.cancel()
+            await asyncio.wait_for(reaping.wait(), 5)
+            assert _alive(pids[1])
+            busy = await daemon.run(_req("run_during_reap", executor_id="cwd"), caller_id="hibernaut")
+            assert busy.status == "refused" and "workspace_busy" in (busy.error_summary or "")
+        finally:
+            release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
 
@@ -693,9 +711,12 @@ def test_worktree_commands_do_not_block_the_event_loop(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
 
+    creating, ticked = threading.Event(), threading.Event()
+
     class _SlowBackend(GitWorktreeBackend):
         def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> CreatedWorktree:
-            time.sleep(1.0)  # a slow `orca worktree create` / `git worktree add`
+            creating.set()
+            assert ticked.wait(5), "no event-loop tick while a worktree was being created"
             return super().create(primary_checkout=primary_checkout, workdir=workdir, branch=branch, base_ref=base_ref)
 
     cfg = _config(tmp_path, repo)
@@ -710,12 +731,13 @@ def test_worktree_commands_do_not_block_the_event_loop(tmp_path: Path) -> None:
             last = time.monotonic()
             while not stop.is_set():
                 await asyncio.sleep(0.02)
+                if creating.is_set():
+                    ticked.set()
                 now = time.monotonic()
                 gaps.append(now - last)
                 last = now
 
         ticker = asyncio.create_task(_ticker())
-        await asyncio.sleep(0.1)
         res = await daemon.run(_req("run_slow_create", executor_id="cwd", work_key="gh#11"), caller_id="hibernaut")
         stop.set()
         await ticker
@@ -733,9 +755,11 @@ def test_concurrent_resolves_with_same_hint_get_distinct_worktrees(tmp_path: Pat
     repo = tmp_path / "repo"
     _init_repo(repo)
 
+    both_creating = threading.Barrier(2, timeout=5)
+
     class _SlowBackend(GitWorktreeBackend):
         def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> CreatedWorktree:
-            time.sleep(0.5)
+            both_creating.wait()
             return super().create(primary_checkout=primary_checkout, workdir=workdir, branch=branch, base_ref=base_ref)
 
     cfg = _config(tmp_path, repo)

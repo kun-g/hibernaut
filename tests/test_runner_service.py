@@ -59,7 +59,9 @@ def _check(repo: Path, request: str | bytes, **env: str) -> subprocess.Completed
 # --- the fixed check program
 
 
-def test_report_names_the_commit_and_recomputes_with_git_and_sha256_alone(tmp_path: Path) -> None:
+def test_report_names_the_commit_and_recomputes_with_git_and_sha256_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     repo = tmp_path / "repo"
     head = protocol_repo(repo)
     proc = _check(repo, CheckRequest(head).to_json())
@@ -77,7 +79,13 @@ def test_report_names_the_commit_and_recomputes_with_git_and_sha256_alone(tmp_pa
     assert subprocess.check_output(["sh", "-c", shell], cwd=repo, text=True).split()[0] == report["manifest_sha256"]
     # Deterministic, and independent of the worktree's files and of the hold.
     (repo / PROTOCOL_FILES[0]).write_text("tampered", encoding="utf-8")
-    assert _check(repo, CheckRequest(head, hold_seconds=1).to_json()).stdout == proc.stdout
+    delays = []
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(protocol_check.time, "sleep", delays.append)
+    with io.TextIOWrapper(io.BytesIO(CheckRequest(head, hold_seconds=1).to_json().encode())) as stdin:
+        monkeypatch.setattr(sys, "stdin", stdin)
+        assert protocol_check.main() == 0
+    assert delays == [1] and capsys.readouterr().out == proc.stdout
 
 
 def test_this_checkout_passes_the_check() -> None:

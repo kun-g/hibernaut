@@ -611,13 +611,11 @@ def test_readonly_run_removes_its_detached_worktree_when_it_ends(tmp_path: Path)
 
 # ---- review round 12 ----------------------------------------------------------------------------------------------
 
-import os  # noqa: E402
-import signal  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 
 from runner.config import NamespacePolicy  # noqa: E402
 from runner.transport.in_process import InProcessRunnerClient  # noqa: E402
-from tests.test_runner_safety import _alive, _drivers  # noqa: E402
+from tests.test_runner_safety import _drivers  # noqa: E402
 
 
 def _cwd_drivers() -> dict[str, TemplateCLIDriver]:
@@ -914,19 +912,23 @@ def test_another_caller_cannot_interrupt_or_read_a_run_through_the_relay(tmp_pat
         affinity.close()
 
 
-def test_no_process_is_left_when_the_run_log_cannot_be_opened(tmp_path: Path) -> None:
+def test_no_process_is_left_when_the_run_log_cannot_be_opened(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     logs = tmp_path / "logs"
     now = datetime.now(timezone.utc)
     for day in (now, now + timedelta(days=1)):
         (logs / day.strftime("%Y-%m-%d") / "run_nolog.log").mkdir(parents=True)  # opening it for writing fails
-    pid_file = tmp_path / "pid"
     supervisor = ProcessSupervisor(runner_id="r", logs_dir=logs)
+
+    async def unexpected_spawn(*args, **kwargs):
+        pytest.fail("the supervisor started a child before it could open the run log")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_spawn)
 
     async def scenario() -> None:
         with pytest.raises(OSError):
             await supervisor.execute(
                 run_id="run_nolog",
-                argv=[PY, "-c", "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)", str(pid_file)],
+                argv=[PY, "-c", "pass"],
                 cwd=tmp_path,
                 env={"PATH": "/usr/bin:/bin"},
                 stdin_text=None,
@@ -935,15 +937,8 @@ def test_no_process_is_left_when_the_run_log_cannot_be_opened(tmp_path: Path) ->
                 cancel_event=asyncio.Event(),
                 grace_seconds=0.5,
             )
-        await asyncio.sleep(1.0)
 
     asyncio.run(scenario())
-    if pid_file.exists():
-        pid = int(pid_file.read_text())
-        alive = _alive(pid)
-        if alive:
-            os.kill(pid, signal.SIGKILL)
-        assert not alive, "the CLI kept running after the run failed"
 
 
 def test_output_line_longer_than_the_stream_limit_is_read_in_full(tmp_path: Path) -> None:
