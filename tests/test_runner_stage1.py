@@ -33,6 +33,8 @@ from runner.supervisor import STRIPPED_SECRET_ENV_KEYS, strip_long_lived_secrets
 from runner.transport.in_process import InProcessRunnerClient
 from runner.worktree import GitWorktreeBackend, WorkspaceIsolationError, WorktreeManager
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 def _init_git_repo(repo: Path, *, with_remote: bool = True) -> Path | None:
     repo.mkdir(parents=True, exist_ok=True)
@@ -71,8 +73,9 @@ def _make_config(tmp_path: Path, repo: Path, *, max_concurrent: int = 2, interac
 
 def test_runner_zero_business_deps_ast_gate() -> None:
     forbidden = {"agent_runtime", "taskboard", "switchboard", "workshop", "memory_hub"}
-    runner_root = Path("src/runner")
-    for py_file in runner_root.rglob("*.py"):
+    runner_files = sorted((REPO_ROOT / "src" / "runner").rglob("*.py"))
+    assert runner_files
+    for py_file in runner_files:
         tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -85,7 +88,7 @@ def test_runner_zero_business_deps_ast_gate() -> None:
 
 
 def test_schemas_v1_valid_json_and_roundtrip() -> None:
-    schema_dir = Path("schemas/runner/v1")
+    schema_dir = REPO_ROOT / "schemas" / "runner" / "v1"
     expected = {
         "runner.capabilities.schema.json",
         "runner.run_request.schema.json",

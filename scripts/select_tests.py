@@ -75,6 +75,7 @@ RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/test_taskboard_dual_process_e2e.py",
         ),
     ),
+    ("schemas/runner/**", ("tests/test_runner_stage1.py",)),
     ("docs/dispatch/**", ("tests/test_sde_delivery.py",)),
     ("docs/process/versioning.md", ("tests/test_sde_delivery.py",)),
     ("guidance.toml", ("tests/test_sde_delivery.py",)),

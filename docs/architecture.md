@@ -278,3 +278,5 @@
 ## 11. Runner（执行面 / 执行节点）
 
 `src/runner/` 是无业务语义的通用代码执行宿主包（`.importlinter` 契约 `runner-zero-business-deps` 禁止其导入 `agent_runtime` / `taskboard` / `switchboard` / `workshop` / `memory_hub`），遵循 [`ADR-0001`](adr/0001-cross-project-protocol-schema.md) 的 JSON Schema Draft 2020-12 契约（[`schemas/runner/v1/`](../schemas/runner/v1/)），支持 Stage 1 本机同进程直调（`InProcessRunnerClient`）与 Stage 2 反向 WebSocket 多节点调度（`RunnerRelayHub` / `RunnerRelayAgent` + `conn_epoch` + `WorkspaceAffinityStore`）。完整设计见 [`docs/runner.md`](runner.md) 与交互式蓝图 [`docs/runner_blueprint.html`](runner_blueprint.html)；HB 控制面薄适配层见 `src/agent_runtime/adapters/runner_bridge.py`。
+
+- **组装根接入**：本阶段未接入。`app/` 不导入 `runner`，`hibernaut.toml` 没有对应配置项，执行器仍由 `LocalCLIExecutor` / `SDEExecutor` 构建。接入时在 `app/main.py` 构建各项目执行器处，按新的显式配置项把 `RunnerExecutorBridge` 加进 `executors_by_project`；未配置时行为不变。
