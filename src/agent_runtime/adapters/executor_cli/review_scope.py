@@ -61,10 +61,11 @@ class ReviewScope:
                      if claims[i] == n and (n not in in_changes or fits[i, n] <= _SAME_PLACE)]
             if named:
                 backed[n] = min(named)[1]
-        # The others have to identify one of the items left by themselves; as many as possible get one.
+        # Those that name none have to identify one of the items left by themselves; as many as possible get one. One
+        # more report of an item that is taken says nothing about another item.
         settled = set(backed)
         rest = sorted((min(fits[i, n] for n in range(len(self.previous))), i) for i in candidates
-                      if i not in backed.values() and self.previous)
+                      if claims[i] is None and self.previous)
 
         def place(i: int, tried: set[int]) -> bool:
             for n in sorted(range(len(self.previous)), key=lambda n: fits[i, n]):

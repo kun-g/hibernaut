@@ -553,7 +553,7 @@ def _whole_number(raw: object) -> str:
     return str(int(raw)) if isinstance(raw, int) or raw.is_integer() else ""
 
 
-def _git(workdir: Path, *args: str, env: Mapping[str, str] | None = None) -> str:
+def git_output(workdir: Path, *args: str, env: Mapping[str, str] | None = None) -> str:
     proc = subprocess.run(
         ["git", *args], cwd=str(workdir), capture_output=True, text=True, check=False,
         env=dict(env) if env is not None else None,
@@ -563,7 +563,7 @@ def _git(workdir: Path, *args: str, env: Mapping[str, str] | None = None) -> str
     return proc.stdout
 
 
-def _git_paths(workdir: Path, *args: str) -> list[str]:
+def git_paths(workdir: Path, *args: str) -> list[str]:
     proc = subprocess.run(["git", *args], cwd=str(workdir), capture_output=True, check=False)
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", "replace").strip()[:500]
@@ -572,8 +572,8 @@ def _git_paths(workdir: Path, *args: str) -> list[str]:
 
 
 def worktree_fingerprint(workdir: Path) -> str:
-    head = _git(workdir, "rev-parse", "HEAD").strip()
-    index = Path(_git(workdir, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+    head = git_output(workdir, "rev-parse", "HEAD").strip()
+    index = Path(git_output(workdir, "rev-parse", "--path-format=absolute", "--git-path", "index").strip())
     # Snapshot tracked and untracked (non-ignored) files through a scratch index; the real index stays untouched.
     with tempfile.TemporaryDirectory(prefix="hibernaut-review-") as tmp:
         scratch = Path(tmp) / "index"
@@ -583,25 +583,22 @@ def worktree_fingerprint(workdir: Path) -> str:
             # data, which misses same-size edits within the same mtime second (0 would disable that check).
             os.utime(scratch, (1, 1))
         env = {**os.environ, "GIT_INDEX_FILE": str(scratch)}
-        _git(workdir, "add", "-A", env=env)
-        tree = _git(workdir, "write-tree", env=env).strip()
+        git_output(workdir, "add", "-A", env=env)
+        tree = git_output(workdir, "write-tree", env=env).strip()
     return f"{head}:{tree}"
 
 
 def snapshot_diff(workdir: Path, before: str, after: str) -> str:
     # Fingerprints are "<head>:<tree>"; their tree objects stay in the object store, so two snapshots diff directly.
-    diff = _git(workdir, "diff", before.split(":", 1)[1], after.split(":", 1)[1])
+    diff = git_output(workdir, "diff", before.split(":", 1)[1], after.split(":", 1)[1])
     if len(diff) > _MAX_DIFF_CHARS:
         diff = diff[:_MAX_DIFF_CHARS] + f"\n[diff truncated at {_MAX_DIFF_CHARS} characters]"
     return diff
 
 
 def review_scope(
-    workdir: Path, before: str, after: str, *, previous: Sequence[Mapping[str, str]], notes: Sequence[str]
+    workdir: Path, changed: Sequence[str], *, previous: Sequence[Mapping[str, str]], notes: Sequence[str]
 ) -> ReviewScope:
-    # Both names of a renamed file count as changed. The list is complete where the quoted diff is truncated.
-    changed = _git_paths(workdir, "diff", "--name-only", "--no-relative", "--no-renames", "-z",
-                         before.split(":", 1)[1], after.split(":", 1)[1])
     return ReviewScope(root=repo_root(workdir), workdir=workdir, previous=tuple(previous), changed=tuple(changed),
                        notes=tuple(notes))
 
@@ -612,13 +609,13 @@ def _collect_diff(workdir: Path, base_ref: str) -> tuple[str, list[str]]:
         base, base_ref = merge_base(workdir, base_ref)
     except ValueError as exc:
         raise ReviewAborted(str(exc)) from exc
-    commits = _git(workdir, "log", "--oneline", f"{base}..HEAD").strip()
-    stat = _git(workdir, "diff", "--stat", base).strip()
-    untracked = _git(workdir, "ls-files", "--others", "--exclude-standard").strip()
-    diff = _git(workdir, "diff", base)
+    commits = git_output(workdir, "log", "--oneline", f"{base}..HEAD").strip()
+    stat = git_output(workdir, "diff", "--stat", base).strip()
+    untracked = git_output(workdir, "ls-files", "--others", "--exclude-standard").strip()
+    diff = git_output(workdir, "diff", base)
     # -z: raw NUL-separated names; the default output quotes non-ASCII paths, which no glob would match.
-    changed = _git_paths(workdir, "diff", "--name-only", "--no-relative", "-z", base)
-    changed += _git_paths(workdir, "ls-files", "--others", "--exclude-standard", "--full-name", "-z")
+    changed = git_paths(workdir, "diff", "--name-only", "--no-relative", "-z", base)
+    changed += git_paths(workdir, "ls-files", "--others", "--exclude-standard", "--full-name", "-z")
     if not diff.strip() and not untracked:
         raise ReviewAborted(f"no changes between {base_ref} ({base[:12]}) and {workdir}")
     if len(diff) > _MAX_DIFF_CHARS:

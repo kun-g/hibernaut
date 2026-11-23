@@ -96,6 +96,15 @@ class TestReviewScope(unittest.TestCase):
             with self.subTest([i["location"] for i in order]):
                 self.assertEqual(self.kept(*order, previous=previous), [i["location"] for i in order])
 
+    def test_a_second_report_of_one_item_does_not_take_another_items_place(self):
+        previous = [block("calc.py:2"), block("calc.py:40")]
+        named = {"basis": "unfixed_previous", "previous_item": 1}
+        items = [block("calc.py:2", **named), block("calc.py:2", **named), block("calc.py:40", trigger="other words")]
+        for order in (items, items[::-1]):
+            with self.subTest([i["location"] for i in order]):
+                kept = self.kept(*order, previous=previous)
+                self.assertEqual(sorted(kept), ["calc.py:2", "calc.py:40"])
+
     def test_without_a_reference_another_problem_in_the_same_file_is_a_note(self):
         for label in ({}, {"basis": "unfixed_previous"}, {"basis": "unfixed_previous", "previous_item": 4}):
             for location in ("calc.py:80", "calc.py", "calc.py:1-99", "old.py:2", "tests/test_calc.py:3"):

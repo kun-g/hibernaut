@@ -672,6 +672,26 @@ class PRDelivery:
         self._git(cwd, "fetch", "--quiet", cfg.remote, f"+refs/heads/{cfg.base_branch}:{self._base_ref()}")
         return self._git(cwd, "rev-parse", "--verify", f"{self._base_ref()}^{{commit}}").stdout.strip()
 
+    @property
+    def base_ref(self) -> str:
+        return self._base_ref()
+
+    def same_but_version(self, before: str, after: str) -> bool:
+        # Whether a version file's two texts differ in the version alone, as the delivery step leaves it.
+        def rest(text: str) -> tuple[str, str] | None:
+            m = self._pattern.search(text)
+            return (text[:m.start("version")], text[m.end("version"):]) if m is not None else None
+
+        return rest(before) is not None and rest(before) == rest(after)
+
+    def base_tip(self, workdir: Path) -> str:
+        # The base branch as the remote has it now; "" when it cannot be fetched.
+        try:
+            with self._repo_lock(workdir):
+                return self._fetch_base(workdir)
+        except _Problem:
+            return ""
+
     def _prepare(self, req: DeliveryRequest, rec: DeliveryRecord, is_interrupted: Callable[[], bool]) -> None:
         cfg, cwd = self._config, req.workdir
         self._checkpoint(is_interrupted)
