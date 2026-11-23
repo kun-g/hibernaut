@@ -44,14 +44,55 @@ checkout_access = "readwrite"   # readonly | readwrite，默认 readwrite
 - 可写的 `workdir` 只给一个 Inbox 用：`pattern` 须是单个精确 ID，两条绑定不能指向同一个可写目录（已存在的按 inode 比较；尚不存在的部分不分大小写比较，区分大小写的卷上也一样），也不能落在某个项目的检出或某个 Steward 的 `workdir` 里。`checkout_access = "readonly"` 可以共享目录、可以用正则。
 - `readonly` 对 CLI agent 是声明：运行时据此放行共享，并在提示里写明不改文件，但不拦 CLI 的写操作。真正只读由该 CLI 自己的参数保证（如 `--permission-mode plan`）。
 - 这些 Inbox 总是在 Hibernaut 进程本机起 CLI，`[runner]` 的 `executors` 只作用于项目 Inbox，Runner 的逐次工具授权在这里不生效。
-- 只能用不带 `role` 的 CLI agent。`sde`、`code-reviewer`、`steward` 依赖项目检出，加载时拒绝。
-- 一条绑定自成一个转投范围：可以在本 Inbox 内换 agent 接力，不能与项目或别的绑定互投。
+- 可用不带 `role` 的 CLI agent；`checkout_access = "readonly"` 的绑定还可用 `steward`（见下节）。`sde`、`code-reviewer` 依赖项目检出，加载时拒绝。`agents` 省略时指全部 CLI agent，加上本绑定 `default_agent`、`rules` 点名的 steward。
+- 一条绑定自成一个转投范围：可以在本 Inbox 内换 agent 接力，不能与别的绑定互投；写了 `forward_to` 才能转投到列出的项目主 Inbox。
+
+## 全局 Steward 与转投白名单
+
+不属于项目的 `steward` 接个人对话（如飞书单聊）：能答的自己答，要动手的派给对的项目。
+
+```toml
+[agents.ash]
+role = "steward"
+executor = "claude-code"
+skills = ["builtin:steward"]
+
+[[runtime.inbox_bindings]]
+pattern = "user:main"
+default_agent = "ash"
+agents = ["ash"]
+workdir = "~/workspace"
+checkout_access = "readonly"
+forward_to = ["proj:hibernaut", "proj:sure"]
+```
+
+- **目录**：以绑定的 `workdir` 为准，须是 Orca 已登记的 Git 检出；agent 自己也写了 `workdir` 的须是同一个目录，`branch` 照旧每次核对。没有 Orca 终端时挂起等人批准重试，与项目 Steward 相同。
+- **`forward_to`**：每项是某个项目的主 Inbox（`inbox_id` 的第一个精确 ID），写错哪一项，加载和热加载的报错就点名哪一项。省略即不能出本绑定。
+- **只有一个方向**：绑定 → 列出的主 Inbox。不能指定 `target_agent`，由项目的规则选；`return_to` 只能是来源 Inbox 自己。项目不能主动转投到 `user:*` / `sys:*`，只有结果能回投。其余约束（跳数、白名单 agent、逐次过 `inbox.forward`）不变。
+- **按当时的配置判**：转投申请、审批后补发、会话恢复、Run 收尾入队前都重判。热加载删掉一项后，还在跑的旧 Run 也发不出去：暂存的转投丢弃，并在原对话里说明（`kind = "forward_refused"`）；已派出的活照做，但结果被扣下等人决定，不会自动回投。已经入队的转投不收回。
+- **提示词**：同一个 `builtin:steward`，在非项目 Inbox 里自动换成不提项目检出的那一份（`skills/steward-global/`），配置里没有单独的名字。路由清单只列白名单项目的名字、主 Inbox、默认 agent 与 `[projects.<name>] description`。
+- **查询**：`list_sessions` / `list_events` 可看自己的 Inbox 与白名单项目的全部 Inbox；读文件和 `git` 只限 `workdir`。
+- **答复**：接手的 agent 直接答复原对话；带 `return_to` 的由全局 Steward 汇总后答复同一处。
+
+### 一个对话里的几件活
+
+同一个飞书单聊的消息共用一个会话键，所以每次跨范围转投另立**任务键**，在项目里各有会话、`work_key` 与 worktree，项目 Steward 再派给 `sde` 也不合并；带不带 `return_to` 都一样。
+
+补充怎么回到原来那件：
+
+1. 转投的回执给出任务键；`list_sessions` / `list_events` 的 `correlation_key`、回投事件的 `from_task` 也是它。
+2. 向同一个主 Inbox 转投，`continues` 填该键，不带 `return_to`。还没开始的与原活同批处理；已开始的进原会话。
+3. 那个会话还欠着结果时，一份结果同时答原活和补充；不欠时直接答复原对话。项目 Steward 把补充转给正在做这件活的 agent 时同样并进它的会话，不另立委派。
+4. 只认本对话、本 Inbox 派出且还开着的活；已结束的被拒，连同原请求与结果按新活另投。
+5. 全局 Steward 的会话被关闭时，它派出的活一并关闭。
 
 ## 硬约束（由代码执行）
 
 | 约束 | 不满足时 |
 |---|---|
 | 每次转投、回投过 `PermissionPort` 的 `inbox.forward` | `block` 拒绝，`defer` 等人批准 |
+| 转投目标在同一项目（或同一绑定）内，或是绑定 `forward_to` 列出的项目主 Inbox；跨范围时不指定 agent，`return_to` 只能是来源 Inbox | 拒绝；审批放行、Run 收尾时按当时的配置重判 |
+| 回投到别的范围时，等结果的 Inbox 现在的 `forward_to` 仍列着本项目 | 结果扣下，等人决定 |
 | Agent 在 Inbox 绑定的 `agents` 白名单里 | 明确拒绝，不换别的 agent |
 | 非项目 Inbox 有显式 `workdir`，且不与项目 Inbox 重叠、不共享可写目录 | 配置拒绝加载；热加载保留旧配置 |
 | `inbox_id` 匹配某个项目或某条 `[[runtime.inbox_bindings]]` | 事件保持 `pending`，记 `WARNING` |

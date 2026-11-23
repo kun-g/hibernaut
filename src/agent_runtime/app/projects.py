@@ -136,15 +136,17 @@ class WorkdirBinding:
     binding: InboxBinding
     workdir: str
     readonly: bool = False
+    # Main inboxes of the projects its agents may forward work to.
+    forward_to: tuple[str, ...] = ()
 
     def route(self) -> InboxRoute:
-        # A scope of its own: work is forwarded neither to a project nor to another binding's directory.
+        # A scope of its own: work goes to no other binding's directory, and to a project only through forward_to.
         return InboxRoute(project=f"runtime.inbox_bindings:{self.binding.inbox}", binding=self.binding,
-                          has_bindings=True)
+                          has_bindings=True, forward_to=self.forward_to)
 
 
 _BINDING_KEYS = frozenset({"pattern", "default_agent", "agents", "rules"})
-_WORKDIR_KEYS = frozenset({"workdir", "checkout_access"})
+_WORKDIR_KEYS = frozenset({"workdir", "checkout_access", "forward_to"})
 CHECKOUT_ACCESS = ("readwrite", "readonly")
 _MATCH_KEYS = frozenset({"source", "event_type", "tags", "agent"})
 
@@ -202,11 +204,18 @@ def parse_inbox_bindings(
 
 
 def parse_workdir_bindings(
-    raw: object, *, declared: Mapping[str, AgentConfig], resolve: Callable[[str], str]
+    raw: object,
+    *,
+    declared: Mapping[str, AgentConfig],
+    resolve: Callable[[str], str],
+    # Steward agents, with the workdir each one names itself.
+    stewards: Mapping[str, str],
+    # Main inbox -> its project.
+    main_inboxes: Mapping[str, str],
 ) -> tuple[WorkdirBinding, ...]:
     if raw is None:
         return ()
-    # Roles work in a project: in its worktrees, its reviews or, read-only, its main checkout.
+    # Roles work in a project: in its worktrees or its reviews. Only a Steward, which writes nothing, works without one.
     plain = [name for name, agent in declared.items() if agent.role is None]
     bindings: list[WorkdirBinding] = []
     for index, item in enumerate(_tables("runtime.inbox_bindings", raw)):
@@ -223,14 +232,30 @@ def parse_workdir_bindings(
         if access not in CHECKOUT_ACCESS:
             raise ValueError(f"{where}: checkout_access must be one of {', '.join(CHECKOUT_ACCESS)}, got {access!r}")
         binding = _binding(where, item, rule, declared.keys())
-        for agent in (binding.default_agent, *binding.agents, *(r.agent for r in binding.rules)):
-            if agent not in plain:
+        named = tuple(dict.fromkeys((binding.default_agent, *binding.agents, *(r.agent for r in binding.rules))))
+        for agent in named:
+            if agent in plain:
+                continue
+            if agent not in stewards:
                 raise ValueError(f"{where}: agent '{agent}' has role '{declared[agent].role}', which only works in a "
                                  "project; use an agent on a CLI executor")
+            if access != "readonly":
+                raise ValueError(f"{where}: agent '{agent}' has role '{declared[agent].role}', which outside a project "
+                                 "needs checkout_access = \"readonly\"")
+            own = stewards[agent]
+            if own and directory_key(Path(own)) != directory_key(Path(workdir)):
+                raise ValueError(f"{where}: agents.{agent} has another workdir ({own}) than this binding ({workdir})")
+        forward_to = _texts(where, item, "forward_to")
+        for target in forward_to:
+            if target not in main_inboxes:
+                raise ValueError(f"{where}: forward_to '{target}' is not the main inbox of a project (main inboxes: "
+                                 f"{', '.join(sorted(main_inboxes)) or 'none'})")
         bindings.append(WorkdirBinding(
-            rule=rule, workdir=workdir, readonly=access == "readonly",
-            # An omitted list means any agent that can work here, not any declared one.
-            binding=binding if binding.agents else replace(binding, agents=tuple(plain)),
+            rule=rule, workdir=workdir, readonly=access == "readonly", forward_to=forward_to,
+            # An omitted list means any agent that can work here: every CLI agent, and the Stewards the binding names.
+            binding=binding if binding.agents else replace(
+                binding, agents=tuple(dict.fromkeys((*plain, *named)))
+            ),
         ))
     return tuple(bindings)
 
@@ -356,6 +381,22 @@ class _Bound(Protocol):
     def agents(self) -> tuple[AgentConfig, ...]: ...
 
 
+class _Target(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def inbox_id(self) -> str: ...
+
+    @property
+    def description(self) -> str: ...
+
+    @property
+    def default_agent(self) -> str | None: ...
+
+    def route(self, inbox_id: str) -> InboxRoute: ...
+
+
 def validate_project_bindings(projects: Iterable[_Bound]) -> None:
     # An inbox belongs to one project, so a binding that also matches another project's inbox is a mistake: it would
     # never apply there.
@@ -388,6 +429,24 @@ def _rule_line(rule: InboxMatchRule) -> str:
     if rule.tags:
         conditions.append(f"tags include {', '.join(rule.tags)}")
     return f"{' and '.join(conditions)} -> `{rule.agent}`"
+
+
+def build_global_manifest(
+    inbox_id: str, binding: InboxBinding, agents: Sequence[AgentConfig], targets: Sequence[_Target],
+    default_agent: str,
+) -> str:
+    # What a Steward outside any project needs: the projects it may send work to, and nothing of what is inside them.
+    parts = [f"You work in `{inbox_id}`, which belongs to no project. Its default agent is `{binding.default_agent}`.",
+             "", "Agents of this inbox:"]
+    parts += [_agent_line(a) for a in agents if a.name in (*binding.agents, binding.default_agent)]
+    parts += ["", "Projects you may forward work to, through their main inbox only:" if targets
+              else "No project takes work from here: forwarding to one is refused."]
+    for project in targets:
+        bound = project.route(project.inbox_id).binding
+        agent = bound.default_agent if bound is not None else project.default_agent or default_agent
+        line = f"- `{project.name}`: main inbox `{project.inbox_id}`, default agent `{agent}`"
+        parts.append(f"{line}. {project.description}" if project.description else line)
+    return "\n".join(parts)
 
 
 def build_routing_manifest(project: _Bound) -> str:

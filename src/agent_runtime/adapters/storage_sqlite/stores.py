@@ -634,6 +634,8 @@ def _forward_from_json(raw: object, inbox_id: str) -> ForwardSpec | None:
         reply_channel=text("reply_channel"),
         reply_target=text("reply_target"),
         origin_key=text("origin_key"),
+        task_key=text("task_key"),
+        return_key=text("return_key"),
         delegation_id=text("delegation_id"),
         work_key=text("work_key"),
         pending_returns=texts("pending_returns"),
