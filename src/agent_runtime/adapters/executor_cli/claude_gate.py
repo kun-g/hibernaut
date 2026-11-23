@@ -34,13 +34,12 @@ from agent_runtime.adapters.executor_cli.claude_code import (  # noqa: E402
 )
 from agent_runtime.adapters.executor_cli.cli_terminal import (  # noqa: E402
     GRACE_SECONDS,
-    Stopped,
+    check_stop,
     end_group,
     exited,
-    ignore_signals,
     one_shot_env,
     starting,
-    stop_on_signals,
+    supervised,
 )
 
 _POLL_SECONDS = 0.1
@@ -57,22 +56,18 @@ def _report(path: Path, body: dict[str, Any]) -> None:
 
 
 def main(spec_path: str) -> int:
-    running: list[subprocess.Popen[bytes]] = []
     spec: dict[str, Any] = {}
-    stop_on_signals()
-    try:
-        spec = json.loads(Path(spec_path).read_text(encoding="utf-8"))
-        return _main(spec, running)
-    except Stopped as stop:
-        return 128 + stop.signum
-    except _Released:
-        print("\n[hibernaut] Hibernaut closed this terminal; ending it.", file=sys.stderr, flush=True)
-        return 1
-    finally:
-        ignore_signals()
-        for proc in running:
-            # Only the probe can be running in a one-off check; cli_terminal.py ends this process after its own grace.
-            end_group(proc, grace=0 if spec.get("once") else None)
+
+    def body(running: list[subprocess.Popen[bytes]]) -> int:
+        spec.update(json.loads(Path(spec_path).read_text(encoding="utf-8")))
+        try:
+            return _main(spec, running)
+        except _Released:
+            print("\n[hibernaut] Hibernaut closed this terminal; ending it.", file=sys.stderr, flush=True)
+            return 1
+
+    # Only the probe can be running in a one-off check; cli_terminal.py ends this process after its own grace.
+    return supervised(body, grace=lambda: 0 if spec.get("once") else None)
 
 
 def _main(spec: dict[str, Any], running: list[subprocess.Popen[bytes]]) -> int:
@@ -154,6 +149,7 @@ def _probe(argv: list[str], env: dict[str, str], timeout: float, lease: Path,
         if exited(proc.pid, _POLL_SECONDS):
             reader.join(timeout=GRACE_SECONDS)
             break
+        check_stop()
         if not lease.exists():
             raise _Released
         if time.monotonic() >= deadline:
@@ -168,6 +164,7 @@ def _probe(argv: list[str], env: dict[str, str], timeout: float, lease: Path,
 
 
 def _become(argv: list[str], env: dict[str, str], lease: Path) -> int:
+    check_stop()
     if not lease.exists():
         raise _Released
     # Python ignores these, and an ignored signal stays ignored in the program that takes this one's place.
@@ -198,6 +195,7 @@ def _supervise(argv: list[str], env: dict[str, str], lease: Path, running: list[
         except OSError:
             pass
     while not exited(proc.pid, _POLL_SECONDS):
+        check_stop()
         if not lease.exists():
             raise _Released
     # Exit with the agent, after ending whatever it left in its group.
