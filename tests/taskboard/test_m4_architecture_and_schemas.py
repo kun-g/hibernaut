@@ -164,3 +164,11 @@ def test_taskboard_ast_architecture_boundaries() -> None:
             top = mod.split(".")[0]
             assert top not in {"sqlite3", "switchboard"}, f"L0 core imported {mod}"
             assert not mod.startswith(("taskboard.adapters", "taskboard.engine", "taskboard.ports"))
+
+    # taskboard.app (composition root) sits above every layer. This is an AST check rather than an
+    # import-linter layer: the delivery checks may resolve `taskboard` from another checkout.
+    for py_file in TASKBOARD_SRC.rglob("*.py"):
+        if (TASKBOARD_SRC / "app") in py_file.parents:
+            continue
+        for mod in _extract_imported_modules(py_file):
+            assert not mod.startswith("taskboard.app"), f"{py_file} imported the composition root {mod}"
