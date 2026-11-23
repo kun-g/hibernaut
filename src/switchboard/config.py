@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import re
+import threading
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -108,6 +110,8 @@ class SwitchboardConfig:
     delivery: DeliveryConfig = field(default_factory=DeliveryConfig)
     outbound: OutboundConfig = field(default_factory=OutboundConfig)
     relay: RelayConfig = field(default_factory=RelayConfig)
+    # Drain limit of a shutdown; what is still running then is cut off.
+    shutdown_timeout_seconds: float = 10.0
 
 
 _HTTP = HttpConfig()
@@ -117,6 +121,8 @@ _FEISHU = FeishuConfig()
 _DELIVERY = DeliveryConfig()
 _OUTBOUND = OutboundConfig()
 _RELAY = RelayConfig()
+_SECTIONS = ("http", "sqlite", "routing", "feishu", "github", "delivery", "outbound", "relay")
+_MAX_PORT = 65535
 
 
 class ConfigError(ValueError):
@@ -136,6 +142,11 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
     delivery = _section(raw, "delivery")
     outbound = _section(raw, "outbound")
 
+    for name in _SECTIONS:
+        # TOML puts a top-level key written below a table header into that table, where nothing would read it.
+        if "shutdown_timeout_seconds" in _section(raw, name):
+            raise ConfigError(f"shutdown_timeout_seconds must come before the first table, not inside [{name}]")
+
     policy = str(routing.get("unmatched_policy", "fallback"))
     if policy not in ("fallback", "reject"):
         raise ConfigError("routing.unmatched_policy must be 'fallback' or 'reject'")
@@ -143,56 +154,54 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
     delivery_backoff = _backoff(delivery, "delivery")
     outbound_backoff = _backoff(outbound, "outbound")
     max_parallel = delivery.get("max_parallel")
-    if max_parallel is not None and int(max_parallel) < 1:
-        raise ConfigError("delivery.max_parallel must be at least 1")
     return SwitchboardConfig(
         http=HttpConfig(
-            host=str(http.get("host", _HTTP.host)),
-            port=int(http.get("port", _HTTP.port)),
-            max_body_bytes=int(http.get("max_body_bytes", _HTTP.max_body_bytes)),
+            host=_text(http, "http", "host", _HTTP.host),
+            port=_integer(http, "http", "port", _HTTP.port, 0, _MAX_PORT),
+            max_body_bytes=_integer(http, "http", "max_body_bytes", _HTTP.max_body_bytes, 1),
             base_path=normalize_base_path(http.get("base_path", _HTTP.base_path)),
         ),
         sqlite=SqliteConfig(
-            path=str(sqlite.get("path", _SQLITE.path)),
-            busy_timeout_ms=int(sqlite.get("busy_timeout_ms", _SQLITE.busy_timeout_ms)),
+            # "" would open a private temporary database that is gone after a restart.
+            path=_text(sqlite, "sqlite", "path", _SQLITE.path),
+            busy_timeout_ms=_integer(sqlite, "sqlite", "busy_timeout_ms", _SQLITE.busy_timeout_ms, 0),
         ),
         routing=RoutingConfig(
-            default_scope=str(routing.get("default_scope", _ROUTING.default_scope)),
+            default_scope=_text(routing, "routing", "default_scope", _ROUTING.default_scope),
             unmatched_policy=policy,
-            github_repos={k.lower(): str(v) for k, v in _table(routing, "github_repos").items()},
-            github_owners={k.lower(): str(v) for k, v in _table(routing, "github_owners").items()},
-            feishu_chats={k: str(v) for k, v in _table(routing, "feishu_chats").items()},
+            github_repos={k.lower(): v for k, v in _scopes(routing, "github_repos").items()},
+            github_owners={k.lower(): v for k, v in _scopes(routing, "github_owners").items()},
+            feishu_chats=_scopes(routing, "feishu_chats"),
             event_consumers=_event_consumers(_table(routing, "event_consumers")),
         ),
         feishu=FeishuConfig(
-            group_require_mention=bool(feishu.get("group_require_mention", True)),
+            group_require_mention=_boolean(feishu, "feishu", "group_require_mention", _FEISHU.group_require_mention),
             bot_open_id=_optional(feishu.get("bot_open_id")),
-            api_base=str(feishu.get("api_base", _FEISHU.api_base)),
+            api_base=_url(feishu, "feishu", "api_base", _FEISHU.api_base),
         ),
         github=GitHubConfig(require_label=_optional(str(_section(raw, "github").get("require_label") or "").strip())),
         delivery=DeliveryConfig(
             retry_backoff_seconds=delivery_backoff or _DELIVERY.retry_backoff_seconds,
             dead_letter_alert_channel=_optional(delivery.get("dead_letter_alert_channel")),
             dead_letter_alert_target=_optional(delivery.get("dead_letter_alert_target")),
-            max_parallel=None if max_parallel is None else int(max_parallel),
+            max_parallel=None if max_parallel is None else _integer(delivery, "delivery", "max_parallel", 1, 1),
         ),
         outbound=OutboundConfig(
-            rate_limit_per_target_rpm=int(
-                outbound.get("rate_limit_per_target_rpm", _OUTBOUND.rate_limit_per_target_rpm)
+            rate_limit_per_target_rpm=_integer(
+                outbound, "outbound", "rate_limit_per_target_rpm", _OUTBOUND.rate_limit_per_target_rpm, 1
             ),
-            max_retry_attempts=int(
-                outbound.get("max_retry_attempts", _OUTBOUND.max_retry_attempts)
-            ),
+            max_retry_attempts=_integer(outbound, "outbound", "max_retry_attempts", _OUTBOUND.max_retry_attempts, 1),
             retry_backoff_seconds=outbound_backoff or _OUTBOUND.retry_backoff_seconds,
             approval_channel=str(outbound.get("approval_channel", _OUTBOUND.approval_channel)),
             approval_target=_optional(outbound.get("approval_target")),
-            github_api_base=str(outbound.get("github_api_base", _OUTBOUND.github_api_base)),
+            github_api_base=_url(outbound, "outbound", "github_api_base", _OUTBOUND.github_api_base),
             github_app_owners=_strings(outbound, "github_app_owners"),
             reply_to_origin=_strings(outbound, "reply_to_origin") if "reply_to_origin" in outbound else _OUTBOUND.reply_to_origin,
             notify_channel=_optional(outbound.get("notify_channel")),
             notify_target=_optional(outbound.get("notify_target")),
         ),
         relay=_relay(_section(raw, "relay")),
+        shutdown_timeout_seconds=_shutdown_timeout(raw.get("shutdown_timeout_seconds", 10.0)),
     )
 
 
@@ -232,22 +241,19 @@ def _relay(relay: Mapping[str, Any]) -> RelayConfig:
     transport = str(relay.get("transport", _RELAY.transport))
     if transport not in TRANSPORT_MODES:
         raise ConfigError(f"relay.transport must be one of {list(TRANSPORT_MODES)}")
-    enabled = bool(relay.get("enabled", _RELAY.enabled))
+    enabled = _boolean(relay, "relay", "enabled", _RELAY.enabled)
     if transport != "in_process" and not enabled:
         raise ConfigError(f"relay.transport = {transport!r} needs relay.enabled = true")
     path = str(relay.get("path", _RELAY.path))
     if not path.startswith("/"):
         raise ConfigError("relay.path must start with '/'")
-    seconds = {
-        name: float(relay.get(name, getattr(_RELAY, name)))
-        for name in ("auth_timeout_sec", "heartbeat_sec", "ack_timeout_sec")
-    }
-    for name, value in seconds.items():
-        if value <= 0:
+    seconds: dict[str, float] = {}
+    for name in ("auth_timeout_sec", "heartbeat_sec", "ack_timeout_sec"):
+        value = _number(relay.get(name, getattr(_RELAY, name)), f"relay.{name}")
+        if not 0 < value <= threading.TIMEOUT_MAX:
             raise ConfigError(f"relay.{name} must be positive")
-    max_in_flight = int(relay.get("max_in_flight", _RELAY.max_in_flight))
-    if max_in_flight < 1:
-        raise ConfigError("relay.max_in_flight must be at least 1")
+        seconds[name] = value
+    max_in_flight = _integer(relay, "relay", "max_in_flight", _RELAY.max_in_flight, 1)
     listen_port = relay.get("listen_port")
     return RelayConfig(
         enabled=enabled,
@@ -258,7 +264,7 @@ def _relay(relay: Mapping[str, Any]) -> RelayConfig:
         max_in_flight=max_in_flight,
         transport=transport,
         listen_host=_optional(relay.get("listen_host")),
-        listen_port=None if listen_port is None else int(listen_port),
+        listen_port=None if listen_port is None else _integer(relay, "relay", "listen_port", 0, 0, _MAX_PORT),
     )
 
 
@@ -276,13 +282,75 @@ def _table(section: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     return cast(Mapping[str, Any], value)
 
 
+def _scopes(routing: Mapping[str, Any], name: str) -> dict[str, str]:
+    table = _table(routing, name)
+    for key, scope in table.items():
+        if not isinstance(scope, str) or not scope.strip():
+            raise ConfigError(f"routing.{name}.{key!r} must be a non-empty scope")
+    return dict(table)
+
+
+def _text(section: Mapping[str, Any], table: str, name: str, default: str) -> str:
+    value = section.get(name, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{table}.{name} must be a non-empty string")
+    return value
+
+
+def _url(section: Mapping[str, Any], table: str, name: str, default: str) -> str:
+    value = _text(section, table, name, default)
+    if not value.startswith(("http://", "https://")):
+        raise ConfigError(f"{table}.{name} must be an http:// or https:// URL")
+    return value
+
+
+# 0/1 and numeric strings were read as meant before validation existed and still load; what was misread
+# ("false" as true, true as 1, 80.5 as 80) is rejected.
+def _boolean(section: Mapping[str, Any], table: str, name: str, default: bool) -> bool:
+    value = section.get(name, default)
+    if value not in (0, 1):
+        raise ConfigError(f"{table}.{name} must be true or false")
+    return bool(value)
+
+
+def _number(value: object, name: str) -> float:
+    if isinstance(value, int | float | str) and not isinstance(value, bool):
+        try:
+            number = float(value)
+        except (ValueError, OverflowError):
+            pass
+        else:
+            if math.isfinite(number):
+                return number
+    raise ConfigError(f"{name} must be a finite number, got {value!r}")
+
+
+def _integer(
+    section: Mapping[str, Any], table: str, name: str, default: int, minimum: int, maximum: int | None = None
+) -> int:
+    value = _number(section.get(name, default), f"{table}.{name}")
+    bounds = f"at least {minimum}" if maximum is None else f"between {minimum} and {maximum}"
+    if not value.is_integer() or value < minimum or (maximum is not None and value > maximum):
+        raise ConfigError(f"{table}.{name} must be an integer, {bounds}")
+    return int(value)
+
+
+def _shutdown_timeout(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float) or not 0 < value <= threading.TIMEOUT_MAX:
+        raise ConfigError(f"shutdown_timeout_seconds must be a positive number of seconds, got {value!r}")
+    return float(value)
+
+
 def _backoff(section: Mapping[str, Any], name: str) -> tuple[float, ...]:
     value = section.get("retry_backoff_seconds")
     if value is None:
         return ()
     if not isinstance(value, list) or not value:
         raise ConfigError(f"{name}.retry_backoff_seconds must be a non-empty list")
-    return tuple(float(item) for item in cast(list[Any], value))
+    delays = tuple(_number(item, f"{name}.retry_backoff_seconds") for item in cast(list[Any], value))
+    if any(not 0 <= delay <= threading.TIMEOUT_MAX for delay in delays):
+        raise ConfigError(f"{name}.retry_backoff_seconds must not contain negative or unusably large delays")
+    return delays
 
 
 def _optional(value: Any) -> str | None:

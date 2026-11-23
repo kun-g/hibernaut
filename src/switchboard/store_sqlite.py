@@ -132,9 +132,16 @@ class SwitchboardStore:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(_SCHEMA)
 
-    def close(self) -> None:
-        with self._lock:
+    # A statement holds the lock until it commits, so a successful close never cuts a transaction. False: the lock
+    # was not free within timeout (-1 waits) and the connection stays open.
+    def close(self, timeout: float = -1) -> bool:
+        if not self._lock.acquire(timeout=timeout):
+            return False
+        try:
             self._conn.close()
+        finally:
+            self._lock.release()
+        return True
 
     def pragma(self, name: str) -> Any:
         with self._lock:
