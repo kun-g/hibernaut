@@ -138,7 +138,7 @@ path = "{self.sb_db}"
 default_scope = "{SCOPE}"
 
 [delivery]
-retry_backoff_seconds = [0.2, 0.2, 0.2, 0.2, 0.2]
+retry_backoff_seconds = [0.05, 0.05, 0.05, 0.05, 0.05]
 
 [outbound]
 # A closed loopback port: replies are recorded in outbound_messages but never reach GitHub.
@@ -285,8 +285,15 @@ consumer_id = "{CONSUMER}"
         self.assertEqual(self.hibernaut.stop(), 0, self.hibernaut.logs())
         first = self.post_message("off-1", "first while offline")
         second = self.post_message("off-2", "second while offline")
-        # Give the delivery worker several retry periods (0.2s) to prove nothing is attempted while offline.
-        time.sleep(1.5)
+        # Observe the offline head of the queue being deferred on successive delivery rounds.
+        def next_retry():
+            [(due,)] = query(self.sb_db, "SELECT next_retry_at FROM delivery_log WHERE event_id = ? AND consumer_id = ?",
+                             (first, CONSUMER))
+            return due
+
+        for _ in range(3):
+            due = next_retry()
+            self.wait(lambda: next_retry() > due, "offline delivery deferred again")
         self.assertEqual(self.delivery(first), ("pending", 0))
         self.assertEqual(self.delivery(second), ("pending", 0))
 

@@ -318,7 +318,7 @@ class DrainTests(ShutdownHarness):
         with socket.create_connection(("127.0.0.1", board.http.port), timeout=5) as idle:
             # A request line that never ends is not a request yet.
             idle.sendall(b"POST /webh")
-            time.sleep(0.1)
+            self.assertTrue(wait_until(lambda: bool(board.http._server._waiting)))
             started = time.monotonic()
             self.assertTrue(board.stop())
             self.assertLess(time.monotonic() - started, 3)
@@ -330,7 +330,7 @@ class DrainTests(ShutdownHarness):
         headers = github_headers(raw, "ping", "d-9")
         head = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
         with socket.create_connection(("127.0.0.1", board.http.port), timeout=5) as sock:
-            time.sleep(0.1)
+            self.assertTrue(wait_until(lambda: bool(board.http._server._waiting)))
             stopper, result = self.stop_in_thread(board)
             self.assertTrue(wait_until(lambda: refused(board.http.port)))
             sock.sendall(f"POST /webhooks/github HTTP/1.1\r\nHost: x\r\nContent-Length: {len(raw)}\r\n{head}\r\n".encode() + raw)
@@ -360,8 +360,8 @@ class TimeoutTests(ShutdownHarness):
 
     def stuck_delivery(self, **sections: Mapping[str, Any]) -> tuple[Switchboard, Gate]:
         gate = Gate()
-        self.addCleanup(gate.opened.set)
         board = self.board(timeout=0.2, sections=sections)
+        self.addCleanup(gate.opened.set)
 
         def handler(event: CanonicalEvent) -> DeliverStatus:
             gate.pass_through()
@@ -389,8 +389,8 @@ class TimeoutTests(ShutdownHarness):
 
     def test_stuck_outbound_send(self) -> None:
         gate = Gate()
-        self.addCleanup(gate.opened.set)
         board = self.board(timeout=0.2, http_client=GatedHttpClient(gate))
+        self.addCleanup(gate.opened.set)
         board.gateway.deliver(text_message(1))
         self.assertTrue(gate.entered.wait(5))
         self.assert_forced(board, "outbound")
@@ -422,8 +422,7 @@ class TimeoutTests(ShutdownHarness):
         before = set(threading.enumerate())
         with socket.create_connection(("127.0.0.1", board.http.port), timeout=5) as sock:
             sock.sendall(b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
-            self.assertTrue(wait_until(lambda: bool(set(threading.enumerate()) - before)))
-            time.sleep(0.1)
+            self.assertTrue(wait_until(lambda: bool(board.http._server._active)))
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 self.assert_forced(board, "HTTP")
@@ -447,8 +446,8 @@ class TimeoutTests(ShutdownHarness):
     # A board with one dead letter and an MCP call held in its token check.
     def stuck_mcp_call(self, tool: str, arguments: dict[str, str]) -> tuple[Switchboard, Gate, set[threading.Thread]]:
         gate = Gate()
-        self.addCleanup(gate.opened.set)
         board = self.board(timeout=0.2, credentials=GatedCredentials(gate, "mcp"))
+        self.addCleanup(gate.opened.set)
         dead = ready_event(1, "proj:a")
         # Not due, so the worker leaves it alone.
         later = utc_now() + timedelta(hours=1)
@@ -683,12 +682,14 @@ class SignalTests(unittest.TestCase):
                 proc, port = self.start(60, ("-c", SIGNALLED_OFF_MAIN))
                 assert proc.stdin is not None
                 if second is not None:
-                    self.hang_request(port)
+                    ws, _ = handshake(f"ws://127.0.0.1:{port}/ws/relay")
+                    self.addCleanup(ws.close)
                 os.write(proc.stdin.fileno(), bytes([first]))
                 if second is None:
                     self.assertEqual(proc.wait(8), 0, self.output())
                     continue
-                self.assertTrue(wait_until(lambda: refused(port)), self.output())
+                self.assertIsInstance(recv_message(ws), Close)
+                self.assertTrue(refused(port))
                 os.write(proc.stdin.fileno(), bytes([second]))
                 self.assertEqual(proc.wait(8), 128 + second, self.output())
 
@@ -696,10 +697,12 @@ class SignalTests(unittest.TestCase):
         for first, second in ((signal.SIGTERM, signal.SIGTERM), (signal.SIGTERM, signal.SIGINT), (signal.SIGINT, signal.SIGTERM)):
             with self.subTest(first=first.name, second=second.name):
                 proc, port = self.start(60)
-                self.hang_request(port)
+                ws, _ = handshake(f"ws://127.0.0.1:{port}/ws/relay")
+                self.addCleanup(ws.close)
                 proc.send_signal(first)
-                self.assertTrue(wait_until(lambda: refused(port)))
-                time.sleep(0.3)
+                # The unacknowledged close frame proves the first signal reached the drain.
+                self.assertIsInstance(recv_message(ws), Close)
+                self.assertTrue(refused(port))
                 self.assertIsNone(proc.poll(), self.output())
                 started = time.monotonic()
                 proc.send_signal(second)
