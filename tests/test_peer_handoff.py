@@ -437,6 +437,9 @@ class TestResultSurvivesRestart(PeerCase):
                 await task_run
         self.db.close()
         first = session.reply(task, "still working")
+        # Each reply is its own connection, handled on its own receiver thread; the order asserted below
+        # is the session's send order, so the second is sent once the first is stored.
+        await asyncio.to_thread(self.wait_inbox, 1)
         second = session.reply(task, json.dumps({"task_id": "sess-1", "attempt_id": binding.peer_attempt, **DONE}))
         await asyncio.to_thread(self.wait_inbox, 2)
 
