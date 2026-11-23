@@ -296,7 +296,14 @@ class OutboundGateway:
 
         schedule = self._config.retry_backoff_seconds
         delay = float(schedule[min(attempts - 1, len(schedule) - 1)])
-        self._reschedule(row, now + timedelta(seconds=delay), attempts, result.error, now)
+        when = now + timedelta(seconds=delay)
+        if result.retry_after_seconds is not None:
+            try:
+                # The clock is read again: the wait starts at the response, not when the request began.
+                when = max(when, self._clock() + timedelta(seconds=result.retry_after_seconds))
+            except OverflowError:
+                pass  # No such date; keep the backoff, or the row would be resent on every pass.
+        self._reschedule(row, when, attempts, result.error, now)
         return False
 
     def _reschedule(

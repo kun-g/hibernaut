@@ -64,6 +64,17 @@ class FeishuTenantTokenSourceTests(unittest.TestCase):
             self.source.token()
         self.assertTrue(flaky.exception.retryable)
 
+    def test_rate_limit_sent_as_http_400_is_retryable_and_other_400s_are_not(self) -> None:
+        self.http.responses.append(HttpResponse(400, b'{"code":99991400,"msg":"request trigger frequency limit"}'))
+        with self.assertRaises(FeishuAuthError) as limited:
+            self.source.token()
+        self.assertTrue(limited.exception.retryable)
+        for body in (b'{"code":10003,"msg":"invalid param"}', b'{"code":["odd"]}'):
+            self.http.responses.append(HttpResponse(400, body))
+            with self.assertRaises(FeishuAuthError) as wrong:
+                self.source.token()
+            self.assertFalse(wrong.exception.retryable)
+
 
 class FeishuOutboundWithAppTokenTests(unittest.TestCase):
     def setUp(self) -> None:
