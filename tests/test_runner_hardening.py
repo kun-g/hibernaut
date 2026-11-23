@@ -15,7 +15,7 @@ from runner.registry import NoEligibleRunnerError, WorkspaceAffinityStore
 from runner.supervisor import ProcessSupervisor
 from runner.transport.relay_hub import RunnerConnectionLostError, RunnerRelayHub
 from runner.transport.ws_protocol import WSConnectionClosed, WSProtocolError, client_handshake, recv_json, send_json
-from tests.test_runner_safety import PY, _config, _count_drivers, _init_repo, _req
+from tests.test_runner_safety import PY, _config, _count_drivers, _count_started, _hold_count, _init_repo, _req
 
 _ENV_SCRIPT = "import json, os; print(json.dumps({'env': dict(os.environ)}))"
 
@@ -380,14 +380,15 @@ def test_daemon_checks_caller_and_workspace_before_reusing_a_run_id(tmp_path: Pa
     other_workspace = dataclasses.replace(original, owner_scope="proj:b", work_key="gh#2")
 
     async def scenario() -> None:
-        running = asyncio.create_task(daemon.run(original, caller_id="hibernaut"))
-        await asyncio.sleep(0.3)
-        # In flight: another workspace (or another caller) may not join this run.
-        joined = await daemon.run(other_workspace, caller_id="hibernaut")
-        assert (joined.status, joined.error_kind) == ("refused", "permission_denied")
-        assert "run_id" in (joined.error_summary or "")
-        stranger = await daemon.run(original, caller_id="workshop")
-        assert (stranger.status, stranger.error_kind) == ("refused", "permission_denied")
+        with _hold_count(counter):
+            running = asyncio.create_task(daemon.run(original, caller_id="hibernaut"))
+            await _count_started(counter)
+            # In flight: another workspace (or another caller) may not join this run.
+            joined = await daemon.run(other_workspace, caller_id="hibernaut")
+            assert (joined.status, joined.error_kind) == ("refused", "permission_denied")
+            assert "run_id" in (joined.error_summary or "")
+            stranger = await daemon.run(original, caller_id="workshop")
+            assert (stranger.status, stranger.error_kind) == ("refused", "permission_denied")
         done = await running
         assert done.status == "succeeded"
         # Finished: same rules, and the original caller still gets the original result.
@@ -420,12 +421,13 @@ def test_hub_refuses_a_run_id_reused_for_another_request(tmp_path: Path) -> None
         await agent.start()
         await agent.wait_connected()
         try:
-            running = asyncio.create_task(hub.run(original))
-            await asyncio.sleep(0.2)
-            with pytest.raises(RunIdConflictError):
-                await asyncio.wait_for(hub.run(conflicting), 2.0)
-            with pytest.raises(RunIdConflictError):
-                await asyncio.wait_for(hub.run(original, caller_id="workshop"), 2.0)
+            with _hold_count(counter):
+                running = asyncio.create_task(hub.run(original))
+                await _count_started(counter)
+                with pytest.raises(RunIdConflictError):
+                    await asyncio.wait_for(hub.run(conflicting), 2.0)
+                with pytest.raises(RunIdConflictError):
+                    await asyncio.wait_for(hub.run(original, caller_id="workshop"), 2.0)
             done = await asyncio.wait_for(running, 15.0)
             with pytest.raises(RunIdConflictError):
                 await asyncio.wait_for(hub.run(conflicting), 2.0)
@@ -760,11 +762,12 @@ def test_daemon_refuses_a_run_id_reused_with_different_execution_fields(tmp_path
     changed = dataclasses.replace(original, **change)
 
     async def scenario() -> None:
-        running = asyncio.create_task(daemon.run(original, caller_id="hibernaut"))
-        await asyncio.sleep(0.3)
-        joined = await daemon.run(changed, caller_id="hibernaut")
-        assert (joined.status, joined.error_kind) == ("refused", "permission_denied")
-        assert "run_id" in (joined.error_summary or "")
+        with _hold_count(counter):
+            running = asyncio.create_task(daemon.run(original, caller_id="hibernaut"))
+            await _count_started(counter)
+            joined = await daemon.run(changed, caller_id="hibernaut")
+            assert (joined.status, joined.error_kind) == ("refused", "permission_denied")
+            assert "run_id" in (joined.error_summary or "")
         done = await running
         assert done.status == "succeeded"
         again = await daemon.run(changed, caller_id="hibernaut")
@@ -796,11 +799,12 @@ def test_hub_refuses_a_run_id_reused_with_a_different_prompt_or_interactive(tmp_
         await agent.start()
         await agent.wait_connected()
         try:
-            running = asyncio.create_task(hub.run(original))
-            await asyncio.sleep(0.2)
-            for variant in variants:
-                with pytest.raises(RunIdConflictError):
-                    await asyncio.wait_for(hub.run(variant), 2.0)
+            with _hold_count(counter):
+                running = asyncio.create_task(hub.run(original))
+                await _count_started(counter)
+                for variant in variants:
+                    with pytest.raises(RunIdConflictError):
+                        await asyncio.wait_for(hub.run(variant), 2.0)
             done = await asyncio.wait_for(running, 15.0)
             for variant in variants:
                 with pytest.raises(RunIdConflictError):
@@ -824,12 +828,13 @@ def test_run_refused_as_workspace_busy_runs_when_retried_after_the_workspace_fre
     counter = tmp_path / "count"
 
     async def scenario() -> None:
-        holder = asyncio.create_task(daemon.run(_req("run_holder", executor_id="count", prompt=str(counter)), caller_id="hibernaut"))
-        await asyncio.sleep(0.3)
-        retried = _req("run_retried", executor_id="count", prompt=str(counter))
-        busy = await daemon.run(retried, caller_id="hibernaut")
-        assert (busy.error_summary or "").startswith("workspace_busy")
-        assert not daemon.knows_run(retried.run_id)
+        with _hold_count(counter):
+            holder = asyncio.create_task(daemon.run(_req("run_holder", executor_id="count", prompt=str(counter)), caller_id="hibernaut"))
+            await _count_started(counter)
+            retried = _req("run_retried", executor_id="count", prompt=str(counter))
+            busy = await daemon.run(retried, caller_id="hibernaut")
+            assert (busy.error_summary or "").startswith("workspace_busy")
+            assert not daemon.knows_run(retried.run_id)
         assert (await holder).status == "succeeded"
         again = await daemon.run(retried, caller_id="hibernaut")
         assert again.status == "succeeded", again.error_summary
@@ -858,10 +863,11 @@ def test_another_caller_cannot_interrupt_or_read_a_run_in_process(tmp_path: Path
     req = _req("run_owned", executor_id="count", prompt=str(counter))
 
     async def scenario() -> None:
-        running = asyncio.create_task(owner.run(req))
-        await asyncio.sleep(0.3)
-        res = await stranger.interrupt(InterruptRequest(run_id=req.run_id, reason="user_cancel"))
-        assert (res.accepted, res.state) == (False, "not_found")
+        with _hold_count(counter):
+            running = asyncio.create_task(owner.run(req))
+            await _count_started(counter)
+            res = await stranger.interrupt(InterruptRequest(run_id=req.run_id, reason="user_cancel"))
+            assert (res.accepted, res.state) == (False, "not_found")
         done = await running
         assert done.status == "succeeded"
         assert daemon.query_run(req.run_id, caller_id="workshop") is None
@@ -888,10 +894,11 @@ def test_another_caller_cannot_interrupt_or_read_a_run_through_the_relay(tmp_pat
         await agent.start()
         await agent.wait_connected()
         try:
-            running = asyncio.create_task(hub.run(req, caller_id="hibernaut"))
-            await asyncio.sleep(0.4)
-            res = await hub.interrupt(InterruptRequest(run_id=req.run_id, reason="user_cancel"), caller_id="workshop")
-            assert (res.accepted, res.state) == (False, "not_found")
+            with _hold_count(counter):
+                running = asyncio.create_task(hub.run(req, caller_id="hibernaut"))
+                await _count_started(counter)
+                res = await hub.interrupt(InterruptRequest(run_id=req.run_id, reason="user_cancel"), caller_id="workshop")
+                assert (res.accepted, res.state) == (False, "not_found")
             done = await asyncio.wait_for(running, 15.0)
             assert done.status == "succeeded"
             assert await hub.query_run("s-1", req.run_id, caller_id="workshop") is None

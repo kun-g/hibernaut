@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from functools import cache
 from pathlib import Path
 from typing import Any, Sequence
@@ -488,13 +489,39 @@ def test_interrupt_retries_until_run_is_registered(tmp_path: Path) -> None:
         daemon.close()
 
 
-# Appends one line per execution to the path in argv[1], then reports success after a short delay.
-_COUNT_SCRIPT = (
-    "import json, sys, time\n"
-    "open(sys.argv[1], 'a').write('x\\n')\n"
-    "time.sleep(1.0)\n"
-    "print(json.dumps({'outcome': 'emit', 'message': 'ok'}))\n"
-)
+# Publish the count after opening the optional gate, so the test can immediately release the child.
+_COUNT_SCRIPT = """\
+import json, sys
+from pathlib import Path
+counter = Path(sys.argv[1])
+gate = counter.with_suffix('.gate')
+reader = gate.open('rb', buffering=0) if gate.exists() else None
+with counter.open('a') as out:
+    out.write('x\\n')
+if reader is not None:
+    with reader:
+        reader.read(1)
+print(json.dumps({'outcome': 'emit', 'message': 'ok'}))
+"""
+
+
+@contextmanager
+def _hold_count(counter: Path):
+    gate = counter.with_suffix(".gate")
+    os.mkfifo(gate)
+    # RDWR keeps entering and releasing nonblocking even if the child fails to start.
+    with os.fdopen(os.open(gate, os.O_RDWR), "wb", buffering=0) as writer:
+        try:
+            yield
+        finally:
+            gate.unlink()
+            writer.write(b"1")
+
+
+async def _count_started(counter: Path) -> None:
+    async with asyncio.timeout(10):
+        while not counter.exists():
+            await asyncio.sleep(0.01)
 
 
 def _count_drivers() -> dict[str, TemplateCLIDriver]:
@@ -535,17 +562,17 @@ def test_agent_accepts_duplicate_submit_of_inflight_run_when_slots_full(tmp_path
         await asyncio.wait_for(ready.wait(), 5.0)
         submit = {"type": "run.submit", "conn_epoch": 1, "caller_id": "hibernaut", "request": req.to_dict()}
 
-        await send_json(conn["w"], submit, mask=False)
-        first = await asyncio.wait_for(frames.get(), 5.0)
-        assert first["type"] == "run.accepted" and first["accepted"] is True
-        while not counter.exists():
-            await asyncio.sleep(0.02)
-        assert daemon.capabilities_sync().slots.available == 0
+        with _hold_count(counter):
+            await send_json(conn["w"], submit, mask=False)
+            first = await asyncio.wait_for(frames.get(), 5.0)
+            assert first["type"] == "run.accepted" and first["accepted"] is True
+            await _count_started(counter)
+            assert daemon.capabilities_sync().slots.available == 0
 
-        await send_json(conn["w"], submit, mask=False)
-        second = await asyncio.wait_for(frames.get(), 5.0)
-        assert second["type"] == "run.accepted"
-        assert second["accepted"] is True, f"in-flight run_id rejected: {second.get('reason')}"
+            await send_json(conn["w"], submit, mask=False)
+            second = await asyncio.wait_for(frames.get(), 5.0)
+            assert second["type"] == "run.accepted"
+            assert second["accepted"] is True, f"in-flight run_id rejected: {second.get('reason')}"
 
         completed = [await asyncio.wait_for(frames.get(), 10.0) for _ in range(2)]
         assert [f["type"] for f in completed] == ["run.completed", "run.completed"]
@@ -629,15 +656,16 @@ def test_hub_overlapping_waiters_on_one_run_id_share_one_submission(tmp_path: Pa
         await agent.start()
         await agent.wait_connected()
 
-        impatient = asyncio.create_task(asyncio.wait_for(hub.run(req), 0.4))
-        await asyncio.sleep(0.1)
-        patient = asyncio.create_task(hub.run(req))
-        await asyncio.sleep(0.1)
-        rec = hub.registry.get("share-1")
-        assert rec is not None and rec.reserved_slots == 1, "the second waiter reserved another slot"
-
-        with pytest.raises(asyncio.TimeoutError):
-            await impatient
+        with _hold_count(counter):
+            impatient = asyncio.create_task(hub.run(req))
+            await _count_started(counter)
+            patient = asyncio.create_task(hub.run(req))
+            # Let the second waiter enter hub.run before cancelling the first one's wait.
+            await asyncio.sleep(0)
+            rec = hub.registry.get("share-1")
+            assert rec is not None and rec.reserved_slots == 1, "the second waiter reserved another slot"
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(impatient, timeout=0)
         got = await asyncio.wait_for(patient, 10.0)
         assert got.status == "succeeded"
         assert counter.read_text(encoding="utf-8") == "x\n"

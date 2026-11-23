@@ -8,12 +8,12 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from agent_runtime.adapters.channels.gdrive_tasks import DriveTaskPoller, parse_task_markdown
-from agent_runtime.adapters.delivery import MERGE_TOOL, OPEN_PR_TOOL, PRDelivery
+from agent_runtime.adapters.delivery import MERGE_TOOL, OPEN_PR_TOOL, DeliveryConfig, DeliveryRecord, PRDelivery
 from agent_runtime.adapters.executor_cli import OrcaWorktreeManager
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.project_guidance import Selection, load_guidance, pin_head
 from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
-from agent_runtime.adapters.executor_cli.sde import SDE_SCHEMA, SDEExecutor, SDEOptions
+from agent_runtime.adapters.executor_cli.sde import SDE_SCHEMA, SDEExecutor, SDEOptions, _State
 from agent_runtime.adapters.permissions.security import AutoModePermissionAdapter
 from agent_runtime.adapters.storage_sqlite import SQLiteSessionStoreAdapter
 from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
@@ -215,56 +215,56 @@ class TestSDEDelivery(SDEDeliveryCase):
         assert isinstance(outcome, Emit), outcome
         self.assertIn("# Reject zero\n\ndivide must raise on zero", self.calls("sde")[0]["prompt"])
 
+
+class TestSDEDeliveryResult(unittest.IsolatedAsyncioTestCase):
+    url = "https://github.example/o/r/pull/1"
+
+    async def finish(self, record=None, *, auto_merge=False, open_pr=True):
+        delivery = None
+        if record is not None:
+            delivery = PRDelivery(DeliveryConfig(open_pr=open_pr, auto_merge=auto_merge), Mock(), env={})
+            self.enterContext(patch.object(delivery, "deliver", return_value=record))
+        executor = SDEExecutor(profile=ClaudeCodeProfile(name="sde"), options=SDEOptions(review=False), reviewer=None,
+                               worktree_manager=Mock(spec=OrcaWorktreeManager), inbox_checkout_map={}, tasks=Mock(),
+                               delivery=delivery)
+        state = _State(stage="develop", requirements="divide", base_ref="main", workdir="/test/repo", change_kind="fix")
+        return await executor._finish("session", "native", state, Mock(permissions=InMemoryPermission()), review="pass")
+
     async def test_a_merged_delivery_closes_the_session(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
-        outcome = await self.executor(delivery=self.delivery(auto_merge=True)).execute(
-            [event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
+        record = DeliveryRecord(state="merged", pr_url=self.url, history=["deleted origin/hb/task-1"])
+        outcome = await self.finish(record, auto_merge=True)
+        self.assertIsInstance(outcome, Emit)
         self.assertTrue(outcome.close_session)
-        text = outcome.messages[0]
-        self.assertIn("Delivery: merged", text)
-        self.assertIn("deleted origin/hb/task-1", text)
-        self.assertIn("Worktree: the PR is merged", text)
+        for part in ("Delivery: merged", "deleted origin/hb/task-1", "Worktree: the PR is merged"):
+            self.assertIn(part, outcome.messages[0])
 
     async def test_an_open_pr_keeps_the_session(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})], reviewer=[PASS])
-        outcome = await self.executor(delivery=self.delivery()).execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
+        outcome = await self.finish(DeliveryRecord(state="pr_open", pr_url=self.url))
+        self.assertIsInstance(outcome, Emit)
         self.assertFalse(outcome.close_session)
         self.assertNotIn("Worktree: the PR is merged", outcome.messages[0])
 
     async def test_the_result_carries_the_delivery_outcome_for_the_outbox(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
-        state = self.gh_state()
-        state["checks"] = [{"name": "gates", "state": "FAILURE", "bucket": "fail"}]
-        self.state_file.write_text(json.dumps(state))
-        outcome = await self.executor(delivery=self.delivery(auto_merge=True)).execute(
-            [event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
+        record = DeliveryRecord(state="pr_open", pr_url=self.url, merge_hold="ci", merge_hold_detail="CI failed (gates)")
+        outcome = await self.finish(record, auto_merge=True)
+        self.assertIsInstance(outcome, Emit)
         self.assertEqual((outcome.status, outcome.close_session), ("done", False))
-        self.assertEqual(outcome.delivery, DeliveryOutcome(
-            state="pr_open", pr_url="https://github.example/o/r/pull/1", auto_merge=True, hold="ci",
-            hold_detail="CI failed (gates)"))
+        self.assertEqual(outcome.delivery, DeliveryOutcome(state="pr_open", pr_url=self.url, auto_merge=True,
+                                                           hold="ci", hold_detail="CI failed (gates)"))
 
     async def test_a_merged_result_carries_a_merged_outcome(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
-        outcome = await self.executor(delivery=self.delivery(auto_merge=True)).execute(
-            [event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
-        self.assertEqual(outcome.delivery, DeliveryOutcome(
-            state="merged", pr_url="https://github.example/o/r/pull/1", auto_merge=True))
+        outcome = await self.finish(DeliveryRecord(state="merged", pr_url=self.url), auto_merge=True)
+        self.assertIsInstance(outcome, Emit)
+        self.assertEqual(outcome.delivery, DeliveryOutcome(state="merged", pr_url=self.url, auto_merge=True))
 
     async def test_without_delivery_the_result_carries_no_outcome(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])
-        outcome = await self.executor(review=False).execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
+        outcome = await self.finish()
+        self.assertIsInstance(outcome, Emit)
         self.assertIsNone(outcome.delivery)
 
     async def test_local_delivery_keeps_the_session(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])
-        outcome = await self.executor(review=False, delivery=self.delivery(open_pr=False)).execute(
-            [event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
+        outcome = await self.finish(DeliveryRecord(), open_pr=False)
+        self.assertIsInstance(outcome, Emit)
         self.assertFalse(outcome.close_session)
 
 

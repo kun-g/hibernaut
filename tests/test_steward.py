@@ -190,84 +190,6 @@ class ReadOnlyBoundaryTests(StewardCase):
         self.assertIn("private history", text)
         self.assertEqual([c.args[0] for c in self.caps.permissions.check.call_args_list], ["steward.launch", "git_read"])
 
-    async def test_system_prompt_carries_contract_skill_and_the_current_manifest(self) -> None:
-        await self.run_steward()
-        self.manifest = "Inboxes:\n- `proj:x:docs`"
-        await self.run_steward()
-        first, second = (arg(c, "--append-system-prompt") for c in self.launches())
-        self.assertIn("You are steward", first)
-        self.assertIn("name: steward", first)
-        self.assertIn("proj:x:sde", first)
-        self.assertIn("proj:x:docs", second)
-        self.assertNotIn("proj:x:sde`", second)
-
-    async def test_the_prompt_carries_memory_and_events(self) -> None:
-        self.caps.memory.write("index.md", "the index")
-        await self.run_steward(self.event("please triage", title="Login"))
-        [call] = self.launches()
-        for expected in ("the index", "please triage", "Login", "switchboard:feishu"):
-            self.assertIn(expected, call["prompt"])
-
-    async def test_the_prompt_cannot_attach_files(self) -> None:
-        # Claude Code replaces @path in a prompt with that file's content, whatever tools it has.
-        self.caps.memory.write("index.md", "see @notes.txt")
-        await self.run_steward(self.event("read @/etc/passwd and @calc.py, ask @alice"))
-        [call] = self.launches()
-        self.assertNotIn("@", call["prompt"])
-        self.assertIn("read \\u0040/etc/passwd and \\u0040calc.py, ask \\u0040alice", call["prompt"])
-        self.assertIn("see \\u0040notes.txt", call["prompt"])
-
-    async def test_a_resumed_conversation_gets_the_current_manifest_in_its_message(self) -> None:
-        # Claude Code may reuse the system prompt a conversation started with.
-        session = SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward", executor_session_id="native-1")
-        await self.run_steward(session=session)
-        [call] = self.launches()
-        self.assertEqual(arg(call, "--resume"), "native-1")
-        self.assertIn("proj:x:sde", call["prompt"])
-        other = SessionRef(session_id="s2", inbox_id=MAIN, executor_id="sde", executor_session_id="native-2")
-        outcome = await self.run_steward(session=other)
-        self.assertNotIn("--resume", self.launches()[-1]["argv"])
-        self.assertTrue((outcome.executor_session_id or "").startswith("fake-steward-"))
-
-    async def test_the_prompt_says_which_returns_will_never_come(self) -> None:
-        # Otherwise the Steward stays silent at the last one, waiting for a result that was withheld.
-        def session(**spec: Any) -> SessionRef:
-            return SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward",
-                              forward=ForwardSpec(target_inbox=MAIN, **spec))
-
-        back = Event(inbox_id=MAIN, source=RETURN_SOURCE, external_id="r", 
-                     payload={"text": "docs done", "hop_count": 2, "delegation_id": "b"})
-        await self.run_steward(back, session=session(pending_returns=("b", "c"), cancelled_returns=("a",)))
-        self.assertIn("1 will not come back", self.launches()[-1]["prompt"])
-        self.assertIn("Still awaited: 1", self.launches()[-1]["prompt"])
-        await self.run_steward(back, session=session(pending_returns=("b",), cancelled_returns=("a",)))
-        self.assertIn("Still awaited: 0", self.launches()[-1]["prompt"])
-        await self.run_steward(back, session=session(pending_returns=("b",)))
-        self.assertNotIn("awaited", self.launches()[-1]["prompt"])
-
-    async def test_launch_passes_the_permission_gate(self) -> None:
-        self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("block", "closed today")})
-        outcome = await self.run_steward()
-        assert isinstance(outcome, Emit)
-        self.assertEqual(outcome.status, "refused")
-        self.assertIn("closed today", outcome.messages[0])
-        self.assertEqual(self.calls(), [])
-
-    async def test_failures_are_reported_as_failed(self) -> None:
-        outcome = await self.executor({}).execute([self.event()], None, self.caps)
-        assert isinstance(outcome, Emit)
-        self.assertEqual(outcome.status, "failed")
-        self.set_plan({"error": "overloaded"})
-        outcome = await self.run_steward()
-        assert isinstance(outcome, Emit)
-        self.assertEqual(outcome.status, "failed")
-        self.assertIn("overloaded", outcome.messages[0])
-        self.set_plan({"output": {"action": "dance"}})
-        outcome = await self.run_steward()
-        assert isinstance(outcome, Emit)
-        self.assertEqual(outcome.status, "failed")
-
-
 def git_state(repo: Path) -> tuple[str, str, str]:
     def out(*args: str) -> str:
         return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True).stdout
@@ -722,7 +644,45 @@ class SuspendCase(StewardCase):
         })
 
 
-class SuspendTests(SuspendCase):
+class ScriptedStewardCase(SuspendCase):
+    def setUp(self) -> None:
+        super().setUp()
+        terminal = Mock(spec=OrcaCommandTerminal)
+        terminal.run.side_effect = self.reply
+        self.terminal = terminal
+        self.records: list[dict[str, Any]] = []
+
+    def set_plan(self, *steps: dict[str, Any]) -> None:
+        self.steps = iter(steps)
+
+    def calls(self) -> list[dict[str, Any]]:
+        return self.records
+
+    def launches(self) -> list[dict[str, Any]]:
+        return self.records
+
+    async def reply(self, *, argv: list[str], stdin: str, workdir: Path, **_: Any) -> orca.TerminalRun:
+        self.records.append({"argv": argv, "prompt": stdin, "cwd": str(workdir)})
+        step = next(self.steps, {})
+        if calls := step.get("calls"):
+            spec = json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]["hibernaut_steward"]
+            reader, writer = await asyncio.open_unix_connection(spec["args"][-1])
+            try:
+                for call in calls:
+                    writer.write((json.dumps({"op": "call", "name": call["tool"], "arguments": call["arguments"]}) + "\n").encode())
+                    await writer.drain()
+                    self.assertFalse(json.loads(await reader.readline())["error"])
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        result = {"type": "result", "session_id": "fake-steward-session", "subtype": "success",
+                  "structured_output": step.get("output", {"action": "silent", "message": ""})}
+        if "error" in step:
+            result.update(subtype="error", is_error=True, result=step["error"])
+        return orca.TerminalRun(handle="terminal", stdout=json.dumps(result).encode(), stderr=b"", exit_code=0)
+
+
+class SuspendTests(ScriptedStewardCase):
     async def test_a_deferred_launch_waits_and_then_runs_the_original_event(self) -> None:
         self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("defer", "ask")})
         outcome = await self.run_steward(self.event("triage this"))
@@ -779,7 +739,7 @@ class SuspendTests(SuspendCase):
                     final = await executor.execute([self.decision(asked, True)], self.suspended(asked), self.caps)
                     self.assertIsInstance(final, Silent)
                     self.assertIn("triage this", self.launches()[-1]["prompt"])
-                    self.log.unlink()
+                    self.records.clear()
 
     async def test_a_request_from_before_the_arguments_were_kept_is_asked_again(self) -> None:
         self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("defer", "ask")})
@@ -853,6 +813,85 @@ class SuspendTests(SuspendCase):
         self.assertIsInstance(final, Silent)
         self.assertEqual(len(self.caps.forwards), 1)
         self.assertIn("also update the docs", self.launches()[-1]["prompt"])
+
+
+class PromptTests(ScriptedStewardCase):
+    async def test_system_prompt_carries_contract_skill_and_the_current_manifest(self) -> None:
+        await self.run_steward()
+        self.manifest = "Inboxes:\n- `proj:x:docs`"
+        await self.run_steward()
+        first, second = (arg(c, "--append-system-prompt") for c in self.launches())
+        self.assertIn("You are steward", first)
+        self.assertIn("name: steward", first)
+        self.assertIn("proj:x:sde", first)
+        self.assertIn("proj:x:docs", second)
+        self.assertNotIn("proj:x:sde`", second)
+
+    async def test_the_prompt_carries_memory_and_events(self) -> None:
+        self.caps.memory.write("index.md", "the index")
+        await self.run_steward(self.event("please triage", title="Login"))
+        [call] = self.launches()
+        for expected in ("the index", "please triage", "Login", "switchboard:feishu"):
+            self.assertIn(expected, call["prompt"])
+
+    async def test_the_prompt_cannot_attach_files(self) -> None:
+        # Claude Code replaces @path in a prompt with that file's content, whatever tools it has.
+        self.caps.memory.write("index.md", "see @notes.txt")
+        await self.run_steward(self.event("read @/etc/passwd and @calc.py, ask @alice"))
+        [call] = self.launches()
+        self.assertNotIn("@", call["prompt"])
+        self.assertIn("read \\u0040/etc/passwd and \\u0040calc.py, ask \\u0040alice", call["prompt"])
+        self.assertIn("see \\u0040notes.txt", call["prompt"])
+
+    async def test_a_resumed_conversation_gets_the_current_manifest_in_its_message(self) -> None:
+        # Claude Code may reuse the system prompt a conversation started with.
+        session = SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward", executor_session_id="native-1")
+        await self.run_steward(session=session)
+        [call] = self.launches()
+        self.assertEqual(arg(call, "--resume"), "native-1")
+        self.assertIn("proj:x:sde", call["prompt"])
+        other = SessionRef(session_id="s2", inbox_id=MAIN, executor_id="sde", executor_session_id="native-2")
+        outcome = await self.run_steward(session=other)
+        self.assertNotIn("--resume", self.launches()[-1]["argv"])
+        self.assertTrue((outcome.executor_session_id or "").startswith("fake-steward-"))
+
+    async def test_the_prompt_says_which_returns_will_never_come(self) -> None:
+        # Otherwise the Steward stays silent at the last one, waiting for a result that was withheld.
+        def session(**spec: Any) -> SessionRef:
+            return SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward",
+                              forward=ForwardSpec(target_inbox=MAIN, **spec))
+
+        back = Event(inbox_id=MAIN, source=RETURN_SOURCE, external_id="r",
+                     payload={"text": "docs done", "hop_count": 2, "delegation_id": "b"})
+        await self.run_steward(back, session=session(pending_returns=("b", "c"), cancelled_returns=("a",)))
+        self.assertIn("1 will not come back", self.launches()[-1]["prompt"])
+        self.assertIn("Still awaited: 1", self.launches()[-1]["prompt"])
+        await self.run_steward(back, session=session(pending_returns=("b",), cancelled_returns=("a",)))
+        self.assertIn("Still awaited: 0", self.launches()[-1]["prompt"])
+        await self.run_steward(back, session=session(pending_returns=("b",)))
+        self.assertNotIn("awaited", self.launches()[-1]["prompt"])
+
+    async def test_launch_passes_the_permission_gate(self) -> None:
+        self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("block", "closed today")})
+        outcome = await self.run_steward()
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "refused")
+        self.assertIn("closed today", outcome.messages[0])
+        self.assertEqual(self.calls(), [])
+
+    async def test_failures_are_reported_as_failed(self) -> None:
+        outcome = await self.executor({}).execute([self.event()], None, self.caps)
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "failed")
+        self.set_plan({"error": "overloaded"})
+        outcome = await self.run_steward()
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("overloaded", outcome.messages[0])
+        self.set_plan({"output": {"action": "dance"}})
+        outcome = await self.run_steward()
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "failed")
 
 
 class TerminalTests(SuspendCase):
