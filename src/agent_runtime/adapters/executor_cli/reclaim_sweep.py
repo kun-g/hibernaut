@@ -51,7 +51,7 @@ class WorktreeReclaimSweeper:
     # is merged and that nothing uses any more is reclaimed through OrcaWorktreeManager.reclaim, with all its gates.
     # Only rows of the workspaces table in 'ready' state are looked at, and only those whose checkout belongs to a
     # configured project (target_for). A skip is logged once per worktree and reason, never sent to the Outbox; the
-    # Outbox hears of a worktree only when the sweep finally reclaims it.
+    # Outbox hears of a worktree only when the sweep finally reclaims it, or forgets one whose directory is gone.
     def __init__(
         self,
         *,
@@ -120,8 +120,18 @@ class WorktreeReclaimSweeper:
         target = self._target_for(record)
         if target is None:
             return skipped(f"checkout {record.repo_checkout} belongs to no configured project")
-        if not Path(record.workdir).name.startswith("hb-"):
+        workdir = Path(record.workdir)
+        if not workdir.name.startswith("hb-"):
             return skipped(f"Refused reclaim for '{record.workdir}': directory name lacks 'hb-' prefix")
+        if not workdir.exists() and not workdir.is_symlink():
+            # Removed outside Hibernaut: its sessions can never resume and its HEAD cannot be read for merge evidence,
+            # so reclaim() forgets it once nothing queued or running still needs it.
+            head = merged_head(target.delivery, self._deliveries, record.work_key)
+            result = target.manager.reclaim(record.work_key, merged_head=head)
+            if not result.reclaimed:
+                return skipped(result.reason)
+            self._outbox.enqueue(target.inbox_id, result.reason, metadata={"kind": "reclaim_alert"})
+            return SweepOutcome(record.work_key, record.workdir, True, "forgotten: directory no longer exists")
         # Database-only checks first, so a busy worktree costs no git or GitHub call.
         in_use = target.manager.in_use(record)
         if in_use is not None:
