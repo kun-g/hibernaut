@@ -17,6 +17,8 @@
 
 仓库只保存模板。`.env`、`switchboard.toml`、`Caddyfile` 是每台机器的实例文件，已在 `.gitignore` 中忽略。
 
+与 Taskboard 一起部署、同一域名下按 `/switchboard`、`/taskboard` 子路径分流（Dokploy / Traefik 或 Caddy）、路由切到经 Taskboard 与回滚、旧域名下线，见 [`deploy/taskboard/README.md`](../taskboard/README.md)。
+
 ## 前提
 
 - VPS 已安装 Docker Engine 与 Compose 插件（`docker compose version` 可用）。
@@ -35,7 +37,7 @@ chmod 600 .env
 ```
 
 1. `Caddyfile`：把 `sb.example.com` 换成你的域名。
-2. `switchboard.toml`：按需改 `[routing]`（仓库、飞书群到 `inbox_id` 的映射）、`[github]`、`[feishu]`、`[outbound]`。`[github] require_label`（默认 `hibernaut`）决定哪些 Issue/PR 及其评论会入站，公开仓库不要清空；`[routing.event_consumers]` 在没有 Taskboard 时把 Issue/PR 事件直接投给 Hibernaut，部署了 Taskboard 再删掉。不要改 `[http] host/port`、`[sqlite] path` 和 `[relay] path`，它们与 Dockerfile、Compose、Caddyfile 对应；不要设置 `[relay] listen_port`，Caddy 只转发 8790。
+2. `switchboard.toml`：按需改 `[routing]`（仓库、飞书群到 `inbox_id` 的映射）、`[github]`、`[feishu]`、`[outbound]`。`[github] require_label`（默认 `hibernaut`）决定哪些 Issue/PR 及其评论会入站，公开仓库不要清空；`[routing.event_consumers]` 在没有 Taskboard 时把 Issue/PR 事件直接投给 Hibernaut，部署了 Taskboard 再删掉（切流与回滚见 [`deploy/taskboard/README.md`](../taskboard/README.md) 第 4 节）。不要改 `[http] host/port`、`[sqlite] path` 和 `[relay] path`，它们与 Dockerfile、Compose、Caddyfile 对应；不要设置 `[relay] listen_port`，Caddy 只转发 8790。
 3. `.env`：填下表中的变量，令牌可用 `openssl rand -hex 32` 生成。
 
    | 变量 | 内容 |

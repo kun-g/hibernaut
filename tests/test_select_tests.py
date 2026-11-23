@@ -38,7 +38,12 @@ class TestSelectTests(unittest.TestCase):
     def test_taskboard_service_entry_and_example_config_select_service_tests(self) -> None:
         entry = select_tests(["src/taskboard/app/__main__.py"])
         self.assertEqual(
-            entry.tests, ("tests/taskboard/test_m7_service.py", "tests/test_taskboard_dual_process_e2e.py")
+            entry.tests,
+            (
+                "tests/taskboard/test_m7_service.py",
+                "tests/test_taskboard_dual_process_e2e.py",
+                "tests/test_taskboard_triple_process_e2e.py",
+            ),
         )
         example = select_tests(["taskboard.example.toml"])
         self.assertFalse(example.full_suite)
@@ -48,6 +53,28 @@ class TestSelectTests(unittest.TestCase):
         res = select_tests(["deploy/switchboard/Dockerfile"])
         self.assertFalse(res.full_suite)
         self.assertEqual(res.tests, ("tests/test_switchboard_deploy.py",))
+
+    def test_taskboard_deploy_kit_and_prepare_script_select_the_deploy_test(self) -> None:
+        for changed in (
+            "deploy/taskboard/Dockerfile",
+            "deploy/taskboard/docker-compose.yml",
+            "deploy/taskboard/README.md",
+            "scripts/prepare_taskboard_deploy.py",
+        ):
+            with self.subTest(changed):
+                res = select_tests([changed])
+                self.assertFalse(res.full_suite)
+                self.assertEqual(res.tests, ("tests/test_taskboard_deploy.py",))
+
+    def test_triple_process_e2e_runs_when_any_of_its_three_entrypoints_changes(self) -> None:
+        for entry in (
+            "src/switchboard/app.py",
+            "src/taskboard/app/__main__.py",
+            "src/agent_runtime/app/main.py",
+            "tests/dual_process_hibernaut.py",
+        ):
+            with self.subTest(entry):
+                self.assertIn("tests/test_taskboard_triple_process_e2e.py", select_tests([entry]).tests)
 
     def test_delivery_and_channel_changes_stay_scoped_to_affected_tests(self) -> None:
         delivery = select_tests(["src/agent_runtime/adapters/delivery/pr_delivery.py"])

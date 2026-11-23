@@ -31,3 +31,9 @@ deploy/switchboard/.env
 deploy/switchboard/switchboard.toml
 deploy/switchboard/Caddyfile
 !deploy/switchboard/.env.example
+
+# Taskboard container deployment (joint stack with Switchboard): only templates are tracked
+deploy/taskboard/.env
+deploy/taskboard/taskboard.toml
+deploy/taskboard/Caddyfile
+!deploy/taskboard/.env.example

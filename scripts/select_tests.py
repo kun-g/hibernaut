@@ -54,6 +54,13 @@ STATIC_DEPS: dict[str, tuple[str, ...]] = {
     # Both start `python -m taskboard.app`; the dual-process test also `python -m switchboard.app`.
     "tests/taskboard/test_m7_service.py": ("src/taskboard/app/__main__.py",),
     "tests/test_taskboard_dual_process_e2e.py": ("src/taskboard/app/__main__.py", "src/switchboard/app.py"),
+    # Starts all three: switchboard.app, taskboard.app and Hibernaut main() through dual_process_hibernaut.py.
+    "tests/test_taskboard_triple_process_e2e.py": (
+        "src/taskboard/app/__main__.py",
+        "src/switchboard/app.py",
+        "src/agent_runtime/app/main.py",
+        "tests/dual_process_hibernaut.py",
+    ),
 }
 
 RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -63,6 +70,8 @@ RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("taskboard.example.toml", ("tests/taskboard/test_m7_service.py",)),
     ("deploy/gdrive-proxy/**", ("tests/test_gdrive_credential_proxy.py",)),
     ("deploy/switchboard/**", ("tests/test_switchboard_deploy.py",)),
+    ("deploy/taskboard/**", ("tests/test_taskboard_deploy.py",)),
+    ("scripts/prepare_taskboard_deploy.py", ("tests/test_taskboard_deploy.py",)),
     ("deploy/ccpeer/**", ("tests/test_ccpeer.py",)),
     (
         "schemas/taskboard/**",
