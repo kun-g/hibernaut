@@ -81,6 +81,58 @@ class TestConflictResolution(unittest.TestCase):
                 self.setUp()
                 self.assertFalse(self.resolve(files)[0])
 
+    def block(self, base, ours, theirs, resolved):
+        # One conflict block in the middle of a file.
+        def text(lines):
+            return "".join(f"{ln}\n" for ln in ["top = 1", "", *lines, "", "end = 1"])
+
+        self.setUp()
+        self.commit({"f.py": text(base)}, "base file")
+        run_git(self.repo, "checkout", "-q", "main")
+        run_git(self.repo, "merge", "-q", "task")
+        run_git(self.repo, "checkout", "-q", "task")
+        return self.resolve({"f.py": text(resolved)}, ours={"f.py": text(ours)}, theirs={"f.py": text(theirs)})[0]
+
+    def test_a_block_may_combine_what_the_sides_have(self):
+        for name, args in {
+            "both calls kept": ([], ["notify(a)"], ["notify(b)"], ["notify(a)", "notify(b)"]),
+            "the other order": ([], ["notify(a)"], ["notify(b)"], ["notify(b)", "notify(a)"]),
+            "both functions kept": ([], ["def f():", "    return 1"], ["def g():", "    return 1"],
+                                    ["def f():", "    return 1", "def g():", "    return 1"]),
+            "arguments combined": (["call(x)"], ["call(x, a)"], ["call(x, b)"], ["call(x, a, b)"]),
+            "one side deleted it": (["call(x)"], ["call(x, a)"], [], []),
+            "documents": (["说明一。"], ["说明一。补充甲。"], ["说明一。补充乙。"], ["说明一。补充甲。补充乙。"]),
+        }.items():
+            with self.subTest(name):
+                self.assertTrue(self.block(*args))
+
+    def test_a_block_that_the_sides_do_not_explain_is_reviewed(self):
+        two = ([], ["notify(a)"], ["notify(b)"])
+        for name, args in {
+            "a call of one side twice": (*two, ["notify(a)", "notify(a)"]),
+            "a call repeated beyond both sides": (*two, ["notify(a)", "notify(b)", "notify(b)"]),
+            "a call repeated with words of the other side": ([], ["notify(a, b)"], ["notify(b)"],
+                                                             ["notify(b)", "notify(b)"]),
+            "lines that look like a separator": ([], ["Title", "======="], ["other"], ["Title", "=======", "other"]),
+            "spaces in a string": ([], ["notify('a b')"], ["notify(b)"], ["notify('a  b')", "notify(b)"]),
+            "a changed call kept in both versions": (["notify(x)"], ["notify(a)"], ["notify(b)"],
+                                                     ["notify(a)", "notify(b)"]),
+            "words in another order": ([], ["send(a, b)"], ["send(c)"], ["send(b, a)"]),
+            "both sides dropped": (*two, []),
+            "part of one side": ([], ["check(a)", "notify(a)"], ["notify(b)"], ["notify(a)"]),
+            "what both sides kept dropped": (["if ok:", "    run(x)"], ["if ok:", "    run(a)"], ["if ok:", "    run(b)", "    log()"],
+                                             ["run(a)", "log()"]),
+            "another indentation": ([], ["if a:", "    f()", "g()"], ["h()"], ["if a:", "    f()", "    g()", "h()"]),
+            "quotes": ([], ["notify(a)"], ["notify(b)"], ['notify("a")', "notify(b)"]),
+        }.items():
+            with self.subTest(name):
+                self.assertFalse(self.block(*args))
+
+    def test_each_block_is_explained_by_its_own_sides(self):
+        # new(y) belongs to the second block; using it in the first one is another change.
+        swapped = self.MERGED.replace("new(x)", "new(y)")
+        self.assertFalse(self.resolve({"f.py": swapped})[0])
+
     def test_conflicts_without_blocks_are_not_judged(self):
         # main deleted a file the task changed: restoring the task's copy changes nothing, removing it is a decision.
         for remove, expected in (((), True), (("keep.py",), False)):
@@ -268,7 +320,10 @@ class TestHandBackReview(SDEDeliveryCase):
     async def test_the_version_file_hides_no_other_change_made_before_the_hand_back(self):
         await self.sneaky_commit(VERSION_FILE)
 
-    async def sneaky_commit(self, rel):
+    async def test_the_version_file_hides_no_mode_change_made_before_the_hand_back(self):
+        await self.sneaky_commit(VERSION_FILE, mode=0o755, shown="new mode 100755")
+
+    async def sneaky_commit(self, rel, mode=0, shown="+s = 1"):
         self.conflict()
         delivery = self.delivery()
         original, done = delivery.deliver, []
@@ -277,7 +332,10 @@ class TestHandBackReview(SDEDeliveryCase):
             if not done:
                 done.append(True)
                 target = self.wt / rel
-                target.write_text((target.read_text() if target.exists() else "") + "s = 1\n")
+                if mode:
+                    target.chmod(mode)
+                else:
+                    target.write_text((target.read_text() if target.exists() else "") + "s = 1\n")
                 run_git(self.wt, "add", "-A")
                 run_git(self.wt, "commit", "-qm", "sneaky")
             return original(request, **kwargs)
@@ -289,7 +347,7 @@ class TestHandBackReview(SDEDeliveryCase):
         self.assertEqual(len(self.calls("reviewer")), 2)
         delta = self.delta()[0]
         self.assertIn(rel, delta)
-        self.assertIn("+s = 1", delta)
+        self.assertIn(shown, delta)
 
     async def test_main_merged_during_a_fix_round_is_left_out_too(self):
         self.push_main(OTHER, message="main adds a module")
@@ -301,6 +359,46 @@ class TestHandBackReview(SDEDeliveryCase):
         self.assertIn("raise ValueError", delta)
         self.assertNotIn("main_only.py", delta)
         self.assertNotIn("main_only.py", prompt.split("## Incremental review\n")[1])
+
+    async def test_a_repeated_call_in_a_conflict_is_reviewed(self):
+        self.push_main({"calc.py": "def divide(a, b):\n    notify(b)\n    return a\n"}, message="notify b")
+        self.set_plan(sde=[dev({"calc.py": "def divide(a, b):\n    notify(a)\n    return a\n"}),
+                           self.merge_step({"calc.py": "def divide(a, b):\n    notify(a)\n    notify(a)\n    return a\n"})],
+                      reviewer=[PASS, PASS])
+        outcome = await self.executor(delivery=self.delivery()).execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertEqual(len(self.calls("reviewer")), 2)
+        self.assertNotIn("not reviewed again", outcome.messages[0])
+
+    async def merged_in_a_fix_round(self, delivery, base_ref):
+        # The task's local main stays behind; the developer merges origin/main while fixing round 1's item.
+        self.push_main(OTHER, message="main adds a module")
+        self.set_plan(sde=[dev({"calc.py": TASK_CALC}), {**dev(FIX), "run": [["git", "fetch", "-q"], *MERGE_MAIN]}],
+                      reviewer=[FIRST, PASS])
+        outcome = await self.executor(delivery=delivery).execute(
+            [event(self.payload(base_ref=base_ref))], None, self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertNotEqual(out(self.wt, "rev-parse", "main"), out(self.wt, "rev-parse", "origin/main"))
+        delta, prompt = self.delta()
+        self.assertIn("raise ValueError", delta)
+        self.assertNotIn("main_only.py", delta)
+        self.assertNotIn("main_only.py", prompt.split("## Code diff")[1])
+
+    async def test_a_delivery_without_prs_still_knows_the_remote_base(self):
+        await self.merged_in_a_fix_round(self.delivery(open_pr=False), "main")
+
+    async def test_without_delivery_a_local_base_stands_for_its_upstream(self):
+        await self.merged_in_a_fix_round(None, "main")
+
+    async def test_without_delivery_or_upstream_the_remote_branch_of_the_same_name_counts(self):
+        run_git(self.wt, "branch", "--unset-upstream", "main")
+        await self.merged_in_a_fix_round(None, "main")
+
+    async def test_the_default_base_is_resolved_the_same_way(self):
+        # Newer git recreates origin/HEAD on fetch.
+        run_git(self.wt, "config", "remote.origin.followRemoteHEAD", "never")
+        run_git(self.wt, "update-ref", "--no-deref", "-d", "refs/remotes/origin/HEAD")
+        await self.merged_in_a_fix_round(None, "")
 
     async def test_an_unreviewed_change_is_not_skipped(self):
         # review=pending (a declined retry) never counts as passed.

@@ -21,8 +21,10 @@ from agent_runtime.adapters.delivery import (
 from agent_runtime.adapters.executor_cli.base_merge import (
     SinceReview,
     changed_paths,
-    file_text,
+    newest_base,
     only_conflicts_resolved,
+    regular_file,
+    with_upstreams,
     without_base,
 )
 from agent_runtime.adapters.executor_cli.claude_code import (
@@ -41,6 +43,7 @@ from agent_runtime.adapters.executor_cli.orca import (
 from agent_runtime.adapters.executor_cli.peer import PEER_TOOLS, SUBAGENT_TOOLS
 from agent_runtime.adapters.executor_cli.process import is_approval, join_text, last_text, target_events
 from agent_runtime.adapters.executor_cli.project_guidance import (
+    DEFAULT_BASES,
     ENTRY_FILE,
     GuidanceDoc,
     GuidancePin,
@@ -847,9 +850,9 @@ class SDEExecutor:
     def _since_review(self, state: _State, workdir: Path, snapshot: str) -> SinceReview:
         delivery = self._delivery
         if delivery is None or not delivery.config.open_pr:
-            try:
-                base, _ = merge_base(workdir, state.base_ref)
-            except ValueError:
+            refs = with_upstreams(workdir, [state.base_ref] if state.base_ref else DEFAULT_BASES)
+            base = newest_base(workdir, snapshot, [delivery.base_ref, *refs] if delivery is not None else refs)
+            if not base:
                 return SinceReview(state.reviewed_snapshot.split(":", 1)[1])
         elif state.recheck:
             # What decides whether a review is needed at all is read from the remote, not from a local ref.
@@ -880,8 +883,11 @@ class SDEExecutor:
             since = without_base(workdir, reviewed, now, base_sha)
             tree = now.split(":", 1)[1]
             for path in changed_paths(workdir, since.tree, tree):
-                texts = [file_text(workdir, t, path) for t in (since.tree, tree)]
-                if path != delivery.config.version_file or not delivery.same_but_version(*texts):
+                before, after = (regular_file(workdir, t, path) for t in (since.tree, tree))
+                if path != delivery.config.version_file or before is None or after is None or before[0] != after[0]:
+                    return reviewed
+                texts = [blob.decode("utf-8", "surrogateescape") for _, blob in (before, after)]
+                if not delivery.same_but_version(*texts):
                     return reviewed
         except ReviewAborted:
             return reviewed
