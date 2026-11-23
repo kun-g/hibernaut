@@ -40,7 +40,7 @@
 - **`conn_epoch`**：RelayHub 给同一 `consumer_id` 每次握手成功分配的单调递增连接代号。新连接握手后旧连接以 Close 4009 关闭，任何携带非当前 `conn_epoch` 的 `ack` / `nack` 都被丢弃，防止两条连接同时确认（防脑裂）。
 - **ccpeer 接收端 vs. Claude Code 会话**：Claude Code 会话是 Orca 终端等处运行的交互式 `claude` 进程，在 `<配置目录>/sessions/` 登记 `messagingSocketPath`；ccpeer 接收端是以某个名字登记成 `standalone` 会话的常驻进程，只收不推理，把对方 `SendMessage(<名字>)` 的回复写进收件箱（`inbox.jsonl`，控制回执在 `control.jsonl`）。消息里的 `from-name`、`from-mode` 是发送方自称，不鉴别身份。
 - **交接方式（`handoff`）：`mcp` vs. `peer`**：Claude Code 角色会话取任务、交结果的通道，按项目配置。`mcp` 由启动器挂的 `hibernaut_handoff` MCP 服务读写 hb 进程所建的轮次目录；`peer` 把任务以 ccpeer 消息发给会话、会话 `SendMessage` 把结果 JSON 发回常驻接收端，hb 按持久化游标读收件箱。`task_id` 标识一次任务（取 Hibernaut `session_id`），`attempt_id` 标识其中一轮（首次开发、返工、跟进各一个），结果必须带上当前轮的两者才被接受。
-- **通审 vs. 增量复核**：SDE 内置评审的两种范围。通审看整份改动，任何问题都能阻断（第 1 轮，或人追加需求后的那一轮）；增量复核（其余各轮）只能阻断上一轮没修好的项和上一轮之后改动引入的新问题，范围外的阻断由程序降级为跟进。
+- **通审 vs. 增量复核**：SDE 内置评审的两种范围。通审看整份改动，任何问题都能阻断（第 1 轮，或没有上一轮阻断与交付交回可对照时）；增量复核（其余各轮，挂起期间有人跟进也一样）只能阻断上一轮没修好的项和上一轮之后改动引入的新问题，范围外的阻断由程序降级为跟进。
 - **跟进（评审）**：评审 `notes` 里不阻断的意见，含被降级的阻断；交付时列在 PR 正文与 Outbox 消息，不打回开发。与挂起期间人发来的 follow-up（并入需求）不是一回事。
 - **Taskboard（多源任务与 DAG 排期）**：负责归集来自多源的任务（`TaskItem`），维护任务状态与 DAG 先后依赖关系（`TaskDependency`，含环检测）；上游结案后自动解锁下游并经 Switchboard 发送 `work.ready` 事件唤醒 Hibernaut。不直接触碰 Session、Worktree 或执行器。
 - **Runner（执行面 / 执行节点）**：独立部署在本机（如 Mac）或远端 VPS 上的执行宿主服务，负责管理所在机器的磁盘工作区（Orca / `git worktree` 与三关安全回收）、子进程生命周期、日志流落盘及 `yetone/magpie` 环境对接，并在其内部托管多个具体 Executor。与 Hibernaut 控制面通过 `ExecutorPort` / `RunnerPort` 解耦，可跨项目复用。

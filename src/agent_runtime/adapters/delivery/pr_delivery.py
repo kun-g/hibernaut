@@ -41,8 +41,10 @@ TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRI
 _SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 _MAX_MAIN_MOVES = 3
 _TAIL = 4000
-# GitHub rejects a PR body over 65536 characters; the Outbox message always has the whole list.
-_MAX_FOLLOWUPS = 15_000
+# GitHub rejects a longer PR body; the Outbox message always has every follow-up in full.
+_MAX_BODY = 65_536
+# A follow-up that does not fit is cut, unless so little would be left that it says nothing.
+_MIN_CUT = 80
 # No CI result for this long while the base has moved past the PR: GitHub may never run CI for it.
 _EMPTY_CHECKS_GRACE = 300.0
 CIResult = Literal["passed", "failed", "stale"]
@@ -401,18 +403,26 @@ def remote_env(base: Mapping[str, str]) -> dict[str, str]:
     return env
 
 
-def _followup_list(notes: Sequence[str]) -> str:
+def _followup_list(notes: Sequence[str], room: int) -> str:
     # One line each. A zero-width space keeps a quoted decorator or number from pinging a person or closing an issue.
-    lines: list[str] = []
-    size = 0
-    for i, note in enumerate(notes):
-        line = "- " + re.sub(r"([@#])(?=\w)", "\\1\u200b", " ".join(note.split()))
-        size += len(line) + 1
-        if size > _MAX_FOLLOWUPS:
-            lines.append(f"- 另有 {len(notes) - i} 条，见 Hibernaut 完成消息")
+    lines = ["- " + re.sub(r"([@#])(?=\w)", "\\1\u200b", " ".join(note.split())) for note in notes]
+    full = "\n".join(lines)
+    if len(full) <= room:
+        return full
+
+    def ending(missing: int) -> str:
+        return f"- 已截断，另有 {missing} 条未列；全文见 Hibernaut 完成消息"
+
+    shown: list[str] = []
+    left = room - len(ending(len(lines)))
+    for line in lines:
+        if len(line) + 1 > left:
+            if left > _MIN_CUT:
+                shown.append(line[:left - 2] + "…")
             break
-        lines.append(line)
-    return "\n".join(lines)
+        shown.append(line)
+        left -= len(line) + 1
+    return "\n".join([*shown, ending(len(lines) - len(shown))])
 
 
 def _tail(text: str, limit: int = _TAIL) -> str:
@@ -832,17 +842,23 @@ class PRDelivery:
                         "recomputes it before merging.")
         review = f"review={req.review}" + (f"\n\n{req.review_detail}" if req.review_detail else "")
         issue = self._issue_line(req.issue)
-        return "\n\n".join([
+        before = [
             *([issue] if issue else []),
             f"## Summary\n{req.summary or '(none)'}",
             f"## Change\nKind: {req.change_kind}\n\nRationale: {req.rationale or '(none)'}",
             f"## Version\n{version}",
             f"## Checks (run by Hibernaut on {rec.head_sha[:12]})\n{checks}",
             f"## Review\n{review}",
-            *([f"## 跟进\n{_followup_list(req.followups)}"] if req.followups else []),
+        ]
+        after = [
             f"## Test evidence (from the developer)\n```text\n{_tail(req.test_evidence, 20000)}\n```",
             f"Delivered by Hibernaut for task `{req.work_key}`.",
-        ])
+        ]
+        if not req.followups:
+            return "\n\n".join([*before, *after])
+        heading = "## 跟进\n"
+        room = _MAX_BODY - len("\n\n".join([*before, heading, *after]))
+        return "\n\n".join([*before, heading + _followup_list(req.followups, room), *after])
 
     def _list_prs(self, cwd: Path, branch: str) -> list[dict[str, Any]]:
         proc = self._gh(cwd, "pr", "list", "--head", branch, "--base", self._config.base_branch, "--state", "all",

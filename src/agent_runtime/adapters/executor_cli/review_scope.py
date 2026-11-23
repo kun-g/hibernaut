@@ -13,8 +13,10 @@ INTRODUCED = "introduced_since_previous"
 BASES = (UNFIXED, INTRODUCED)
 _MAX_FILES_SHOWN = 300
 _TOKEN = re.compile(r"[^\s:,;()\[\]{}<>`'\"#|，。；：（）「」、]+")
-# Where an item says the work is; trigger and impact also name callers that are fine as they are.
-_ITEM_FILES = ("location", "fix")
+_LINE = re.compile(r"[:#]L?\d")
+_SPOT = re.compile(r"(?P<path>[^\s:,;()\[\]{}<>`'\"#|，。；：（）「」、]+)[:#]L?(?P<start>\d{1,9})(?:[-–]L?(?P<end>\d{1,9}))?")
+# How surely a finding is a previous item again, best first; the first two identify it without its number.
+_SAME_TRIGGER, _SAME_PLACE, _SAME_FILE, _ELSEWHERE = range(4)
 _DOWNGRADED = re.compile(r"（已降级：[^（）]*）$")
 
 
@@ -41,38 +43,60 @@ class ReviewScope:
                 "notes": notes, "downgraded": len(items) - len(blocking), "reviewer_verdict": review["verdict"]}
 
     def _reasons(self, items: list[dict[str, str]]) -> list[str]:
-        # Decided on what the program can check, not on the label alone:
-        # - a location in a changed file can be a new problem, whatever the label says;
-        # - an item numbered as a previous one stands for that previous item. Its location may be elsewhere (a missing test,
-        #   moved code), but then for one item only, so a number cannot carry further findings in unchanged code;
-        # - without a label or a usable number, the location must be in a file the previous items name, so a reviewer
-        #   that omits them never turns an unfixed item into a pass.
+        # Decided on what the program can check, not on the label alone. A location in a changed file can be a new
+        # problem, whatever the label says. Outside those files a finding must stand for a previous item, and each
+        # previous item backs one finding, so re-reviews can never block on more unchanged code than the round before.
         changed = set(self.changed)
-        previous = [(_text(p["location"]), self._files(" ".join(p.get(k, "") for k in _ITEM_FILES)))
-                    for p in self.previous]
-        files = [self._files(item["location"]) for item in items]
-
-        def about(i: int, n: int) -> bool:
-            where, named = previous[n]
-            return _text(items[i]["location"]) == where or not files[i].isdisjoint(named)
-
         claims = [self._claim(item) for item in items]
-        used = {n for i, n in enumerate(claims) if n is not None and about(i, n)}
-        reasons: list[str] = []
-        for i, item in enumerate(items):
-            basis, claim, reason = item.get("basis"), claims[i], ""
-            if files[i].isdisjoint(changed):
-                if basis == INTRODUCED:
-                    reason = "标为上一轮之后引入，但 location 不在上一轮之后改动的文件里"
-                elif claim is not None and (about(i, claim) or claim not in used):
-                    used.add(claim)
-                elif claim is not None:
-                    reason = f"上一轮第 {claim + 1} 条已由本轮另一条阻断对应，location 也不在它涉及的文件里"
-                elif not any(about(i, n) for n in range(len(previous))):
-                    reason = ("标为上一轮未修好，但对应不上上一轮的任何阻断" if basis == UNFIXED else
-                              "没有写明依据 basis，location 也不在上一轮阻断涉及或上一轮之后改动的文件里")
-            reasons.append(reason)
+        outside = [i for i, item in enumerate(items) if self._files(item["location"]).isdisjoint(changed)]
+        in_changes = {n for i, n in enumerate(claims) if n is not None and i not in outside}
+        pairs: list[tuple[int, int, int]] = []
+        for i in outside:
+            if items[i].get("basis") == INTRODUCED:
+                continue
+            for n, previous in enumerate(self.previous):
+                fit = self._fit(items[i], previous)
+                # Its number is enough for one finding wherever it is (a missing test, moved code), unless a finding
+                # in a changed file already stands for that item. Anything else has to identify the item itself.
+                if fit <= _SAME_PLACE or (claims[i] == n and n not in in_changes):
+                    pairs.append((fit, i, n))
+        backed: dict[int, int] = {}
+        for _, i, n in sorted(pairs):
+            if i not in backed and n not in backed.values():
+                backed[i] = n
+        reasons = [""] * len(items)
+        for i in outside:
+            claim = claims[i]
+            if items[i].get("basis") == INTRODUCED:
+                reasons[i] = "标为上一轮之后引入，但 location 不在上一轮之后改动的文件里"
+            elif i not in backed and claim is not None:
+                reasons[i] = f"上一轮第 {claim + 1} 条已由本轮另一条阻断对应"
+            elif i not in backed:
+                reasons[i] = "没有指明上一轮的哪一条，位置与触发条件也对不上，location 不在上一轮之后改动的文件里"
         return reasons
+
+    def _fit(self, item: Mapping[str, str], previous: Mapping[str, str]) -> int:
+        where, was = self._files(item["location"]), self._files(previous["location"])
+        same_file = not where.isdisjoint(was)
+        same_text = _text(item["location"]) == _text(previous["location"])
+        if _text(item["trigger"]).casefold() == _text(previous["trigger"]).casefold() and (same_file or same_text):
+            return _SAME_TRIGGER
+        # Outside the changes the file is as it was, so the item's lines have not moved.
+        lines = self._lines(previous["location"])
+        if any(path in lines and any(a <= start <= b for a, b in lines[path])
+               for path, spans in self._lines(item["location"]).items() for start, _ in spans):
+            return _SAME_PLACE
+        if same_text and _LINE.search(item["location"]):
+            return _SAME_PLACE
+        return _SAME_FILE if same_file else _ELSEWHERE
+
+    def _lines(self, text: str) -> dict[str, list[tuple[int, int]]]:
+        found: dict[str, list[tuple[int, int]]] = {}
+        for m in _SPOT.finditer(self._relative(text)):
+            start = int(m["start"])
+            for path in self._files(m["path"]):
+                found.setdefault(path, []).append((start, max(start, int(m["end"] or start))))
+        return found
 
     def _claim(self, item: Mapping[str, str]) -> int | None:
         raw = item.get("previous_item", "")
@@ -83,8 +107,7 @@ class ReviewScope:
     def _files(self, text: str) -> set[str]:
         # Repository files a text names, however the reviewer wrote them: changed ones (deleted files included) and
         # ones that exist. A bare or partial path that is no file itself matches a changed file ending in it.
-        for base in (self.root, self.root.resolve(), self.workdir, self.workdir.resolve()):
-            text = text.replace(f"{base}/", "")
+        text = self._relative(text)
         found = {p for p in self.changed
                  if p in text and re.search(rf"(?<![\w./-]){re.escape(p)}(?![\w/-]|\.\w)", text)}
         prefix = os.path.relpath(self.workdir.resolve(), self.root.resolve())
@@ -97,11 +120,17 @@ class ReviewScope:
             found |= existing or {p for p in self.changed if p == token or p.endswith(f"/{token}")}
         return found
 
+    def _relative(self, text: str) -> str:
+        for base in (self.root, self.root.resolve(), self.workdir, self.workdir.resolve()):
+            text = text.replace(f"{base}/", "")
+        return text
+
     def render(self) -> str:
         n = len(self.previous)
         unfixed = (
             f'`{UNFIXED}`: one of the {n} blocking item{"" if n == 1 else "s"} numbered in the previous review round '
-            "is still not fixed. Set previous_item to its number and keep its location, or name where the code moved."
+            "is still not fixed. Set previous_item to its number (each number backs one blocking item) and keep its location, or name where "
+            "the code moved."
             if n else f"`{UNFIXED}`: not applicable, the previous round passed with no blocking item."
         )
         shown = self.changed[:_MAX_FILES_SHOWN]
@@ -113,7 +142,9 @@ class ReviewScope:
             "An earlier round reviewed the whole change. This round blocks only on:",
             f"1. {unfixed}",
             f"2. `{INTRODUCED}`: a new problem caused by the changes since that review. The location is the line in a "
-            "changed file (listed below) that causes it, even when the damage shows in unchanged code.",
+            "changed file (listed below) that causes it, even when the damage shows in unchanged code. A requirement a person "
+            "added since that review that the changes do not meet is such a problem, located in the changed file "
+            "closest to it.",
             "Everything else you find goes to notes, whatever its severity: notes are delivered as follow-ups. "
             "Hibernaut turns any other blocking item into a note. The full diff above is context.",
             "Files changed since the previous review:",

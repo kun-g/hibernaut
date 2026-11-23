@@ -221,8 +221,6 @@ class _State:
     resume_log: list[str] = field(default_factory=_no_history)
     # Notes of every review round, downgraded blocking items included; delivered as follow-ups.
     review_notes: list[str] = field(default_factory=_no_history)
-    # A person added requirements since the last review, so the next one covers the whole change again.
-    new_requirements: bool = False
 
     def fields(self) -> dict[str, Any]:
         return {f: getattr(self, f) for f in self.__slots__}
@@ -526,7 +524,6 @@ class SDEExecutor:
         text = "\n\n".join(state.followups)
         if text:
             state.requirements = f"{state.requirements}\n\n## Follow-up from a person\n{text}"
-            state.new_requirements = True
         state.followups = []
         return text
 
@@ -768,19 +765,17 @@ class SDEExecutor:
                 snapshot = await asyncio.to_thread(worktree_fingerprint, workdir)
                 previous, scope = "", None
                 if (state.blocking or state.recheck) and state.reviewed_snapshot:
-                    if not state.new_requirements:
-                        # Unchanged code can still miss a requirement added since; only then may it block again.
-                        scope = await asyncio.to_thread(
-                            review_scope, workdir, state.reviewed_snapshot, snapshot, previous=state.blocking,
-                            notes=state.review_notes,
-                        )
+                    scope = await asyncio.to_thread(
+                        review_scope, workdir, state.reviewed_snapshot, snapshot, previous=state.blocking,
+                        notes=state.review_notes,
+                    )
                     delta = await asyncio.to_thread(snapshot_diff, workdir, state.reviewed_snapshot, snapshot)
                     if state.blocking:
                         previous = (
                             f"## Previous review round\n{state.last_review}\n\n"
                             f"## Changes since the previous review\n```diff\n{delta}\n```"
                         )
-                    elif scope is not None:
+                    else:
                         previous = _recheck_section(state.recheck, state.last_review, delta)
                 pin, selection = await asyncio.to_thread(self._guidance_inputs, state)
                 subject = state.work_key or workdir.name
@@ -814,7 +809,6 @@ class SDEExecutor:
             state.reviewed_snapshot = snapshot
             state.blocking = blocking
             state.recheck = ""
-            state.new_requirements = False
             if review["verdict"] == "pass":
                 return await self._finish(session_id, native, state, caps, review="pass", progress=progress)
             if state.rounds >= self._options.max_review_rounds:

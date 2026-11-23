@@ -51,33 +51,51 @@ class TestReviewScope(unittest.TestCase):
         # Naming a previous item does not turn unchanged code into changed code.
         self.assertEqual(self.kept(block("calc.py:2", previous_item=1, **new)), [])
 
-    def test_an_unfixed_previous_item_blocks_wherever_its_file_is(self):
-        unfixed = {"basis": "unfixed_previous"}
-        self.assertEqual(self.kept(block("calc.py:7", previous_item=1, **unfixed)), ["calc.py:7"])
-        # Numbered, but reported at a place the item did not name (here a missing test): still that item.
-        self.assertEqual(self.kept(block("tests/test_calc.py:1", previous_item=1, **unfixed)), ["tests/test_calc.py:1"])
-        self.assertEqual(self.kept(block("commit history", previous_item=1, **unfixed)), ["commit history"])
-        # A number without its label says the same.
-        self.assertEqual(self.kept(block("old.py:2", previous_item=1)), ["old.py:2"])
-        # Without a usable number the file decides.
-        self.assertEqual(self.kept(block("calc.py:7", **unfixed)), ["calc.py:7"])
-        self.assertEqual(self.kept(block("calc.py:7", previous_item=4, **unfixed)), ["calc.py:7"])
-        self.assertEqual(self.kept(block("old.py:2", previous_item=4, **unfixed)), [])
-
-    def test_one_previous_item_does_not_carry_findings_from_other_files(self):
+    def test_a_numbered_unfixed_item_blocks_wherever_it_is(self):
         unfixed = {"basis": "unfixed_previous", "previous_item": 1}
-        for order in (("old.py:2", "calc.py:7"), ("calc.py:7", "old.py:2")):
-            with self.subTest(order):
-                self.assertEqual(self.kept(*(block(loc, **unfixed) for loc in order)), ["calc.py:7"])
-        self.assertEqual(self.kept(block("old.py:2", **unfixed), block("tests/test_calc.py:1", **unfixed)), ["old.py:2"])
+        # Reported at a place the item did not name (a missing test), or at no file: still that item.
+        for location in ("calc.py:7", "tests/test_calc.py:1", "commit history"):
+            with self.subTest(location):
+                self.assertEqual(self.kept(block(location, trigger="other words", **unfixed)), [location])
+        # A number without its label says the same.
+        self.assertEqual(self.kept({**OLD_CODE, "previous_item": 1}), ["old.py:2"])
 
-    def test_files_the_previous_item_names_in_its_text_count_as_its_files(self):
-        previous = block("calc.py:2", fix="add a case to tests/test_calc.py")
-        self.assertEqual(self.kept(block("tests/test_calc.py:3", basis="unfixed_previous"), previous=[previous]),
-                         ["tests/test_calc.py:3"])
+    def test_one_previous_item_backs_one_finding_outside_the_changes(self):
+        unfixed = {"basis": "unfixed_previous", "previous_item": 1}
+        # The closest one: the same place, else the same file, else the first.
+        for locations, kept in ((("old.py:2", "calc.py:2"), "calc.py:2"), (("calc.py:80", "calc.py:2"), "calc.py:2"),
+                                (("old.py:2", "calc.py:80"), "calc.py:80"), (("old.py:2", "commits"), "old.py:2"),
+                                (("calc.py:80", "calc.py:90", "calc.py:100"), "calc.py:80")):
+            with self.subTest(locations):
+                items = [block(loc, trigger=f"case {i}", **unfixed) for i, loc in enumerate(locations)]
+                self.assertEqual(self.kept(*items), [kept])
+        # A finding in a changed file that stands for the item leaves none over, except at the item's own place.
+        there = block("pkg/mod.py:1", trigger="t", **unfixed)
+        self.assertEqual(self.kept(there, block("calc.py:80", trigger="u", **unfixed)), ["pkg/mod.py:1"])
+        self.assertEqual(self.kept(there, block("calc.py:2", trigger="u", **unfixed)), ["pkg/mod.py:1", "calc.py:2"])
 
-        # A caller it only mentions as the trigger does not.
-        self.assertEqual(self.kept(OLD_CODE, previous=[block("calc.py:2", trigger="old.py calls divide")]), [])
+    def test_without_a_reference_another_problem_in_the_same_file_is_a_note(self):
+        for label in ({}, {"basis": "unfixed_previous"}, {"basis": "unfixed_previous", "previous_item": 4}):
+            for location in ("calc.py:80", "calc.py", "calc.py:1-99", "old.py:2", "tests/test_calc.py:3"):
+                with self.subTest(label=label, location=location):
+                    previous = [block("calc.py:2", fix="add a case to tests/test_calc.py")]
+                    item = block(location, trigger="total is read before it is set", **label)
+                    self.assertEqual(self.kept(item, previous=previous), [])
+
+    def test_without_a_reference_the_same_place_or_trigger_identifies_the_previous_item(self):
+        # The file is unchanged, so its lines have not moved.
+        for previous, location in (("calc.py:2", "calc.py:2"), ("calc.py:2", "./calc.py#L2"), ("calc.py:2-6", "calc.py:4"),
+                                   ("my docs/说明.md:3", "my docs/说明.md:3")):
+            with self.subTest(location):
+                item = block(location, trigger="worded differently")
+                self.assertEqual(self.kept(item, previous=[block(previous)]), [location])
+        self.assertEqual(self.kept(block("calc.py:80", trigger="Divide(1,  0)")), ["calc.py:80"])
+        self.assertEqual(self.kept(block("missing tests"), previous=[block("missing tests")]), ["missing tests"])
+        # The same trigger in an unrelated file is another finding, and each previous item is matched once.
+        self.assertEqual(self.kept(block("old.py:2")), [])
+        self.assertEqual(self.kept(block("calc.py:2"), block("calc.py:2")), ["calc.py:2"])
+        pair = [block("calc.py:2", trigger="a"), block("calc.py:2", trigger="b")]
+        self.assertEqual(self.kept(*pair, previous=pair), ["calc.py:2", "calc.py:2"])
 
     def test_unusable_numbers_and_file_names_do_not_break_a_review(self):
         huge = block("old.py:2", basis="unfixed_previous", previous_item="9" * 5000)
@@ -86,10 +104,6 @@ class TestReviewScope(unittest.TestCase):
         scope = self.scope(changed=[b"caf\xe9.py".decode("utf-8", "surrogateescape"), *(f"f{i}" for i in range(400))])
         scope.render().encode("utf-8")
         self.assertIn("- ... and 101 more", scope.render())
-
-    def test_without_a_basis_the_location_decides(self):
-        self.assertEqual(self.kept(block("pkg/mod.py:1"), block("calc.py:2"), OLD_CODE), ["pkg/mod.py:1", "calc.py:2"])
-        self.assertEqual(self.kept(block("missing tests"), previous=[block("missing tests")]), ["missing tests"])
 
     def test_after_a_passed_review_only_changed_files_block(self):
         items = (block("pkg/mod.py:1", basis="introduced_since_previous"),
@@ -227,27 +241,52 @@ class TestRoleReviewRounds(SDEDeliveryCase):
         assert isinstance(outcome, Emit), outcome
         self.assertIn("lost main's change", self.calls("sde")[2]["prompt"])
 
-    async def test_new_requirements_after_a_review_are_reviewed_in_full(self):
-        # Code that does not meet a requirement a person added since is unchanged code; it must still block.
-        self.set_plan(sde=[dev(BUGGY), dev(FIX), dev({"old.py": "def total(xs):\n    return sum(xs or [])\n"})],
-                      reviewer=[FIRST, verdict(OLD_CODE), PASS])
+    async def test_a_follow_up_is_developed_and_the_next_review_stays_incremental(self):
+        # A message added while the task waited does not reopen code the earlier round already covered.
+        for follow_up, recheck in (("carry on with the original requirements", False), ("keep main's divide", True)):
+            with self.subTest(follow_up):
+                await self.follow_up_round(follow_up, recheck)
+
+    async def follow_up_round(self, follow_up, recheck):
+        for name in ("sde", "reviewer"):
+            Path(f"{self.plan}.{name}.n").unlink(missing_ok=True)
+        self.log.unlink(missing_ok=True)
+        late = verdict({**OLD_CODE, "basis": "introduced_since_previous"})
+        question = {"output": {"status": "needs_input", "summary": "s", "test_evidence": "", "question": "which?",
+                               "change_kind": "fix", "change_rationale": "r"}}
+        if recheck:
+            self.push_main({"calc.py": MAIN_CALC}, message="divide returns b")
+            self.set_plan(sde=[dev({"calc.py": TASK_CALC}), question,
+                               {**dev({"calc.py": RESOLVED}, commit="merge"), "run": MERGE_MAIN}], reviewer=[PASS, late])
+        else:
+            self.set_plan(sde=[dev(BUGGY), question, dev(FIX)], reviewer=[FIRST, late])
+        executor = self.executor(delivery=self.delivery(open_pr=recheck))
+        outcome = await executor.execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Suspend), outcome
+        batch = [event({"text": follow_up}), event({"approval_request_id": outcome.request_id, "approved": True})]
+        done = await executor.execute(batch, self.resume(outcome), self.caps)
+        assert isinstance(done, Emit), done
+        self.assertIn("round 2 pass (1 downgraded)", done.messages[0])
+        self.assertIn(follow_up, self.calls("sde")[2]["prompt"])
+        prompt = self.calls("reviewer")[1]["prompt"]
+        self.assertIn(follow_up, prompt)
+        scope = prompt.split("## Incremental review\n")[1]
+        # An added requirement the changes do not meet is a problem of those changes.
+        self.assertIn("requirement a person added", scope)
+        self.assertEqual("## Why this is reviewed again" in prompt, recheck)
+
+    async def test_a_follow_up_with_the_approval_of_a_spent_review_stays_incremental(self):
+        self.set_plan(sde=[dev(BUGGY), dev(FIX)], reviewer=[FIRST, verdict(OLD_CODE)])
         executor = self.executor(delivery=self.delivery())
         executor._options = type(executor._options)(max_review_rounds=1)
         outcome = await executor.execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Suspend), outcome
-        batch = [event({"text": "total must accept None"}),
+        batch = [event({"text": "fix it as originally required"}),
                  event({"approval_request_id": outcome.request_id, "approved": True})]
-        resumed = await executor.execute(batch, self.resume(outcome), self.caps)
-        assert isinstance(resumed, Suspend), resumed
-        self.assertIn("old.py:2", resumed.prompt)
-        prompt = self.calls("reviewer")[1]["prompt"]
-        self.assertIn("## Previous review round", prompt)
-        self.assertNotIn("## Incremental review", prompt)
-        # With no further requirement the next round is incremental again.
-        done = await executor.execute([event({"approval_request_id": resumed.request_id, "approved": True})],
-                                      self.resume(resumed), self.caps)
+        done = await executor.execute(batch, self.resume(outcome), self.caps)
         assert isinstance(done, Emit), done
-        self.assertIn("## Incremental review", self.calls("reviewer")[2]["prompt"])
+        self.assertIn("fix it as originally required", self.calls("sde")[1]["prompt"])
+        self.assertIn("round 2 pass (1 downgraded)", done.messages[0])
 
     async def test_rounds_still_run_out_and_wait_for_a_person(self):
         unfixed = block("calc.py:2", basis="unfixed_previous", previous_item=1)
@@ -284,23 +323,23 @@ class TestRoleReviewRounds(SDEDeliveryCase):
 
     def test_a_checkpoint_from_before_notes_were_kept_still_loads(self):
         fields = _State(stage="review_pending", workdir="/w", base_ref="", requirements="r").fields()
-        for new in ("review_notes", "new_requirements"):
-            del fields[new]
+        del fields["review_notes"]
         state = _State.load(json.dumps({"sde": fields}))
         assert state is not None
-        self.assertEqual((state.review_notes, state.new_requirements), ([], False))
+        self.assertEqual(state.review_notes, [])
 
 
 class TestFollowUpSection(DeliveryCase):
-    def body(self, *followups):
-        wt = self.clone("task-1", "hb/task-1")
+    def body(self, *followups, summary="s"):
+        key = f"task-{getattr(self, 'n', 1)}"
+        wt = self.clone(key, f"hb/{key}")
         (wt / "calc.py").write_text("x = 1\n")
         git(wt, "commit", "-qam", "work")
         request = DeliveryRequest(
-            work_key="task:1", workdir=wt, title="t", summary="s", test_evidence="e", change_kind="fix",
+            work_key=f"task:{key[-1]}", workdir=wt, title="t", summary=summary, test_evidence="e", change_kind="fix",
             rationale="r", review="pass", followups=followups)
         self.delivery().deliver(request, permissions=self.allow())
-        return self.gh_state()["prs"][0]["body"]
+        return self.gh_state()["prs"][-1]["body"]
 
     def allow(self):
         from tests.fakes import InMemoryPermission
@@ -310,12 +349,38 @@ class TestFollowUpSection(DeliveryCase):
         section = self.body("first\nline", "use @property; fixes #12").split("## 跟进\n")[1].split("\n\n## ")[0]
         self.assertEqual(section, "- first line\n- use @​property; fixes #​12")
 
-    def test_a_long_list_is_cut_at_an_item_and_says_so(self):
-        body = self.body(*(f"note {i} " + "x" * 900 for i in range(40)))
-        section = body.split("## 跟进\n")[1].split("\n\n## ")[0]
-        self.assertLess(len(section), 16_000)
-        self.assertRegex(section.splitlines()[-1], r"^- 另有 \d+ 条，见 Hibernaut 完成消息$")
+    def section(self, body):
+        return body.split("## 跟进\n")[1].split("\n\n## ")[0]
+
+    def test_notes_are_whole_while_the_body_fits(self):
+        note = "n" * 15_001
+        self.assertEqual(self.section(self.body(note, "second")), f"- {note}\n- second")
+
+    def test_the_room_left_by_the_rest_of_the_body_is_used_to_the_last_character(self):
+        overhead = len(self.body("x")) - 1
+        self.gh_reset()
+        exact = "n" * (65_536 - overhead)
+        body = self.body(exact)
+        self.assertEqual((len(body), self.section(body)), (65_536, f"- {exact}"))
+        self.gh_reset()
+        over = self.body(exact + "n")
+        self.assertLessEqual(len(over), 65_536)
+        self.assertGreater(len(over), 65_000)
+        lines = self.section(over).splitlines()
+        self.assertTrue(lines[0].startswith("- nnnn") and lines[0].endswith("…"), lines[0][-20:])
+        self.assertEqual(lines[-1], "- 已截断，另有 0 条未列；全文见 Hibernaut 完成消息")
+
+    def test_a_list_that_does_not_fit_says_how_many_are_missing(self):
+        body = self.body(*(f"note {i} " + "x" * 900 for i in range(100)), summary="s" * 20_000)
+        self.assertLessEqual(len(body), 65_536)
+        lines = self.section(body).splitlines()
+        self.assertEqual(lines[-1], f"- 已截断，另有 {100 - (len(lines) - 1)} 条未列；全文见 Hibernaut 完成消息")
+        self.assertGreater(len(lines), 40)
         self.assertIn("## Test evidence", body)
+
+    def gh_reset(self):
+        # Another PR body in the same test: a fresh task branch and clone.
+        self.n = getattr(self, "n", 1) + 1
 
 
 if __name__ == "__main__":
