@@ -936,6 +936,83 @@ class TestReload(PoolCase):
                 stop.set()
                 await asyncio.wait_for(serving, 10)
 
+    @contextlib.asynccontextmanager
+    async def reloading(self, agents, executors=None):
+        self.path = self.root / "hibernaut.toml"
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.port = sock.getsockname()[1]
+        stderr = io.StringIO()
+        self._seq = 0
+        base = self.raw
+        raw = {"agents": agents, "executors": executors or {}}
+        self.raw = lambda: {**base(projects={"a": TASKS}, executors=raw["executors"]), "agents": raw["agents"]}
+        self.write()
+        config = load_config(self.path)
+        daemon = build_daemon_from_config(config)
+        self.addCleanup(daemon.close)
+        stop = asyncio.Event()
+
+        async def reload(**changed):
+            raw.update(changed)
+            self.write()
+            await self.until(lambda: "[config] Reloaded" in stderr.getvalue())
+
+        with contextlib.redirect_stderr(stderr):
+            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02,
+                                                           outbox_interval_seconds=0.02))
+            try:
+                yield daemon, reload
+            finally:
+                self.probe.release(*self.probe.gates)
+                stop.set()
+                await asyncio.wait_for(serving, 10)
+                self.raw = base
+
+    async def test_a_reload_that_brings_the_first_limit_counts_the_runs_in_progress(self):
+        plain = {"writer": {"executor": "sde"}, "other": {"executor": "sde"}}
+        for name, changed, free in (
+            ("agent", {"agents": {**plain, "writer": {"executor": "sde", "max_concurrency": 1}}}, "other"),
+            ("driver", {"executors": {"sde": {"max_concurrency": 1}}}, "claude"),
+        ):
+            with self.subTest(name):
+                self.setUp()
+                async with self.reloading(plain) as (daemon, reload):
+                    self.post(daemon, "proj:a:1", "block-1", executor="writer")
+                    await self.until(lambda: self.probe.active_texts() == ["block-1"])
+                    await reload(**changed)
+                    self.post(daemon, "proj:a:2", "block-2", executor="writer")
+                    self.post(daemon, "proj:a:3", "free", executor=free)
+                    await self.until(lambda: "free" in self.probe.finished)
+                    await self.settle()
+                    self.assertEqual(self.probe.active_texts(), ["block-1"])
+                    self.probe.release("block-1")
+                    await self.until(lambda: self.probe.active_texts() == ["block-2"])
+
+    async def test_the_second_agent_of_a_dispatch_counts_too(self):
+        # Neither is limited when they run, so both use the slot taken for the first.
+        plain = {"writer": {"executor": "sde"}, "other": {"executor": "claude"}}
+        for name, changed in (
+            ("agent", {"agents": {**plain, "writer": {"executor": "sde", "max_concurrency": 1}}}),
+            ("driver", {"executors": {"sde": {"max_concurrency": 1}}}),
+        ):
+            with self.subTest(name):
+                self.setUp()
+                async with self.reloading(plain) as (daemon, reload):
+                    self.post(daemon, "proj:a:1", "block-0", executor="other", key="k0")
+                    await self.until(lambda: self.probe.active_texts() == ["block-0"])
+                    self.post(daemon, "proj:a:1", "block-1", executor="writer", key="k1")
+                    self.probe.release("block-0")
+                    await self.until(lambda: self.probe.active_texts() == ["block-1"])
+                    await reload(**changed)
+                    self.post(daemon, "proj:a:2", "block-2", executor="writer")
+                    self.post(daemon, "proj:a:3", "free", executor="other")
+                    await self.until(lambda: "free" in self.probe.finished)
+                    await self.settle()
+                    self.assertEqual(self.probe.active_texts(), ["block-1"])
+                    self.probe.release("block-1")
+                    await self.until(lambda: self.probe.active_texts() == ["block-2"])
+
     async def test_lowering_global_limit_on_reload_waits_for_old_runs_to_drain(self):
         self.path = self.root / "hibernaut.toml"
         with socket.socket() as sock:

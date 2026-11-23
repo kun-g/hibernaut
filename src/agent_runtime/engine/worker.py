@@ -338,6 +338,8 @@ class AgentWorker:
         on_forward: Callable[[str], object] | None = None,
         on_worktree_reclaim: Callable[[str], object] | None = None,
         hold: Callable[[Event], str | None] | None = None,
+        # Called on the event loop with the inbox and the agent of every batch before it runs.
+        on_batch_start: Callable[[str, str], object] | None = None,
         run_start_listener: RunStartListener | None = None,
         open_runs: OpenRunPort | None = None,
         run_ledger: RunLedgerPort | None = None,
@@ -372,6 +374,7 @@ class AgentWorker:
         self._on_forward = on_forward
         self._on_worktree_reclaim = on_worktree_reclaim
         self._hold = hold
+        self._on_batch_start = on_batch_start
         self._run_start_listener = run_start_listener
         # Without a registry every executor runs as a plain ExecutorPort and a stop waits for its Runs.
         self._open_runs = open_runs
@@ -1291,6 +1294,8 @@ class AgentWorker:
         open_run: OpenRun | None,
     ) -> _BatchEnd:
         # Runs one batch to its result. open_run set means resuming a Run a stopped process detached.
+        if self._on_batch_start is not None:
+            self._on_batch_start(inbox_id, executor.executor_id)
         batch_ids = [evt.event_id for evt in batch]
         consumed_ids: set[str] = set(batch_ids)
         target_batch_key = self._batch_key(batch[0], active_session)

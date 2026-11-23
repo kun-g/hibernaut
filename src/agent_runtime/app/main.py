@@ -643,6 +643,11 @@ def executor_quota_hold(
                              keys_of=lambda event: keys.event_keys(event, route))
 
 
+def batch_counter(pool: AsyncWorkerPool, keys: LimitKeyResolver) -> Callable[[str, str], None]:
+    return lambda inbox_id, agent_id: pool.limiter.count(
+        inbox_id, executor_key=keys.driver(agent_id), agent_key=agent_id)
+
+
 def build_daemon(
     *,
     db_path: str | Path = "./hibernaut.db",
@@ -745,6 +750,7 @@ def build_daemon(
                     wk, notify_outbox=outbox, inbox_id=_iid
                 ),
                 hold=_quota_hold(inbox_id),
+                on_batch_start=batch_counter(pool, limit_keys),
                 lock=lock,
                 sessions=sessions,
                 run_start_listener=gdrive_writer,
@@ -768,6 +774,7 @@ def build_daemon(
                 wk, notify_outbox=outbox, inbox_id=_iid
             ),
             hold=_quota_hold(inbox_id),
+            on_batch_start=batch_counter(pool, limit_keys),
             lock=lock,
             sessions=sessions,
             run_start_listener=gdrive_writer,
@@ -821,7 +828,7 @@ def build_daemon(
 
     resolved_limits = limits or ConcurrencyLimits()
     limit_keys = LimitKeyResolver(
-        limits=resolved_limits, inbox=inbox, sessions=sessions, open_runs=open_runs, route=_route,
+        inbox=inbox, sessions=sessions, open_runs=open_runs, route=_route,
         global_default_executor=global_default_executor or (
             default_executor.executor_id if executors_factory is None and executor_factory is None else None
         ),
@@ -1227,7 +1234,7 @@ def build_daemon_from_config(
                               binding=project.route(inbox_id).binding)
 
         limit_keys = LimitKeyResolver(
-            limits=limits, inbox=daemon.inbox, sessions=daemon.sessions, open_runs=daemon.open_runs, route=_cli_route,
+            inbox=daemon.inbox, sessions=daemon.sessions, open_runs=daemon.open_runs, route=_cli_route,
             global_default_executor=config.runtime.default_agent,
             drivers={name: agent.executor for name, agent in config.agents.items()},
         )
@@ -1261,6 +1268,7 @@ def build_daemon_from_config(
                 on_worktree_reclaim=reclaim,
                 hold=executor_quota_hold(inbox_id, pool=daemon.pool, limits=limits, keys=limit_keys,
                                          route=_cli_route(inbox_id)),
+                on_batch_start=batch_counter(daemon.pool, limit_keys),
                 run_start_listener=daemon.gdrive_result_writer,
                 open_runs=daemon.open_runs,
                 run_ledger=daemon.ledger.recorder if daemon.ledger is not None else None,

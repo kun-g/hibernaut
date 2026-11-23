@@ -35,6 +35,9 @@ class ConcurrencyLimiter:
         self._max_concurrency = max_concurrency
         self._limits = limits or ConcurrencyLimits()
         self._held: dict[str, LimitKeys] = {}
+        # Every driver and agent counted for an inbox until its dispatch ends: the keys it was admitted with and those
+        # of later batches, which have no limit then but may be given one by a reload.
+        self._counted: dict[str, tuple[set[str], set[str]]] = {}
         self._projects: Counter[str] = Counter()
         self._executors: Counter[str] = Counter()
         self._agents: Counter[str] = Counter()
@@ -100,13 +103,24 @@ class ConcurrencyLimiter:
         if not self.available(inbox_id, project_key=project_key, executor_key=executor_key, agent_key=agent_key):
             return False
         self._held[inbox_id] = LimitKeys(project_key, executor_key, agent_key)
+        self._counted[inbox_id] = (set(), set())
         if project_key is not None:
             self._projects[project_key] += 1
-        if executor_key is not None:
-            self._executors[executor_key] += 1
-        if agent_key is not None:
-            self._agents[agent_key] += 1
+        self.count(inbox_id, executor_key=executor_key, agent_key=agent_key)
         return True
+
+    def count(self, inbox_id: str, *, executor_key: str | None, agent_key: str | None) -> None:
+        counted = self._counted.get(inbox_id)
+        if counted is None:
+            # A worker used outside the pool has no slot.
+            return
+        for key, mine, used in (
+            (executor_key, counted[0], self._executors),
+            (agent_key, counted[1], self._agents),
+        ):
+            if key is not None and key not in mine:
+                mine.add(key)
+                used[key] += 1
 
     def release(self, inbox_id: str) -> None:
         keys = self._held.pop(inbox_id, None)
@@ -116,14 +130,11 @@ class ConcurrencyLimiter:
             self._projects[keys.project] -= 1
             if self._projects[keys.project] <= 0:
                 del self._projects[keys.project]
-        if keys.executor is not None:
-            self._executors[keys.executor] -= 1
-            if self._executors[keys.executor] <= 0:
-                del self._executors[keys.executor]
-        if keys.agent is not None:
-            self._agents[keys.agent] -= 1
-            if self._agents[keys.agent] <= 0:
-                del self._agents[keys.agent]
+        for mine, used in zip(self._counted.pop(inbox_id), (self._executors, self._agents), strict=True):
+            for key in mine:
+                used[key] -= 1
+                if used[key] <= 0:
+                    del used[key]
         self._notify()
 
 
@@ -140,7 +151,6 @@ class LimitKeyResolver:
     def __init__(
         self,
         *,
-        limits: ConcurrencyLimits,
         inbox: InboxPort,
         sessions: SessionStorePort,
         open_runs: OpenRunPort | None,
@@ -149,7 +159,6 @@ class LimitKeyResolver:
         # Agent id -> the [executors.<id>] it runs on; an id not listed is its own executor.
         drivers: Mapping[str, str] | None = None,
     ) -> None:
-        self._limits = limits
         self._inbox = inbox
         self._sessions = sessions
         self._open_runs = open_runs
@@ -163,8 +172,7 @@ class LimitKeyResolver:
         except AmbiguousProjectMatch:
             # The worker factory raises it again and the pool reports it there.
             return LimitKeys()
-        if not self._limits.executors and not self._limits.agents:
-            return LimitKeys(route.project)
+        # Resolved without any limit too: a reload may bring the first one while this Run is in progress.
         try:
             return self._next_keys(inbox_id, route)
         except Exception:  # noqa: BLE001
@@ -186,7 +194,10 @@ class LimitKeyResolver:
     def _agent_keys(self, route: LimitRoute, agent_id: str | None) -> LimitKeys:
         if agent_id is None:
             return LimitKeys(route.project)
-        return LimitKeys(route.project, self._drivers.get(agent_id, agent_id), agent_id)
+        return LimitKeys(route.project, self.driver(agent_id), agent_id)
+
+    def driver(self, agent_id: str) -> str:
+        return self._drivers.get(agent_id, agent_id)
 
     def _next_keys(self, inbox_id: str, route: LimitRoute) -> LimitKeys:
         # What the worker runs first: a Run a stopped process detached, else the first event it may claim.
