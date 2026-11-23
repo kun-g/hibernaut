@@ -23,6 +23,10 @@ from typing import IO, Any
 
 POLL_SECONDS = 0.25
 GRACE_SECONDS = 3.0
+# Orca's hooks in the CLI report its session with these, and Orca then takes the end of a one-shot run for an
+# interrupted session and resumes it interactively in a new tab. Without them Orca never registers the session.
+ORCA_SESSION_VARS = ("ORCA_PANE_KEY", "ORCA_AGENT_PANE", "ORCA_TAB_ID")
+ORCA_SESSION_PREFIXES = ("ORCA_AGENT_HOOK_", "ORCA_AGENT_LAUNCH")
 STOP_SIGNALS = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
 
 
@@ -116,6 +120,10 @@ def main(spec_path: str) -> int:
             end_group(proc)
 
 
+def _one_shot_env(env: dict[str, str]) -> dict[str, str]:
+    return {k: v for k, v in env.items() if k not in ORCA_SESSION_VARS and not k.startswith(ORCA_SESSION_PREFIXES)}
+
+
 def _run(spec_path: Path, running: list[subprocess.Popen[bytes]]) -> int:
     spec: dict[str, Any] = json.loads(spec_path.read_text(encoding="utf-8"))
     argv: list[str] = spec["argv"]
@@ -125,8 +133,9 @@ def _run(spec_path: Path, running: list[subprocess.Popen[bytes]]) -> int:
     try:
         # A session of its own: the group can be ended as a whole, and a CLI that opens /dev/tty fails instead of
         # stopping in the background.
-        proc = subprocess.Popen(argv, cwd=spec["cwd"], env={**os.environ, **spec["env"]}, start_new_session=True,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(argv, cwd=spec["cwd"], env=_one_shot_env({**os.environ, **spec["env"]}),
+                                start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
     except OSError as exc:
         _write_atomic(exit_path, {"exit": None, "error": f"cannot start '{argv[0]}': {exc.strerror or exc}"})
         print(f"[hibernaut] cannot start {argv[0]}: {exc.strerror or exc}", file=sys.stderr, flush=True)

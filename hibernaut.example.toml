@@ -140,7 +140,8 @@ args = ["-p", "{prompt}", "--permission-mode", "plan"]
 timeout_seconds = 300.0
 terminal = "orca"               # 仅作评审者（SDE reviewer = "grok"）时生效：在任务 worktree 的 Orca 终端里跑同一条命令，人可实时旁观；
 #                               # 结果从包装脚本写的文件读，不读屏幕；读回后（失败、超时、中断同样）立即关闭终端，不等交付，
-#                               # 评审记录留终端句柄与 CLI 会话 ID。项目 terminal_backend 不是 orca 或 orca 命令失败时退回子进程，
+#                               # 评审记录留终端句柄与 CLI 会话 ID。CLI 环境里去掉 Orca 的会话登记变量（ORCA_AGENT_HOOK_* 等），
+#                               # 否则 Orca 会在新标签里 --resume 这次一次性会话。项目 terminal_backend 不是 orca 或 orca 命令失败时退回子进程，
 #                               # 评审结论首行注明 terminal=fallback。可选 none（默认，子进程）| orca。
 
 # 给 SDE 当 CLI 评审者用的 grok：{review_schema} 由评审替换为紧凑的结论 JSON Schema，grok 据此输出

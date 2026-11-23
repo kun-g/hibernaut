@@ -1054,8 +1054,8 @@ async def _close_quietly(handle: str, workdir: Path) -> bool:
 
 
 async def _close_cli_terminal(handle: str, workdir: Path) -> None:
-    # Orca keeps the tab of a command that ended and may resume the agent it recognised there in an interactive
-    # session, so the handle is closed even when its process is gone. What happens here never changes the run's result.
+    # Orca keeps the tab of a command that ended, so the handle is closed even when its process is gone. What happens
+    # here never changes the run's result.
     async def close() -> None:
         try:
             await _orca("terminal", "close", "--terminal", handle, cwd=workdir)
