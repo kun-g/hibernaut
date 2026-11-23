@@ -15,11 +15,13 @@ import unittest
 from collections.abc import Mapping
 from concurrent.futures import thread as futures_thread
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from switchboard.app import Switchboard, build_switchboard
-from switchboard.envelope import CanonicalEvent
+from switchboard.envelope import CanonicalEvent, utc_now
 from switchboard.http_client import HttpResponse
 from switchboard.ports import DeliverStatus, OutboundMessage
 from switchboard.relay_protocol import Ack, Close, Push, connect, encode_message
@@ -49,14 +51,26 @@ class Gate:
 
 
 class GatedCredentials(StaticCredentials):
-    def __init__(self, gate: Gate) -> None:
+    def __init__(self, gate: Gate, channel: str = "github") -> None:
         super().__init__()
         self.gate: Gate | None = gate
+        self.channel = channel
 
     def get_webhook_secret(self, channel: str) -> str | None:
-        if channel == "github" and self.gate is not None:
+        if channel == self.channel and self.gate is not None:
             self.gate.pass_through()
         return super().get_webhook_secret(channel)
+
+
+# Records every use of the connection, so a test can tell that none came after a point.
+class RecordingConnection:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.used: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.used.append(name)
+        return getattr(self._conn, name)
 
 
 class GatedHttpClient(FakeHttpClient):
@@ -411,6 +425,94 @@ class TimeoutTests(ShutdownHarness):
             with contextlib.suppress(OSError):
                 sock.sendall(b" " * 99)
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    # Each tool writes inside MCPInboundAdapter.handle(), so nothing after handle() can hold it back.
+    MCP_WRITES: tuple[tuple[str, dict[str, str]], ...] = (
+        ("submit_work", {"external_id": "late", "subject": "late"}),
+        ("replay_delivery", {"event_id": "", "consumer_id": "hibernaut"}),
+    )
+
+    # A board with one dead letter and an MCP call held in its token check.
+    def stuck_mcp_call(self, tool: str, arguments: dict[str, str]) -> tuple[Switchboard, Gate, set[threading.Thread]]:
+        gate = Gate()
+        self.addCleanup(gate.opened.set)
+        board = self.board(timeout=0.2, credentials=GatedCredentials(gate, "mcp"))
+        dead = ready_event(1, "proj:a")
+        # Not due, so the worker leaves it alone.
+        later = utc_now() + timedelta(hours=1)
+        board.store.insert_inbound(dead, ["hibernaut"], later)
+        board.store.update_delivery(
+            dead.event_id, "hibernaut", status="dead_letter", attempts=6, next_retry_at=later, last_error="x", now=later
+        )
+        if "event_id" in arguments:
+            arguments = {**arguments, "event_id": dead.event_id}
+        before = set(threading.enumerate())
+
+        def client() -> None:
+            with contextlib.suppress(OSError):
+                mcp_call(board.http.base_url, tool, arguments)
+
+        threading.Thread(target=client, daemon=True).start()
+        self.assertTrue(gate.entered.wait(5))
+        return board, gate, before
+
+    def assert_no_late_write(self) -> None:
+        self.assertEqual(self.rows("SELECT external_id FROM inbound_events WHERE external_id = 'late'"), [])
+        self.assertEqual(self.rows("SELECT status, attempts FROM delivery_log"), [("dead_letter", 6)])
+
+    def test_mcp_call_released_after_the_stop_does_not_reach_the_closed_database(self) -> None:
+        for tool, arguments in self.MCP_WRITES:
+            with self.subTest(tool):
+                self.setUp()
+                board, gate, before = self.stuck_mcp_call(tool, arguments)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.assert_forced(board, "HTTP")
+                    conn = RecordingConnection(board.store._conn)  # pyright: ignore[reportPrivateUsage]
+                    board.store._conn = conn  # type: ignore[assignment]  # pyright: ignore
+                    gate.opened.set()
+                    self.assertTrue(wait_until(lambda: set(threading.enumerate()) <= before))
+                self.assertEqual(conn.used, [])
+                self.assertNotIn("Traceback", stderr.getvalue())
+                self.assertNotIn("ProgrammingError", stderr.getvalue())
+                self.assert_no_late_write()
+
+    def test_mcp_call_released_after_a_stop_that_could_not_close_the_database_writes_nothing(self) -> None:
+        for tool, arguments in self.MCP_WRITES:
+            with self.subTest(tool):
+                self.setUp()
+                board, gate, before = self.stuck_mcp_call(tool, arguments)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with board.store._lock:  # pyright: ignore[reportPrivateUsage]
+                        with self.assertLogs("switchboard", level="WARNING") as logs:
+                            self.assertFalse(board.stop())
+                    self.assertIn("SQLite write", "\n".join(logs.output))
+                    conn = RecordingConnection(board.store._conn)  # pyright: ignore[reportPrivateUsage]
+                    board.store._conn = conn  # type: ignore[assignment]  # pyright: ignore
+                    gate.opened.set()
+                    self.assertTrue(wait_until(lambda: set(threading.enumerate()) <= before))
+                self.assertEqual(conn.used, [])
+                self.assertNotIn("Traceback", stderr.getvalue())
+                self.assert_no_late_write()
+
+    def test_mcp_call_released_between_the_cut_and_the_close_writes_nothing(self) -> None:
+        for tool, arguments in self.MCP_WRITES:
+            with self.subTest(tool):
+                self.setUp()
+                board, gate, before = self.stuck_mcp_call(tool, arguments)
+                close = board.store.close
+
+                def release_then_close(timeout: float = -1) -> bool:
+                    gate.opened.set()
+                    self.assertTrue(wait_until(lambda: set(threading.enumerate()) <= before))
+                    return close(timeout)
+
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), mock.patch.object(board.store, "close", release_then_close):
+                    self.assert_forced(board, "HTTP")
+                self.assertNotIn("Traceback", stderr.getvalue())
+                self.assert_no_late_write()
 
     def test_silent_relay_peers_are_cut_at_the_same_deadline(self) -> None:
         board = self.board(timeout=0.3, sections={"relay": {"enabled": True, "transport": "hybrid"}})

@@ -3,10 +3,12 @@ from __future__ import annotations
 import math
 import os
 import re
+import socket
 import threading
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from ipaddress import IPv6Address
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit
@@ -17,6 +19,8 @@ UnmatchedPolicy = Literal["fallback", "reject"]
 TransportMode = Literal["in_process", "relay", "hybrid"]
 TRANSPORT_MODES: tuple[TransportMode, ...] = ("in_process", "relay", "hybrid")
 _BAD_PATH_CHARS = re.compile(r"[\s?#]")
+# Underscores are no DNS syntax, but names from /etc/hosts and container networks use them.
+_HOST_LABEL = re.compile(r"[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?")
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +224,21 @@ def normalize_base_path(value: object) -> str:
     return path
 
 
+# Syntax only, nothing is looked up. Digits and dots that are no IPv4 address are no host name either.
+def is_ipv4_or_host_name(host: str) -> bool:
+    if re.fullmatch(r"[0-9.]+", host):
+        try:
+            socket.inet_aton(host)
+        except OSError:
+            return False
+        return True
+    try:
+        name = host.encode("idna").decode("ascii").removesuffix(".")
+    except UnicodeError:
+        return False
+    return len(name) <= 253 and all(_HOST_LABEL.fullmatch(label) for label in name.split("."))
+
+
 def _strings(section: Mapping[str, Any], name: str) -> tuple[str, ...]:
     value = section.get(name, [])
     if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in cast(list[Any], value)):
@@ -234,7 +253,14 @@ def _event_consumers(table: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
             raise ConfigError(f"routing.event_consumers: unknown event type {event_type!r}")
         if not isinstance(consumers, list) or not all(isinstance(c, str) and c for c in cast(list[Any], consumers)):
             raise ConfigError(f"routing.event_consumers.{event_type!r} must be a list of consumer ids")
-        routes[event_type] = tuple(cast(list[str], consumers))
+        names = cast(list[str], consumers)
+        # One delivery row per event and consumer: a repeated one would fail the insert of every such event.
+        repeated = sorted({name for name in names if names.count(name) > 1})
+        if repeated:
+            raise ConfigError(
+                f"routing.event_consumers.{event_type!r} lists {', '.join(map(repr, repeated))} more than once"
+            )
+        routes[event_type] = tuple(names)
     return routes
 
 
@@ -303,13 +329,13 @@ def _url(section: Mapping[str, Any], table: str, name: str, default: str) -> str
     try:
         parts = urlsplit(value)
         port = parts.port
-        # Offline part of what a connection would do with the name: empty and over-long labels fail here.
-        host = (parts.hostname or "").encode("idna")
+        host = parts.hostname or ""
+        usable = bool(IPv6Address(host)) if ":" in host else is_ipv4_or_host_name(host)
     except ValueError as exc:
         raise ConfigError(f"{table}.{name} is not a usable URL: {exc}") from exc
-    if parts.scheme not in ("http", "https") or not host or port == 0 or _BAD_PATH_CHARS.search(value):
+    if parts.scheme not in ("http", "https") or not usable or port == 0 or _BAD_PATH_CHARS.search(value):
         raise ConfigError(
-            f"{table}.{name} must be an http:// or https:// URL with a host, and no spaces, query or fragment"
+            f"{table}.{name} must be an http:// or https:// URL with a valid host and port, and no spaces, query or fragment"
         )
     return value
 

@@ -109,7 +109,7 @@ class Switchboard:
 
         blocked: list[str] = []
         # A list, not a generator: every server must refuse late requests, also after the first one timed out.
-        if not all([server.drain(deadline) for server in servers]):
+        if not all([server.drain(deadline, self.store.refuse_intake) for server in servers]):
             blocked.append("HTTP requests")
         if not self.worker.join(left()):
             blocked.append("deliveries")

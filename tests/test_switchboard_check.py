@@ -160,6 +160,12 @@ transport = "hybrid"
         code, _, err = self.check("[http]\nport = 0\n[relay]\nenabled = true\nlisten_port = 0\n", relay)
         self.assertEqual((code, err), (0, ""))
 
+    def test_usable_listen_names(self) -> None:
+        for host in ("localhost", "LOCALHOST", "localhost.", "my_service", "a-b.example", "0x7f.1", "b\u00fccher.example"):
+            with self.subTest(host):
+                code, _, err = self.check(f'[http]\nhost = "{host}"\n')
+                self.assertEqual(code, 0, err)
+
     def test_usable_api_bases(self) -> None:
         for url in ("https://api.github.com", "http://127.0.0.1:9", "https://ghe.example.com:8443/api/v3/", "http://[::1]:80"):
             with self.subTest(url):
@@ -234,6 +240,7 @@ class InvalidConfigTests(CheckHarness):
         bad = (
             "https://", "https:///path", "https://:443", "https://api.github.com:http", "https://api.github.com:70000",
             "https://api.github.com:0", "https://[::1", "https://a b.example", "https://a..example",
+            "https://a$b.example", "https://-a.example", "https://a%20b.example", "https://999.0.0.1",
             "https://api.github.com?x=1", "https://api.github.com#frag", "ftp://api.github.com", "api.github.com",
         )
         for table, name in (("feishu", "api_base"), ("outbound", "github_api_base")):
@@ -281,11 +288,41 @@ class InvalidConfigTests(CheckHarness):
                 self.assertIn("relay.listen_port", err)
 
     def test_listen_addresses_the_ipv4_server_cannot_bind(self) -> None:
-        for host in ("::", "::1", "999.0.0.1", "1.2.3.4.5"):
-            with self.subTest(host):
-                code, _, err = self.check(f'[http]\nhost = "{host}"\n')
-                self.assertEqual(code, 1)
+        long_label, long_name = "a" * 64, ".".join(["a" * 60] * 5)
+        bad = (
+            "::", "::1", "999.0.0.1", "1.2.3.4.5", "127.0.0.1:8790", "localhost/", "local host", " localhost",
+            "127.0.0.1 ", "127.0.0.1 x", "http://localhost", "a..b", ".a", "-a.example", "a-.example", "a$b", "*",
+            "a\\u0000b", "a\\tb", long_label, long_name, "b\u00fccher\u3002/",
+        )
+        for host in bad:
+            with self.subTest(field="http.host", host=host):
+                code, out, err = self.check(f'[http]\nhost = "{host}"\n')
+                self.assertEqual((code, out), (1, ""))
                 self.assertIn("http.host", err)
+                self.assertNotIn("relay.listen_host", err)
+            with self.subTest(field="relay.listen_host", host=host):
+                code, out, err = self.check(
+                    f'[relay]\nenabled = true\nlisten_host = "{host}"\nlisten_port = 8791\n',
+                    {"SWITCHBOARD_RELAY_WEBHOOK_SECRET": "test-relay"},
+                )
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn("relay.listen_host", err)
+                self.assertNotIn("http.host", err)
+
+    def test_consumer_listed_twice_for_one_event_type(self) -> None:
+        for consumers in ('["hibernaut", "hibernaut"]', '["hibernaut", "taskboard", "hibernaut"]'):
+            with self.subTest(consumers):
+                toml = f'[routing.event_consumers]\n"work.ready" = {consumers}\n'
+                code, out, err = self.check(toml)
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn("routing.event_consumers.'work.ready'", err)
+                self.assertIn("'hibernaut'", err)
+                with self.assertRaises(ConfigError):
+                    load_config(self.path)
+        # The same consumer may take several event types.
+        self.assertEqual(
+            self.check('[routing.event_consumers]\n"work.ready" = ["a", "b"]\n"work.opened" = ["a"]\n')[0], 0
+        )
 
     def test_enabled_relay_needs_its_token(self) -> None:
         for toml in ('[relay]\nenabled = true\ntransport = "relay"\n', "[relay]\nenabled = true\n"):

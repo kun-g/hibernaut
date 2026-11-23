@@ -50,7 +50,7 @@ class _Server(ThreadingHTTPServer):
         self._waiting: set[object] = set()
         self._active: set[object] = set()
         self._closed = False
-        # Set when a drain ran out of time: the store is about to close, so no request may start a write.
+        # Set when a drain ran out of time: the store is about to close, so no request goes any further.
         self.cut = False
         super().__init__(address, _Handler)
 
@@ -86,7 +86,7 @@ class _Server(ThreadingHTTPServer):
             self._active.discard(request)
             self._state.notify_all()
 
-    def drain(self, deadline: float) -> bool:
+    def drain(self, deadline: float, on_cut: Callable[[], None] | None) -> bool:
         head_deadline = min(deadline, time.monotonic() + HEAD_GRACE_SEC)
         with self._state:
             while self._active or self._waiting:
@@ -97,6 +97,9 @@ class _Server(ThreadingHTTPServer):
             self._closed = True
             drained = not self._active
             self.cut = not drained
+            # Before the sockets go, so that no write starts once a client has seen its connection cut.
+            if self.cut and on_cut is not None:
+                on_cut()
             cut = [*self._waiting, *self._active]
         for request in cut:
             try:
@@ -195,6 +198,9 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             parsed = adapter.handle(headers, raw_body)
         except Exception as exc:  # noqa: BLE001
+            if self._srv().cut:
+                self.close_connection = True
+                return
             pipeline.record_rejection(stage="inbound", http_status=500, source=source, reason=repr(exc))
             self._reply(500, {"error": "internal error"})
             return
@@ -282,9 +288,10 @@ class SwitchboardHTTPServer:
             self._thread = None
         self._server.server_close()
 
-    # Waits for the requests already accepted; afterwards none is handled any more. False: some are still running.
-    def drain(self, deadline: float) -> bool:
-        return self._server.drain(deadline)
+    # Waits for the requests already accepted; afterwards none is handled any more. False: some are still running,
+    # and on_cut was called before their connections were cut.
+    def drain(self, deadline: float, on_cut: Callable[[], None] | None = None) -> bool:
+        return self._server.drain(deadline, on_cut)
 
     def stop(self, timeout: float = 5.0) -> None:
         self.stop_accepting()

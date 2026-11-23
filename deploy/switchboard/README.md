@@ -68,7 +68,7 @@ chmod 600 .env
 - 通过：stdout 输出监听地址、路由规则数、已启用渠道，退出码 0。渠道按环境变量里有没有凭据判断，只显示名字。
 - 失败：stderr 每行一个问题，含配置路径和字段名，退出码 1。
 - 启动时会静默忽略的半截配置只有 `--check` 会报：死信告警只填了渠道或目标、`notify_channel` 没有 `notify_target`、`[relay] listen_host` 没有 `listen_port`、App ID 与私钥（Secret）只填了一个。
-- 同样只有 `--check` 会报：启用了 Relay 但环境变量里没有 `SWITCHBOARD_RELAY_WEBHOOK_SECRET`；Relay 与 HTTP 同端口且地址重叠（`0.0.0.0` 与任何地址重叠；主机名不解析）；监听地址是 IPv6 或写错的 IPv4。因此要带着服务的环境变量执行。
+- 同样只有 `--check` 会报：启用了 Relay 但环境变量里没有 `SWITCHBOARD_RELAY_WEBHOOK_SECRET`；Relay 与 HTTP 同端口且地址重叠（`0.0.0.0` 与任何地址重叠；主机名不解析）；监听地址是 IPv6、写错的 IPv4 或不合法的主机名。因此要带着服务的环境变量执行。
 
 ### 停机
 

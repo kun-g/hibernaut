@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import os
-import re
 import socket
 from collections.abc import Mapping
 
-from switchboard.config import SwitchboardConfig
+from switchboard.config import SwitchboardConfig, is_ipv4_or_host_name
 from switchboard.credentials import EnvCredentialBroker, feishu_app_credentials, github_app_credentials
 
 _RELAY_SECRET = "SWITCHBOARD_RELAY_WEBHOOK_SECRET"
@@ -18,24 +17,14 @@ _CREDENTIAL_PAIRS = (
 
 # The address bind() would use, without a lookup: names other than localhost stay names.
 def _address(host: str) -> str:
-    if host.lower() == "localhost":
+    host = host.lower().removesuffix(".")
+    if host == "localhost":
         return "127.0.0.1"
     try:
         # Also reads the short forms bind() accepts ("0", "127.1").
         return socket.inet_ntoa(socket.inet_aton(host))
     except OSError:
-        return host.lower()
-
-
-# The servers are IPv4 only; digits and dots that are no IPv4 address are no host name either.
-def _unbindable(host: str) -> bool:
-    if not re.fullmatch(r"[0-9.]+", host):
-        return ":" in host
-    try:
-        socket.inet_aton(host)
-    except OSError:
-        return True
-    return False
+        return host
 
 
 def _overlap(first: str, second: str) -> bool:
@@ -77,7 +66,8 @@ def config_problems(config: SwitchboardConfig, environ: Mapping[str, str] | None
         if not env.get(_RELAY_SECRET, "").strip():
             problems.append(f"{_RELAY_SECRET} is missing but relay.enabled is true: every relay agent would be rejected")
     for name, host in listeners:
-        if _unbindable(host):
+        # The servers are IPv4 only.
+        if not is_ipv4_or_host_name(host):
             problems.append(f"{name} {host!r} is neither an IPv4 address nor a host name")
     for first_name, second_name in _CREDENTIAL_PAIRS:
         both(env.get(first_name, "").strip(), first_name, env.get(second_name, "").strip(), second_name)

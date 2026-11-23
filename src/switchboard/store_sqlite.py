@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Generator, Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, cast
@@ -119,6 +120,10 @@ class ReplayError(ValueError):
     pass
 
 
+class StoreClosedError(sqlite3.ProgrammingError):
+    pass
+
+
 class SwitchboardStore:
     def __init__(self, path: str, *, busy_timeout_ms: int = 5000) -> None:
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
@@ -126,15 +131,37 @@ class SwitchboardStore:
         # One connection is shared by HTTP threads and background workers, so every
         # statement (reads included) runs under this lock.
         self._lock = threading.Lock()
+        # Checked under the lock, so nothing that was still waiting for it slips past a shutdown.
+        self._intake_refused = False
+        self._closed = False
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(_SCHEMA)
 
+    @contextmanager
+    def _open(self) -> Generator[None, None, None]:
+        with self._lock:
+            if self._closed:
+                raise StoreClosedError("the store is closed")
+            yield
+
+    # New events and replays; what is already stored may still record its outcome until close().
+    @contextmanager
+    def _intake(self) -> Generator[None, None, None]:
+        with self._open():
+            if self._intake_refused:
+                raise StoreClosedError("the store takes no new events or replays")
+            yield
+
+    def refuse_intake(self) -> None:
+        self._intake_refused = True
+
     # A statement holds the lock until it commits, so a successful close never cuts a transaction. False: the lock
-    # was not free within timeout (-1 waits) and the connection stays open.
+    # was not free within timeout (-1 waits) and the connection stays open, but takes no further statement.
     def close(self, timeout: float = -1) -> bool:
+        self._closed = True
         if not self._lock.acquire(timeout=timeout):
             return False
         try:
@@ -144,7 +171,7 @@ class SwitchboardStore:
         return True
 
     def pragma(self, name: str) -> Any:
-        with self._lock:
+        with self._open():
             return self._conn.execute(f"PRAGMA {name}").fetchone()[0]
 
     def insert_inbound(
@@ -154,7 +181,7 @@ class SwitchboardStore:
         now: datetime,
     ) -> bool:
         stamp = format_utc(now)
-        with self._lock:
+        with self._intake():
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 cursor = self._conn.execute(
@@ -198,7 +225,7 @@ class SwitchboardStore:
         return inserted
 
     def find_inbound(self, source: str, external_id: str) -> CanonicalEvent | None:
-        with self._lock:
+        with self._open():
             row = self._conn.execute(
                 "SELECT payload_json FROM inbound_events WHERE source = ? AND external_id = ?",
                 (source, external_id),
@@ -206,14 +233,14 @@ class SwitchboardStore:
         return None if row is None else CanonicalEvent.from_json(str(row["payload_json"]))
 
     def get_inbound(self, event_id: str) -> CanonicalEvent | None:
-        with self._lock:
+        with self._open():
             row = self._conn.execute(
                 "SELECT payload_json FROM inbound_events WHERE event_id = ?", (event_id,)
             ).fetchone()
         return None if row is None else CanonicalEvent.from_json(str(row["payload_json"]))
 
     def feishu_card_report(self, message_id: str, chat_id: str) -> CanonicalEvent | None:
-        with self._lock:
+        with self._open():
             rows = self._conn.execute(
                 """SELECT idempotency_key, target_json FROM outbound_messages
                    WHERE platform_msg_id = ? AND channel = 'feishu'
@@ -233,11 +260,11 @@ class SwitchboardStore:
         return report if report.metadata.get("outcome_kind") == "suspend" else None
 
     def count_inbound(self) -> int:
-        with self._lock:
+        with self._open():
             return int(self._conn.execute("SELECT COUNT(*) FROM inbound_events").fetchone()[0])
 
     def due_deliveries(self, now: datetime, limit: int = 100) -> list[DueDelivery]:
-        with self._lock:
+        with self._open():
             rows = self._conn.execute(_DUE_HEADS_SQL, (format_utc(now), limit)).fetchall()
         return [
             DueDelivery(row=_delivery_row(row), event=CanonicalEvent.from_json(str(row["payload_json"])))
@@ -245,14 +272,14 @@ class SwitchboardStore:
         ]
 
     def next_delivery_at(self) -> str | None:
-        with self._lock:
+        with self._open():
             row = self._conn.execute(
                 "SELECT MIN(next_retry_at) FROM delivery_log WHERE status IN ('pending', 'retry')"
             ).fetchone()
         return None if row[0] is None else str(row[0])
 
     def get_delivery(self, event_id: str, consumer_id: str) -> DeliveryRow | None:
-        with self._lock:
+        with self._open():
             row = self._conn.execute(
                 "SELECT * FROM delivery_log WHERE event_id = ? AND consumer_id = ?",
                 (event_id, consumer_id),
@@ -260,7 +287,7 @@ class SwitchboardStore:
         return None if row is None else _delivery_row(row)
 
     def list_deliveries(self, event_id: str | None = None) -> list[DeliveryRow]:
-        with self._lock:
+        with self._open():
             if event_id is None:
                 rows = self._conn.execute(
                     "SELECT * FROM delivery_log ORDER BY created_at, rowid"
@@ -283,7 +310,7 @@ class SwitchboardStore:
         last_error: str | None,
         now: datetime,
     ) -> None:
-        with self._lock:
+        with self._open():
             self._conn.execute(
                 """
                 UPDATE delivery_log
@@ -304,7 +331,7 @@ class SwitchboardStore:
     # Only 'pending' rows: offline deferrals. Online failures ('retry') keep their backoff.
     def reset_offline_pending(self, consumer_id: str, now: datetime) -> int:
         stamp = format_utc(now)
-        with self._lock:
+        with self._open():
             cursor = self._conn.execute(
                 """
                 UPDATE delivery_log SET next_retry_at = ?, updated_at = ?
@@ -316,7 +343,7 @@ class SwitchboardStore:
 
     def replay_delivery(self, event_id: str, consumer_id: str, now: datetime) -> DeliveryRow:
         stamp = format_utc(now)
-        with self._lock:
+        with self._intake():
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._conn.execute(
@@ -352,7 +379,7 @@ class SwitchboardStore:
             "body_md": msg.body_md,
             "card_payload": None if msg.card_payload is None else dict(msg.card_payload),
         }
-        with self._lock:
+        with self._open():
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 cursor = self._conn.execute(
@@ -387,7 +414,7 @@ class SwitchboardStore:
         return str(existing["msg_id"]), inserted
 
     def due_outbound(self, now: datetime, limit: int = 100) -> list[OutboundRow]:
-        with self._lock:
+        with self._open():
             rows = self._conn.execute(
                 """
                 SELECT * FROM outbound_messages
@@ -400,21 +427,21 @@ class SwitchboardStore:
         return [_outbound_row(row) for row in rows]
 
     def next_outbound_at(self) -> str | None:
-        with self._lock:
+        with self._open():
             row = self._conn.execute(
                 "SELECT MIN(next_retry_at) FROM outbound_messages WHERE status = 'pending'"
             ).fetchone()
         return None if row[0] is None else str(row[0])
 
     def get_outbound(self, msg_id: str) -> OutboundRow | None:
-        with self._lock:
+        with self._open():
             row = self._conn.execute(
                 "SELECT * FROM outbound_messages WHERE msg_id = ?", (msg_id,)
             ).fetchone()
         return None if row is None else _outbound_row(row)
 
     def list_outbound(self) -> list[OutboundRow]:
-        with self._lock:
+        with self._open():
             rows = self._conn.execute(
                 "SELECT * FROM outbound_messages ORDER BY created_at, rowid"
             ).fetchall()
@@ -431,7 +458,7 @@ class SwitchboardStore:
         last_error: str | None,
         now: datetime,
     ) -> None:
-        with self._lock:
+        with self._open():
             self._conn.execute(
                 """
                 UPDATE outbound_messages
@@ -451,7 +478,7 @@ class SwitchboardStore:
             )
 
     def table_names(self) -> set[str]:
-        with self._lock:
+        with self._open():
             rows = self._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
             ).fetchall()
