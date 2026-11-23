@@ -27,12 +27,36 @@ class LimitKeys:
 
 class ConcurrencyLimiter:
     # Used only on the pool's event loop: check and take happen without an await in between, so they are atomic.
+    # Shared across config-reload generations so retired Runs keep counting against the current limits until they finish.
     def __init__(self, max_concurrency: int, limits: ConcurrencyLimits | None = None) -> None:
         self._max_concurrency = max_concurrency
         self._limits = limits or ConcurrencyLimits()
         self._held: dict[str, LimitKeys] = {}
         self._projects: Counter[str] = Counter()
         self._executors: Counter[str] = Counter()
+        self._listeners: list[Callable[[], None]] = []
+
+    def subscribe(self, listener: Callable[[], None]) -> Callable[[], None]:
+        self._listeners.append(listener)
+
+        def _unsubscribe() -> None:
+            try:
+                self._listeners.remove(listener)
+            except ValueError:
+                pass
+
+        return _unsubscribe
+
+    def _notify(self) -> None:
+        for listener in tuple(self._listeners):
+            listener()
+
+    def reconfigure(self, max_concurrency: int, limits: ConcurrencyLimits | None = None) -> None:
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency must be >= 1")
+        self._max_concurrency = max_concurrency
+        self._limits = limits or ConcurrencyLimits()
+        self._notify()
 
     @property
     def active(self) -> int:
@@ -72,8 +96,13 @@ class ConcurrencyLimiter:
             return
         if keys.project is not None:
             self._projects[keys.project] -= 1
+            if self._projects[keys.project] <= 0:
+                del self._projects[keys.project]
         if keys.executor is not None:
             self._executors[keys.executor] -= 1
+            if self._executors[keys.executor] <= 0:
+                del self._executors[keys.executor]
+        self._notify()
 
 
 @dataclass(frozen=True, slots=True)

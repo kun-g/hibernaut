@@ -361,6 +361,58 @@ tbody tr.clickable { cursor: pointer; }
 }
 .topo-collapse-hint:hover { color: var(--text-dim); }
 
+/* Expandable event rows (Event -> Session detail) */
+tbody tr.ev-row { cursor: pointer; }
+tbody tr.ev-row.expanded { background: rgba(30, 41, 59, 0.42); }
+.ev-caret {
+  display: inline-block; width: 12px; color: var(--text-muted);
+  transition: transform 0.16s ease, color 0.16s ease;
+  font-size: 10px; vertical-align: middle; margin-right: 3px;
+}
+tr.ev-row:hover .ev-caret, tr.ev-row.expanded .ev-caret { color: #93c5fd; }
+tr.ev-row.expanded .ev-caret { transform: rotate(90deg); }
+
+tr.ev-detail-row:hover { background: transparent; }
+tr.ev-detail-row > td {
+  padding: 0 14px 12px 26px;
+  background: rgba(11, 15, 23, 0.42);
+  border-bottom: 1px solid var(--border);
+}
+.ev-detail-box {
+  padding-top: 10px;
+  display: flex; flex-direction: column; gap: 9px;
+}
+.ev-detail-meta {
+  display: flex; flex-wrap: wrap; gap: 6px 16px;
+  font-size: 11.5px; color: var(--text-dim); font-family: var(--mono);
+}
+.ev-detail-meta b { color: var(--text-muted); font-weight: 500; }
+.ev-sess-list {
+  display: flex; flex-direction: column; gap: 7px;
+}
+.ev-sess-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left: 3px solid #3b82f6;
+  border-radius: 8px;
+  padding: 9px 12px;
+  display: flex; flex-direction: column; gap: 5px;
+}
+.ev-sess-card.st-active { border-left-color: var(--cyan); }
+.ev-sess-card.st-suspended { border-left-color: var(--amber); }
+.ev-sess-card.st-closed, .ev-sess-card.st-archived { border-left-color: var(--text-muted); }
+.ev-sess-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+}
+.ev-sess-meta {
+  display: flex; flex-wrap: wrap; gap: 5px 14px;
+  font-size: 11.5px; color: var(--text-dim); font-family: var(--mono);
+}
+.ev-sess-empty {
+  font-size: 12px; color: var(--text-muted);
+  padding: 8px 11px; border: 1px dashed var(--border); border-radius: 7px;
+}
+
 /* Drawer modal */
 .drawer-backdrop {
   position: fixed; inset: 0; background: rgba(0, 0, 0, 0.62);
