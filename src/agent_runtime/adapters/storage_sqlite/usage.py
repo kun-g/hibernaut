@@ -13,7 +13,8 @@ def _review_key(work_key: str) -> str:
 class SQLiteWorkUsage:
     # Who still needs a task's worktree, read from the shared database at the moment of asking. Sessions that carry
     # the work_key itself are counted by the session store; this adds independently dispatched reviewers (their own
-    # correlation_key, review_of in the payload), queued or running events, and a delivery left unfinished.
+    # correlation_key, review_of in the payload), queued or running events, open Runs of its sessions, and a
+    # delivery left unfinished.
     def __init__(self, db: SQLiteDatabase) -> None:
         self._db = db
 
@@ -29,6 +30,15 @@ class SQLiteWorkUsage:
             (work_key,),
         )
         out += [f"event {r['event_id']} ({r['status']})" for r in rows]
+        # A Run left open (its executor may still write in the worktree) holds it whatever its session's status.
+        runs = self._db.fetchall(
+            """
+            SELECT o.session_id FROM open_runs o JOIN sessions s ON s.session_id = o.session_id
+            WHERE s.work_key = ? ORDER BY o.started_at, o.session_id
+            """,
+            (work_key,),
+        )
+        out += [f"run of session {r['session_id']} is open" for r in runs]
         row = self._db.fetchone("SELECT record_json FROM deliveries WHERE work_key = ?", (work_key,))
         if row is not None:
             raw: object = json.loads(str(row["record_json"]))

@@ -1,13 +1,16 @@
 import asyncio
+import json
+import shutil
 import unittest
 from pathlib import Path
 
 from agent_runtime.adapters.delivery import DeliveryConfig
-from agent_runtime.adapters.executor_cli import CommandResult
+from agent_runtime.adapters.executor_cli import CommandResult, OrcaWorktreeManager
 from agent_runtime.adapters.executor_cli.reclaim_sweep import SweepTarget, WorktreeReclaimSweeper
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDeliveryStore,
     SQLiteInboxAdapter,
+    SQLiteOpenRunStore,
     SQLiteOutboxAdapter,
     SQLiteWorkUsage,
 )
@@ -207,6 +210,194 @@ class TestSweepTouchesOnlyHibernautWorktrees(SweepCase, unittest.TestCase):
         self.workspaces.reserve_creating(work_key="task:11", repo_checkout=str(self.primary),
                                          workdir=str(self.root / "hb-task-11"), branch="hb/task-11")
         self.assertEqual([o.work_key for o in self.sweeper().sweep_once()], ["task:9"])
+
+
+class TestSweepForgetsWorktreesRemovedByHand(SweepCase, unittest.TestCase):
+    # The directory was deleted outside Hibernaut (by hand, by Orca, by an older flow); only the record is left.
+    def session(self, session_id="dev-1", status="active", correlation_key="task:9"):
+        self.sessions.save(SessionRef(session_id=session_id, inbox_id=INBOX, correlation_key=correlation_key,
+                                      work_key="task:9", status=status))
+
+    def remove_by_hand(self, prune=True):
+        shutil.rmtree(self.wt)
+        if prune:
+            git(self.primary, "worktree", "prune")
+
+    def registered(self):
+        return str(self.wt.resolve()) in git(self.primary, "worktree", "list", "--porcelain")
+
+    def test_a_missing_directory_drops_the_record_closes_its_sessions_and_alerts_once(self):
+        self.session("dev-1", "active")
+        self.session("dev-2", "suspended", correlation_key="task:9:child")
+        self.remove_by_hand()
+        sweeper = self.sweeper()
+        [outcome] = sweeper.sweep_once()
+        self.assertTrue(outcome.reclaimed, outcome.reason)
+        self.assertIsNone(self.workspaces.get("task:9"))
+        self.assertEqual(self.sessions.get("dev-1").status, "closed")
+        self.assertEqual(self.sessions.get("dev-2").status, "closed")
+        [alert] = self.messages()
+        self.assertIn(str(self.wt), alert)
+        self.assertIn("no longer exists", alert)
+        self.assertIn("record removed", alert)
+        self.assertIn("dev-1", alert)
+        self.assertIn("dev-2", alert)
+        self.assertEqual(self.outbox.fetch_pending(limit=10)[0].metadata.get("kind"), "reclaim_alert")
+        self.assertEqual(sweeper.sweep_once(), [])
+
+    def test_no_merge_evidence_is_needed_once_the_directory_is_gone(self):
+        # The reused-branch case: HEAD cannot be read, so the merge can never be told; nothing is left to protect.
+        self.gh["merged"] = CommandResult(1, "", "gh: no network")
+        self.remove_by_hand()
+        [outcome] = self.sweeper().sweep_once()
+        self.assertTrue(outcome.reclaimed, outcome.reason)
+        self.assertIsNone(self.workspaces.get("task:9"))
+        [alert] = self.messages()
+        self.assertIn("no sessions closed", alert)
+
+    def test_a_worktree_git_still_registers_is_pruned_first(self):
+        self.remove_by_hand(prune=False)
+        self.assertTrue(self.registered())
+        [outcome] = self.sweeper().sweep_once()
+        self.assertTrue(outcome.reclaimed, outcome.reason)
+        self.assertFalse(self.registered())
+        self.assertIsNone(self.workspaces.get("task:9"))
+
+    def test_a_registration_prune_cannot_drop_keeps_the_record(self):
+        git(self.primary, "worktree", "lock", str(self.wt))
+        self.remove_by_hand(prune=False)
+        sweeper = self.sweeper()
+        for _ in range(2):
+            [outcome] = sweeper.sweep_once()
+            self.assertFalse(outcome.reclaimed)
+            self.assertIn("git still registers", outcome.reason)
+        self.assertEqual(self.workspaces.get("task:9").status, "ready")
+        self.assertEqual(self.messages(), [])
+        self.assertEqual(len(self.logged), 1)
+
+    def test_a_pending_event_keeps_the_record_and_its_session_and_is_logged_once(self):
+        self.session()
+        event_id = self.queued_event()
+        self.remove_by_hand()
+        sweeper = self.sweeper()
+        for _ in range(3):
+            [outcome] = sweeper.sweep_once()
+            self.assertFalse(outcome.reclaimed)
+            self.assertIn(f"event {event_id} (pending)", outcome.reason)
+        self.assertEqual(self.workspaces.get("task:9").status, "ready")
+        self.assertEqual(self.sessions.get("dev-1").status, "active")
+        self.assertEqual(self.messages(), [])
+        self.assertEqual(len(self.logged), 1)
+
+        self.drop(event_id)
+        self.assertTrue(sweeper.sweep_once()[0].reclaimed)
+        self.assertEqual(self.sessions.get("dev-1").status, "closed")
+
+    def test_an_open_run_keeps_the_record(self):
+        self.session()
+        runs = SQLiteOpenRunStore(self.db, self.root / "runs")
+        runs.open(session_id="dev-1", inbox_id=INBOX, executor_id="sde", event_ids=[], code_version="t")
+        self.remove_by_hand()
+        sweeper = self.sweeper()
+        for _ in range(2):
+            [outcome] = sweeper.sweep_once()
+            self.assertFalse(outcome.reclaimed)
+            self.assertIn("run of session dev-1 is open", outcome.reason)
+        self.assertIsNotNone(self.workspaces.get("task:9"))
+        self.assertEqual(self.sessions.get("dev-1").status, "active")
+        self.assertEqual(len(self.logged), 1)
+
+        runs.discard("dev-1")
+        self.assertTrue(sweeper.sweep_once()[0].reclaimed)
+
+    def test_the_merged_heads_local_branch_goes_with_the_record(self):
+        self.delivered()
+        self.remove_by_hand()
+        [outcome] = self.sweeper().sweep_once()
+        self.assertTrue(outcome.reclaimed, outcome.reason)
+        self.assertEqual(self.local_branch(), "")
+        self.assertIn("deleted local branch hb/task-9", self.messages()[0])
+
+    def test_a_missing_directory_without_the_hb_prefix_is_left_alone(self):
+        other = self.root / "mine"
+        git(self.primary, "worktree", "add", "-q", "-b", "mine", str(other))
+        self.workspaces.reserve_creating(work_key="task:10", repo_checkout=str(self.primary), workdir=str(other),
+                                         branch="mine")
+        self.workspaces.mark_ready("task:10", workdir=str(other), branch="mine")
+        shutil.rmtree(other)
+        outcomes = {o.work_key: o for o in self.sweeper().sweep_once()}
+        self.assertFalse(outcomes["task:10"].reclaimed)
+        self.assertIn("'hb-' prefix", outcomes["task:10"].reason)
+        self.assertIsNotNone(self.workspaces.get("task:10"))
+
+    def test_creating_and_reclaiming_records_with_missing_directories_are_not_touched(self):
+        self.remove_by_hand()
+        record = self.workspaces.get("task:9")
+        self.assertIsNotNone(self.workspaces.claim_for_reclaim("task:9", seen_updated_at=record.updated_at,
+                                                               stale_before=""))
+        self.workspaces.reserve_creating(work_key="task:11", repo_checkout=str(self.primary),
+                                         workdir=str(self.root / "hb-task-11"), branch="hb/task-11")
+        self.assertEqual(self.sweeper().sweep_once(), [])
+        self.assertEqual(self.workspaces.get("task:9").status, "reclaiming")
+        self.assertEqual(self.workspaces.get("task:11").status, "creating")
+
+    def test_the_delivery_time_reclaim_handles_a_missing_directory_too(self):
+        self.session()
+        self.remove_by_hand(prune=False)
+        result = self.manager(self.usage.blockers).reclaim("task:9", notify_outbox=self.outbox, inbox_id=INBOX)
+        self.assertTrue(result.reclaimed, result.reason)
+        self.assertIsNone(self.workspaces.get("task:9"))
+        self.assertFalse(self.registered())
+        self.assertEqual(self.sessions.get("dev-1").status, "closed")
+        [alert] = self.messages()
+        self.assertIn("no longer exists", alert)
+        self.assertIn("dev-1", alert)
+
+    def test_the_delivery_time_reclaim_keeps_a_missing_directory_still_in_use(self):
+        event_id = self.queued_event()
+        self.remove_by_hand()
+        result = self.manager(self.usage.blockers).reclaim("task:9", notify_outbox=self.outbox, inbox_id=INBOX)
+        self.assertFalse(result.reclaimed)
+        self.assertIn(f"event {event_id} (pending)", result.reason)
+        self.assertEqual(self.workspaces.get("task:9").status, "ready")
+
+
+class TestSweepAsksOrcaAboutMissingDirectories(SweepCase, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.orca_paths: list[str] = []
+        self.orca_calls: list[list[str]] = []
+        shutil.rmtree(self.wt)
+        git(self.primary, "worktree", "prune")
+
+    def orca_runner(self, cmd, cwd):
+        if cmd[0] != "orca":
+            return self.runner(cmd, cwd)
+        self.orca_calls.append(list(cmd))
+        if cmd[:3] == ["orca", "worktree", "list"]:
+            rows = [{"path": p} for p in self.orca_paths]
+            return CommandResult(0, json.dumps({"ok": True, "result": {"worktrees": rows, "truncated": False}}), "")
+        return CommandResult(1, "", "unexpected orca call")
+
+    def target_for(self, record):
+        manager = OrcaWorktreeManager(workspace_store=self.workspaces, session_store=self.sessions, backend="orca",
+                                      runner=self.orca_runner, usage=self.usage.blockers)
+        return SweepTarget(manager=manager, delivery=self.delivery_config, inbox_id=INBOX)
+
+    def test_a_worktree_orca_still_lists_keeps_the_record(self):
+        self.orca_paths = [str(self.wt)]
+        [outcome] = self.sweeper().sweep_once()
+        self.assertFalse(outcome.reclaimed)
+        self.assertIn("Orca still lists", outcome.reason)
+        self.assertIsNotNone(self.workspaces.get("task:9"))
+        self.assertEqual(self.messages(), [])
+
+    def test_a_worktree_orca_no_longer_lists_is_forgotten_without_an_orca_removal(self):
+        self.orca_paths = [str(self.primary)]
+        [outcome] = self.sweeper().sweep_once()
+        self.assertTrue(outcome.reclaimed, outcome.reason)
+        self.assertIsNone(self.workspaces.get("task:9"))
+        self.assertEqual({tuple(c[:3]) for c in self.orca_calls}, {("orca", "worktree", "list")})
 
 
 class TestSweepLoop(SweepCase, unittest.IsolatedAsyncioTestCase):
