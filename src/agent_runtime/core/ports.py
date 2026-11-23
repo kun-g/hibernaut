@@ -21,7 +21,8 @@ from agent_runtime.core.models import (
 
 
 class InboxPort(Protocol):
-    # Dedup key: (inbox_id, source, external_id); duplicates return status='dropped'.
+    # Dedup key: (inbox_id, source, external_id); duplicates return status='dropped'. Every event it returns carries
+    # the 'seq' it was queued under, which a claim, requeue or replay never changes.
     def append(self, event: Event) -> tuple[Event, bool]: ...
     # True while the event with this dedup key is pending or processing; lets a poller skip it without a dropped row.
     def has_open_event(self, inbox_id: str, source: str, external_id: str) -> bool: ...

@@ -21,6 +21,7 @@ from agent_runtime.adapters.executor_cli import (
     SDEOptions,
     StewardExecutor,
 )
+from agent_runtime.adapters.executor_cli import steward_tools
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
 from agent_runtime.adapters.executor_cli.steward_git import GitRefused, check_git_args
@@ -488,6 +489,43 @@ class ToolTests(StewardCase):
             self.assertNotIn("needle", text, args)
         self.assertIn("open.txt", asked)
 
+    async def test_search_judges_the_whole_path_whatever_is_in_it(self) -> None:
+        (self.repo / "private\npublic.txt").write_text("needle one\n")
+        (self.repo / "private\rpublic.txt").write_text("needle two\n")
+        (self.repo / "private\n7").write_text("needle three\n")
+        (self.repo / "public.txt").write_text("needle four\rneedle five\r\nneedle six\n")
+        (self.repo / "open\nname.txt").write_text("needle seven\n")
+        git(self.repo, "add", "-A")
+        judged: list[str] = []
+
+        class Policy:
+            def check(self, tool_name: str, args: dict[str, Any]) -> PermissionDecision:
+                if tool_name == "read_file":
+                    judged.append(args["path"])
+                    return PermissionDecision("block" if args["path"].startswith("private") else "allow", "private")
+                return PermissionDecision("allow", "")
+
+        self.caps.permissions = Policy()
+        failed, text = await self.tool("search_files", pattern="needle")
+        self.assertFalse(failed, text)
+        self.assertEqual(set(judged), {"private\npublic.txt", "private\rpublic.txt", "private\n7", "public.txt",
+                                       "open\nname.txt"})
+        for hidden in ("one", "two", "three"):
+            self.assertNotIn(f"needle {hidden}", text)
+        for shown in ("four", "five", "six", "seven"):
+            self.assertIn(f"needle {shown}", text)
+        self.assertIn('"open\\nname.txt":1:needle seven', text)
+
+    async def test_search_shows_nothing_it_cannot_tell_the_file_of(self) -> None:
+        for record in (b"no record", b"a.txt\0x\0needle\n", b"a.txt\x001\0needle"):
+            with self.subTest(record), patch.object(steward_tools, "run_git", return_value=record):
+                failed, text = await self.tool("search_files", pattern="needle")
+                self.assertTrue(failed, text)
+                self.assertNotIn("needle\n", text)
+        with patch.object(steward_tools, "run_git", return_value=b"bad\xff.txt\x001\0needle x\ncalc.py\x001\0needle a\0b\ncalc.py\x002:needle c\n"):
+            self.assertEqual(await self.tool("search_files", pattern="needle"),
+                             (False, "calc.py:1:needle a\0b\ncalc.py:2:needle c\n"))
+
     async def test_a_path_in_history_shows_only_a_file(self) -> None:
         (self.repo / "secrets").mkdir()
         (self.repo / "secrets/key.txt").write_text("needle\n")
@@ -658,6 +696,73 @@ class SuspendTests(StewardCase):
         [call] = self.launches()
         self.assertIn("triage this", call["prompt"])
         self.assertIn("one more thing", call["prompt"])
+
+    async def test_an_approved_launch_is_judged_again(self) -> None:
+        self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("defer", "ask")})
+        outcome = await self.run_steward(self.event("triage this"))
+        assert isinstance(outcome, Suspend)
+        self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("block", "closed today")})
+        final = await self.run_steward(self.decision(outcome, True), session=self.suspended(outcome))
+        assert isinstance(final, Emit)
+        self.assertEqual(final.status, "refused")
+        self.assertIn("closed today", final.messages[0])
+        self.assertEqual(self.calls(), [])
+
+    async def test_an_approval_holds_only_for_the_launch_it_was_asked_for(self) -> None:
+        self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("defer", "ask")})
+        other = self.root / "other"
+        other.mkdir()
+        fake = fake_command(self.root)
+        variants = {
+            "checkout": ({MAIN: str(other)}, {}),
+            "launcher": (None, {"launcher": ClaudeCodeLauncher(name="second", command=fake)}),
+            "command": (None, {"launcher": ClaudeCodeLauncher(name="fake", command=f"{self.root}/elsewhere")}),
+            "launcher env": (None, {"launcher": ClaudeCodeLauncher(name="fake", command=fake, env={"A": "1"})}),
+            "env": (None, {"env": {"A": "secret-value"}}),
+            "model": (None, {"model": "claude-opus-5-5"}),
+        }
+        for name, (checkouts, changed) in variants.items():
+            with self.subTest(name):
+                outcome = await self.run_steward(self.event("triage this"))
+                assert isinstance(outcome, Suspend)
+                executor = self.executor(checkouts)
+                executor._profile = replace(executor._profile, **changed)  # pyright: ignore[reportPrivateUsage]
+                asked = await executor.execute([self.decision(outcome, True)], self.suspended(outcome), self.caps)
+                assert isinstance(asked, Suspend)
+                self.assertNotEqual(asked.request_id, outcome.request_id)
+                self.assertEqual(self.calls(), [])
+                self.assertNotIn("secret-value", asked.session_checkpoint)
+                # The new request is for the launch as it is now, and keeps what it was for.
+                if name in ("model", "checkout"):
+                    final = await executor.execute([self.decision(asked, True)], self.suspended(asked), self.caps)
+                    self.assertIsInstance(final, Silent)
+                    self.assertIn("triage this", self.launches()[-1]["prompt"])
+                    self.log.unlink()
+
+    async def test_a_request_from_before_the_arguments_were_kept_is_asked_again(self) -> None:
+        self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("defer", "ask")})
+        outcome = await self.run_steward()
+        assert isinstance(outcome, Suspend)
+        old = json.loads(outcome.session_checkpoint)
+        del old["launch"]
+        session = replace(self.suspended(outcome), checkpoint=json.dumps(old))
+        self.assertIsInstance(await self.run_steward(self.decision(outcome, True), session=session), Suspend)
+        self.assertEqual(self.calls(), [])
+
+    async def test_a_second_attempt_is_judged_too(self) -> None:
+        answers = [PermissionDecision("allow", ""), PermissionDecision("block", "closed meanwhile")]
+
+        class Policy:
+            def check(self, tool_name: str, args: dict[str, Any]) -> PermissionDecision:
+                return answers.pop(0)
+
+        self.caps.permissions = Policy()
+        self.set_plan({"error": "no such conversation"}, {"output": {"action": "reply", "message": "hello"}})
+        session = SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward", executor_session_id="gone")
+        outcome = await self.run_steward(session=session)
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "refused")
+        self.assertEqual(len(self.launches()), 1)
 
     async def test_a_rejected_launch_stops(self) -> None:
         self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("defer", "ask")})

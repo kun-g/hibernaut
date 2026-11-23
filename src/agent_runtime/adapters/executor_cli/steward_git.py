@@ -139,13 +139,13 @@ def _without_filters(checkout: Path, env: dict[str, str]) -> dict[str, str]:
     try:
         listed = subprocess.run(
             ["git", "config", "--name-only", "-z", "--get-regexp", r"^filter\."], cwd=checkout, env=env,
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="surrogateescape", timeout=_GIT_TIMEOUT,
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=_GIT_TIMEOUT,
         )
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise ToolError(f"git: {exc}") from exc
     if listed.returncode not in (0, 1):
-        raise ToolError(f"git config exited {listed.returncode}: {listed.stderr.strip()[-2000:]}")
-    drivers = dict.fromkeys(name.rpartition(".")[0] for name in listed.stdout.split("\0") if name.count(".") > 1)
+        raise ToolError(f"git config exited {listed.returncode}: {os.fsdecode(listed.stderr).strip()[-2000:]}")
+    drivers = dict.fromkeys(name.rpartition(".")[0] for name in os.fsdecode(listed.stdout).split("\0") if name.count(".") > 1)
     unset = [(f"{driver}.{key}", value) for driver in drivers
              for key, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))]
     for index, (key, value) in enumerate(unset):
@@ -153,21 +153,42 @@ def _without_filters(checkout: Path, env: dict[str, str]) -> dict[str, str]:
     return {**env, "GIT_CONFIG_COUNT": str(len(unset))}
 
 
-def exec_git(checkout: Path, args: Sequence[str], ok: Sequence[int] = (0,)) -> str:
+def run_git(checkout: Path, args: Sequence[str], ok: Sequence[int] = (0,)) -> bytes:
     env = _git_env()
     if args[0] in _READS_CHECKOUT:
         env = _without_filters(checkout, env)
     try:
         done = subprocess.run(
             ["git", "--no-pager", *(part for item in _GIT_CONFIG for part in ("-c", item)), *args],
-            cwd=checkout, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-            timeout=_GIT_TIMEOUT,
+            cwd=checkout, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=_GIT_TIMEOUT,
         )
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise ToolError(f"git: {exc}") from exc
     if done.returncode not in ok:
-        raise ToolError(f"git {args[0]} exited {done.returncode}: {done.stderr.strip()[-2000:]}")
+        said = done.stderr.decode("utf-8", errors="replace").strip()[-2000:]
+        raise ToolError(f"git {args[0]} exited {done.returncode}: {said}")
     return done.stdout
+
+
+def exec_git(checkout: Path, args: Sequence[str], ok: Sequence[int] = (0,)) -> str:
+    # For reading, not for names: bytes that are no text are replaced.
+    return run_git(checkout, args, ok).decode("utf-8", errors="replace")
+
+
+def file_name(raw: bytes) -> str | None:
+    # None: a name that is no text can neither be judged by the gate nor named by the Steward.
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def git_names(checkout: Path, args: Sequence[str], *, skip: bool = False) -> list[str]:
+    # A -z listing.
+    names = [file_name(raw) for raw in run_git(checkout, args).split(b"\0") if raw]
+    if None in names and not skip:
+        raise ToolError(f"git {args[0]}: a file name here is not valid UTF-8; narrow it with a path")
+    return list(dict.fromkeys(name for name in names if name is not None))
 
 
 def _commit(checkout: Path, revision: str) -> str:
@@ -203,10 +224,6 @@ def _diff_revision(checkout: Path, revision: str) -> str:
     return dots.join(_commit(checkout, side or "HEAD") for side in (left, right))
 
 
-def _names(out: str) -> list[str]:
-    return list(dict.fromkeys(name for name in out.split("\0") if name))
-
-
 def plan_git(checkout: Path, call: GitCall) -> tuple[list[str], list[str]]:
     # (files whose content the answer shows, the git arguments that show it; none when there is nothing to show)
     command, options, revisions = call.command, call.options, call.revisions
@@ -234,9 +251,9 @@ def plan_git(checkout: Path, call: GitCall) -> tuple[list[str], list[str]]:
     else:
         compared = [o for o in options if o in ("--cached", "--staged", "--merge-base")]
         listings = [["diff", *_PLAIN, _NO_SUBMODULES, "--name-only", "-z", "--no-renames", "--no-relative", *compared, *revisions]]
-    files = [name for listing in listings
-             for name in exec_git(checkout, [*listing, "--", *call.paths]).split("\0") if name]
-    files = list(dict.fromkeys(files))
+    files = list(dict.fromkeys(
+        name for listing in listings for name in git_names(checkout, [*listing, "--", *call.paths])
+    ))
     if len(files) > _MAX_CONTENT_FILES:
         raise ToolError(f"git: {len(files)} files; narrow it with paths after --, or use --stat")
     if not files:

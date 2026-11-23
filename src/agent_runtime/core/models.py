@@ -68,6 +68,8 @@ class Event:
     session_id: str | None = None
     correlation_key: str | None = None
     status: EventStatus = "pending"
+    # Place in the Event Inbox, set by the store: which of two events came first, whatever their clocks said.
+    seq: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +141,10 @@ class ForwardSpec:
     settled_returns: tuple[tuple[str, str], ...] = ()
     # What this session owed is owed by the agent it handed it on to: nothing it says about that work goes outside.
     handed_on: bool = False
+    # Closed on request, not by its own Run: what it sent out ends with it, started or not.
+    closed: bool = False
+    # The session this one went on as when its Run gave it another id.
+    continued_in: str | None = None
     # An operator replayed the event that brought this piece: its result counts although the piece is settled.
     replayed: bool = False
     # Failed events of this session that do not end the task outside: told to the agent it owed a result, or a

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -87,8 +88,9 @@ def _no_forwards() -> list[dict[str, Any]]:
 @dataclass(slots=True)
 class _State:
     stage: str
-    # The prompt of a launch that waits for approval.
+    # The prompt of a launch that waits for approval, and what is launched.
     prompt: str = ""
+    launch: dict[str, Any] = field(default_factory=dict[str, Any])
     # What arrived while a person was deciding.
     followups: list[str] = field(default_factory=list[str])
     forwards: list[dict[str, Any]] = field(default_factory=_no_forwards)
@@ -109,10 +111,11 @@ class _State:
         data = cast(dict[str, Any], parsed)
         forwards = data.get("forwards")
         followups = data.get("followups")
-        message = data.get("message")
+        message, launch = data.get("message"), data.get("launch")
         return _State(
             stage=str(data.get("stage", "")),
             prompt=str(data.get("prompt", "")),
+            launch=cast(dict[str, Any], launch) if isinstance(launch, dict) else {},
             followups=[str(f) for f in cast(list[object], followups)] if isinstance(followups, list) else [],
             forwards=[cast(dict[str, Any], f) for f in cast(list[object], forwards) if isinstance(f, dict)]
             if isinstance(forwards, list) else [],
@@ -178,7 +181,7 @@ class StewardExecutor:
             if not approved:
                 return self._emit(session_id, native, "launch declined", "stopped")
             return await self._launch(session_id, native, "\n\n".join([state.prompt, *followups]) + note, caps, tools,
-                                      approved=True)
+                                      approved=state.launch)
         results = [self._send(tools, wanted, pending) if approved else f"declined: {_summary(wanted)}"
                    for wanted in state.forwards]
         if approved and not followups and not any(r.startswith("refused") for r in results):
@@ -204,26 +207,35 @@ class StewardExecutor:
         caps: RunCapabilities,
         tools: StewardTools,
         *,
-        approved: bool = False,
+        # The launch a person approved.
+        approved: Mapping[str, Any] | None = None,
     ) -> RunOutcome:
         p = self._profile
-        if not approved:
-            decision = caps.permissions.check(STEWARD_LAUNCH_TOOL, {
-                "executor": p.name, "checkout": str(tools.checkout), "harness": p.harness, "launcher": p.launcher.name,
-                "billing": p.billing, "model": p.model, "effort": p.effort,
-            })
+
+        def refused() -> RunOutcome | None:
+            # Judged for every process, as it is started now: an approval only lifts a defer, for the same launch.
+            args, launch = self._launch_args(tools)
+            decision = caps.permissions.check(STEWARD_LAUNCH_TOOL, args)
             if decision.action == "block":
                 return self._emit(session_id, native, decision.reason, "refused")
-            if decision.action == "defer":
+            if decision.action == "defer" and launch != approved:
                 return Suspend(request_id=new_id("req"), prompt=decision.reason,
-                               session_checkpoint=_State(stage="launch", prompt=prompt).dump(),
+                               session_checkpoint=_State(stage="launch", prompt=prompt, launch=launch).dump(),
                                session_id=session_id, executor_session_id=native)
+            return None
+
+        stopped = refused()
+        if stopped is not None:
+            return stopped
         try:
             result = await self._converse(native, prompt, caps, tools)
         except ClaudeCodeError as exc:
             if native is None or tools.calls:
                 return self._emit(session_id, native, str(exc), "failed")
             # The native conversation may be gone; memory and the events carry what a new one needs.
+            stopped = refused()
+            if stopped is not None:
+                return stopped
             try:
                 result = await self._converse(None, prompt, caps, tools)
             except ClaudeCodeError as retried:
@@ -245,6 +257,17 @@ class StewardExecutor:
                 session_id=session_id, executor_session_id=native,
             )
         return self._answer(session_id, native, reply)
+
+    def _launch_args(self, tools: StewardTools) -> tuple[dict[str, Any], dict[str, Any]]:
+        # (what the gate judges, what an approval is tied to). Environment values may be private, so only their digest
+        # is kept.
+        p = self._profile
+        args: dict[str, Any] = {
+            "executor": p.name, "checkout": str(tools.checkout), "harness": p.harness, "launcher": p.launcher.name,
+            "launcher_command": p.launcher.command, "billing": p.billing, "model": p.model, "effort": p.effort,
+        }
+        env = json.dumps([p.launcher.env, p.env, p.credential_proxy_url], sort_keys=True)
+        return args, {**args, "env": hashlib.sha256(env.encode()).hexdigest()}
 
     async def _converse(
         self, native: str | None, prompt: str, caps: RunCapabilities, tools: StewardTools

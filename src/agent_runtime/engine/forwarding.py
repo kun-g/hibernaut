@@ -142,12 +142,36 @@ def settled_return(event: Event, sessions: SessionStorePort) -> bool:
         _asking_session(sessions, asked),
     ):
         known = session.forward if session is not None and session.inbox_id == event.inbox_id else None
+        if known is not None and known.closed and session is not None and session.status == "closed":
+            return True
         # The event that settled it may run again, after a crash before it was marked done.
         if known is not None and (piece in known.cancelled_returns or any(
             done == piece and by != event.event_id for done, by in known.settled_returns
         )):
             return True
     return False
+
+
+def withdrawn(spec: ForwardSpec, inbox_id: str, sessions: SessionStorePort) -> bool:
+    # Work whose session was closed, or that this session stopped waiting for: it does not start, and what comes of it
+    # goes nowhere. An operator who replays it means it.
+    if spec.replayed:
+        return False
+    for session in (current_session(sessions, spec.parent_session_id), _asking_session(sessions, spec)):
+        known = session.forward if session is not None else None
+        if session is None or known is None:
+            continue
+        if spec.delegation_id is not None and spec.delegation_id in known.cancelled_returns:
+            return True
+        # A relay inside an inbox that asks for no result is not its session's own any more.
+        if known.closed and session.status == "closed" and (spec.delegation_id or session.inbox_id != inbox_id):
+            return True
+    return False
+
+
+def withdrawn_forward(event: Event, sessions: SessionStorePort) -> bool:
+    spec = carried_spec(event) if event.source == FORWARD_SOURCE else None
+    return spec is not None and withdrawn(spec, event.inbox_id, sessions)
 
 
 def same_piece(event: Event, batch: Sequence[Event]) -> bool:
@@ -182,6 +206,9 @@ def own_task(event: Event, sessions: SessionStorePort) -> Event:
 def run_spec(events: Sequence[Event], session: SessionRef | None) -> ForwardSpec | None:
     # How the work of this Run reached it: what its events carry, on top of what the session already knew.
     saved = session.forward if session is not None else None
+    if saved is not None and saved.closed:
+        # At work again.
+        saved = replace(saved, closed=False)
     carried = [(evt, spec) for evt in events if (spec := carried_spec(evt)) is not None]
     returned_now = returned_pieces(events)
     waiting = tuple(p for p in (saved.pending_returns if saved is not None else ()) if p not in returned_now)
@@ -194,9 +221,12 @@ def run_spec(events: Sequence[Event], session: SessionRef | None) -> ForwardSpec
         if saved is not None and (saved.return_to is not None or saved.pending_returns):
             # Still part of the chain this session is in; a chain that is over leaves nothing to the next one.
             hops = max(hops, saved.hop_count)
-        forwards = [spec for evt, spec in carried if evt.source == FORWARD_SOURCE]
+        forwards = [(evt, spec) for evt, spec in carried if evt.source == FORWARD_SOURCE]
         if forwards:
-            latest = next((spec for spec in reversed(forwards) if spec.return_to), forwards[-1])
+            source, latest = next((found for found in reversed(forwards) if found[1].return_to), forwards[-1])
+            if saved is not None and forwarded_piece(source) is None:
+                # The same work, so it is still done for the session it was done for.
+                latest = replace(latest, parent_session_id=saved.parent_session_id)
             if latest.return_to is None and saved is not None and saved.return_to is not None:
                 # Handed on inside the inbox: the session still owes what it owed.
                 return replace(saved, hop_count=hops, pending_returns=waiting, settled_returns=settled,
@@ -256,11 +286,29 @@ def is_open(session: SessionRef) -> bool:
     return session.status in ("active", "suspended")
 
 
+def current_session(sessions: SessionStorePort, session_id: str | None) -> SessionRef | None:
+    # The session itself, or the one it went on as.
+    session = sessions.get(session_id) if session_id else None
+    seen: set[str] = set()
+    while session is not None and session.status == "archived" and session.session_id not in seen:
+        seen.add(session.session_id)
+        following = session.forward.continued_in if session.forward is not None else None
+        session = (sessions.get(following) if following else None) or session
+    return session
+
+
+def owner_session_id(session: SessionRef, sessions: SessionStorePort) -> str | None:
+    # The session it works for now, which it closes with; parent_session_id on the session is the one it was made for.
+    found = (session.forward.parent_session_id if session.forward is not None else None) or session.parent_session_id
+    current = current_session(sessions, found)
+    return current.session_id if current is not None else found
+
+
 def _asking_session(sessions: SessionStorePort, spec: ForwardSpec) -> SessionRef | None:
     # The session up the parent chain that belongs to the inbox the result goes back to.
     current = spec.parent_session_id
     for _ in range(MAX_FORWARD_HOPS):
-        session = sessions.get(current) if current else None
+        session = current_session(sessions, current)
         if session is None or session.inbox_id == spec.return_to:
             return session
         current = session.parent_session_id
@@ -467,21 +515,23 @@ class ForwardStage:
         if relayed and agent == self.agent_id:
             raise ForwardRefused(f"agent '{self.agent_id}' cannot forward to itself in '{target}'")
         back = _text(return_to)
-        passing = False
-        if spec is not None and spec.return_to is not None:
-            # The same work goes on with another agent, and what is owed for it with it.
-            passing = relayed if back is None else back == spec.return_to != self.inbox_id
-        inside = relayed if back is None else back != self.inbox_id
-        if (passing and any(map(passed_on, self.staged))) or (spec is not None and spec.handed_on and inside):
+        owed = spec.return_to if spec is not None else None
+        # Anything but a part this session gets back itself goes on whole, with what is owed for it: an agent that
+        # answered outside or another inbox would answer the same work a second time.
+        whole = back is None or back != self.inbox_id
+        passing = owed is not None and whole and back in (None, owed)
+        if owed is not None and whole and not passing:
+            raise ForwardRefused(f"return_to must be '{self.inbox_id}', or '{owed}' to hand this work on")
+        if (passing and any(map(passed_on, self.staged))) or (spec is not None and spec.handed_on and whole):
             raise ForwardRefused(
                 "this work is already handed on to another agent, which answers for it; end your turn without a result"
             )
         if passing:
             assert spec is not None
-            back = spec.return_to
+            back = owed
             asker = _asking_session(self.sessions, spec)
-            if relayed and asker is not None and (asker.inbox_id, asker.agent_id) == (target, agent):
-                raise ForwardRefused(f"agent '{agent}' waits for your result here; end your turn with it")
+            if target == back and (not relayed or (asker is not None and asker.agent_id == agent)):
+                raise ForwardRefused(f"'{target}' waits for your result; end your turn with it")
         if back is not None:
             if back == target and not relayed:
                 raise ForwardRefused(f"return_to '{back}' is the target inbox itself")

@@ -37,7 +37,7 @@ class EventDiagnostics:
 
 
 _EVENT_COLUMNS = """event_id, inbox_id, source, external_id, occurred_at,
-                   payload_json, session_id, correlation_key, status"""
+                   payload_json, session_id, correlation_key, status, seq"""
 
 
 class SQLiteInboxAdapter:
@@ -56,6 +56,7 @@ class SQLiteInboxAdapter:
             session_id=row["session_id"],
             correlation_key=row["correlation_key"],
             status=cast(EventStatus, str(row["status"])),
+            seq=int(row["seq"]),
         )
 
     def append(self, event: Event) -> tuple[Event, bool]:
@@ -72,7 +73,7 @@ class SQLiteInboxAdapter:
             is_duplicate = existing is not None
             status: EventStatus = "dropped" if is_duplicate else "pending"
             stored = replace(event, status=status)
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO event_inbox (
                     event_id, inbox_id, source, external_id, occurred_at,
@@ -91,7 +92,7 @@ class SQLiteInboxAdapter:
                     stored.status,
                 ),
             )
-        return stored, is_duplicate
+        return replace(stored, seq=cursor.lastrowid), is_duplicate
 
     def has_open_event(self, inbox_id: str, source: str, external_id: str) -> bool:
         row = self._db.fetchone(
@@ -637,6 +638,8 @@ def _forward_from_json(raw: object, inbox_id: str) -> ForwardSpec | None:
         cancelled_returns=texts("cancelled_returns"),
         settled_returns=pairs("settled_returns"),
         handed_on=item.get("handed_on") is True,
+        closed=item.get("closed") is True,
+        continued_in=text("continued_in"),
         replayed=item.get("replayed") is True,
         owed_failures=texts("owed_failures"),
         held=_held_from_json(item.get("held")),

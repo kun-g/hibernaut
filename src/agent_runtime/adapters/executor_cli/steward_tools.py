@@ -16,8 +16,11 @@ from agent_runtime.adapters.executor_cli.steward_git import (
     ToolError,
     check_git_args,
     exec_git,
+    file_name,
+    git_names,
     outside,
     plan_git,
+    run_git,
 )
 from agent_runtime.core.models import Event, ForwardRefused, SessionStatus
 from agent_runtime.core.ports import RunCapabilities, SessionStorePort
@@ -40,6 +43,9 @@ class EventLister(Protocol):
     ) -> list[Event]: ...
 
 
+_MATCH = re.compile(rb"([^\0]+)\0(\d+)[\0:]([^\n]*)\n")
+
+
 def _real_path(checkout: Path, path: str) -> str:
     # The path the permission gate judges and that is read: no other spelling or link leads round a rule for it.
     target = (checkout / path).resolve()
@@ -50,8 +56,8 @@ def _real_path(checkout: Path, path: str) -> str:
 
 def _list_files(checkout: Path, pathspec: str) -> list[str]:
     # What git tracks or would track: neither .git nor ignored files (.env and the like).
-    out = exec_git(checkout, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", pathspec])
-    return list(dict.fromkeys(name for name in out.split("\0") if name))
+    return git_names(checkout, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", pathspec],
+                     skip=True)
 
 
 def _read_file(checkout: Path, path: str, offset: int, limit: int) -> str:
@@ -73,12 +79,27 @@ def _read_file(checkout: Path, path: str, offset: int, limit: int) -> str:
 
 def _search(checkout: Path, pattern: str, pathspec: str) -> list[tuple[str, str, str]]:
     # (path, line number, line); links are not followed, ignored files are left out.
-    out = exec_git(checkout, [
+    out = run_git(checkout, [
         "grep", "-n", "-I", "-E", "-z", "--no-color", "--no-column", "--no-textconv", "--no-recurse-submodules",
         "--untracked", "-e", pattern, "--", pathspec,
     ], ok=(0, 1))
-    found = (re.fullmatch(r"([^\0]+)\0(\d+)[\0:](.*)", line) for line in out.split("\n"))
-    return [(m[1], m[2], m[3]) for m in found if m is not None]
+    # A file name may hold a newline, so each record is read from where the last one ended: the name up to the first
+    # NUL, the number, the line. One that does not fit leaves unknown whose content follows, so nothing is shown.
+    found: list[tuple[str, str, str]] = []
+    at = 0
+    while at < len(out):
+        record = _MATCH.match(out, at)
+        if record is None:
+            raise ToolError("search_files: the result cannot be told apart by file; narrow the glob")
+        path = file_name(record[1])
+        if path is not None:
+            found.append((path, record[2].decode(), record[3].decode("utf-8", errors="replace")))
+        at = record.end()
+    return found
+
+
+def _shown_path(path: str) -> str:
+    return path if path.isprintable() else json.dumps(path, ensure_ascii=False)
 
 
 def _clip(text: str) -> str:
@@ -269,7 +290,7 @@ class StewardTools:
             if len(shown) == _MAX_MATCHES:
                 shown.append("[more matches: narrow the pattern or the glob]\n")
                 break
-            shown.append(f"{path}:{number}:{line[:_SNIPPET]}\n")
+            shown.append(f"{_shown_path(path)}:{number}:{line[:_SNIPPET]}\n")
         return "".join(shown)
 
     async def _list_files(self, arguments: dict[str, Any]) -> str:
