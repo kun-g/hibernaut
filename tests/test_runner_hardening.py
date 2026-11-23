@@ -183,11 +183,11 @@ def test_unbound_workspace_is_claimed_before_the_first_ack(tmp_path: Path) -> No
             run1 = asyncio.create_task(hub.run(first))
             submit = await asyncio.wait_for(recv_json(ra, wa, expect_masked=False, send_masked=True), 2.0)
             assert submit["request"]["run_id"] == "run_w1"
-            # a-1 has not acknowledged yet; the same workspace must not be sent to b-1.
-            with pytest.raises(NoEligibleRunnerError):
-                await asyncio.wait_for(hub.run(second), 2.0)
-            with pytest.raises(asyncio.TimeoutError):
+            # a-1 has not acknowledged yet; the same workspace must not be sent to b-1 (nor anywhere else).
+            run2 = asyncio.create_task(hub.run(second))
+            with pytest.raises(TimeoutError):
                 await asyncio.wait_for(recv_json(rb, wb, expect_masked=False, send_masked=True), 0.3)
+            assert not run2.done()
             assert affinity.lookup(namespace="hb", project_key="hibernaut", owner_scope="proj:hb", work_key="gh#9") == "a-1"
 
             # A rejection proves a-1 never ran it, so the claim is released.
@@ -198,14 +198,112 @@ def test_unbound_workspace_is_claimed_before_the_first_ack(tmp_path: Path) -> No
             )
             with pytest.raises(RuntimeError):
                 await asyncio.wait_for(run1, 2.0)
-            assert affinity.lookup(namespace="hb", project_key="hibernaut", owner_scope="proj:hb", work_key="gh#9") is None
+            # Only then is the second write dispatched, as a fresh claim.
+            nxt = await asyncio.wait_for(recv_json(ra, wa, expect_masked=False, send_masked=True), 2.0)
+            assert nxt["request"]["run_id"] == "run_w2"
+            assert affinity.lookup(namespace="hb", project_key="hibernaut", owner_scope="proj:hb", work_key="gh#9") == "a-1"
+            run2.cancel()
         finally:
             wa.close()
             wb.close()
             await hub.stop()
 
     try:
-        asyncio.run(scenario())
+        asyncio.run(asyncio.wait_for(scenario(), 20.0))
+    finally:
+        caps_a.close()
+        caps_b.close()
+        affinity.close()
+
+
+@pytest.mark.parametrize("source", ["inherited", "driver"])
+def test_proxy_url_with_user_credentials_never_reaches_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    proxy = "http://proxy-user:placeholder-pass@proxy.example:8080"
+    if source == "inherited":
+        monkeypatch.setenv("HTTPS_PROXY", proxy)
+        drivers = _env_driver()
+    else:
+        monkeypatch.delenv("HTTPS_PROXY", raising=False)
+        drivers = _env_driver({"HTTPS_PROXY": proxy})
+    daemon = RunnerDaemon(_config(tmp_path, repo), drivers=drivers)
+    try:
+        res = asyncio.run(daemon.run(_req("run_proxy", executor_id="env"), caller_id="hibernaut"))
+    finally:
+        daemon.close()
+    assert (res.status, res.error_kind) == ("refused", "permission_denied")
+    assert "HTTPS_PROXY" in (res.error_summary or "")
+    assert "placeholder-pass" not in (res.error_summary or "")
+    assert "placeholder-pass" not in res.stdout_excerpt
+
+
+def test_proxy_url_without_credentials_still_reaches_the_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
+    daemon = RunnerDaemon(_config(tmp_path, repo), drivers=_env_driver())
+    try:
+        res = asyncio.run(daemon.run(_req("run_proxy_ok", executor_id="env"), caller_id="hibernaut"))
+    finally:
+        daemon.close()
+    assert res.status == "succeeded", res.error_summary
+    assert json.loads(res.stdout_excerpt)["env"]["HTTPS_PROXY"] == "http://proxy.example:8080"
+
+
+def test_rejected_first_claim_on_a_multi_slot_node_does_not_split_the_workspace(tmp_path: Path) -> None:
+    # a-1 has two slots, so without serialising, the second write for gh#7 also goes to a-1 while the first is
+    # unacknowledged; a-1 then rejects the first, which moves to b-1, and both nodes would write gh#7.
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    affinity = WorkspaceAffinityStore(tmp_path / "affinity.db")
+    hub = RunnerRelayHub(shared_token="tok", affinity=affinity, heartbeat_seconds=30.0)
+    caps_a = RunnerDaemon(_config(tmp_path, repo, runner_id="a-1", max_concurrent=2), drivers=_count_drivers())
+    caps_b = RunnerDaemon(_config(tmp_path, repo, runner_id="b-1", max_concurrent=1), drivers=_count_drivers())
+    first = _req("run_c1", executor_id="count", prompt="unused", work_key="gh#7")
+    second = _req("run_c2", executor_id="count", prompt="unused", work_key="gh#7")
+
+    def bound() -> str | None:
+        return affinity.lookup(namespace="hb", project_key="hibernaut", owner_scope="proj:hb", work_key="gh#7")
+
+    async def scenario() -> None:
+        host, port = await hub.start("127.0.0.1", 0)
+        ra, wa, epoch_a = await _raw_agent(host, port, caps_a.capabilities_sync().to_dict())
+        rb, wb, epoch_b = await _raw_agent(host, port, caps_b.capabilities_sync().to_dict())
+        try:
+            run1 = asyncio.create_task(hub.run(first))
+            submit = await asyncio.wait_for(recv_json(ra, wa, expect_masked=False, send_masked=True), 2.0)
+            assert submit["request"]["run_id"] == "run_c1"
+            run2 = asyncio.create_task(hub.run(second))
+            # While a-1 has not confirmed the first claim, the second write for gh#7 is not dispatched anywhere.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(recv_json(ra, wa, expect_masked=False, send_masked=True), 0.3)
+
+            await send_json(
+                wa,
+                {"type": "run.accepted", "conn_epoch": epoch_a, "run_id": "run_c1", "accepted": False, "reason": "slots_full"},
+                mask=True,
+            )
+            moved = await asyncio.wait_for(recv_json(rb, wb, expect_masked=False, send_masked=True), 2.0)
+            assert moved["request"]["run_id"] == "run_c1"
+            await send_json(wb, {"type": "run.accepted", "conn_epoch": epoch_b, "run_id": "run_c1", "accepted": True}, mask=True)
+
+            # gh#7 now lives on b-1, which is full: the second write waits for b-1 instead of going to a-1.
+            with pytest.raises(NoEligibleRunnerError):
+                await asyncio.wait_for(run2, 2.0)
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(recv_json(ra, wa, expect_masked=False, send_masked=True), 0.3)
+            assert bound() == "b-1"
+            run1.cancel()
+        finally:
+            wa.close()
+            wb.close()
+            await hub.stop()
+
+    try:
+        asyncio.run(asyncio.wait_for(scenario(), 20.0))
     finally:
         caps_a.close()
         caps_b.close()

@@ -55,8 +55,16 @@ _CREDENTIAL_NAME_RE: Final = re.compile(
 )
 
 
+# A URL with user info (scheme://user[:password]@host), e.g. an authenticated proxy: allowed names can carry secrets too.
+_URL_USERINFO_RE: Final = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/?#\s]*@")
+
+
 def is_credential_env_name(name: str) -> bool:
     return bool(_CREDENTIAL_NAME_RE.search(name))
+
+
+def _carries_url_credentials(value: str) -> bool:
+    return bool(_URL_USERINFO_RE.search(value))
 
 
 def build_child_env(
@@ -70,11 +78,18 @@ def build_child_env(
         for k, v in base_env.items()
         if (k in CHILD_ENV_ALLOWLIST or k.startswith(CHILD_ENV_ALLOWED_PREFIXES)) and not is_credential_env_name(k)
     }
+    # Refused rather than dropped, so a node configured with an authenticated proxy fails loudly instead of running
+    # offline; messages name the variable only, never its value.
+    for k, v in env.items():
+        if _carries_url_credentials(v):
+            raise PermissionError(f"runner environment variable {k!r} carries URL credentials")
     env["GIT_TERMINAL_PROMPT"] = "0"
     if extra_env:
         for k, v in extra_env.items():
             if is_credential_env_name(k) or k in _LEASE_ENV_KEYS:
                 raise PermissionError(f"refusing to inject credential-like key {k!r} into child env")
+            if _carries_url_credentials(v):
+                raise PermissionError(f"driver environment variable {k!r} carries URL credentials")
             env[k] = v
     if credential_lease is not None:
         env["RUNNER_BROKER_URL"] = credential_lease.broker_url

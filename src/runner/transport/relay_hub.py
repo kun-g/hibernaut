@@ -47,6 +47,12 @@ class _RunnerConn:
     send_lock: asyncio.Lock
 
 
+@dataclass(slots=True)
+class _DispatchGate:
+    lock: asyncio.Lock
+    users: int = 0
+
+
 class RunnerRelayHub:
     def __init__(
         self,
@@ -79,6 +85,7 @@ class RunnerRelayHub:
         self._pending_result: dict[str, asyncio.Future[RunResult]] = {}
         self._pending_rpc: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._inflight: dict[str, asyncio.Future[RunResult]] = {}
+        self._dispatch_gates: dict[tuple[str, str, str, str], _DispatchGate] = {}
         self._hb_task: asyncio.Task[None] | None = None
         self._rpc_seq = 0
 
@@ -134,6 +141,47 @@ class RunnerRelayHub:
             task.exception()  # retrieved here so a submission nobody waits for any more does not warn
 
     async def _submit_and_wait(self, req: RunRequest, caller_id: str) -> RunResult:
+        gate = await self._enter_dispatch_gate(req)
+        try:
+            runner_id, res_fut = await self._dispatch(req, caller_id)
+        finally:
+            self._leave_dispatch_gate(req, gate)
+        try:
+            return await res_fut
+        finally:
+            self._forget_run(req.run_id)
+            self._registry.release_slot(runner_id)
+
+    async def _enter_dispatch_gate(self, req: RunRequest) -> _DispatchGate | None:
+        # Writes to one workspace are dispatched one at a time, up to the node's acknowledgement: while a claim is
+        # unconfirmed nobody else may lean on it, so a rejection proves that no request on that node uses the
+        # workspace and the claim can be released.
+        if req.readonly:
+            return None
+        key = (req.namespace, req.project_key, req.owner_scope, req.work_key)
+        gate = self._dispatch_gates.get(key)
+        if gate is None:
+            gate = self._dispatch_gates[key] = _DispatchGate(lock=asyncio.Lock())
+        gate.users += 1
+        try:
+            await gate.lock.acquire()
+        except BaseException:
+            self._drop_gate_user(key, gate)
+            raise
+        return gate
+
+    def _leave_dispatch_gate(self, req: RunRequest, gate: _DispatchGate | None) -> None:
+        if gate is None:
+            return
+        gate.lock.release()
+        self._drop_gate_user((req.namespace, req.project_key, req.owner_scope, req.work_key), gate)
+
+    def _drop_gate_user(self, key: tuple[str, str, str, str], gate: _DispatchGate) -> None:
+        gate.users -= 1
+        if gate.users == 0 and self._dispatch_gates.get(key) is gate:
+            del self._dispatch_gates[key]
+
+    async def _dispatch(self, req: RunRequest, caller_id: str) -> tuple[str, asyncio.Future[RunResult]]:
         excluded: set[str] = set()
         loop = asyncio.get_running_loop()
         while True:
@@ -204,11 +252,7 @@ class RunnerRelayHub:
                     runner_id=runner_id,
                 )
 
-            try:
-                return await res_fut
-            finally:
-                self._forget_run(req.run_id)
-                self._registry.release_slot(runner_id)
+            return runner_id, res_fut
 
     def _claim_workspace(self, req: RunRequest, runner_id: str) -> bool:
         if self._affinity.lookup(
