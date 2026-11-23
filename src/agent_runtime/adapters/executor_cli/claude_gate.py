@@ -31,12 +31,11 @@ from agent_runtime.adapters.executor_cli.claude_code import (  # noqa: E402
 )
 from agent_runtime.adapters.executor_cli.cli_terminal import (  # noqa: E402
     GRACE_SECONDS,
-    Stopped,
+    check_stop,
     end_group,
     exited,
-    ignore_signals,
     starting,
-    stop_on_signals,
+    supervised,
 )
 
 _POLL_SECONDS = 0.1
@@ -53,19 +52,14 @@ def _report(path: Path, body: dict[str, Any]) -> None:
 
 
 def main(spec_path: str) -> int:
-    running: list[subprocess.Popen[bytes]] = []
-    stop_on_signals()
-    try:
-        return _main(json.loads(Path(spec_path).read_text(encoding="utf-8")), running)
-    except Stopped as stop:
-        return 128 + stop.signum
-    except _Released:
-        print("\n[hibernaut] Hibernaut closed this terminal; ending it.", flush=True)
-        return 1
-    finally:
-        ignore_signals()
-        for proc in running:
-            end_group(proc)
+    def body(running: list[subprocess.Popen[bytes]]) -> int:
+        try:
+            return _main(json.loads(Path(spec_path).read_text(encoding="utf-8")), running)
+        except _Released:
+            print("\n[hibernaut] Hibernaut closed this terminal; ending it.", flush=True)
+            return 1
+
+    return supervised(body)
 
 
 def _main(spec: dict[str, Any], running: list[subprocess.Popen[bytes]]) -> int:
@@ -141,6 +135,7 @@ def _probe(argv: list[str], env: dict[str, str], timeout: float, lease: Path,
         if exited(proc.pid, _POLL_SECONDS):
             reader.join(timeout=GRACE_SECONDS)
             break
+        check_stop()
         if not lease.exists():
             raise _Released
         if time.monotonic() >= deadline:
@@ -172,6 +167,7 @@ def _supervise(argv: list[str], env: dict[str, str], lease: Path, running: list[
         except OSError:
             pass
     while not exited(proc.pid, _POLL_SECONDS):
+        check_stop()
         if not lease.exists():
             raise _Released
     # Exit with the agent, after ending whatever it left in its group.
