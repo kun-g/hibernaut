@@ -73,7 +73,8 @@ class TestSelectTests(unittest.TestCase):
         self.assertFalse(updater.full_suite)
         self.assertEqual(
             updater.tests,
-            ("tests/test_auto_update.py", "tests/test_config_reload.py", "tests/test_graceful_stop.py"),
+            ("tests/test_auto_update.py", "tests/test_config_reload.py", "tests/test_graceful_stop.py",
+             "tests/test_listener_handover.py"),
         )
 
         readme = select_tests(["README.md"])

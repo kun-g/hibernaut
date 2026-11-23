@@ -24,6 +24,7 @@ from agent_runtime.adapters.channels import (
     DriveResultWriter,
     DriveTaskPoller,
     FileOutboxChannel,
+    ListenerHandover,
     MCPServerAdapter,
     ProxiedDriveClient,
     WebhookHTTPServer,
@@ -1092,12 +1093,18 @@ async def serve_configured(
     switchboard: SwitchboardHandle | None = None,
     reload_interval: float = 1.0,
     outbox_interval_seconds: float = 1.0,
+    listeners: ListenerHandover | None = None,
 ) -> None:
     # A reload never waits for Runs in progress: the listener stays up and takes the new handler, services restart
     # within one tick, and the old worker pool is retired (no new claims) while its last Runs finish in the
     # background. worker_leases keeps the old and new pools off the same inbox. A stop follows the same principle:
     # see drain_pools().
-    server = WebhookHTTPServer((config.channels.host, config.channels.port), daemon.http_handler())
+    address = (config.channels.host, config.channels.port)
+    server = (
+        listeners.server(address, daemon.http_handler())
+        if listeners is not None
+        else WebhookHTTPServer(address, daemon.http_handler())
+    )
     changes = config_changes(path, stop, interval=reload_interval)
 
     async with asyncio.TaskGroup() as tasks:
@@ -1180,7 +1187,7 @@ async def serve_configured(
             )
             for g in generations:
                 g.pool_stop.set()
-            await _close_server(server, server_thread)
+            await _close_server(server, server_thread, release=listeners.release if listeners is not None else None)
             await generation.stop_services()
 
 
@@ -1225,8 +1232,16 @@ def _serve_in_thread(server: WebhookHTTPServer) -> threading.Thread:
     return thread
 
 
-async def _close_server(server: WebhookHTTPServer, thread: threading.Thread) -> None:
+async def _close_server(
+    server: WebhookHTTPServer,
+    thread: threading.Thread,
+    *,
+    release: Callable[[WebhookHTTPServer], None] | None = None,
+) -> None:
     await asyncio.to_thread(server.shutdown)
+    if release is not None:
+        # Waits for the supervisor's ack; services still run on the loop until stop_services().
+        await asyncio.to_thread(release, server)
     server.server_close()
     thread.join()
 
@@ -1257,6 +1272,8 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=banner)
     args = parser.parse_args()
 
+    # Before anything can start a subprocess: the descriptor numbers leave os.environ here.
+    listeners = ListenerHandover.from_environ(os.environ)
     board: SwitchboardHandle | None = None
     if args.config:
         cfg = load_config(args.config)
@@ -1280,6 +1297,7 @@ def main() -> None:
     if args.mcp_stdio:
         # Keep stdout clean for JSON-RPC 2.0 frames in stdio mode.
         assert daemon.mcp_server is not None
+        listeners.close()
         try:
             daemon.mcp_server.serve_stdio(sys.stdin, sys.stdout)
         finally:
@@ -1318,19 +1336,27 @@ def main() -> None:
                     switchboard=board,
                     reload_interval=args.config_poll_interval,
                     outbox_interval_seconds=args.outbox_interval,
+                    listeners=listeners,
                 )
             else:
-                await daemon.run(
-                    stop_event=stop_event,
-                    force_stop_event=force_stop,
-                    webhook_host=host,
-                    webhook_port=port,
-                    outbox_interval_seconds=args.outbox_interval,
-                )
+                server = listeners.server((host, port), daemon.http_handler())
+                try:
+                    await daemon.run(
+                        server=server,
+                        stop_event=stop_event,
+                        force_stop_event=force_stop,
+                        outbox_interval_seconds=args.outbox_interval,
+                    )
+                finally:
+                    listeners.release(server)
+                    server.server_close()
         finally:
-            daemon.close()
+            listeners.close()
+            # The relay closes while the database is still open: a push arriving until then is stored and acked,
+            # and from the close on the hub keeps events for this consumer until the next daemon connects.
             if board is not None:
                 board.stop()
+            daemon.close()
 
     asyncio.run(_serve())
 
