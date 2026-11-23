@@ -12,7 +12,7 @@
 - **L3 (`adapters/` + `app/`)**：实现 L1 `Protocol` 端口；禁止绕过 L1 端口让 L2 直接耦合具体数据库、LLM SDK 或外部通道。
 - **`src/switchboard/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`taskboard`、`runner`、`memory_hub`（`.importlinter` 契约 `switchboard-zero-business-deps`）。
 - **`src/ccpeer/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`switchboard`、`taskboard`、`runner`、`memory_hub`（`.importlinter` 契约 `ccpeer-zero-business-deps`）。
-- **`src/runner/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`taskboard`、`switchboard`、`workshop`、`memory_hub`（`.importlinter` 契约 `runner-zero-business-deps`）。控制面经 `agent_runtime/adapters/runner_bridge.py` 单向依赖它。
+- **`src/runner/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`taskboard`、`switchboard`、`workshop`、`memory_hub`、`ledger`（`.importlinter` 契约 `runner-zero-business-deps`）。控制面经 `agent_runtime/adapters/runner_bridge.py` 单向依赖它。
 
 ## 2. 核心词汇表与并发红线
 
@@ -55,7 +55,7 @@ pyright
 
 - `lint-imports`：验证 `.importlinter` 全部架构分层与反向依赖契约（0 broken）。
 - `pytest -v`：验证 AST 静态边界测试、Port 契约测试、多 `inbox_id` 并发隔离及 `NewEventPolicy`（`defer`/`fold`/`interrupt`）端到端测试。
-- `pyright`：对 `src/agent_runtime/core`、`src/agent_runtime/engine`、`src/switchboard`、`src/ccpeer`、`src/taskboard` 与 `src/runner` 执行 strict 静态类型检查（0 errors, 0 warnings）。
+- `pyright`：对 `src/agent_runtime/core`、`src/agent_runtime/engine`、`src/switchboard`、`src/ccpeer`、`src/taskboard`、`src/runner` 与 `src/ledger` 执行 strict 静态类型检查（0 errors, 0 warnings）。
 
 ## 6. 文档增量协作闭环规范
 

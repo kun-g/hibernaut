@@ -10,8 +10,8 @@ from typing import Any
 
 import pytest
 
-from agent_runtime.adapters.runner_bridge import RunnerExecutorBridge
-from agent_runtime.core.models import Emit, Event, PermissionDecision, SessionRef, Silent, Suspend
+from agent_runtime.adapters.runner_bridge import RunnerExecutorBridge, translate_run_result
+from agent_runtime.core.models import Emit, Event, PermissionDecision, RunTelemetry, SessionRef, Silent, Suspend
 from runner.cli_drivers import (
     StreamEvent,
     TemplateCLIDriver,
@@ -72,7 +72,7 @@ def _make_config(tmp_path: Path, repo: Path, *, max_concurrent: int = 2, interac
 
 
 def test_runner_zero_business_deps_ast_gate() -> None:
-    forbidden = {"agent_runtime", "taskboard", "switchboard", "workshop", "memory_hub"}
+    forbidden = {"agent_runtime", "taskboard", "switchboard", "workshop", "memory_hub", "ledger"}
     runner_files = sorted((REPO_ROOT / "src" / "runner").rglob("*.py"))
     assert runner_files
     for py_file in runner_files:
@@ -434,6 +434,42 @@ def test_hb_runner_executor_bridge(tmp_path: Path) -> None:
     assert outcome.messages == ("done from runner",)
     assert outcome.executor_session_id == "claude:c1"
     daemon.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "structured", "expected_type"),
+    [
+        ("succeeded", {"outcome": "silent"}, Silent),
+        ("succeeded", None, Emit),
+        ("failed", None, Emit),
+        ("timed_out", None, Emit),
+        ("refused", None, Emit),
+        ("succeeded", {"outcome": "suspend", "prompt": "ok?"}, Suspend),
+    ],
+)
+def test_bridge_outcomes_carry_run_telemetry_for_the_ledger(
+    status: str, structured: dict[str, Any] | None, expected_type: type
+) -> None:
+    result = RunResult(
+        run_id="run_t",
+        runner_id="local",
+        status=status,  # type: ignore[arg-type]
+        executor_id="claude",
+        started_at="2026-01-01T00:00:00Z",
+        ended_at="2026-01-01T00:00:01Z",
+        duration_ms=1000,
+        exit_code=0 if status == "succeeded" else 2,
+        error_summary=None if status == "succeeded" else "boom on stderr",
+        stdout_excerpt="tokens: 12",
+        structured_output=structured,
+    )
+    outcome = translate_run_result(result, session_id="sess_1")
+    assert isinstance(outcome, expected_type)
+    assert outcome.telemetry == RunTelemetry(
+        stdout="tokens: 12",
+        stderr="" if status == "succeeded" else "boom on stderr",
+        exit_code=0 if status == "succeeded" else 2,
+    )
 
 
 def test_parse_runner_config_toml(tmp_path: Path) -> None:

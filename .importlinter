@@ -115,3 +115,4 @@ forbidden_modules =
     switchboard
     workshop
     memory_hub
+    ledger

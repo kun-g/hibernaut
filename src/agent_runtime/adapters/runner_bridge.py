@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Coroutine, Sequence
+from dataclasses import replace
 from typing import Any
 
 from agent_runtime.core.models import (
@@ -10,6 +11,7 @@ from agent_runtime.core.models import (
     EmitStatus,
     Event,
     RunOutcome,
+    RunTelemetry,
     SessionRef,
     Silent,
     Suspend,
@@ -115,6 +117,16 @@ async def _uncancellable(coro: Coroutine[Any, Any, None]) -> None:
 
 
 def translate_run_result(result: RunResult, *, session_id: str) -> RunOutcome:
+    # The worker's run ledger logs, prices and classifies a Run from its telemetry, as it does for LocalCLIExecutor.
+    telemetry = RunTelemetry(
+        stdout=result.stdout_excerpt,
+        stderr=result.error_summary or "",
+        exit_code=result.exit_code,
+    )
+    return replace(_translate_status(result, session_id=session_id), telemetry=telemetry)
+
+
+def _translate_status(result: RunResult, *, session_id: str) -> RunOutcome:
     if result.status == "interrupted":
         raise asyncio.CancelledError(result.error_summary or "interrupted")
 
