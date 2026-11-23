@@ -96,6 +96,17 @@ class TaskLink:
 
 
 @dataclass(frozen=True, slots=True)
+class HeldReturn:
+    # An agent:return event that was refused, as it would be queued.
+    agent_id: str
+    external_id: str
+    payload: dict[str, Any]
+    reason: str
+    # How the decision finishes the Taskboard task the result belongs to; empty when it has none.
+    task_fields: dict[str, Any] = field(default_factory=dict[str, Any])
+
+
+@dataclass(frozen=True, slots=True)
 class ForwardSpec:
     target_inbox: str
     target_agent: str | None = None
@@ -111,6 +122,8 @@ class ForwardSpec:
     origin_key: str | None = None
     # Results this session still waits for from work it forwarded with a return to its own inbox.
     pending_returns: int = 0
+    # Set only on the suspended session that keeps a refused return until a person decides on it.
+    held: HeldReturn | None = None
 
 
 @dataclass(frozen=True, slots=True)

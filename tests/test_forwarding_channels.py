@@ -47,6 +47,11 @@ class DriveTests(unittest.TestCase):
         self.assertEqual(self.parent(), "dir-failed")
         self.assertIn("agent 'sde' is not allowed", self.drive.contents["f1"])
 
+    def test_a_refusal_owed_to_another_agent_leaves_the_task_open(self) -> None:
+        report = self.report("", session_id=None, rejected="agent 'sde' is not allowed", pending_elsewhere=True)
+        self.assertFalse(self.writer.handle_run_report(report))
+        self.assertEqual((self.parent(), self.drive.contents["f1"]), ("dir-progress", "body"))
+
     def test_failures_of_forwarded_work(self) -> None:
         def failed(**payload: Any) -> bool:
             return self.writer.handle_failed_event(

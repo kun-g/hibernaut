@@ -761,6 +761,8 @@ class DriveResultWriter:
 
     def _write_report(self, report: RunReport) -> bool:
         if report.rejected is not None:
+            if report.pending_elsewhere:
+                return False
             file_id = extract_gdrive_file_id(report.correlation_key)
             if file_id is None:
                 return False

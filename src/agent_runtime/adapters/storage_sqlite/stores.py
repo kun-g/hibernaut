@@ -14,6 +14,7 @@ from agent_runtime.core.models import (
     Event,
     EventStatus,
     ForwardSpec,
+    HeldReturn,
     OutboxMessage,
     OutboxStatus,
     SessionRef,
@@ -621,6 +622,23 @@ def _forward_from_json(raw: object, inbox_id: str) -> ForwardSpec | None:
         reply_target=text("reply_target"),
         origin_key=text("origin_key"),
         pending_returns=count("pending_returns", 0),
+        held=_held_from_json(item.get("held")),
+    )
+
+
+def _held_from_json(raw: object) -> HeldReturn | None:
+    if not isinstance(raw, dict):
+        return None
+    item = cast(dict[str, Any], raw)
+    payload, fields = item.get("payload"), item.get("task_fields")
+    if not isinstance(payload, dict) or not item.get("external_id"):
+        return None
+    return HeldReturn(
+        agent_id=str(item.get("agent_id") or ""),
+        external_id=str(item["external_id"]),
+        payload=cast(dict[str, Any], payload),
+        reason=str(item.get("reason") or ""),
+        task_fields=cast(dict[str, Any], fields) if isinstance(fields, dict) else {},
     )
 
 

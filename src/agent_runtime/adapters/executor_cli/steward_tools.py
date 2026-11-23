@@ -64,8 +64,11 @@ def check_git_args(args: Sequence[str]) -> None:
             bad = re.match(rf"-[^{valued}]*?{refused}", arg) is not None
         if bad:
             raise GitRefused(f"git: option {name} is not available")
-        # Two paths of which one is outside the checkout turn `git diff` into a reader of arbitrary files.
-        if arg.startswith(("/", "~")) or ".." in arg.split("/"):
+        # Two paths of which one is outside the checkout turn `git diff` into a reader of arbitrary files, and git
+        # answers <rev>:<path> with whether that path exists on disk, so the part after a colon counts as a path too.
+        # A leading colon (index entry or pathspec magic) is never needed here.
+        named = arg.split(":") if arg.startswith("-L") or not arg.startswith("-") else [arg]
+        if arg.startswith(":") or any(p.startswith(("/", "~")) or ".." in p.split("/") for p in named):
             raise GitRefused(f"git: {arg} is outside the checkout")
 
 

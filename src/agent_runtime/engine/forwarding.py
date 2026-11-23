@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Never, assert_never, cast
 
@@ -163,24 +163,23 @@ def return_session(sessions: SessionStorePort, spec: ForwardSpec) -> str | None:
     return None
 
 
-def return_event(
+def return_payload(
     *,
     inbox_id: str,
     agent_id: str,
     session_id: str | None,
     spec: ForwardSpec,
     events: Sequence[Event],
-    sessions: SessionStorePort,
     text: str,
     status: str,
     title: str = "",
     delivery: DeliveryOutcome | None = None,
-) -> Event:
-    assert spec.return_to is not None
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "text": text,
         "status": status,
-        "hop_count": spec.hop_count + 1,
+        # Never past the limit: whoever gets a result at the limit can answer it but not forward again.
+        "hop_count": min(spec.hop_count + 1, MAX_FORWARD_HOPS),
         "forwarded_from": inbox_id,
         "forwarded_by": agent_id,
         **_reply_fields(spec, events),
@@ -192,16 +191,60 @@ def return_event(
     if delivery is not None:
         payload["delivery"] = {"state": delivery.state, "pr_url": delivery.pr_url, "hold": delivery.hold,
                                "hold_detail": delivery.hold_detail}
+    return payload
+
+
+def return_event(
+    spec: ForwardSpec, *, external_id: str, payload: dict[str, Any], sessions: SessionStorePort
+) -> Event:
+    # Addressed when it is queued: the parent session may have closed while a person decided.
+    assert spec.return_to is not None
     parent = return_session(sessions, spec)
     return Event(
         inbox_id=spec.return_to,
         source=RETURN_SOURCE,
-        external_id=chain_external_id("return", events, 0),
+        external_id=external_id,
         payload=payload,
         session_id=parent,
         # A named session keeps its own key; the conversation's key would move that key away from its holder.
         correlation_key=spec.origin_key if parent is None else None,
     )
+
+
+def return_refusal(
+    spec: ForwardSpec,
+    *,
+    inbox_id: str,
+    agent_id: str,
+    payload: Mapping[str, Any],
+    permissions: PermissionPort,
+    routes: Callable[[str], InboxRoute | None] | None,
+) -> ForwardRefused | None:
+    # Why a result may not go back to spec.return_to now: "block" whatever anyone approves, "defer" until a person does.
+    assert spec.return_to is not None
+    if routes is not None:
+        here, there = routes(inbox_id), routes(spec.return_to)
+        if here is None or there is None or here.project != there.project:
+            return ForwardRefused(f"return_to '{spec.return_to}' is not an inbox of this project", "block")
+    decision = permissions.check(FORWARD_TOOL, {
+        "inbox_id": inbox_id,
+        "agent_id": agent_id,
+        "target_inbox": spec.return_to,
+        "target_agent": None,
+        "return_to": None,
+        "hop_count": spec.hop_count + 1,
+        "text": payload["text"],
+        "status": payload["status"],
+    })
+    if decision.action == "block":
+        return ForwardRefused(decision.reason, "block")
+    if spec.hop_count >= MAX_FORWARD_HOPS:
+        return ForwardRefused(
+            f"this work already made {spec.hop_count} hop(s) between agents (limit {MAX_FORWARD_HOPS})", "defer"
+        )
+    if decision.action == "defer":
+        return ForwardRefused(decision.reason, "defer")
+    return None
 
 
 @dataclass(slots=True)

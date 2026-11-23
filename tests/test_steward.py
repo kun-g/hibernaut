@@ -317,18 +317,31 @@ class ToolTests(StewardCase):
         self.assertEqual(git_state(self.repo), before)
         self.assertFalse((self.repo / "leak").exists())
 
+    async def test_git_does_not_tell_whether_a_file_outside_the_checkout_exists(self) -> None:
+        (self.root / "outside.txt").write_text("secret")
+        for rev in (f"HEAD:{self.root}/outside.txt", "HEAD:../outside.txt", ":../outside.txt", "HEAD:a/../../outside.txt"):
+            failed, text = await self.tool("git", args=["show", rev])
+            self.assertTrue(failed)
+            self.assertTrue(text.startswith("git: ") and text.endswith("is outside the checkout"), text)
+
     def test_git_argument_rules(self) -> None:
         for args in (["status", "--short"], ["diff", "main...HEAD", "--", "src/a.py"], ["log", "--oneline", "a..b"],
                      ["show", "HEAD:calc.py"], ["diff", "HEAD..origin/main"], ["rev-parse", "HEAD"], ["merge-base", "a", "b"],
                      ["log", "-SOauth", "-5"], ["diff", "-U3", "-w"], ["blame", "-w", "-L1,/S/", "a"],
-                     ["blame", "--ignore-rev", "abc", "a"]):
+                     ["blame", "--ignore-rev", "abc", "a"],
+                     ["show", "HEAD~1:src/a.py"], ["log", "--format=%h: %s"], ["log", "-L1,2:src/a.py"],
+                     ["log", "-Sfoo:/bar"], ["diff", "origin/main...HEAD"], ["show", "HEAD@{0}:a"]):
             check_git_args(args)
         for args in (["push"], ["diff", "--output", "x"], ["log", "--outp=x"], ["diff", "--ext-diff"], ["diff", "--ext"],
                      ["diff", "--no-index", "a", "b"], ["diff", "../x", "a"], ["diff", "/etc/passwd", "a"],
                      ["show", "--textconv"], ["blame", "--contents", "/etc/passwd"], ["diff", "-O/etc/passwd"],
                      ["log", "--show-signature"], ["diff", "a/../../b"], ["diff", "~/x", "a"], ["grep", "-O", "x"],
                      ["blame", "--ignore-revs-file=../x", "a"], ["blame", "--ignore-revs-f", "x", "a"],
-                     ["blame", "-S../x", "a"], ["blame", "-wS", "/x", "a"], ["diff", "-pO/x"]):
+                     ["blame", "-S../x", "a"], ["blame", "-wS", "/x", "a"], ["diff", "-pO/x"],
+                     ["show", "HEAD:../x"], ["show", "HEAD:foo/../../x"], ["show", ":../x"], ["show", ":x"],
+                     ["show", "HEAD:/etc/passwd"], ["show", "HEAD:~/x"], ["diff", "HEAD:../x", "HEAD:a"],
+                     ["diff", "--", ":(top)../x"], ["diff", "a..HEAD:../x"], ["show", "HEAD:.."],
+                     ["rev-parse", "HEAD:/etc/passwd"], ["log", "-L1,2:/etc/passwd"]):
             with self.assertRaises(GitRefused, msg=str(args)):
                 check_git_args(args)
 
@@ -519,6 +532,41 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(git_state(self.repo)[0], "")
         sources = [e.source for e in daemon.inbox.list_events()]
         self.assertEqual(sorted(sources), sorted(["switchboard:feishu", FORWARD_SOURCE, RETURN_SOURCE]))
+
+    async def test_a_deferred_return_waits_for_its_own_approval(self) -> None:
+        self.set_plan(
+            [
+                {"calls": [{"tool": "forward_to_inbox", "arguments": {
+                    "target_inbox": SDE, "text": "do it", "return_to": MAIN}}]},
+                {"output": {"action": "reply", "message": "all done"}},
+            ],
+            [{"write": {"calc.py": "x = 1\n"}}],
+        )
+        check = AutoModePermissionAdapter.check
+
+        def gate(adapter: AutoModePermissionAdapter, tool: str, args: dict[str, Any]) -> PermissionDecision:
+            if tool == "inbox.forward" and args["target_inbox"] == MAIN:
+                return PermissionDecision("defer", "results need a look")
+            return check(adapter, tool, args)
+
+        with patch.object(AutoModePermissionAdapter, "check", gate):
+            daemon = await self.run_daemon((MAIN, "feishu:1", {"text": "x", "reply_channel": "feishu"}))
+            kinds = [m.metadata["kind"] for m in daemon.outbox.fetch_pending(limit=50)]
+            self.assertEqual(kinds, ["approval_request"])
+            [card] = daemon.outbox.fetch_pending(limit=50)
+            daemon.handler.ingest(
+                inbox_id=SDE, source="switchboard:feishu", external_id="decision",
+                payload={"event_type": "approval.decided", "approved": True,
+                         "approval_request_id": card.metadata["approval_request_id"]},
+            )
+            stop = asyncio.Event()
+            pool = asyncio.create_task(daemon.pool.run_forever(stop))
+            await daemon.pool.wait_until_idle(60)
+            stop.set()
+            await pool
+        self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde", "steward"])
+        answers = [(m.inbox_id, m.content) for m in daemon.outbox.fetch_pending(limit=50) if m.metadata["kind"] == "emit"]
+        self.assertEqual(answers, [(MAIN, "all done")])
 
     async def test_direct_forward_answers_from_the_child(self) -> None:
         self.set_plan(

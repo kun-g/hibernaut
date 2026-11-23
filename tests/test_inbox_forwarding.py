@@ -4,8 +4,10 @@ import asyncio
 import tempfile
 import unittest
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteSessionStoreAdapter
 from agent_runtime.core.models import (
@@ -17,6 +19,7 @@ from agent_runtime.core.models import (
     Event,
     ForwardRefused,
     ForwardSpec,
+    HeldReturn,
     InboxBinding,
     InboxMatchRule,
     InboxRoute,
@@ -550,20 +553,6 @@ class AntiLoopTests(ForwardCase):
                 self.assertEqual(refused.action, "block")
         self.assertEqual(self.woken, [])
 
-    async def test_return_past_the_hop_limit_answers_outside(self) -> None:
-        self.ingest(SDE, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=MAIN, hop_count=MAX_FORWARD_HOPS,
-                    reply_channel="feishu", reply_target="oc_1")
-        self.answer("sde", "late")
-        await self.run_inbox(SDE)
-        self.assertEqual(self.queued(MAIN), [])
-        self.assertEqual([(m.content, m.metadata["reply_target"]) for m in self.sent()], [("late", "oc_1")])
-
-    async def test_return_to_another_project_answers_outside(self) -> None:
-        self.ingest(SDE, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=OTHER, hop_count=1)
-        self.answer("sde", "x")
-        await self.run_inbox(SDE)
-        self.assertEqual((self.queued(OTHER), len(self.sent())), ([], 1))
-
 
 class PermissionTests(ForwardCase):
     async def test_every_forward_passes_the_permission_gate(self) -> None:
@@ -587,15 +576,9 @@ class PermissionTests(ForwardCase):
              "text": "x"},
         )
 
-    async def test_block_refuses_and_a_blocked_return_answers_outside(self) -> None:
-        self.forward("steward", SDE, "x", return_to=MAIN)
-        self.ingest()
-        await self.run_inbox()
+    async def test_block_refuses(self) -> None:
         self.permissions = InMemoryPermission({"inbox.forward": PermissionDecision("block", "not today")})
-        self.answer("sde", "done")
-        await self.run_inbox(SDE)
-        self.assertEqual((self.queued(MAIN), [m.content for m in self.sent()]), ([], ["done"]))
-        self.ingest(key="feishu:2")
+        self.ingest()
         refused = await self.refusal(SDE, "x")
         self.assertEqual((str(refused), refused.action), ("not today", "block"))
 
@@ -679,6 +662,220 @@ class ReturnTests(ForwardCase):
         self.assertEqual([e.session_id for e in self.queued(MAIN)], [steward.session_id])
 
 
+class HeldReturnTests(ForwardCase):
+    # A return that is refused waits for a person; it never turns into an answer to the outside.
+    def gate(self, action: Any, reason: str = "ask first") -> None:
+        self.permissions = InMemoryPermission({"inbox.forward": PermissionDecision(action, reason)})
+
+    async def owed(self) -> str:
+        self.forward("steward", SDE, "x", return_to=MAIN)
+        self.ingest(reply_channel="feishu", reply_target="oc_1")
+        await self.run_inbox()
+        steward = self.agents["steward"].runs[0][1]
+        assert steward is not None
+        return steward.session_id
+
+    async def held(self, text: str = "result") -> tuple[RunReport, Any]:
+        self.answer("sde", text)
+        [report] = await self.run_inbox(SDE)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.queued(MAIN), [])
+        return report, self.sent("approval_request")[-1]
+
+    async def decide(self, card: Any, approved: bool, inbox_id: str = SDE) -> list[RunReport]:
+        self.ingest(inbox_id, key=None, approval_request_id=card.metadata["approval_request_id"], approved=approved,
+                    event_type="approval.decided")
+        return await self.run_inbox(inbox_id)
+
+    async def test_a_deferred_return_is_approved_on_its_own_and_then_queued(self) -> None:
+        steward = await self.owed()
+        self.gate("defer")
+        report, card = await self.held()
+        self.assertIsInstance(report.outcome, Suspend)
+        self.assertTrue(report.pending_elsewhere)
+        for expected in ("ask first", "result", MAIN):
+            self.assertIn(expected, card.content)
+        self.assertEqual((card.inbox_id, card.metadata["outcome_kind"], card.metadata["reply_target"]),
+                         (SDE, "suspend", "oc_1"))
+        waiting = self.sessions.find_by_request_id(card.metadata["approval_request_id"])
+        assert waiting is not None
+        child = self.agents["sde"].runs[0][1]
+        assert child is not None
+        self.assertEqual((waiting.inbox_id, waiting.status, waiting.parent_session_id, waiting.agent_id),
+                         (SDE, "suspended", child.session_id, "sde"))
+        # The parent still waits, so its task stays open.
+        parent = self.sessions.get(steward)
+        assert parent is not None and parent.forward is not None
+        self.assertEqual(parent.forward.pending_returns, 1)
+
+        [decided] = await self.decide(card, True)
+        self.assertTrue(decided.pending_elsewhere)
+        [event] = self.queued(MAIN)
+        self.assertEqual((event.source, event.session_id, event.payload["text"], event.payload["status"],
+                          event.payload["hop_count"]), (RETURN_SOURCE, steward, "result", "done", 2))
+        self.assertEqual((len(self.agents["sde"].runs), self.sent()), (1, []))
+        closed = self.sessions.get(waiting.session_id)
+        assert closed is not None
+        self.assertEqual(closed.status, "closed")
+        self.answer("steward", "all done")
+        await self.run_inbox()
+        self.assertEqual([m.content for m in self.sent()], ["all done"])
+
+    async def test_a_declined_return_tells_the_waiting_agent_only_that_it_was_withheld(self) -> None:
+        await self.owed()
+        self.gate("defer")
+        _report, card = await self.held("secret result")
+        await self.decide(card, False)
+        [event] = self.queued(MAIN)
+        self.assertEqual((event.source, event.payload["status"]), (RETURN_SOURCE, "refused"))
+        self.assertNotIn("secret result", str(event.payload))
+        self.assertEqual(self.sent(), [])
+        self.answer("steward", "could not get it")
+        reports = await self.run_inbox()
+        self.assertFalse(reports[-1].pending_elsewhere)
+
+    async def test_a_decision_counts_once(self) -> None:
+        await self.owed()
+        self.gate("defer")
+        _report, card = await self.held()
+        await self.decide(card, True)
+        await self.decide(card, False)
+        self.assertEqual([e.payload["status"] for e in self.queued(MAIN)], ["done"])
+
+    async def test_approval_does_not_override_a_block(self) -> None:
+        await self.owed()
+        self.gate("block", "not today")
+        _report, card = await self.held()
+        await self.decide(card, True)
+        self.assertEqual((self.queued(MAIN), self.sent()), ([], []))
+        again = self.sent("approval_request")[-1]
+        self.assertNotEqual(again.metadata["approval_request_id"], card.metadata["approval_request_id"])
+        self.assertIn("not today", again.content)
+        # Once the policy allows it, the same held result goes out.
+        self.permissions = InMemoryPermission()
+        await self.decide(again, True)
+        self.assertEqual([e.payload["text"] for e in self.queued(MAIN)], ["result"])
+
+    async def test_a_blocked_return_that_is_declined_goes_nowhere(self) -> None:
+        steward = await self.owed()
+        self.gate("block", "not today")
+        _report, card = await self.held("secret result")
+        await self.decide(card, False)
+        self.assertEqual((self.queued(MAIN), self.sent()), ([], []))
+        [notice] = self.sent("return_withheld")
+        self.assertIn("not today", notice.content)
+        self.assertNotIn("secret result", notice.content)
+        parent = self.sessions.get(steward)
+        assert parent is not None and parent.forward is not None
+        self.assertEqual(parent.forward.pending_returns, 1)
+
+    async def test_a_return_at_the_hop_limit_needs_a_person_and_buys_no_hop(self) -> None:
+        self.ingest(SDE, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=MAIN, hop_count=MAX_FORWARD_HOPS,
+                    reply_channel="feishu", reply_target="oc_1")
+        _report, card = await self.held("late")
+        self.assertIn("limit", card.content)
+        await self.decide(card, True)
+        [event] = self.queued(MAIN)
+        self.assertEqual((event.payload["text"], event.payload["hop_count"]), ("late", MAX_FORWARD_HOPS))
+        self.assertIn("limit", str(await self.refusal(SDE, "again")))
+
+    async def test_a_return_to_another_project_never_leaves_this_one(self) -> None:
+        self.ingest(SDE, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=OTHER, hop_count=1)
+        _report, card = await self.held()
+        await self.decide(card, True)
+        await self.decide(self.sent("approval_request")[-1], False)
+        self.assertEqual((self.queued(OTHER), self.sent()), ([], []))
+
+    async def test_failures_and_refusals_are_held_too(self) -> None:
+        await self.owed()
+        self.gate("defer")
+
+        def boom(_e: Sequence[Event], _s: SessionRef | None, _c: RunCapabilities) -> RunOutcome:
+            raise RuntimeError("no disk")
+
+        self.agents["sde"].script = boom
+        with self.assertRaises(ExecutorFailed):
+            await self.run_inbox(SDE)
+        self.ingest(SDE, key="other", source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=MAIN, hop_count=1,
+                    agent_id="ops")
+        [refused] = await self.run_inbox(SDE)
+        self.assertTrue(refused.rejected and refused.pending_elsewhere)
+        self.assertEqual(self.queued(MAIN), [])
+        cards = self.sent("approval_request")
+        self.assertEqual(len(cards), 2)
+        for card in cards:
+            await self.decide(card, True)
+        self.assertEqual([e.payload["status"] for e in self.queued(MAIN)], ["failed", "refused"])
+
+    async def test_the_child_goes_on_while_its_result_is_held(self) -> None:
+        await self.owed()
+        self.gate("defer")
+        _report, card = await self.held()
+        self.ingest(SDE, key="feishu:1", text="thanks, one more thing")
+        self.answer("sde", "second")
+        await self.run_inbox(SDE)
+        child = self.agents["sde"].runs[1][1]
+        assert child is not None
+        self.assertEqual((child.status, child.pending_request_id), ("active", None))
+        self.assertEqual([m.content for m in self.sent()], ["second"])
+        await self.decide(card, True)
+        self.assertEqual([e.payload["text"] for e in self.queued(MAIN)], ["result"])
+
+    async def test_only_a_decision_reaches_a_held_result(self) -> None:
+        await self.owed()
+        self.gate("defer")
+        report, card = await self.held()
+        event = self.ingest(SDE, key=None, session_id=report.session_id, text="hello")
+        await self.run_inbox(SDE)
+        self.assertEqual(len(self.agents["sde"].runs), 1)
+        self.assertEqual([e.status for e in self.inbox.all_events() if e.event_id == event.event_id], ["failed"])
+        await self.decide(card, True)
+        self.assertEqual([e.payload["text"] for e in self.queued(MAIN)], ["result"])
+
+    async def test_a_repeated_run_keeps_one_request(self) -> None:
+        await self.owed()
+        self.gate("defer")
+        self.answer("sde", "result")
+        # A crash before the events are marked done runs them again.
+        with patch.object(self.inbox, "mark_done", side_effect=RuntimeError("crash")), self.assertRaises(RuntimeError):
+            await self.run_inbox(SDE)
+        await self.run_inbox(SDE)
+        self.assertEqual(len(self.agents["sde"].runs), 2)
+        [card] = self.sent("approval_request")
+        await self.decide(card, True)
+        self.assertEqual([e.payload["text"] for e in self.queued(MAIN)], ["result"])
+        self.assertEqual(self.sent(), [])
+
+    async def test_closing_the_child_drops_its_held_result(self) -> None:
+        steward = await self.owed()
+        self.gate("defer")
+        _report, card = await self.held()
+        self.ingest(key=None, session_id=steward, action="close_session")
+        await self.run_inbox()
+        await self.run_inbox(SDE)
+        await self.decide(card, True)
+        self.assertEqual([e for e in self.queued(MAIN) if e.source == RETURN_SOURCE], [])
+
+    async def test_a_task_is_finished_by_the_decision(self) -> None:
+        for approved, action in ((True, "complete"), (False, "release")):
+            with self.subTest(approved=approved):
+                self.permissions = InMemoryPermission({"inbox.forward": PermissionDecision("defer", "ask")})
+                key = f"k:{approved}"
+                self.ingest(SDE, key=key, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=MAIN, hop_count=1)
+                self.ingest(SDE, key=key, event_type="work.ready", task_id=key, hop_count=1)
+                self.answer("sde", "result")
+                await self.run_inbox(SDE)
+
+                def actions(key: str = key) -> list[str]:
+                    return [m.metadata["task_action"] for m in self.outbox.fetch_pending(limit=1000)
+                            if m.metadata.get("task_id") == key]
+
+                self.assertNotIn("complete", actions())
+                self.assertEqual(actions()[-1], "update_stage")
+                await self.decide(self.sent("approval_request")[-1], approved)
+                self.assertEqual(actions()[-1], action)
+
+
 class TaskLinkTests(ForwardCase):
     def task(self, **payload: Any) -> None:
         self.ingest(event_type="work.ready", task_id="t1", trace_id="tr1", hop_count=1, **payload)
@@ -741,6 +938,10 @@ class StorageTests(unittest.TestCase):
             loaded = store.get("s1")
             assert loaded is not None
             self.assertEqual((loaded.forward, loaded.agent_id), (spec, "sde"))
+            waiting = replace(spec, held=HeldReturn(agent_id="sde", external_id="return:e:0", reason="ask",
+                                                    payload={"text": "t", "hop_count": 2}, task_fields={"stage": "x"}))
+            store.save(SessionRef(session_id="s3", inbox_id=SDE, forward=waiting))
+            self.assertEqual(store.get("s3").forward, waiting)  # type: ignore[union-attr]
             self.assertIsNone(store.get("s2").forward)  # type: ignore[union-attr]
             db._conn.execute("UPDATE sessions SET forward = 'not json' WHERE session_id = 's1'")  # pyright: ignore
             # An unreadable record must not reset the hop count.
