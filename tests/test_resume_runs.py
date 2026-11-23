@@ -477,6 +477,8 @@ class TestCLIReviewSurvivesDetach(TerminalCase):
         self.assertEqual(review["cli_terminals"], [handle])
         self.assertEqual(len(self.cli.calls()), 1)
         self.assertFalse(turn_dir.exists())
+        # The detach left the terminal open; the process that read the result closes it.
+        self.assertEqual(self.closes(), [handle])
 
     async def test_a_subprocess_review_is_not_detached(self):
         self.cli.set({"stdout": json.dumps(PASS), "sleep": 0.5})
