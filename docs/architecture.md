@@ -373,7 +373,7 @@
 
 ## 14. Memory Hub：分层预算的项目记忆（`src/memory_hub/`）
 
-`src/memory_hub/` 是只依赖标准库的独立包。`.importlinter` 的 `memory-hub-zero-business-deps` 禁止它导入 `agent_runtime`、`switchboard`、`taskboard`、`runner`、`ledger`；`business-packages-no-memory-hub` 禁止 `switchboard`、`runner`、`taskboard` 导入它；`tests/test_memory_hub.py` 另用 AST 检查。数据契约是 `schemas/v1/memory_{baseline,proposal,search,postmortem}.schema.json`（Draft 2020-12）。包按 v1.0 交付件原样合入，Hibernaut 侧的约束都写在接线层。
+`src/memory_hub/` 是只依赖标准库的独立包。`.importlinter` 的 `memory-hub-zero-business-deps` 禁止它导入 `agent_runtime`、`switchboard`、`taskboard`、`runner`、`ledger`；`business-packages-no-memory-hub` 禁止 `switchboard`、`runner`、`taskboard` 导入它；`tests/test_memory_hub.py` 另用 AST 检查。数据契约是 `schemas/v1/memory_{baseline,proposal,search,postmortem}.schema.json`（Draft 2020-12）。包按 v1.0 交付件合入，之后只改过 `index_fts5.py` 的索引同步（见下文「检索索引」），Hibernaut 侧的约束都写在接线层。
 
 - **分区**：`inbox_id` 先归到 `project_key`：`[memory_hub.inbox_projects]` 的显式映射 → `proj:<key>` 或 `proj:<key>:<子队列>` → `<key>:<任务>`（`user:` 除外）→ 整个 `inbox_id` 规范化。同一 `project_key` 的 Inbox 共用 `<memory_root>/projects/<project_key>/`。
 - **旧目录迁移**（`memory_fs/legacy.py`）：以前每个 `inbox_id` 一个目录。首次访问某 Inbox 的记忆时，把旧目录的文件复制进项目目录，旧目录不动、留标记 `.memory_hub_adopted`，只做一次。主 Inbox（`proj__<key>`）先复制；同名而内容不同的文件放 `notes/legacy/<旧目录>/`，不覆盖。
@@ -390,10 +390,11 @@
   `MemoryPort.write("instructions.md", …)` 因此不再立即生效；`write_memory` 工具的返回文字会说明已排队待批。去重只判 `memory_propose_write`，`MemoryPort.write` 是整文件替换。
 - **端口委托**（`memory_fs/partitioned.py`）：`PartitionedMemoryAdapter` 委托 `LegacyMemoryPortAdapter`，保持 `MemoryPort` 的方法与返回值，另有 `load_baseline_bundle()`。URI 可以写任意项目，适配器只许本项目，越界抛 `PermissionError`。
 - **单写者**（`memory_fs/hub.py` 的 `GovernedMemoryHub`）：包内读改写不加锁，所以每个进程一个 hub，读写与审批持线程锁加 `<memory_root>/.memory_hub.lock` 文件锁，daemon、HTTP 服务与 `--mcp-stdio` 伴随进程不会互相覆盖。提案号校验格式，已决定的提案不能再改判。热加载各代共用同一个 hub，改 `[memory_hub]` 需要重启。
+- **检索索引**（`memory_hub/index_fts5.py`）：项目与共享记忆、知识库挂载各一个 FTS5 库。列文件、同步、查询在同一个 `BEGIN IMMEDIATE` 事务里，GC 的同步与写入后的索引刷新要等它结束，线程间与进程间都互斥；中途失败整体回滚。按项目的局部同步与重建只动该项目和共享层的行，别的项目不受影响。检索不占上面的文件锁，索引大挂载时写入照常。
 - **Prompt Cache 分段**（`memory_fs/segments.py`）：`stable_prefix`（全局与项目 `instructions.md`、`index.md`）在缓存断点前，`volatile_tail`（`reported.md`）在断点后。白盒执行器把前者放系统前缀，后者放每次请求的第一条消息，不进断点与压缩；CLI 与 Steward 的提示词里 `reported.md` 排在稳定部分之后；SDE 照旧只用稳定部分。预算由 `[memory_hub.budget]` 定（单位为估算 token，默认 1500 / 2500 / 1500 / 1000，总上限 6500），超出截断并记 `memory.budget_exceeded` 审计。
 - **工具与权限**：Run 里 `memory_search`、`memory_read`、`memory_propose_write` 默认放行，`memory_approve_proposal` 默认 `defer`：白盒执行器挂起，审批消息里带提案正文。Steward 没有批准工具。Hibernaut 的 MCP 控制面（`memory_bridge.py`）另给运营者 `memory_list_proposals`、`memory_reject_proposal` 与 `memory_record_postmortem`，可跨项目。
 - **复盘**：`memory_record_postmortem` 只收 `run_id`、根因和规则；项目、错误类别、复现次数都从执行账本取。复现指同项目、同错误类别、错误摘要去掉数字与哈希后相同的其他失败 Run；没有摘要的不计。成功的 Run 与不存在的 Run 被拒绝。
 - **机械 GC**（`MemoryGarbageCollector`）：启动时一轮，之后每 `gc_interval_seconds`（默认 86400，0 关闭）一轮，逐项目滚动 `reported.md`、归档已结束会话的旧 `progress/*`、校准 `index.md`、让过期提案失效。只归档会话已关闭且没有其他会话在用的 `progress` 文件，对不上会话的一律保留。
 - **HTTP / MCP 服务**（可选，`[memory_hub.http]`）：`ScopedMemoryHTTPServer` 默认只听回环地址，明文 HTTP，跨主机要在前面加 TLS。每个 token 有角色 `readonly` / `propose` / `admin` 与项目范围，取自环境变量并在启动时删除，agent 子进程拿不到。提案列表按 token 的项目过滤，提案作者取 token 的 subject。`admin` 可批准任意项目的提案，所以不许限定项目。
 - **审计**：hub 的审计事件写入执行账本 `audit_events`，`scope` 为 `project_key`。
-- **测试**：`tests/test_memory_hub.py`（包自身）；`tests/test_memory_hub_wiring.py`（依赖契约、配置、分区与迁移、越权、并发写、分段、工具与审批、复盘、GC、HTTP、热加载）。
+- **测试**：`tests/test_memory_hub.py`（包自身）；`tests/test_memory_hub_wiring.py`（依赖契约、配置、分区与迁移、越权、并发写、索引同步与检索的互斥、分段、工具与审批、复盘、GC、HTTP、热加载）。

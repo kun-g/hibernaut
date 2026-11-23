@@ -27,7 +27,8 @@ _PROPOSAL_ID_RE = re.compile(r"prop_[0-9a-f]+")
 class GovernedMemoryHub(MemoryHub):
     # MemoryHub reads, changes and replaces files without a lock and through one fixed temp name per file, so writers
     # of one memory root must take turns: Runs in threads of this process, its HTTP service, and the stdio MCP
-    # companion process. search() stays outside: it only touches the SQLite indexes, which lock for themselves.
+    # companion process. search() stays outside, since indexing a large mount must not hold up writers; each index
+    # keeps its own sync and query in one SQLite transaction, which GC and writers wait for.
     def __init__(self, config: MemoryHubConfig, *, audit: AuditHookPort | None = None) -> None:
         root = Path(config.memory_root).expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)

@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -173,23 +175,59 @@ class _SingleFTSDatabase:
         with self._lock:
             self._conn.close()
 
-    def reset(self) -> None:
+    @contextmanager
+    def transaction(self) -> Generator[None]:
+        # One at a time, across threads (the lock) and processes (SQLite's write lock). What lists files, syncs and
+        # queries must do so in one transaction: a file another writer indexes after the listing looks stale to the sync.
         with self._lock:
-            self._conn.execute("DELETE FROM indexed_files")
-            self._conn.execute("DELETE FROM memory_fts")
-            self._conn.commit()
+            if self._conn.in_transaction:
+                yield
+                return
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
 
-    def sync_files(self, files: list[tuple[str, str, LayerKind, Path, bool]]) -> tuple[int, int, int]:
+    def reset(self, scopes: tuple[str, ...] | None = None) -> None:
+        with self.transaction():
+            if scopes is None:
+                self._conn.execute("DELETE FROM indexed_files")
+                self._conn.execute("DELETE FROM memory_fts")
+                return
+            for uri in self._rows(scopes):
+                self._remove(uri)
+
+    def _rows(self, scopes: tuple[str, ...] | None) -> dict[str, tuple[int, int]]:
+        # scopes names projects; like the listing of their files, it takes in the shared layer.
+        return {
+            uri: (mtime_ns, size_bytes)
+            for uri, scope, layer, mtime_ns, size_bytes in self._conn.execute(
+                "SELECT uri, scope, layer, mtime_ns, size_bytes FROM indexed_files"
+            )
+            if scopes is None or layer == "shared" or scope in scopes
+        }
+
+    def _remove(self, uri: str) -> None:
+        self._conn.execute("DELETE FROM memory_fts WHERE uri = ?", (uri,))
+        self._conn.execute("DELETE FROM indexed_files WHERE uri = ?", (uri,))
+
+    def sync_files(
+        self,
+        files: list[tuple[str, str, LayerKind, Path, bool]],
+        *,
+        scopes: tuple[str, ...] | None = None,
+    ) -> tuple[int, int, int]:
+        # files is all there is in scopes (None: in the whole index); rows outside them stay.
         indexed_files = 0
         indexed_chunks = 0
         removed_files = 0
         seen_uris: set[str] = set()
 
-        with self._lock:
-            existing = {
-                row[0]: (row[1], row[2])
-                for row in self._conn.execute("SELECT uri, mtime_ns, size_bytes FROM indexed_files")
-            }
+        with self.transaction():
+            existing = self._rows(scopes)
             for uri, scope, layer, path, readonly in files:
                 seen_uris.add(uri)
                 try:
@@ -231,20 +269,14 @@ class _SingleFTSDatabase:
 
             stale = set(existing.keys()) - seen_uris
             for uri in stale:
-                self._conn.execute("DELETE FROM memory_fts WHERE uri = ?", (uri,))
-                self._conn.execute("DELETE FROM indexed_files WHERE uri = ?", (uri,))
+                self._remove(uri)
                 removed_files += 1
-
-            if indexed_files or removed_files:
-                self._conn.commit()
         return indexed_files, indexed_chunks, removed_files
 
     def refresh_single(self, uri: str, scope: str, layer: LayerKind, path: Path, readonly: bool) -> None:
-        with self._lock:
+        with self.transaction():
             if not path.is_file():
-                self._conn.execute("DELETE FROM memory_fts WHERE uri = ?", (uri,))
-                self._conn.execute("DELETE FROM indexed_files WHERE uri = ?", (uri,))
-                self._conn.commit()
+                self._remove(uri)
                 return
             st = path.stat()
             content = path.read_text(encoding="utf-8", errors="replace")
@@ -274,7 +306,6 @@ class _SingleFTSDatabase:
                 """,
                 (uri, scope, layer, st.st_mtime_ns, st.st_size, digest, updated_at, int(readonly), len(chunks)),
             )
-            self._conn.commit()
 
     def query(
         self,
@@ -355,16 +386,18 @@ class DualFTSIndex:
 
     def sync_project_domain(self, scopes: tuple[str, ...] | None = None) -> tuple[int, int, int]:
         files: list[tuple[str, str, LayerKind, Path, bool]] = []
-        for uri, scope, layer_str, path in self._store.iter_indexable_files(scopes=scopes):
-            layer: LayerKind = "project" if layer_str == "project" else "shared"
-            files.append((uri, scope, layer, path, False))
-        return self._project_db.sync_files(files)
+        with self._project_db.transaction():
+            for uri, scope, layer_str, path in self._store.iter_indexable_files(scopes=scopes):
+                layer: LayerKind = "project" if layer_str == "project" else "shared"
+                files.append((uri, scope, layer, path, False))
+            return self._project_db.sync_files(files, scopes=scopes)
 
     def sync_kb_domain(self) -> tuple[int, int, int]:
         files: list[tuple[str, str, LayerKind, Path, bool]] = []
-        for uri, mount_name, path in self._mounts.iter_files():
-            files.append((uri, mount_name, "kb", path, True))
-        return self._kb_db.sync_files(files)
+        with self._kb_db.transaction():
+            for uri, mount_name, path in self._mounts.iter_files():
+                files.append((uri, mount_name, "kb", path, True))
+            return self._kb_db.sync_files(files)
 
     def refresh_uri(self, uri: str, scope: str, layer: LayerKind, path: Path) -> None:
         if layer == "kb":
@@ -373,12 +406,14 @@ class DualFTSIndex:
             self._project_db.refresh_single(uri, scope, layer, path, False)
 
     def rebuild(self, *, scopes: tuple[str, ...] | None = None, include_kb: bool = True) -> IndexStats:
-        self._project_db.reset()
-        pf, pc, pr = self.sync_project_domain(scopes=scopes)
+        with self._project_db.transaction():
+            self._project_db.reset(scopes)
+            pf, pc, pr = self.sync_project_domain(scopes=scopes)
         kf = kc = 0
         if include_kb:
-            self._kb_db.reset()
-            kf, kc, _ = self.sync_kb_domain()
+            with self._kb_db.transaction():
+                self._kb_db.reset()
+                kf, kc, _ = self.sync_kb_domain()
         return IndexStats(
             indexed_files=pf,
             indexed_chunks=pc,
@@ -388,7 +423,6 @@ class DualFTSIndex:
         )
 
     def search(self, query: SearchQuery) -> SearchResponse:
-        self.sync_project_domain()
         allowed_layers: set[LayerKind] = set()
         if query.include_project:
             allowed_layers.add("project")
@@ -396,27 +430,30 @@ class DualFTSIndex:
             allowed_layers.add("shared")
 
         combined: list[SearchHit] = []
-        if allowed_layers:
-            combined.extend(
-                self._project_db.query(
-                    query.query,
-                    allowed_scopes={query.scope},
-                    allowed_layers=allowed_layers,
-                    include_archived=query.include_archived,
-                    limit=query.top_k,
+        with self._project_db.transaction():
+            self.sync_project_domain()
+            if allowed_layers:
+                combined.extend(
+                    self._project_db.query(
+                        query.query,
+                        allowed_scopes={query.scope},
+                        allowed_layers=allowed_layers,
+                        include_archived=query.include_archived,
+                        limit=query.top_k,
+                    )
                 )
-            )
         if query.include_kb and self._mounts.names:
-            self.sync_kb_domain()
-            combined.extend(
-                self._kb_db.query(
-                    query.query,
-                    allowed_scopes=None,
-                    allowed_layers={"kb"},
-                    include_archived=query.include_archived,
-                    limit=query.top_k,
+            with self._kb_db.transaction():
+                self.sync_kb_domain()
+                combined.extend(
+                    self._kb_db.query(
+                        query.query,
+                        allowed_scopes=None,
+                        allowed_layers={"kb"},
+                        include_archived=query.include_archived,
+                        limit=query.top_k,
+                    )
                 )
-            )
         combined.sort(key=lambda h: h.score, reverse=True)
         return SearchResponse(
             scope=query.scope,

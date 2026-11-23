@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -35,7 +36,7 @@ from agent_runtime.app.config import load_config, parse_config
 from agent_runtime.app.main import build_daemon, build_daemon_from_config, serve_configured
 from agent_runtime.core.models import Emit, Event, SessionRef, Suspend
 from ledger import RunRecord
-from memory_hub import BaselineBudgetConfig, LegacyMemoryPortAdapter, MemoryHubConfig, WriteProposal
+from memory_hub import BaselineBudgetConfig, LegacyMemoryPortAdapter, MemoryHubConfig, SearchQuery, WriteProposal
 from tests.fakes import InMemoryMemoryStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -186,6 +187,133 @@ def test_concurrent_writers_lose_nothing(tmp_path: Path) -> None:
     finally:
         for opened in hubs:
             opened.close()
+
+
+def _note(hub: GovernedMemoryHub, uri: str, text: str) -> None:
+    hub.propose_write(WriteProposal(target_uri=uri, op="upsert_file", content=text, rationale="r", force_new=True))
+
+
+def _indexed(hub: GovernedMemoryHub) -> set[str]:
+    # What a query can see right now: no search(), which would sync first.
+    with sqlite3.connect(hub.root / ".index" / "memory_index.db") as conn:
+        files = {str(r[0]) for r in conn.execute("SELECT uri FROM indexed_files")}
+        assert files >= {str(r[0]) for r in conn.execute("SELECT uri FROM memory_fts")}
+    return {uri for uri in files if "/notes/" in uri}
+
+
+def _index_three_notes(hub: GovernedMemoryHub) -> None:
+    shared = hub.root / "shared" / "notes" / "s.md"
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    shared.write_text("kestrel shared\n")
+    _note(hub, "proj://a/notes/a.md", "kestrel in a")
+    _note(hub, "proj://b/notes/b.md", "kestrel in b")
+    assert _search(hub, "b") >= {"proj://b/notes/b.md", "shared://notes/s.md"}
+
+
+def _search(hub: GovernedMemoryHub, scope: str) -> set[str]:
+    return {hit.uri for hit in hub.search(SearchQuery(scope=scope, query="kestrel")).items}
+
+
+def test_collecting_one_project_keeps_the_other_projects_index(hub: GovernedMemoryHub) -> None:
+    _index_three_notes(hub)
+    hub.run_mechanical_gc("a", closed_work_keys=set())
+    assert _indexed(hub) == {"proj://a/notes/a.md", "proj://b/notes/b.md", "shared://notes/s.md"}
+
+
+def test_a_partial_sync_removes_what_is_gone_from_where_it_looked(hub: GovernedMemoryHub) -> None:
+    _index_three_notes(hub)
+    for rel in ("projects/a/notes/a.md", "projects/b/notes/b.md", "shared/notes/s.md"):
+        (hub.root / rel).unlink()
+    hub.run_mechanical_gc("a", closed_work_keys=set())
+    assert _indexed(hub) == {"proj://b/notes/b.md"}
+    assert _search(hub, "b") == set()
+
+
+def test_rebuilding_one_project_keeps_the_other_projects_index(hub: GovernedMemoryHub) -> None:
+    _index_three_notes(hub)
+    hub.rebuild_index(scopes=("a",))
+    assert _indexed(hub) == {"proj://a/notes/a.md", "proj://b/notes/b.md", "shared://notes/s.md"}
+
+
+# The daemon's threads share one hub; its stdio MCP companion process opens another on the same root.
+@pytest.fixture(params=["same hub", "another hub"])
+def neighbour(request: pytest.FixtureRequest, hub: GovernedMemoryHub) -> Iterator[GovernedMemoryHub]:
+    if request.param == "same hub":
+        yield hub
+        return
+    opened = GovernedMemoryHub(hub.config)
+    yield opened
+    opened.close()
+
+
+def test_nothing_changes_the_index_between_a_searchs_sync_and_its_query(
+    hub: GovernedMemoryHub, neighbour: GovernedMemoryHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _index_three_notes(hub)
+    database = hub._index._project_db  # pyright: ignore[reportPrivateUsage]
+    query = database.query
+    gc = threading.Thread(target=lambda: neighbour.run_mechanical_gc("a", closed_work_keys=set()))
+    waited: list[bool] = []
+
+    def query_after_gc_had_its_chance(*args: Any, **kwargs: Any) -> Any:
+        gc.start()
+        gc.join(0.5)
+        waited.append(gc.is_alive())
+        return query(*args, **kwargs)
+
+    monkeypatch.setattr(database, "query", query_after_gc_had_its_chance)
+    assert "proj://b/notes/b.md" in _search(hub, "b")
+    gc.join(10)
+    assert waited == [True] and not gc.is_alive()
+
+
+def test_a_note_written_while_a_search_syncs_stays_indexed(
+    hub: GovernedMemoryHub, neighbour: GovernedMemoryHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _index_three_notes(hub)
+    store = hub._store  # pyright: ignore[reportPrivateUsage]
+    listing = store.iter_indexable_files
+    writer = threading.Thread(target=lambda: _note(neighbour, "proj://b/notes/new.md", "kestrel late"))
+
+    def list_then_let_the_writer_in(**kwargs: Any) -> Any:
+        files = list(listing(**kwargs))
+        if writer.ident is None:
+            writer.start()
+            writer.join(0.5)
+        return iter(files)
+
+    monkeypatch.setattr(store, "iter_indexable_files", list_then_let_the_writer_in)
+    _search(hub, "b")
+    writer.join(10)
+    assert not writer.is_alive()
+    assert "proj://b/notes/new.md" in _indexed(hub)
+
+
+def test_a_failed_sync_leaves_the_index_as_it_was_and_unlocked(
+    hub: GovernedMemoryHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _index_three_notes(hub)
+    before = _indexed(hub)
+    (hub.root / "projects" / "b" / "notes" / "b.md").write_text("kestrel edited and longer")
+    unreadable = hub.root / "projects" / "b" / "notes" / "z.md"
+    unreadable.write_text("kestrel z")
+    read_text = Path.read_text
+
+    def fail_on_z(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == unreadable:
+            raise FileNotFoundError(path)
+        return read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Path, "read_text", fail_on_z)
+        with pytest.raises(FileNotFoundError):
+            _search(hub, "b")
+    assert _indexed(hub) == before
+    other = GovernedMemoryHub(hub.config)
+    try:
+        assert "proj://b/notes/z.md" in _search(other, "b")
+    finally:
+        other.close()
 
 
 def test_proposal_ids_cannot_leave_the_proposals_directory(hub: GovernedMemoryHub, tmp_path: Path) -> None:
