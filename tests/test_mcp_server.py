@@ -97,6 +97,11 @@ class TestMCPServerAdapter(unittest.IsolatedAsyncioTestCase):
                 "hibernaut_resolve_approval",
                 "hibernaut_reclaim_workspace",
                 "hibernaut_close_session",
+                "hibernaut_list_runs",
+                "hibernaut_get_run_log",
+                "hibernaut_list_audits",
+                "hibernaut_executor_stats",
+                "hibernaut_replay_event",
             ],
         )
 

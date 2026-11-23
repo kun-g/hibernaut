@@ -10,6 +10,8 @@ from switchboard.envelope import CanonicalEvent
 DeliverStatus = Literal["acked", "nack", "offline", "timeout"]
 OutboundKind = Literal["text", "approval_card", "comment"]
 IngestStatus = Literal["accepted", "duplicate", "invalid"]
+# None lets a sink infer it from the outcome.
+AuditSeverity = Literal["info", "warn", "error"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +100,8 @@ class CredentialBrokerPort(Protocol):
     def issue_ephemeral(self, channel: str) -> str | None: ...
 
 
+# correlation_key, scope, trace_id and severity are optional ledger fields (ADR-0001 AuditRecord); sinks that do not
+# store them ignore them, so existing callers and sinks are unaffected.
 class AuditSinkPort(Protocol):
     def emit_audit(
         self,
@@ -109,6 +113,10 @@ class AuditSinkPort(Protocol):
         external_id: str | None = None,
         consumer_id: str | None = None,
         detail: Mapping[str, Any] | None = None,
+        correlation_key: str | None = None,
+        scope: str | None = None,
+        trace_id: str | None = None,
+        severity: AuditSeverity | None = None,
     ) -> None: ...
 
 
@@ -123,6 +131,10 @@ class NoopAuditSink:
         external_id: str | None = None,
         consumer_id: str | None = None,
         detail: Mapping[str, Any] | None = None,
+        correlation_key: str | None = None,
+        scope: str | None = None,
+        trace_id: str | None = None,
+        severity: AuditSeverity | None = None,
     ) -> None:
         return None
 
@@ -141,18 +153,24 @@ class RecordingAuditSink:
         external_id: str | None = None,
         consumer_id: str | None = None,
         detail: Mapping[str, Any] | None = None,
+        correlation_key: str | None = None,
+        scope: str | None = None,
+        trace_id: str | None = None,
+        severity: AuditSeverity | None = None,
     ) -> None:
-        self.records.append(
-            {
-                "stage": stage,
-                "outcome": outcome,
-                "source": source,
-                "event_id": event_id,
-                "external_id": external_id,
-                "consumer_id": consumer_id,
-                "detail": dict(detail or {}),
-            }
-        )
+        record: dict[str, Any] = {
+            "stage": stage,
+            "outcome": outcome,
+            "source": source,
+            "event_id": event_id,
+            "external_id": external_id,
+            "consumer_id": consumer_id,
+            "detail": dict(detail or {}),
+        }
+        # Only when given, so a record from a caller that passes none keeps its old shape.
+        ledger_fields = {"correlation_key": correlation_key, "scope": scope, "trace_id": trace_id, "severity": severity}
+        record.update({key: value for key, value in ledger_fields.items() if value is not None})
+        self.records.append(record)
 
 
 # Audit is a side channel: a failing sink degrades to stderr and never breaks the main path.
@@ -166,7 +184,22 @@ def safe_audit(
     external_id: str | None = None,
     consumer_id: str | None = None,
     detail: Mapping[str, Any] | None = None,
+    correlation_key: str | None = None,
+    scope: str | None = None,
+    trace_id: str | None = None,
+    severity: AuditSeverity | None = None,
 ) -> None:
+    # Passed only when given: a sink written against the older signature keeps working.
+    ledger_fields: dict[str, Any] = {
+        key: value
+        for key, value in (
+            ("correlation_key", correlation_key),
+            ("scope", scope),
+            ("trace_id", trace_id),
+            ("severity", severity),
+        )
+        if value is not None
+    }
     try:
         sink.emit_audit(
             stage,
@@ -176,6 +209,7 @@ def safe_audit(
             external_id=external_id,
             consumer_id=consumer_id,
             detail=detail,
+            **ledger_fields,
         )
     except Exception as exc:  # noqa: BLE001
         print(

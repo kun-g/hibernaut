@@ -214,7 +214,8 @@ class TestWiring(unittest.IsolatedAsyncioTestCase):
         with contextlib.redirect_stdout(out):
             await daemon.channel.send(INBOX, "full body", {"kind": "emit"})
         self.assertEqual(out.getvalue(), f"[OUTBOX:emit] inbox={INBOX} | full body\n")
-        self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.is_dir()), ["mem"])
+        # logs/ holds the run ledger's run logs (beside ledger.db); no outbox directory appears.
+        self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.is_dir()), ["logs", "mem"])
 
     async def test_configured_console_prints_one_summary_line(self) -> None:
         daemon = self._from_config({"outbox_dir": "outbox", "port": 9123})

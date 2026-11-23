@@ -35,6 +35,8 @@ from agent_runtime.core.models import NewEventPolicy
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     db_path: str = "./hibernaut.db"
+    # The run ledger's own SQLite file (runs, audits); "" puts ledger.db beside db_path.
+    ledger_db_path: str = ""
     memory_root: str = "./agent_memory"
     max_concurrency: int = 4
     new_event_policy: NewEventPolicy = "defer"
@@ -393,6 +395,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
 
     runtime = RuntimeConfig(
         db_path=str(rt_raw.get("db_path", "./hibernaut.db")),
+        ledger_db_path=str(rt_raw.get("ledger_db_path", "") or ""),
         memory_root=str(rt_raw.get("memory_root", "./agent_memory")),
         max_concurrency=int(rt_raw.get("max_concurrency", 4)),
         new_event_policy=cast(NewEventPolicy, policy),

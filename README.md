@@ -20,6 +20,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 人工审批 | 权限门禁返回 `defer`、agent 需要人回答或交付受阻时挂起，审批后从断点继续 |
 | 安全 | agent 进程不持有真实密钥：API key 由外置代理注入，Drive 密钥由独立系统用户保管，GitHub 走宿主机凭据 |
 | 运维 | 配置热加载、跟随 `origin/main` 自动更新；Outbox 上报失败按 5/15/45/135/405 秒持久化退避，重启不丢进度 |
+| 执行账本 | 同仓的独立包 `src/ledger/`：每个 Run 记一条档案（结局、执行器、耗时、错误类别、日志、token 与费用），同进程 Switchboard 的审计也记入，存在独立的 `ledger.db`；执行器失败按类别分流（瞬时故障 5/15/45 秒退避重试，配置或权限错误第 1 次即停，执行故障不重试），最终失败发告警；MCP 只读工具查询 Run、日志、审计与执行器统计，`hibernaut_replay_event` 重放失败事件。设计见 [`docs/observability-ledger-design.md`](docs/observability-ledger-design.md) |
 | Switchboard | 同仓的独立包：外部事件归一、去重、路由、统一出站；可与 Hibernaut 同进程运行，或经 Relay 连到公网的 Switchboard |
 | Taskboard | 同仓的独立包：多来源任务归集（一个任务可挂多个来源）、5 态状态机、DAG 依赖与环检测、上游完成后自动解锁下游，经 Switchboard 发 `work.ready` 或给人发待办通知；SQLite 存储。独立常驻服务 `python -m taskboard.app` 经 Relay 消费 Switchboard 事件、经 Switchboard `/mcp` 上行，并以 HTTP `/mcp`（可挂同域子路径，如 `/taskboard/mcp`）或 `--mcp-stdio` 提供 7 个 `tb_*` MCP 工具；Hibernaut 接 `work.ready` 执行，并以 `execution.reported` 回报 `claim` / `update_stage` / `complete` / `release`（审批挂起后恢复仍回写同一任务）。设计见 [`docs/taskboard.md`](docs/taskboard.md) |
 
@@ -66,7 +67,7 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 
 | 配置段 | 管什么 |
 | :--- | :--- |
-| `[runtime]` | 数据库与记忆目录、并发数、新事件策略（`defer` / `fold` / `interrupt`）、全局默认执行器 |
+| `[runtime]` | 数据库与记忆目录、并发数、新事件策略（`defer` / `fold` / `interrupt`）、全局默认执行器；`ledger_db_path` 是执行账本的独立数据库（默认 `db_path` 同目录的 `ledger.db`，运行日志在它旁边的 `logs/runs/`） |
 | `[channels]` | HTTP 端口、MCP 的密钥环境变量名；`outbox_dir` 设置后每条 Outbox 消息另存为该目录下一个带任务上下文的 Markdown 文件；配置了 `auto_merge` 却停在 PR 未合并时，状态为「待合并」并写明 PR 链接与未合并原因 |
 | `[executors.<id>]` | CLI 模板；写 `role = "sde"` 或 `role = "code-reviewer"` 则是角色执行器。SDE 的 `review`、`reviewer` 决定评审开关和评审者 |
 | `[launchers.<name>]`、`[credential_proxy]` | Claude Code 启动命令；`billing = "api"` 时经外置凭据代理 |
@@ -113,8 +114,9 @@ python3 scripts/run_updating.py --config hibernaut.toml
 
 | 文档 | 内容 |
 | :--- | :--- |
-| [`docs/architecture.md`](docs/architecture.md) | 完整设计：生命周期（§1）、分层（§2）、会话与路由及各入口（§3）、执行器、评审、SDE、PR 交付、worktree、多 inbox 项目、热加载（§4）、并发与新事件策略（§5）、Switchboard（§7）、ccpeer（§9）、Taskboard（§10） |
+| [`docs/architecture.md`](docs/architecture.md) | 完整设计：生命周期（§1）、分层（§2）、会话与路由及各入口（§3）、执行器、评审、SDE、PR 交付、worktree、多 inbox 项目、热加载（§4）、并发与新事件策略（§5）、Switchboard（§7）、ccpeer（§9）、Taskboard（§10）、执行账本（§11） |
 | [`docs/taskboard.md`](docs/taskboard.md) | Taskboard 完整设计方案：职责边界、5 态状态机、DAG 解锁与异常传播、Flow 展开、与 Switchboard 的 Schema 契约、DDL 与门禁 |
+| [`docs/observability-ledger-design.md`](docs/observability-ledger-design.md) | 执行账本（Observability / Ledger）设计基线：定位与边界、双层数据契约、错误分类与分流、日志与计费、重放与 Memory 闸门；接线见架构文档 §11 |
 | [`docs/glossary.md`](docs/glossary.md) | 术语表（术语以它为准） |
 | [`AGENTS.md`](AGENTS.md) | 开发规范与提交门禁 |
 | [`docs/dispatch/`](docs/dispatch) | 派单模板：SDE 任务（`/events`、Drive）、独立评审 |
@@ -136,7 +138,9 @@ src/agent_runtime/
 src/switchboard/  # 独立包，不依赖 agent_runtime
 src/ccpeer/       # 独立包：与本机 Claude Code 会话收发消息（发送、会话发现、常驻接收端），只依赖标准库
 src/taskboard/    # 独立包：多源任务归集与 DAG 编排（core/ L0、ports.py L1、engine/ L2、adapters/ L3、app/ 配置与入口），只依赖标准库与 switchboard
+src/ledger/       # 独立包：执行账本与审计（独立 ledger.db、运行日志、错误分类、MCP 只读查询），只依赖标准库
 schemas/taskboard/  # Taskboard 与 Switchboard 之间事件 metadata 的 JSON Schema（Draft 2020-12）
+schemas/v1/         # 执行账本的 AuditRecord / RunRecord JSON Schema（ADR-0001，Draft 2020-12）
 ```
 
 提交前三道门禁必须全绿：
@@ -145,5 +149,5 @@ schemas/taskboard/  # Taskboard 与 Switchboard 之间事件 metadata 的 JSON S
 pip install -e ".[dev]"
 lint-imports   # 分层与反向依赖检查
 pytest -v      # 契约、并发、端到端测试（本地快检可用 pytest -n auto $(python scripts/select_tests.py)）
-pyright        # core/、engine/、switchboard/、ccpeer/、taskboard/ 的 strict 类型检查
+pyright        # core/、engine/、switchboard/、ccpeer/、taskboard/、ledger/ 的 strict 类型检查
 ```
