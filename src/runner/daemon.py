@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping, cast
+from typing import Any, Callable, Mapping, ParamSpec, TypeVar, cast
 
 from runner.cli_drivers import (
     CLIDriver,
@@ -21,11 +22,13 @@ from runner.protocol import (
     InterruptResult,
     ReclaimRequest,
     ReclaimResult,
+    RunIdentity,
     RunRequest,
     RunResult,
     RunStatus,
     RunnerCapabilities,
     SlotSnapshot,
+    run_identity,
     utc_now_iso,
 )
 from runner.supervisor import ProcessSupervisor, build_child_env
@@ -37,6 +40,33 @@ from runner.worktree import (
     restore_readonly_worktree,
     worktree_fingerprint,
 )
+
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+async def _to_thread_to_completion(fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+    # For worktree work that changes the disk: a cancelled await would otherwise return while the thread keeps
+    # changing the workspace, and the caller would give up its workspace claim too early. The thread always runs to
+    # its end; a cancellation is raised after that.
+    task = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.done():
+                if task.cancelled():
+                    raise
+                cancelled = True
+                result = task.result()
+                break
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 @dataclass(slots=True)
@@ -70,6 +100,7 @@ class RunnerDaemon:
         self._stream_pipe: StreamPipe = stream_pipe or NoopStreamPipe()
         self._active_runs: dict[str, _InFlightRun] = {}
         self._completed_runs: dict[str, RunResult] = {}
+        self._run_identities: dict[str, RunIdentity] = {}
         self._active_slots = 0
         # One process tree per workspace: an entry stays until its run's process group has been reaped.
         self._busy_workspaces: dict[tuple[str, str, str, str, bool], str] = {}
@@ -115,18 +146,25 @@ class RunnerDaemon:
         return self.capabilities_sync()
 
     async def run(self, req: RunRequest, *, caller_id: str) -> RunResult:
-        if (done := self._completed_runs.get(req.run_id)) is not None:
-            return done
-        if (in_flight := self._active_runs.get(req.run_id)) is not None:
-            return await asyncio.shield(in_flight.future)
-
         started_at = utc_now_iso()
         start_mono = time.monotonic()
 
+        # Authorization comes before any reuse of a run_id, and a reused run_id must be the same request: otherwise a
+        # caller could read, or wait on, another task's run.
         try:
             policy = self._config.authorize_namespace(req.namespace, caller_id)
         except PermissionError as exc:
             return self._refused(req, started_at, start_mono, "permission_denied", str(exc))
+        identity = run_identity(req, caller_id)
+        known = self._run_identities.get(req.run_id)
+        if known is not None and known != identity:
+            return self._refused(
+                req, started_at, start_mono, "permission_denied", f"run_id {req.run_id!r} belongs to another request"
+            )
+        if (done := self._completed_runs.get(req.run_id)) is not None:
+            return done
+        if (in_flight := self._active_runs.get(req.run_id)) is not None:
+            return await asyncio.shield(in_flight.future)
 
         project = self._config.projects.get(req.project_key)
         if project is None:
@@ -161,6 +199,7 @@ class RunnerDaemon:
         loop = asyncio.get_running_loop()
         entry = _InFlightRun(future=loop.create_future(), cancel_event=asyncio.Event())
         self._active_runs[req.run_id] = entry
+        self._run_identities[req.run_id] = identity
         self._active_slots += 1
 
         try:
@@ -246,15 +285,25 @@ class RunnerDaemon:
                 reason=f"runs still active on this workspace: {', '.join(sorted(active))}",
                 blockers=("run_active",),
             )
-        # git/orca subprocesses run off the event loop so other runs' watchdogs and interrupts keep ticking.
-        return await asyncio.to_thread(
-            self._worktrees.reclaim,
-            policy=policy,
-            project=project,
-            owner_scope=req.owner_scope,
-            work_key=req.work_key,
-            merged_head_sha=req.merged_head_sha,
-        )
+        # Both directories of the workspace (task and readonly) stay claimed until the reclaim thread is done, so a run
+        # that arrives after the check above cannot mount a directory that is about to be deleted. git/orca run off
+        # the event loop so other runs' watchdogs and interrupts keep ticking.
+        keys = [(req.namespace, req.project_key, req.owner_scope, req.work_key, ro) for ro in (False, True)]
+        for key in keys:
+            self._busy_workspaces[key] = "(reclaim)"
+        try:
+            return await _to_thread_to_completion(
+                self._worktrees.reclaim,
+                policy=policy,
+                project=project,
+                owner_scope=req.owner_scope,
+                work_key=req.work_key,
+                merged_head_sha=req.merged_head_sha,
+            )
+        finally:
+            for key in keys:
+                if self._busy_workspaces.get(key) == "(reclaim)":
+                    del self._busy_workspaces[key]
 
     async def _execute_slot(
         self,
@@ -281,7 +330,20 @@ class RunnerDaemon:
                 req, policy=policy, project=project, driver=driver, entry=entry, started_at=started_at, start_mono=start_mono
             )
         finally:
-            self._busy_workspaces.pop(busy_key, None)
+            try:
+                if req.readonly:
+                    # A readonly worktree lives only for its run; nothing is left for a later reclaim to find.
+                    await _to_thread_to_completion(
+                        self._worktrees.remove_readonly,
+                        policy=policy,
+                        project=project,
+                        owner_scope=req.owner_scope,
+                        work_key=req.work_key,
+                    )
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).warning("readonly worktree of %s was not removed", req.run_id, exc_info=True)
+            finally:
+                self._busy_workspaces.pop(busy_key, None)
 
     async def _execute_claimed(
         self,
@@ -295,7 +357,7 @@ class RunnerDaemon:
         start_mono: float,
     ) -> RunResult:
         try:
-            resolved = await asyncio.to_thread(
+            resolved = await _to_thread_to_completion(
                 self._worktrees.resolve,
                 policy=policy,
                 project=project,
@@ -305,7 +367,7 @@ class RunnerDaemon:
                 name_hint=req.name_hint,
             )
             if not req.readonly:
-                await asyncio.to_thread(
+                await _to_thread_to_completion(
                     self._worktrees.assert_writable,
                     policy=policy,
                     project=project,
@@ -355,7 +417,7 @@ class RunnerDaemon:
         if pre_fp is not None:
             post_fp = await asyncio.to_thread(worktree_fingerprint, resolved.workdir)
             if post_fp != pre_fp:
-                await asyncio.to_thread(restore_readonly_worktree, resolved.workdir, resolved.ref.head_sha)
+                await _to_thread_to_completion(restore_readonly_worktree, resolved.workdir, resolved.ref.head_sha)
                 return RunResult(
                     run_id=req.run_id,
                     runner_id=self._config.runner_id,

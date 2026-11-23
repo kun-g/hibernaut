@@ -89,6 +89,17 @@ def _drivers() -> dict[str, TemplateCLIDriver]:
             command=PY,
             args=("-c", "import json, os; print(json.dumps({'cwd': os.getcwd()}))"),
         ),
+        "look": TemplateCLIDriver(
+            executor_id="look",
+            driver_kind="custom",
+            command=PY,
+            args=(
+                "-c",
+                "import json, os, pathlib, subprocess; print(json.dumps({'cwd': os.getcwd(), "
+                "'mutated': pathlib.Path('mutated.txt').exists(), 'readme': pathlib.Path('README.md').read_text(), "
+                "'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()}))",
+            ),
+        ),
         "mutate": TemplateCLIDriver(
             executor_id="mutate",
             driver_kind="custom",
@@ -238,22 +249,28 @@ def test_readonly_runs_use_own_worktree_and_restore_mutations(tmp_path: Path) ->
     daemon = RunnerDaemon(_config(tmp_path, repo), drivers=_drivers())
     primary = repo.resolve()
 
+    async def _look(run_id: str, **kw: Any) -> dict[str, Any]:
+        res = await daemon.run(_req(run_id, executor_id="look", readonly=True, **kw), caller_id="hibernaut")
+        assert res.status == "succeeded", res.error_summary
+        seen: dict[str, Any] = json.loads(res.stdout_excerpt)
+        # The readonly worktree lives only for its run.
+        assert not Path(seen["cwd"]).exists()
+        return seen
+
     async def _scenario() -> None:
-        ro_a = await daemon.run(_req("run_ro_a", executor_id="cwd", owner_scope="proj:a", readonly=True), caller_id="hibernaut")
-        ro_b = await daemon.run(_req("run_ro_b", executor_id="cwd", owner_scope="proj:b", readonly=True), caller_id="hibernaut")
-        assert ro_a.status == "succeeded" and ro_b.status == "succeeded"
-        cwd_a = Path(json.loads(ro_a.stdout_excerpt)["cwd"]).resolve()
-        cwd_b = Path(json.loads(ro_b.stdout_excerpt)["cwd"]).resolve()
+        ro_a = await _look("run_ro_a", owner_scope="proj:a")
+        ro_b = await _look("run_ro_b", owner_scope="proj:b")
+        cwd_a, cwd_b = Path(ro_a["cwd"]).resolve(), Path(ro_b["cwd"]).resolve()
         assert cwd_a != primary and cwd_b != primary
         assert cwd_a != cwd_b, "two inbox_ids mounted the same directory"
 
         mutated = await daemon.run(_req("run_ro_mut", executor_id="mutate", owner_scope="proj:a", readonly=True), caller_id="hibernaut")
         assert mutated.status == "failed" and mutated.error_kind == "permission_denied"
-        assert not (cwd_a / "mutated.txt").exists()
-        assert (cwd_a / "README.md").read_text(encoding="utf-8") == "hello\n"
-        assert _git("status", "--porcelain", "--untracked-files=all", cwd=cwd_a) == ""
         assert not (primary / "mutated.txt").exists()
         assert _git("status", "--porcelain", "--untracked-files=all", cwd=primary) == ""
+        # The next readonly run of the same tuple starts clean.
+        again = await _look("run_ro_again", owner_scope="proj:a")
+        assert again["mutated"] is False and again["readme"] == "hello\n"
 
         # A readonly run of a task that has a write worktree sees that worktree's committed HEAD, in its own directory.
         write = await daemon.run(_req("run_w", executor_id="cwd", owner_scope="proj:a", work_key="gh#7"), caller_id="hibernaut")
@@ -261,18 +278,9 @@ def test_readonly_runs_use_own_worktree_and_restore_mutations(tmp_path: Path) ->
         (write_dir / "feature.txt").write_text("work\n", encoding="utf-8")
         _git("add", "feature.txt", cwd=write_dir)
         _git("commit", "-m", "feature", cwd=write_dir)
-        ro_task = await daemon.run(_req("run_ro_task", executor_id="cwd", owner_scope="proj:a", work_key="gh#7", readonly=True), caller_id="hibernaut")
-        ro_task_dir = Path(json.loads(ro_task.stdout_excerpt)["cwd"]).resolve()
-        assert ro_task_dir not in (write_dir, primary)
-        assert _git("rev-parse", "HEAD", cwd=ro_task_dir) == _git("rev-parse", "HEAD", cwd=write_dir)
-
-        # Reclaim of the tuple removes its readonly worktree too.
-        _git("push", "origin", "HEAD", cwd=write_dir)
-        reclaimed = await daemon.reclaim_workspace(
-            ReclaimRequest(namespace="hb", project_key="hibernaut", owner_scope="proj:a", work_key="gh#7"), caller_id="hibernaut"
-        )
-        assert reclaimed.reclaimed is True
-        assert not ro_task_dir.exists()
+        ro_task = await _look("run_ro_task", owner_scope="proj:a", work_key="gh#7")
+        assert Path(ro_task["cwd"]).resolve() not in (write_dir, primary)
+        assert ro_task["head"] == _git("rev-parse", "HEAD", cwd=write_dir)
 
     try:
         asyncio.run(_scenario())

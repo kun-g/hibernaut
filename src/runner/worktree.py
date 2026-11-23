@@ -494,6 +494,9 @@ class WorktreeManager:
                 ref=self._build_ref(work_key, "HEAD", workdir),
             )
 
+    def remove_readonly(self, *, policy: NamespacePolicy, project: ProjectCheckout, owner_scope: str, work_key: str) -> bool:
+        return self._remove_readonly(policy=policy, project=project, owner_scope=owner_scope, work_key=work_key)
+
     def _remove_readonly(self, *, policy: NamespacePolicy, project: ProjectCheckout, owner_scope: str, work_key: str) -> bool:
         primary = project.checkout_path.resolve()
         workdir = self.readonly_workdir(policy=policy, project=project, owner_scope=owner_scope, work_key=work_key)

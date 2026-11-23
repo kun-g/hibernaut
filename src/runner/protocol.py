@@ -616,3 +616,12 @@ def _req_list(raw: Mapping[str, Any], key: str) -> list[Any]:
     if not isinstance(val, list):
         raise ProtocolValidationError(f"field {key!r} must be list")
     return cast(list[Any], val)
+
+
+RunIdentity: TypeAlias = tuple[str, str, str, str, str, str, bool]
+
+
+def run_identity(req: RunRequest, caller_id: str) -> RunIdentity:
+    # run_id is an idempotency key only within one request: a retry must come from the same caller for the same
+    # workspace and executor. Hub and daemon both refuse a run_id reused for anything else.
+    return (caller_id, req.namespace, req.project_key, req.owner_scope, req.work_key, req.executor_id, req.readonly)

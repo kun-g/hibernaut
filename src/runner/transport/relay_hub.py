@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Mapping, cast
 
@@ -10,9 +11,11 @@ from runner.protocol import (
     InterruptResult,
     ReclaimRequest,
     ReclaimResult,
+    RunIdentity,
     RunRequest,
     RunResult,
     RunnerCapabilities,
+    run_identity,
     utc_now_iso,
 )
 from runner.registry import (
@@ -36,6 +39,15 @@ from runner.transport.ws_protocol import (
 
 class RunnerConnectionLostError(ConnectionError):
     pass
+
+
+class RunIdConflictError(ValueError):
+    pass
+
+
+# How many finished runs the hub remembers for run_id retries (the idempotency window). A retry inside it gets the
+# recorded result instead of a second execution on whichever node has a free slot now.
+FINISHED_RUN_CACHE_SIZE = 4096
 
 
 @dataclass(slots=True)
@@ -85,6 +97,10 @@ class RunnerRelayHub:
         self._pending_result: dict[str, asyncio.Future[RunResult]] = {}
         self._pending_rpc: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._inflight: dict[str, asyncio.Future[RunResult]] = {}
+        self._inflight_identity: dict[str, RunIdentity] = {}
+        self._finished: OrderedDict[str, tuple[RunIdentity, RunResult]] = OrderedDict()
+        # Each pending rpc belongs to the connection it was sent on (runner_id, conn_epoch).
+        self._rpc_target: dict[str, tuple[str, int]] = {}
         self._dispatch_gates: dict[tuple[str, str, str, str], _DispatchGate] = {}
         self._hb_task: asyncio.Task[None] | None = None
         self._rpc_seq = 0
@@ -125,20 +141,42 @@ class RunnerRelayHub:
         return online[0].capabilities
 
     async def run(self, req: RunRequest, *, caller_id: str = "hibernaut") -> RunResult:
-        # run_id is the idempotency key across waiters: every caller of the same run_id shares one submission and
-        # one reserved slot, and a caller that times out or is cancelled leaves the submission running for the rest.
+        # run_id is the idempotency key across waiters and retries of one request: every caller of the same run_id
+        # shares one submission and one reserved slot, a caller that times out or is cancelled leaves the submission
+        # running for the rest, and a finished run is answered from its recorded result. A run_id reused for another
+        # request (caller, workspace or executor) is refused, the same rule the daemon applies.
+        identity = run_identity(req, caller_id)
+        finished = self._finished.get(req.run_id)
+        if finished is not None:
+            if finished[0] != identity:
+                raise RunIdConflictError(f"run_id {req.run_id!r} belongs to another request")
+            return finished[1]
         task = self._inflight.get(req.run_id)
-        if task is None:
+        if task is not None:
+            if self._inflight_identity.get(req.run_id) != identity:
+                raise RunIdConflictError(f"run_id {req.run_id!r} belongs to another request")
+        else:
             task = asyncio.ensure_future(self._submit_and_wait(req, caller_id))
             self._inflight[req.run_id] = task
-            task.add_done_callback(lambda t, rid=req.run_id: self._on_submission_done(rid, t))
+            self._inflight_identity[req.run_id] = identity
+            task.add_done_callback(lambda t, rid=req.run_id, ident=identity: self._on_submission_done(rid, ident, t))
         return await asyncio.shield(task)
 
-    def _on_submission_done(self, run_id: str, task: asyncio.Future[RunResult]) -> None:
+    def _on_submission_done(self, run_id: str, identity: RunIdentity, task: asyncio.Future[RunResult]) -> None:
         if self._inflight.get(run_id) is task:
             del self._inflight[run_id]
-        if not task.cancelled():
-            task.exception()  # retrieved here so a submission nobody waits for any more does not warn
+            self._inflight_identity.pop(run_id, None)
+        if task.cancelled():
+            return
+        if task.exception() is not None:  # retrieved here so a submission nobody waits for any more does not warn
+            return
+        result = task.result()
+        # A refusal ran nothing, so a retry may still run it; anything else ran (or was stopped) on its node.
+        if result.status != "refused":
+            self._finished[run_id] = (identity, result)
+            self._finished.move_to_end(run_id)
+            while len(self._finished) > FINISHED_RUN_CACHE_SIZE:
+                self._finished.popitem(last=False)
 
     async def _submit_and_wait(self, req: RunRequest, caller_id: str) -> RunResult:
         gate = await self._enter_dispatch_gate(req)
@@ -357,6 +395,7 @@ class RunnerRelayHub:
         rpc_id = f"rpc_{self._rpc_seq}"
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending_rpc[rpc_id] = fut
+        self._rpc_target[rpc_id] = (conn.runner_id, conn.conn_epoch)
         try:
             payload = dict(body)
             payload["type"] = frame_type
@@ -367,6 +406,7 @@ class RunnerRelayHub:
             return await asyncio.wait_for(fut, timeout=self._ack_timeout)
         finally:
             self._pending_rpc.pop(rpc_id, None)
+            self._rpc_target.pop(rpc_id, None)
 
     async def _send(self, conn: _RunnerConn, payload: Mapping[str, Any]) -> None:
         async with conn.send_lock:
@@ -444,21 +484,32 @@ class RunnerRelayHub:
                 self._registry.calibrate_heartbeat(
                     runner_id, epoch, RunnerCapabilities.from_dict(cast(Mapping[str, Any], caps_raw))
                 )
+        # Replies only count on the connection the request went out on: another node, or an older connection of the
+        # same node, may answer late with a matching id, and must neither acknowledge, finish nor answer it.
         elif ftype == "run.accepted":
             rid = str(frame.get("run_id", ""))
+            if not self._sent_on(rid, runner_id, epoch):
+                return
             fut = self._pending_ack.pop(rid, None)
             if fut is not None and not fut.done():
                 fut.set_result(frame)
         elif ftype == "run.completed":
             res = RunResult.from_dict(cast(Mapping[str, Any], frame["result"]))
+            if not self._sent_on(res.run_id, runner_id, epoch):
+                return
             fut = self._pending_result.get(res.run_id)
             if fut is not None and not fut.done():
                 fut.set_result(res)
         elif ftype == "rpc.reply":
             rpc_id = str(frame.get("rpc_id", ""))
+            if self._rpc_target.get(rpc_id) != (runner_id, epoch):
+                return
             fut = self._pending_rpc.get(rpc_id)
             if fut is not None and not fut.done():
                 fut.set_result(frame)
+
+    def _sent_on(self, run_id: str, runner_id: str, epoch: int) -> bool:
+        return self._run_to_runner.get(run_id) == runner_id and self._run_epoch.get(run_id) == epoch
 
     async def _heartbeat_loop(self) -> None:
         while True:
