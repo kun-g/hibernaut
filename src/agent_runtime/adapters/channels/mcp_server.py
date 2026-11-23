@@ -14,13 +14,14 @@ from agent_runtime.adapters.storage_sqlite.stores import (
     SQLiteSessionStoreAdapter,
 )
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
-from agent_runtime.core.models import new_id
-from agent_runtime.core.ports import OutboxPort
-from agent_runtime.engine.forwarding import closing_event
+from agent_runtime.core.models import CLOSE_SOURCE, MCP_APPROVAL_SOURCE, Event, new_id
+from agent_runtime.core.ports import LockPort, OutboxPort
+from agent_runtime.engine.closing import close_session
 from agent_runtime.engine.handler import EventHandler
 from ledger import ErrorKind, ServiceName, Severity
 
 _PROTOCOL_VERSION = "2024-11-05"
+_CLOSE_LEASE_SECONDS = 60.0
 
 _TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -220,6 +221,7 @@ class MCPServerAdapter:
         handler: EventHandler,
         sessions: SQLiteSessionStoreAdapter,
         workspaces: SQLiteWorkspaceStore,
+        lock: LockPort,
         inbox: SQLiteInboxAdapter | None = None,
         worktree_manager: OrcaWorktreeManager | None = None,
         outbox: OutboxPort | None = None,
@@ -233,6 +235,7 @@ class MCPServerAdapter:
         self._worktree_manager_for = worktree_manager_for
         self._sessions = sessions
         self._workspaces = workspaces
+        self._lock = lock
         self._inbox = inbox
         self._worktree_manager = worktree_manager
         self._outbox = outbox
@@ -481,7 +484,7 @@ class MCPServerAdapter:
                 payload["comment"] = str(args["comment"])
             result = self._handler.ingest(
                 inbox_id=inbox_id,
-                source="mcp:approval",
+                source=MCP_APPROVAL_SOURCE,
                 external_id=f"mcp-approval:{approval_request_id}:{approved}",
                 payload=payload,
             )
@@ -502,23 +505,36 @@ class MCPServerAdapter:
             }
 
         if tool_name == "hibernaut_close_session":
-            session_id = str(args["session_id"])
-            existing = self._sessions.get(session_id)
-            if existing is None:
-                raise ValueError(f"Session not found: {session_id}")
-            ending = closing_event(existing, self._sessions)
-            self._sessions.close_session(session_id)
-            if ending is not None:
-                self._handler.ingest(
-                    inbox_id=ending.inbox_id,
-                    source=ending.source,
-                    external_id=ending.external_id,
-                    payload=ending.payload,
-                    session_id=ending.session_id,
-                    correlation_key=ending.correlation_key,
-                )
+            return self._close_session(str(args["session_id"]))
+
+        if tool_name in _LEDGER_READ_TOOLS:
+            return self._ledger_read(tool_name, args)
+
+        if tool_name == "hibernaut_replay_event":
+            return self._replay_event(args)
+
+        raise KeyError(tool_name)
+
+    def _close_session(self, session_id: str) -> dict[str, Any]:
+        existing = self._sessions.get(session_id)
+        if existing is None:
+            raise ValueError(f"Session not found: {session_id}")
+        holder = new_id("mcp")
+        if not self._lock.acquire(existing.inbox_id, holder, _CLOSE_LEASE_SECONDS):
+            # A Run has the inbox, and would save the session open again: the worker closes it after that Run.
+            self._handler.queue(Event(
+                inbox_id=existing.inbox_id, source=CLOSE_SOURCE, external_id=f"mcp-close:{holder}",
+                payload={"action": "close_session"}, session_id=session_id,
+            ))
+            refs = self._active_refs(existing.work_key, existing.inbox_id)
+            return {"session_id": session_id, "status": "closing", "work_key": existing.work_key,
+                    "active_refs": refs, "reclaim": None}
+        try:
+            # Read again: the last Run may have ended after the first read.
+            existing = self._sessions.get(session_id) or existing
+            close_session(existing, self._sessions, self._handler.queue, cause=holder)
             work_key = existing.work_key
-            active_refs = self._sessions.count_active_by_work_key(work_key, existing.inbox_id) if work_key else 0
+            active_refs = self._active_refs(work_key, existing.inbox_id)
             reclaim_payload: dict[str, Any] | None = None
             if work_key and active_refs == 0:
                 mgr = self._manager_for(existing.inbox_id, work_key)
@@ -528,21 +544,20 @@ class MCPServerAdapter:
                     "reason": res.reason,
                     "workdir": res.workdir,
                 }
-            return {
-                "session_id": session_id,
-                "status": "closed",
-                "work_key": work_key,
-                "active_refs": active_refs,
-                "reclaim": reclaim_payload,
-            }
+        finally:
+            self._lock.release(existing.inbox_id, holder)
+            # Events that arrived meanwhile found the lease taken.
+            self._handler.wake(existing.inbox_id)
+        return {
+            "session_id": session_id,
+            "status": "closed",
+            "work_key": work_key,
+            "active_refs": active_refs,
+            "reclaim": reclaim_payload,
+        }
 
-        if tool_name in _LEDGER_READ_TOOLS:
-            return self._ledger_read(tool_name, args)
-
-        if tool_name == "hibernaut_replay_event":
-            return self._replay_event(args)
-
-        raise KeyError(tool_name)
+    def _active_refs(self, work_key: str | None, inbox_id: str) -> int:
+        return self._sessions.count_active_by_work_key(work_key, inbox_id) if work_key else 0
 
     def _ledger_read(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._ledger is None:

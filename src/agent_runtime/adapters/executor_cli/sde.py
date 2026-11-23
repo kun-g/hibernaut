@@ -541,7 +541,7 @@ class SDEExecutor:
         inbox_id = events[0].inbox_id
         explicit = last_text(targets, "explicit_workdir")
         work_key = (
-            relayed_work_key(targets)
+            relayed_work_key(targets, session)
             or events[0].correlation_key
             or (session.correlation_key if session is not None else None)
             or f"task:{inbox_id}:{events[0].event_id}"

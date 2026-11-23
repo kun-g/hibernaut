@@ -8,6 +8,7 @@ import tempfile
 import tomllib
 import unittest
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -21,14 +22,17 @@ from agent_runtime.adapters.executor_cli import (
     StewardExecutor,
 )
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
-from agent_runtime.adapters.executor_cli.steward_tools import GitRefused, check_git_args
+from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
+from agent_runtime.adapters.executor_cli.steward_git import GitRefused, check_git_args
 from agent_runtime.adapters.memory_fs import FileSystemMemoryAdapter
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
     SQLiteInboxAdapter,
+    SQLiteLeaseLockAdapter,
     SQLiteSessionStoreAdapter,
     SQLiteTaskMetadataStore,
+    SQLiteTimerAdapter,
     SQLiteWorkspaceStore,
 )
 from agent_runtime.app.config import parse_config
@@ -45,7 +49,9 @@ from agent_runtime.core.models import (
     Silent,
     Suspend,
 )
-from tests.fakes import InMemoryPermission, RecordingChannel
+from agent_runtime.engine.forwarding import carried_spec
+from agent_runtime.engine.worker import AgentWorker
+from tests.fakes import InMemoryOutbox, InMemoryPermission, RecordingChannel
 from tests.test_coder_reviewer import fake_command, git, make_repo
 from tests.test_sde_executor import make_base_repo
 
@@ -200,13 +206,14 @@ class ReadOnlyBoundaryTests(StewardCase):
             return SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward",
                               forward=ForwardSpec(target_inbox=MAIN, **spec))
 
-        back = Event(inbox_id=MAIN, source=RETURN_SOURCE, external_id="r", payload={"text": "docs done", "hop_count": 2})
-        await self.run_steward(back, session=session(pending_returns=2, cancelled_returns=("return:a:0",)))
+        back = Event(inbox_id=MAIN, source=RETURN_SOURCE, external_id="r", 
+                     payload={"text": "docs done", "hop_count": 2, "delegation_id": "b"})
+        await self.run_steward(back, session=session(pending_returns=("b", "c"), cancelled_returns=("a",)))
         self.assertIn("1 will not come back", self.launches()[-1]["prompt"])
         self.assertIn("Still awaited: 1", self.launches()[-1]["prompt"])
-        await self.run_steward(back, session=session(pending_returns=1, cancelled_returns=("return:a:0",)))
+        await self.run_steward(back, session=session(pending_returns=("b",), cancelled_returns=("a",)))
         self.assertIn("Still awaited: 0", self.launches()[-1]["prompt"])
-        await self.run_steward(back, session=session(pending_returns=1))
+        await self.run_steward(back, session=session(pending_returns=("b",)))
         self.assertNotIn("awaited", self.launches()[-1]["prompt"])
 
     async def test_launch_passes_the_permission_gate(self) -> None:
@@ -418,6 +425,95 @@ class ToolTests(StewardCase):
         # It does not tell either whether the pattern matches in a file that may not be read.
         self.assertEqual(text, "open.txt:1:needle in the open\n")
 
+    async def test_a_file_that_may_not_be_read_is_not_shown_through_git_either(self) -> None:
+        (self.repo / "secrets").mkdir()
+        (self.repo / "secrets/key.txt").write_text("needle one\n")
+        (self.repo / "open.txt").write_text("in the open\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "add both")
+        git(self.repo, "tag", "-a", "v1", "-m", "v1")
+        (self.repo / "open.txt").write_text("in the open 2\n")
+        git(self.repo, "commit", "-qam", "open only")
+        (self.repo / "secrets/key.txt").write_text("needle two \n")
+        git(self.repo, "add", "-A")
+        (self.repo / "secrets/key.txt").write_text("needle three \n")
+        (self.repo / "open.txt").write_text("in the open 3\n")
+        blob = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD:secrets/key.txt"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+        asked: list[str] = []
+
+        class Policy:
+            def check(self, tool_name: str, args: dict[str, Any]) -> PermissionDecision:
+                if tool_name != "read_file":
+                    return PermissionDecision("allow")
+                asked.append(args["path"])
+                return PermissionDecision("block" if args["path"].startswith("secrets/") else "allow", "private")
+
+        self.caps.permissions = Policy()
+        self.assertTrue((await self.tool("read_file", path="secrets/key.txt"))[0])
+        self.assertNotIn("needle", (await self.tool("search_files", pattern="needle"))[1])
+        for args in (
+            ["show", "HEAD:secrets/key.txt"], ["show", "v1^{commit}:secrets/key.txt"], ["show", "HEAD:./secrets/key.txt"],
+            ["show", "HEAD^{/add :both}:secrets/key.txt"], ["show", blob], ["show", blob[:12]], ["show", "HEAD~1"],
+            ["show", "v1"], ["show", "-p", "HEAD~1"], ["show", "--stat", "-p", "HEAD~1"], ["show", "HEAD", "HEAD~1"],
+            ["show", "HEAD~2..HEAD"], ["show", "--patch-with-stat", "HEAD~1"], ["show", "HEAD~1", "--", "secrets"],
+            ["diff"], ["diff", "--cached"], ["diff", "HEAD"], ["diff", "HEAD~2", "HEAD"], ["diff", "HEAD~2..HEAD"],
+            ["diff", "--check"], ["diff", "--", "secrets/key.txt"], ["diff", "--", "*.txt"], ["diff", blob, "HEAD:open.txt"],
+            ["diff", "--stat", "-U1"], ["diff", "--word-diff", "HEAD"],
+            ["blame", "secrets/key.txt"], ["blame", "HEAD", "--", "secrets/key.txt"], ["blame", "secrets/key.txt", "HEAD"],
+            ["blame", "./secrets/key.txt"], ["blame", "-L1,1", "secrets/key.txt"], ["blame", "--", "secrets/key.txt"],
+            ["log", "-p"], ["log", "-u"], ["log", "--patch"], ["log", "--patc"], ["log", "-U1"], ["log", "-c", "-p"],
+            ["log", "-Sneed"], ["log", "-G", "need"], ["log", "-L1,1:secrets/key.txt"], ["log", "--full-diff", "-p"],
+            ["log", "--patch-with-raw"], ["log", "--stat", "-p"], ["log", "--cc"], ["log", "--remerge-diff"],
+            ["status", "-v"], ["status", "-vv"], ["status", "--verbose"], ["rev-parse", "HEAD:secrets/key.txt"],
+        ):
+            failed, text = await self.tool("git", args=args)
+            self.assertNotIn("needle", text, args)
+            self.assertTrue(failed, (args, text))
+        for args, expected in (
+            # What the gate allows to be read is still shown ...
+            (["show", "HEAD"], "+in the open 2"), (["show", "HEAD:open.txt"], "in the open 2"),
+            (["show", "HEAD~1", "--", "open.txt"], "+in the open"), (["diff", "--", "open.txt"], "+in the open 3"),
+            (["blame", "open.txt"], "in the open 3"), (["blame", "HEAD", "--", "open.txt"], "in the open 2"),
+            (["diff", "HEAD~1", "HEAD"], "+in the open 2"),
+            # ... and so is everything about the history that is not content.
+            (["log", "--stat", "-3"], "secrets/key.txt"), (["show", "--stat", "HEAD~1"], "secrets/key.txt"),
+            (["show", "--no-patch", "HEAD~1"], "add both"), (["diff", "--name-status"], "secrets/key.txt"),
+            (["log", "--oneline", "--", "secrets/key.txt"], "add both"), (["status", "--short"], "secrets/key.txt"),
+            (["show", "--name-only", "v1"], "secrets/key.txt"),
+        ):
+            failed, text = await self.tool("git", args=args)
+            self.assertFalse(failed, (args, text))
+            self.assertIn(expected, text, args)
+            self.assertNotIn("needle", text, args)
+        self.assertIn("open.txt", asked)
+
+    async def test_a_merge_shows_only_files_that_may_be_read(self) -> None:
+        (self.repo / "key.txt").write_text("base\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "base")
+        base = subprocess.run(["git", "branch", "--show-current"], cwd=self.repo, check=True, capture_output=True,
+                              text=True).stdout.strip()
+        git(self.repo, "checkout", "-qb", "side")
+        (self.repo / "key.txt").write_text("needle side\n")
+        git(self.repo, "commit", "-qam", "side")
+        git(self.repo, "checkout", "-q", base)
+        (self.repo / "key.txt").write_text("needle main\n")
+        git(self.repo, "commit", "-qam", "main")
+        subprocess.run(["git", "merge", "-q", "side"], cwd=self.repo, capture_output=True, check=False)
+        (self.repo / "key.txt").write_text("needle merged\n")
+        self.caps.permissions = InMemoryPermission()
+        self.assertIn("needle", (await self.tool("git", args=["diff"]))[1])
+        denied = InMemoryPermission({"read_file": PermissionDecision("defer", "private")})
+        self.caps.permissions = denied
+        self.assertNotIn("needle", (await self.tool("git", args=["diff"]))[1])
+        git(self.repo, "commit", "-qam", "merged")
+        failed, text = await self.tool("git", args=["show", "HEAD"])
+        self.assertTrue(failed)
+        self.assertNotIn("needle", text)
+        self.caps.permissions = InMemoryPermission()
+        self.assertIn("needle merged", (await self.tool("git", args=["show", "HEAD"]))[1])
+
     async def test_git_writes_are_refused(self) -> None:
         before = git_state(self.repo)
         for args in (["commit", "-m", "x"], ["checkout", "main"], ["branch", "x"], ["diff", "--output=leak"], [], ["-c", "x"]):
@@ -436,10 +532,10 @@ class ToolTests(StewardCase):
     def test_git_argument_rules(self) -> None:
         for args in (["status", "--short"], ["diff", "main...HEAD", "--", "src/a.py"], ["log", "--oneline", "a..b"],
                      ["show", "HEAD:calc.py"], ["diff", "HEAD..origin/main"], ["rev-parse", "HEAD"], ["merge-base", "a", "b"],
-                     ["log", "-SOauth", "-5"], ["diff", "-U3", "-w"], ["blame", "-w", "-L1,/S/", "a"],
+                     ["log", "-5", "-n", "3"], ["diff", "-U3", "-w"], ["blame", "-w", "-L1,/S/", "a"],
                      ["blame", "--ignore-rev", "abc", "a"],
-                     ["show", "HEAD~1:src/a.py"], ["log", "--format=%h: %s"], ["log", "-L1,2:src/a.py"],
-                     ["log", "-Sfoo:/bar"], ["diff", "origin/main...HEAD"], ["show", "HEAD@{0}:a"]):
+                     ["show", "HEAD~1:src/a.py"], ["log", "--format=%h: %s"], ["log", "--since=2026-01-01 10:00"],
+                     ["diff", "origin/main...HEAD"], ["show", "HEAD@{0}:a"]):
             check_git_args(args)
         for args in (["push"], ["diff", "--output", "x"], ["log", "--outp=x"], ["diff", "--ext-diff"], ["diff", "--ext"],
                      ["diff", "--no-index", "a", "b"], ["diff", "../x", "a"], ["diff", "/etc/passwd", "a"],
@@ -450,7 +546,9 @@ class ToolTests(StewardCase):
                      ["show", "HEAD:../x"], ["show", "HEAD:foo/../../x"], ["show", ":../x"], ["show", ":x"],
                      ["show", "HEAD:/etc/passwd"], ["show", "HEAD:~/x"], ["diff", "HEAD:../x", "HEAD:a"],
                      ["diff", "--", ":(top)../x"], ["diff", "a..HEAD:../x"], ["show", "HEAD:.."],
-                     ["rev-parse", "HEAD:/etc/passwd"], ["log", "-L1,2:/etc/passwd"]):
+                     ["rev-parse", "HEAD:/etc/passwd"], ["log", "-L1,2:/etc/passwd"], ["log", "-SOauth"],
+                     ["log", "--grep", "x"], ["log", "-n"], ["blame", "-L"], ["blame", "a", "b", "c"], ["blame"],
+                     ["diff", "a", "b", "c"], ["log", "HEAD:a"], ["show", "HEAD:a", "HEAD:b"], ["diff", "--ext-diff=x"]):
             with self.assertRaises(GitRefused, msg=str(args)):
                 check_git_args(args)
 
@@ -712,7 +810,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
                          (MAIN, "feishu", "feishu:1"))
         self.assertNotIn("implemented", notice.content)
         [steward] = daemon.sessions.list_sessions(inbox_id=MAIN)
-        self.assertEqual(steward.forward.pending_returns, 0)
+        self.assertEqual(steward.forward.pending_returns, ())
 
     async def test_direct_forward_answers_from_the_child(self) -> None:
         self.set_plan(
@@ -749,14 +847,17 @@ class RelayedWorkTests(StewardCase):
         self.worktrees = OrcaWorktreeManager(
             workspace_store=SQLiteWorkspaceStore(self.db), session_store=self.sessions, backend="git",
         )
+        script = self.root / "where"
+        script.write_text("#!/bin/sh\npwd\n")
+        script.chmod(0o700)
         self.cli = LocalCLIExecutor(
             worktree_manager=self.worktrees, inbox_checkout_map={MAIN: str(self.repo)}, default_executor="pwd",
-            templates={"pwd": CLITemplate(name="pwd", command="pwd")},
+            templates={"pwd": CLITemplate(name="pwd", command=str(script))},
         )
 
     def relay(self, source: str = FORWARD_SOURCE) -> Event:
         return Event(inbox_id=MAIN, source=source, external_id="r", correlation_key="forward:sde:feishu:1",
-                     payload={"text": "go on", "base_ref": "HEAD", "work_key": "feishu:1"})
+                     payload={"text": "go on", "base_ref": "HEAD", "work_key": "feishu:1", "forwarded_from": MAIN})
 
     def work_keys(self) -> list[str]:
         return [r["work_key"] for r in self.db.fetchall("SELECT work_key FROM workspaces")]
@@ -778,6 +879,56 @@ class RelayedWorkTests(StewardCase):
     async def test_only_a_relay_names_the_work_it_continues(self) -> None:
         await self.cli.execute([self.relay("webhook")], None, self.caps)  # type: ignore[arg-type]
         self.assertEqual(self.work_keys(), ["forward:sde:feishu:1"])
+
+    async def test_what_follows_a_relay_stays_in_its_worktree(self) -> None:
+        # Through the worker: the relay, two plain messages to the same session, then an approval's answer.
+        outbox = InMemoryOutbox()
+        worker = AgentWorker(
+            worker_id="w", inbox=self.inbox, timers=SQLiteTimerAdapter(self.db), memory=self.caps.memory,
+            permissions=self.caps.permissions, outbox=outbox, lock=SQLiteLeaseLockAdapter(self.db),
+            sessions=self.sessions, executor=self.cli,
+        )
+        self.sessions.save(SessionRef(session_id="dev", inbox_id=MAIN, correlation_key="feishu:1", work_key="feishu:1"))
+        key = "forward:sde:feishu:1"
+        self.inbox.append(Event(inbox_id=MAIN, source=FORWARD_SOURCE, external_id="r", correlation_key=key, payload={
+            "text": "go on", "work_key": "feishu:1", "review_of": "feishu:1", "hop_count": 1, "forwarded_from": MAIN,
+            "parent_session_id": "dev", "origin_key": "feishu:1"}))
+        await worker.process_inbox(MAIN)
+        [session] = [s for s in self.sessions.list_sessions(inbox_id=MAIN) if s.session_id != "dev"]
+        for n in (1, 2):
+            self.inbox.append(Event(inbox_id=MAIN, source="switchboard:feishu", external_id=f"f{n}", correlation_key=key,
+                                    payload={"text": "and this"}))
+            await worker.process_inbox(MAIN)
+        self.inbox.append(Event(inbox_id=MAIN, source="timer:follow_up", external_id="t", payload={"text": "tick"},
+                                session_id=session.session_id))
+        await worker.process_inbox(MAIN)
+        cwds = [m.content.strip() for m in outbox.fetch_pending(limit=100)]
+        self.assertEqual(len(cwds), 4)
+        self.assertEqual(len(set(cwds)), 1, cwds)
+        self.assertEqual(self.work_keys(), ["feishu:1"])
+
+    async def test_sde_and_reviewer_follow_ups_stay_in_the_relayed_worktree(self) -> None:
+        spec = carried_spec(self.relay())
+        session = SessionRef(session_id="s2", inbox_id=MAIN, correlation_key="forward:sde:feishu:1", executor_id="sde",
+                             work_key="feishu:1", forward=spec)
+        follow_up = Event(inbox_id=MAIN, source="switchboard:feishu", external_id="f", payload={"text": "and this",
+                          "base_ref": "HEAD"}, correlation_key="forward:sde:feishu:1")
+        sde = SDEExecutor(
+            profile=ClaudeCodeProfile(
+                name="sde", launcher=ClaudeCodeLauncher(name="fake", command=fake_command(self.root))),
+            options=SDEOptions(review=False), reviewer=None, worktree_manager=self.worktrees,
+            inbox_checkout_map={MAIN: str(self.repo)}, tasks=SQLiteTaskMetadataStore(self.db),
+        )
+        await sde.execute([follow_up], session, self.caps)  # type: ignore[arg-type]
+        self.assertEqual(self.work_keys(), ["feishu:1"])
+        reviewer = CoderReviewerExecutor(
+            profile=ClaudeCodeProfile(
+                name="code-reviewer", launcher=ClaudeCodeLauncher(name="fake", command=fake_command(self.root))),
+            workspaces=SQLiteWorkspaceStore(self.db), tasks=SQLiteTaskMetadataStore(self.db),
+        )
+        request = reviewer._review_input([replace(follow_up, payload={"text": "look again"})], session)  # pyright: ignore
+        [row] = self.db.fetchall("SELECT workdir FROM workspaces")
+        self.assertEqual(str(request.workdir), row["workdir"])
 
 
 if __name__ == "__main__":

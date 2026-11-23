@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Never, assert_never, cast
 
@@ -78,42 +79,90 @@ def carried_spec(event: Event) -> ForwardSpec | None:
         return None
     payload = event.payload
     hops = payload.get("hop_count")
+    forwarded = event.source == FORWARD_SOURCE
     # A missing or malformed count reads as used up, so it can never buy more hops.
     valid = isinstance(hops, int) and not isinstance(hops, bool) and hops >= 1
     return ForwardSpec(
         target_inbox=event.inbox_id,
         target_agent=_text(payload.get("agent_id")),
-        return_to=_text(payload.get("return_to")) if event.source == FORWARD_SOURCE else None,
+        return_to=_text(payload.get("return_to")) if forwarded else None,
         hop_count=cast(int, hops) if valid else MAX_FORWARD_HOPS,
         forwarded_from=_text(payload.get("forwarded_from")),
         parent_session_id=_text(payload.get("parent_session_id")),
         reply_channel=_text(payload.get("reply_channel")),
         reply_target=_text(payload.get("reply_target")),
         origin_key=_text(payload.get("origin_key")),
+        delegation_id=forwarded_piece(event) or None,
+        work_key=_text(payload.get("work_key")) if payload.get("forwarded_from") == event.inbox_id else None,
     )
+
+
+def forwarded_piece(event: Event) -> str | None:
+    # The piece of work a forward asks a result for, "" for one that asks for none, None for any other event. Work
+    # handed on inside an inbox without asking for a result is the same work, so it is None too.
+    if event.source != FORWARD_SOURCE:
+        return None
+    if _text(event.payload.get("return_to")) is None:
+        return None if event.payload.get("forwarded_from") == event.inbox_id else ""
+    return _text(event.payload.get("delegation_id")) or event.external_id
+
+
+def returned_pieces(events: Sequence[Event]) -> set[str]:
+    return {piece for evt in events
+            if evt.source == RETURN_SOURCE and (piece := _text(evt.payload.get("delegation_id")))}
+
+
+def same_piece(event: Event, batch: Sequence[Event]) -> bool:
+    # A Run answers one piece: two in one batch would leave all but one of them without a result of their own.
+    piece = forwarded_piece(event)
+    others = {found for evt in batch if (found := forwarded_piece(evt)) is not None}
+    return piece is None or not others or piece in others
+
+
+def own_task(event: Event, sessions: SessionStorePort) -> Event:
+    # A piece sent to a conversation whose session still owes another one gets a session and worktree of its own.
+    piece = forwarded_piece(event)
+    if piece is None or not event.correlation_key:
+        return event
+    if event.session_id:
+        # Claimed before: bound to the session it ran in, whose key it keeps.
+        holder = sessions.get(event.session_id)
+    else:
+        holder = sessions.find_by_correlation_key(event.inbox_id, event.correlation_key)
+    owed = holder.forward if holder is not None else None
+    if owed is not None and owed.return_to is not None and owed.delegation_id != piece:
+        return replace(event, session_id=None, correlation_key=f"forward:{event.external_id}:{event.correlation_key}")
+    if holder is not None and holder.correlation_key:
+        return replace(event, correlation_key=holder.correlation_key)
+    return event
 
 
 def run_spec(events: Sequence[Event], session: SessionRef | None) -> ForwardSpec | None:
     # How the work of this Run reached it: what its events carry, on top of what the session already knew.
     saved = session.forward if session is not None else None
     carried = [(evt, spec) for evt in events if (spec := carried_spec(evt)) is not None]
-    returns = sum(1 for evt, _ in carried if evt.source == RETURN_SOURCE)
-    waiting = max(0, (saved.pending_returns if saved is not None else 0) - returns)
+    returned_now = returned_pieces(events)
+    waiting = tuple(p for p in (saved.pending_returns if saved is not None else ()) if p not in returned_now)
     if carried:
         hops = max(spec.hop_count for _, spec in carried)
         if saved is not None:
             hops = max(hops, saved.hop_count)
         forwards = [spec for evt, spec in carried if evt.source == FORWARD_SOURCE]
         if forwards:
+            latest = next((spec for spec in reversed(forwards) if spec.return_to), forwards[-1])
+            if latest.return_to is None and saved is not None and saved.return_to is not None:
+                # Handed on inside the inbox: the session still owes what it owed.
+                return replace(saved, hop_count=hops, pending_returns=waiting, work_key=latest.work_key or saved.work_key)
             return replace(
-                forwards[-1], hop_count=hops, pending_returns=waiting,
+                latest, hop_count=hops, pending_returns=waiting,
                 cancelled_returns=saved.cancelled_returns if saved is not None else (),
                 owed_failures=saved.owed_failures if saved is not None else (),
+                work_key=latest.work_key or (saved.work_key if saved is not None else None),
             )
         returned = carried[-1][1]
         if saved is None:
             # The parent session is gone: this one answers outside and starts no new parent.
-            return replace(returned, hop_count=hops, pending_returns=0)
+            return replace(returned, hop_count=hops)
         return replace(saved, hop_count=hops, pending_returns=waiting)
     if saved is None:
         return None
@@ -196,7 +245,8 @@ def return_payload(
         **_reply_fields(spec, events),
     }
     for key, value in (("title", title), ("parent_session_id", spec.parent_session_id),
-                       ("child_session_id", session_id), ("origin_key", spec.origin_key)):
+                       ("child_session_id", session_id), ("origin_key", spec.origin_key),
+                       ("delegation_id", spec.delegation_id)):
         if value:
             payload[key] = value
     if delivery is not None:
@@ -226,7 +276,7 @@ def cancel_event(
     spec: ForwardSpec, *, inbox_id: str, agent_id: str, external_id: str, reason: str, reply: Mapping[str, Any],
     sessions: SessionStorePort,
 ) -> Event | None:
-    # Tells the session that waits for a return that none will come: no result, no hop, no agent runs for it.
+    # Tells the session that waits for this piece that no result will come: no hop, no agent runs for it.
     waiting = _asking_session(sessions, spec)
     if spec.return_to is None or waiting is None:
         return None
@@ -238,6 +288,7 @@ def cancel_event(
         external_id=external_id,
         payload={
             "reason": reason,
+            "delegation_id": spec.delegation_id,
             "forwarded_from": inbox_id,
             "forwarded_by": agent_id,
             **_reply_fields(spec, ()),
@@ -388,7 +439,8 @@ class ForwardStage:
             raise ForwardRefused(decision.reason, "defer")
         event = self._event(target, agent, body, title.strip(), wanted, back, hops, spec, events)
         self.staged.append(event)
-        return event
+        # A copy: the caller may do what it likes with its receipt, what was checked above is what goes out.
+        return deepcopy(event)
 
     def _check_inbox(self, name: str, inbox_id: str) -> InboxRoute | None:
         if self.routes is None:
@@ -417,8 +469,13 @@ class ForwardStage:
             value = next((evt.payload[key] for evt in reversed(events) if evt.payload.get(key)), None)
             if value is not None:
                 payload[key] = value
+        external_id = chain_external_id("forward", events, len(self.staged))
+        piece = external_id if return_to else None
+        if spec is not None and return_to is not None and return_to == spec.return_to != self.inbox_id:
+            # What this session owes itself is passed on, so whoever answers first settles that one piece.
+            piece = spec.delegation_id
         for key, value in (("title", title), ("tags", list(tags)), ("agent_id", agent), ("return_to", return_to),
-                           ("origin_key", root)):
+                           ("origin_key", root), ("delegation_id", piece)):
             if value:
                 payload[key] = value
         key = root
@@ -433,8 +490,9 @@ class ForwardStage:
         return Event(
             inbox_id=target,
             source=FORWARD_SOURCE,
-            external_id=chain_external_id("forward", events, len(self.staged)),
-            payload=payload,
+            external_id=external_id,
+            # Values taken over from the events must not stay shared with them.
+            payload=deepcopy(payload),
             correlation_key=self._distinct(target, key),
         )
 
@@ -448,8 +506,9 @@ class ForwardStage:
             found, n = f"forward:{n}:{key}", n + 1
         return found
 
-    def own_returns(self) -> int:
-        return sum(1 for evt in self.staged if evt.payload.get("return_to") == self.inbox_id)
+    def own_returns(self) -> tuple[str, ...]:
+        return tuple(piece for evt in self.staged
+                     if evt.payload.get("return_to") == self.inbox_id and (piece := forwarded_piece(evt)))
 
     def hand_over(self, link: TaskLink) -> bool:
         # The task goes with the first piece whose agent answers outside by itself.

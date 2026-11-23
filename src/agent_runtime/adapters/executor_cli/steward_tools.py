@@ -5,13 +5,20 @@ import contextlib
 import json
 import os
 import re
-import subprocess
 import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from agent_runtime.adapters.executor_cli.steward_git import (
+    GIT_COMMANDS,
+    ToolError,
+    check_git_args,
+    exec_git,
+    outside,
+    plan_git,
+)
 from agent_runtime.core.models import Event, ForwardRefused, SessionStatus
 from agent_runtime.core.ports import RunCapabilities, SessionStorePort
 
@@ -22,30 +29,9 @@ _SNIPPET = 500
 _MAX_LINES = 2000
 _MAX_MATCHES = 200
 _MAX_FILE = 10 * 1024 * 1024
-_GIT_TIMEOUT = 30.0
 # Longest Unix socket path every supported system accepts (macOS allows 104 bytes).
 _MAX_SOCKET_PATH = 100
 _STREAM_LIMIT = 4 * 1024 * 1024
-
-GIT_COMMANDS = ("status", "diff", "log", "show", "blame", "rev-parse", "merge-base")
-# Options that write a file, read one outside the checkout, or run a configured program. Git accepts any unambiguous
-# prefix of a long option, so each prefix is refused too.
-_GIT_REFUSED = ("--output", "--ext-diff", "--textconv", "--no-index", "--contents", "--ignore-revs-file",
-                "--show-signature")
-# The same for short options, alone or bundled (-pO<file>): (refused letter, letters whose value ends the bundle).
-_GIT_REFUSED_SHORT = {"blame": ("S", "LMC")}
-_GIT_REFUSED_SHORT_DEFAULT = ("O", "SGULlnMBCX")
-# A signature format (%G?) would run the configured signature checker.
-_GIT_CONFIG = ("core.fsmonitor=false", "log.showSignature=false", "gpg.program=false", "gpg.openpgp.program=false",
-               "gpg.x509.program=false", "gpg.ssh.program=false")
-
-
-class ToolError(Exception):
-    pass
-
-
-class GitRefused(ToolError):
-    pass
 
 
 class EventLister(Protocol):
@@ -54,65 +40,17 @@ class EventLister(Protocol):
     ) -> list[Event]: ...
 
 
-def check_git_args(args: Sequence[str]) -> None:
-    if not args or args[0] not in GIT_COMMANDS:
-        raise GitRefused(f"git: only {', '.join(GIT_COMMANDS)} are available")
-    refused, valued = _GIT_REFUSED_SHORT.get(args[0], _GIT_REFUSED_SHORT_DEFAULT)
-    for arg in args[1:]:
-        name = arg.split("=", 1)[0]
-        if arg.startswith("--"):
-            # --ignore-rev is an option of its own, so Git never reads it as short for the refused one.
-            bad = len(name) > 2 and name != "--ignore-rev" and any(option.startswith(name) for option in _GIT_REFUSED)
-        else:
-            bad = re.match(rf"-[^{valued}]*?{refused}", arg) is not None
-        if bad:
-            raise GitRefused(f"git: option {name} is not available")
-        # Two paths of which one is outside the checkout turn `git diff` into a reader of arbitrary files, and git
-        # answers <rev>:<path> with whether that path exists on disk, so the part after a colon counts as a path too.
-        # A leading colon (index entry or pathspec magic) is never needed here.
-        named = arg.split(":") if arg.startswith("-L") or not arg.startswith("-") else [arg]
-        if arg.startswith(":") or any(p.startswith(("/", "~")) or ".." in p.split("/") for p in named):
-            raise GitRefused(f"git: {arg} is outside the checkout")
-
-
-def _git(checkout: Path, args: Sequence[str]) -> str:
-    check_git_args(args)
-    plain = ("--no-ext-diff", "--no-textconv") if args[0] in ("diff", "log", "show", "blame") else ()
-    return _exec_git(checkout, [args[0], *plain, *args[1:]])
-
-
-def _exec_git(checkout: Path, args: Sequence[str], ok: Sequence[int] = (0,)) -> str:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    # Without optional locks `git status` does not even refresh the index.
-    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
-    try:
-        done = subprocess.run(
-            ["git", "--no-pager", *(part for item in _GIT_CONFIG for part in ("-c", item)), *args],
-            cwd=checkout, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-            timeout=_GIT_TIMEOUT,
-        )
-    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-        raise ToolError(f"git: {exc}") from exc
-    if done.returncode not in ok:
-        raise ToolError(f"git {args[0]} exited {done.returncode}: {done.stderr.strip()[-2000:]}")
-    return done.stdout
-
-
-def _outside(path: str) -> bool:
-    return path.startswith(("/", "~")) or ".." in path.split("/")
-
-
 def _real_path(checkout: Path, path: str) -> str:
     # The path the permission gate judges and that is read: no other spelling or link leads round a rule for it.
     target = (checkout / path).resolve()
-    if _outside(path) or not target.is_relative_to(checkout):
+    if outside(path) or not target.is_relative_to(checkout):
         raise ToolError(f"{path} is outside the checkout")
     return target.relative_to(checkout).as_posix()
 
 
 def _list_files(checkout: Path, pathspec: str) -> list[str]:
     # What git tracks or would track: neither .git nor ignored files (.env and the like).
-    out = _exec_git(checkout, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", pathspec])
+    out = exec_git(checkout, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", pathspec])
     return list(dict.fromkeys(name for name in out.split("\0") if name))
 
 
@@ -135,7 +73,7 @@ def _read_file(checkout: Path, path: str, offset: int, limit: int) -> str:
 
 def _search(checkout: Path, pattern: str, pathspec: str) -> list[tuple[str, str, str]]:
     # (path, line number, line); links are not followed, ignored files are left out.
-    out = _exec_git(checkout, [
+    out = exec_git(checkout, [
         "grep", "-n", "-I", "-E", "-z", "--no-color", "--no-column", "--no-textconv", "--no-recurse-submodules",
         "--untracked", "-e", pattern, "--", pathspec,
     ], ok=(0, 1))
@@ -166,7 +104,7 @@ def _optional(arguments: dict[str, Any], key: str) -> str | None:
 def _pathspec(arguments: dict[str, Any]) -> tuple[str | None, str]:
     # (the glob as given, the git pathspec for it)
     glob = _optional(arguments, "glob")
-    if glob is not None and _outside(glob):
+    if glob is not None and outside(glob):
         raise ToolError(f"{glob} is outside the checkout")
     return glob, f":(glob){glob or '**'}"
 
@@ -245,7 +183,10 @@ class StewardTools:
              "inputSchema": _schema(inbox_id=inbox, status={"type": "string", "enum": list(_STATUSES)})},
             {"name": "list_events", "description": "List this project's inbox events, newest first.",
              "inputSchema": _schema(inbox_id=inbox, status=_TEXT, limit={"type": "integer"})},
-            {"name": "git", "description": f"Read the checkout's history: {', '.join(GIT_COMMANDS)}.",
+            {"name": "git",
+             "description": f"Read the checkout's history: {', '.join(GIT_COMMANDS)}. Spell options out, put paths after "
+                            "--. log gives no patches: use show <commit>, diff or blame, which need every file they show "
+                            "to be readable to you; --stat and --name-only need none.",
              "inputSchema": _schema(("args",), args={**_TEXTS, "description": 'e.g. ["log", "--oneline", "-10"]'})},
         ]
 
@@ -277,6 +218,10 @@ class StewardTools:
         decision = self.caps.permissions.check(tool, args)
         if decision.action != "allow":
             raise ToolError(f"{tool} is not permitted ({decision.action}): {decision.reason}")
+
+    def _readable(self, path: str) -> bool:
+        # Every way a file's content is shown passes the gate as a read of that file.
+        return self.caps.permissions.check("read_file", {"path": path}).action == "allow"
 
     async def _forward(self, arguments: dict[str, Any]) -> str:
         wanted: dict[str, Any] = {
@@ -315,10 +260,9 @@ class StewardTools:
         readable: dict[str, bool] = {}
         shown: list[str] = []
         for path, number, line in await asyncio.to_thread(_search, self.checkout, pattern, pathspec):
-            # A match shows a file's content, so each file passes the gate as a read. Saying how many were left out
-            # would tell whether the pattern matches in them.
+            # Saying how many were left out would tell whether the pattern matches in them.
             if path not in readable:
-                readable[path] = self.caps.permissions.check("read_file", {"path": path}).action == "allow"
+                readable[path] = self._readable(path)
             if not readable[path]:
                 continue
             if len(shown) == _MAX_MATCHES:
@@ -396,9 +340,16 @@ class StewardTools:
 
     async def _run_git(self, arguments: dict[str, Any]) -> str:
         args = _strings(arguments, "args")
-        check_git_args(args)
+        call = check_git_args(args)
         self._allow("git_read", {"args": args})
-        return await asyncio.to_thread(_git, self.checkout, args)
+        shown, argv = await asyncio.to_thread(plan_git, self.checkout, call)
+        refused = [path for path in shown if not self._readable(path)]
+        if refused:
+            raise ToolError(
+                f"git: this shows the content of files you may not read ({', '.join(refused[:20])}); name other files "
+                "after --, or ask for --stat or --name-only"
+            )
+        return await asyncio.to_thread(exec_git, self.checkout, argv) if argv else ""
 
     @contextlib.asynccontextmanager
     async def serve(self) -> AsyncGenerator[str]:

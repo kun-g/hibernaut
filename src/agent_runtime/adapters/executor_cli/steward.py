@@ -19,7 +19,6 @@ from agent_runtime.adapters.executor_cli.claude_code import (
 from agent_runtime.adapters.executor_cli.process import is_approval
 from agent_runtime.adapters.executor_cli.steward_tools import EventLister, StewardTools
 from agent_runtime.core.models import (
-    RETURN_SOURCE,
     Emit,
     EmitStatus,
     Event,
@@ -31,6 +30,7 @@ from agent_runtime.core.models import (
     new_id,
 )
 from agent_runtime.core.ports import RunCapabilities, SessionStorePort
+from agent_runtime.engine.forwarding import returned_pieces
 
 STEWARD_ROLE = "steward"
 STEWARD_LAUNCH_TOOL = "steward.launch"
@@ -304,7 +304,7 @@ def _returns_note(events: Sequence[Event], session: SessionRef | None) -> str:
     spec = session.forward if session is not None else None
     if spec is None or not spec.cancelled_returns:
         return ""
-    awaited = max(0, spec.pending_returns - sum(1 for e in events if e.source == RETURN_SOURCE))
+    awaited = len(set(spec.pending_returns) - returned_pieces(events))
     return (
         f"\n\n## returns\nStill awaited: {awaited}, after the events above. Of the parts you sent out from this "
         f"conversation, {len(spec.cancelled_returns)} will not come back: withheld, or ended without a result."

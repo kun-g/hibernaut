@@ -33,6 +33,11 @@ FORWARD_SOURCE = "agent:forward"
 RETURN_SOURCE = "agent:return"
 # Ends one wait of the session it names. It carries no result, and the worker handles it without running an agent.
 RETURN_CANCELLED_SOURCE = "agent:return_cancelled"
+# Closes the session it names, a held result included, when the control plane could not take the inbox's lease.
+CLOSE_SOURCE = "agent:close"
+# Only Hibernaut queues these, and the worker trusts them for it; no public entrance accepts them.
+INTERNAL_SOURCES = frozenset({FORWARD_SOURCE, RETURN_SOURCE, RETURN_CANCELLED_SOURCE, CLOSE_SOURCE})
+MCP_APPROVAL_SOURCE = "mcp:approval"
 
 
 def utc_now_iso() -> str:
@@ -122,11 +127,16 @@ class ForwardSpec:
     reply_target: str | None = None
     # Correlation key of the external conversation this work belongs to.
     origin_key: str | None = None
-    # Results this session still waits for from work it forwarded with a return to its own inbox.
-    pending_returns: int = 0
-    # Returns this session no longer waits for, by external id, so one withheld result ends one wait once.
+    # The piece of work return_to waits for, named by the forward that first sent it out; None when nothing is owed.
+    delegation_id: str | None = None
+    # Work key of the agent in the same inbox that passed the work on: the session goes on in that worktree.
+    work_key: str | None = None
+    # Pieces this session sent out with a return to its own inbox and still waits for, each settled once.
+    pending_returns: tuple[str, ...] = ()
+    # Pieces this session no longer waits for because no result will come.
     cancelled_returns: tuple[str, ...] = ()
-    # Events of this session whose failure or refusal went back to the agent it owed a result, not outside.
+    # Failed events of this session that do not end the task outside: told to the agent it owed a result, or a
+    # refused message while the task goes on.
     owed_failures: tuple[str, ...] = ()
     # Set only on the session that keeps a refused return; the result stays there after the decision.
     held: HeldReturn | None = None

@@ -6,6 +6,7 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, S
 from dataclasses import dataclass, field
 from typing import Any, Generic, Protocol, TypeVar, cast
 
+from agent_runtime.app.inbox_patterns import UncomparablePattern, common_match
 from agent_runtime.core.models import Event, InboxBinding, InboxMatchRule
 from agent_runtime.core.ports import SessionStorePort
 from agent_runtime.engine.worker import ExecutorFailed
@@ -332,6 +333,44 @@ def validate_project_rules(projects: Iterable[_Routable]) -> None:
                 raise ValueError(
                     f"inbox_id {literal!r} of projects.{owner} also matches a pattern of projects.{proj.name}"
                 )
+    _validate_disjoint_patterns(listed)
+
+
+def _validate_disjoint_patterns(projects: Sequence[_Routable]) -> None:
+    # An inbox of both would be ambiguous at every dispatch, so what cannot be told apart here is refused as well.
+    for index, proj in enumerate(projects):
+        for other in projects[index + 1:]:
+            for rule in proj.inbox_rules:
+                for theirs in other.inbox_rules:
+                    if rule.literal is None and theirs.literal is None:
+                        _require_disjoint((proj.name, rule.pattern), (other.name, theirs.pattern))
+
+
+def _require_disjoint(*patterns: tuple[str, str]) -> None:
+    (name, pattern), (other, theirs) = patterns
+    try:
+        shared = common_match(pattern, theirs)
+    except UncomparablePattern:
+        if pattern != theirs:
+            for owner, text in patterns:
+                try:
+                    common_match(text, text)
+                except UncomparablePattern as exc:
+                    raise ValueError(
+                        f"projects.{owner} pattern {text!r} cannot be compared with the inbox_id patterns of another "
+                        f"project: {exc}"
+                    ) from exc
+            raise ValueError(
+                f"projects.{name} pattern {pattern!r} cannot be compared with pattern {theirs!r} of projects.{other}: "
+                "together they are too large"
+            ) from None
+        shared = ""
+    if shared is not None:
+        raise ValueError(
+            f"pattern {pattern!r} of projects.{name} and pattern {theirs!r} of projects.{other} both match inbox_id "
+            f"{shared!r}; make them disjoint" if shared else
+            f"pattern {pattern!r} of projects.{name} and pattern {theirs!r} of projects.{other} both match the same ids"
+        )
 
 
 class ProjectRouter(Generic[P]):

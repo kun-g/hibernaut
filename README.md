@@ -61,6 +61,8 @@ PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
 curl -s localhost:8080/events -H 'Content-Type: application/json' -d @docs/dispatch/sde-task.json
 ```
 
+`source` 不能用 `agent:forward`、`agent:return`、`agent:return_cancelled`、`agent:close`：这些由 Hibernaut 自己入队，外部提交返回 400。
+
 在 Claude Code 等客户端里接入 MCP：`python3 -m agent_runtime.app.main --mcp-stdio --config <hibernaut.toml>`；远程接入设 `mcp_enabled = true`，用 `Authorization: Bearer <HIBERNAUT_MCP_TOKEN>` 访问 `POST /mcp`。
 
 ## 配置
@@ -74,7 +76,7 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 | `[executors.<id>]` | 底层驱动：CLI 模板（写 `command`），或供 Agent 引用的 Claude Code 启动器与计费（都不写）。旧写法仍可用：写 `role` 或 `command` 即同时是同名 Agent |
 | `[agents.<id>]` | Agent：`executor` 指向驱动，`role` 为 `sde` / `code-reviewer` / `steward`，另有 `model`、`effort`、`skills`、`description`。SDE 的 `review`、`reviewer` 决定评审开关和评审者；`steward` 只有 `checkout_access = "readonly"` |
 | `[launchers.<name>]`、`[credential_proxy]` | Claude Code 启动命令；`billing = "api"` 时经外置凭据代理 |
-| `[projects.<name>]` | 仓库、检出路径、服务的 `inbox_id`（字符串或正则数组）、`default_agent`（旧键 `executor`）、worktree 与终端后端 |
+| `[projects.<name>]` | 仓库、检出路径、服务的 `inbox_id`（字符串或正则数组；两个项目的范围有交集时拒绝加载，正则只用可比较的语法，见 `docs/architecture.md`）、`default_agent`（旧键 `executor`）、worktree 与终端后端 |
 | `[[projects.<name>.inbox_bindings]]` | Inbox 与 Agent 的绑定：`pattern`（整串匹配的正则）、`default_agent`、`agents` 白名单、`rules`（按 `source` / `event_type` / `tags` 选 Agent；具名定时器的来源是 `timer:<timer_name>`）。写了绑定的项目，转投只能到有绑定覆盖的 Inbox |
 | `[projects.<name>.delivery]` | PR 交付：开 PR、自动合并、版本文件、检查命令、是否要求评审和 CI、冲突与检查失败交回开发的次数上限（`max_handbacks`）、合并后是否删除源分支（`delete_branch`）、来自 GitHub Issue 的任务在 PR 正文里怎么写这个 Issue（`issue_link`：`closes` 合并后关闭 / `refs` 只关联，默认 / `none` 不写） |
 | `[gdrive]` | Drive 任务队列，部署见 [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md)。任务可引用队列根下 `附件/` 里的文件（frontmatter `attachments` 写文件 ID 或原名，逗号分隔、`[a, b]` 或逐行 `- a` 均可，或正文里写该文件的 Drive ID），Run 开始时下载到 `attachments_dir`（默认数据库旁的 `attachments/`，在 worktree 之外），任务正文末尾附上路径、大小和 sha256，会话结案后删除。上传 `.md` 任务文件时关掉 Drive「将上传的文件转换为 Google 文档格式」 |

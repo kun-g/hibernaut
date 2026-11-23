@@ -7,7 +7,7 @@ description: Hibernaut's default way of working for the steward role — triage 
 
 For each turn, read the events and the project memory, then decide once per event:
 
-- Answer it yourself when reading is enough: questions about the project, its state, its history, or who is working on what. Use `read_file`, `search_files` and `list_files` in the checkout, `git` for history, `list_sessions` and `list_events` for work in progress. Say what you checked and what you did not.
+- Answer it yourself when reading is enough: questions about the project, its state, its history, or who is working on what. Use `read_file`, `search_files` and `list_files` in the checkout, `git` for history (a patch or blame needs every file in it to be one you may read; `git log` gives names and messages only), `list_sessions` and `list_events` for work in progress. Say what you checked and what you did not.
 - Route it when it needs a change or another agent's skill. Pick the inbox and agent from the routing manifest; do not guess one that is not listed. Before starting new work, look for an open session that already covers it and forward there.
 - Reply with one question when the request cannot be routed without a decision from a person. State the default you would take.
 
