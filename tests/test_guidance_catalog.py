@@ -242,6 +242,11 @@ class _Harness(unittest.IsolatedAsyncioTestCase):
         return CoderReviewerExecutor(profile=ClaudeCodeProfile(name="coder-reviewer", launcher=self.launcher),
                                      workspaces=self.workspaces, tasks=self.tasks)
 
+    async def independent_prompt(self, payload):
+        request = self.reviewer()._review_input([event(payload, correlation_key="review:task:1")], None)
+        diff, guidance = await review_inputs(request)
+        return review_prompt(request, guidance, diff)
+
     def sde(self, review=True):
         return SDEExecutor(
             profile=ClaudeCodeProfile(name="sde", launcher=self.launcher),
@@ -435,29 +440,25 @@ class TestIndependentReview(_Harness):
         (self.repo / "VERSION").write_text("9.9.9\n")
         git(self.repo, "commit", "-qam", "change under review rewrites the rules")
         (self.repo / "docs/versioning.md").write_text("RELAXED-UNCOMMITTED\n")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo)))
+        prompt = await self.independent_prompt(self.review_payload(explicit_workdir=str(self.repo)))
         base = subprocess.run(["git", "merge-base", "main", "HEAD"], cwd=self.repo, capture_output=True,
                               text=True, check=True).stdout.strip()
         self.assertEqual(base, self.start)
-        self.assertIn(f"Pinned to commit {base} (merge base of main and HEAD", call["prompt"])
-        self.assertIn(f"Source: {base}:AGENTS.md", call["prompt"])
-        # Verifiable: the quoted body is exactly what `git show <base>:AGENTS.md` prints.
+        self.assertIn(f"Pinned to commit {base} (merge base of main and HEAD", prompt)
+        self.assertIn(f"Source: {base}:AGENTS.md", prompt)
         shown = subprocess.run(["git", "show", f"{base}:AGENTS.md"], cwd=self.repo, capture_output=True,
                                text=True, check=True).stdout.strip()
-        self.assertIn(f"----- begin AGENTS.md -----\n{shown}\n----- end AGENTS.md -----", call["prompt"])
-        self.assertIn("GENERAL-RULE", section(call["prompt"]))
-        self.assertNotIn("RELAXED", section(call["prompt"]))
-        self.assertEqual(bodies(section(call["prompt"])), {"VERSIONING-BODY"})
-        self.assertIn("Selected because: diff touches VERSION", call["prompt"])
+        self.assertIn(f"----- begin AGENTS.md -----\n{shown}\n----- end AGENTS.md -----", prompt)
+        self.assertIn("GENERAL-RULE", section(prompt))
+        self.assertNotIn("RELAXED", section(prompt))
+        self.assertEqual(bodies(section(prompt)), {"VERSIONING-BODY"})
+        self.assertIn("Selected because: diff touches VERSION", prompt)
 
     async def test_independent_review_takes_its_own_activities_and_labels(self):
         (self.repo / "calc.py").write_text("def divide(a, b):\n    return a / b\n")
         git(self.repo, "commit", "-qam", "divide")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo),
-                                                        labels=["issue"]))
-        self.assertEqual(bodies(section(call["prompt"])), {"ISSUES-BODY"})
+        prompt = await self.independent_prompt(self.review_payload(explicit_workdir=str(self.repo), labels=["issue"]))
+        self.assertEqual(bodies(section(prompt)), {"ISSUES-BODY"})
 
     async def test_blocking_item_citing_guidance_needs_a_clause(self):
         bad = json.loads(json.dumps(CITES_VERSIONING))
@@ -504,10 +505,9 @@ class TestNonAsciiDiffPaths(_Harness):
         self.assertIn(self.CN_BODY, guidance)
 
     async def explicit_review(self):
-        evt = event({"executor_id": "coder-reviewer", "text": "the task", "base_ref": "main", "explicit_workdir": str(self.repo)})
-        request = self.reviewer()._review_input([evt], None)
-        evidence, guidance = await review_inputs(request)
-        return {"prompt": review_prompt(request, guidance, evidence)}
+        prompt = await self.independent_prompt({"executor_id": "coder-reviewer", "text": "the task", "base_ref": "main",
+                                                "explicit_workdir": str(self.repo)})
+        return {"prompt": prompt}
 
     async def test_tracked_chinese_paths_select_their_guidance(self):
         (self.repo / "版本/当前.txt").write_text("1.1.0\n", encoding="utf-8")

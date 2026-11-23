@@ -168,16 +168,11 @@ class SupervisorFixture(unittest.TestCase):
         self.fail(f"Missing reply for {prefix!r}; last request error: {last_error!r}")
 
 
-class AutoUpdateTests(SupervisorFixture):
-    update_interval = 0.1
-
+class UpdateRepository(SupervisorFixture):
     def prepare_checkout(self):
         self.origin = self.root / "source"
         self.git(self.root, "init", "-b", "main", str(self.origin))
-        repo = run_updating.ROOT
-        for folder in ("src", "scripts"):
-            shutil.copytree(repo / folder, self.origin / folder, ignore=shutil.ignore_patterns("__pycache__"))
-        shutil.copyfile(repo / ".gitignore", self.origin / ".gitignore")
+        self.populate_origin()
         self.commit(self.origin)
         self.git(self.root, "clone", str(self.origin), str(self.checkout))
 
@@ -188,6 +183,11 @@ class AutoUpdateTests(SupervisorFixture):
     def commit(self, cwd):
         self.git(cwd, "add", ".")
         self.git(cwd, "commit", "-qm", "fixture")
+
+
+class UpdateCandidateTests(UpdateRepository):
+    def populate_origin(self):
+        (self.origin / "tracked").touch()
 
     def test_skips_dirty_diverged_and_non_main(self):
         with patch.object(run_updating, "ROOT", self.checkout):
@@ -203,6 +203,16 @@ class AutoUpdateTests(SupervisorFixture):
             self.assertIsNotNone(run_updating.candidate())
             self.git(self.checkout, "merge", "--ff-only", "topic")
             self.assertIsNone(run_updating.candidate())
+
+
+class AutoUpdateTests(UpdateRepository):
+    update_interval = 0.1
+
+    def populate_origin(self):
+        repo = run_updating.ROOT
+        for folder in ("src", "scripts"):
+            shutil.copytree(repo / folder, self.origin / folder, ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copyfile(repo / ".gitignore", self.origin / ".gitignore")
 
     def test_upgrade_serves_new_response_and_keeps_history(self):
         proc = self.start_supervisor()
