@@ -143,7 +143,7 @@ def main(spec_path: str) -> int:
             end_group(proc)
 
 
-def _one_shot_env(env: dict[str, str]) -> dict[str, str]:
+def one_shot_env(env: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if k not in ORCA_SESSION_VARS and not k.startswith(ORCA_SESSION_PREFIXES)}
 
 
@@ -152,13 +152,14 @@ def _run(spec_path: Path, running: list[subprocess.Popen[bytes]]) -> int:
     argv: list[str] = spec["argv"]
     exit_path = Path(spec["exit.json"])
     deadline = time.monotonic() + float(spec["timeout_seconds"])
+    stdin_path: str | None = spec.get("stdin")
     print(f"[hibernaut] {spec['title']}: running {argv[0]} in {spec['cwd']}", flush=True)
     try:
         # A session of its own: the group can be ended as a whole, and a CLI that opens /dev/tty fails instead of
         # stopping in the background.
-        with starting():
-            proc = subprocess.Popen(argv, cwd=spec["cwd"], env=_one_shot_env({**os.environ, **spec["env"]}),
-                                    start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        with open(stdin_path or os.devnull, "rb") as stdin, starting():
+            proc = subprocess.Popen(argv, cwd=spec["cwd"], env=one_shot_env({**os.environ, **spec["env"]}),
+                                    start_new_session=True, stdin=stdin, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE)
             running.append(proc)
     except OSError as exc:

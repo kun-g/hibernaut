@@ -54,4 +54,4 @@
   - **Executor（驱动）**：没有业务含义的底层 CLI / LLM 驱动（如 `claude`、`grok`、`cursor-agent`、`dsh`，或一个 Claude Code 启动器加计费方式），在 `[executors.<id>]` 声明。一台 Runner 可托管多个 Executor。
   - **Agent（业务主体）**：绑定 Role 与 Skills、权限边界、记忆视角和底层 Executor，在 `[agents.<id>]` 声明，标识为 `agent_id`。同一 Executor 可供多个 Agent 使用。
   - **`agent_id` vs. `executor_id`**：代码与存储沿用的 `executor_id`（`ExecutorPort.executor_id`、`sessions.executor_id`、事件 payload 的旧键）取值就是 `agent_id`；`[executors.<id>]` 写了 `role` 或 `command` 时同时是同名 Agent（旧写法）。
-- **Steward（项目管家）**：`role = "steward"` 的 Agent，项目主 Inbox 的前台：读事件后自己答复、转投给别的 Agent，或汇总回投的结果。在项目主检出里只读运行，不建 worktree，不能编辑文件或执行命令，没有内置工具，读文件也经逐次过门禁的 MCP 工具；可读写所在 Inbox 的 Memory、只读查询本项目的会话与事件。能路由到哪些 Inbox 和 Agent 由 Runtime 每次唤醒时现拼的路由清单（routing manifest）给出。
+- **Steward（项目管家）**：`role = "steward"` 的 Agent，项目主 Inbox 的前台：读事件后自己答复、转投给别的 Agent，或汇总回投的结果。在项目主检出（或配置的 `workdir`）里只读运行，每轮在 Orca 终端里一次性执行，不建 worktree，不能编辑文件或执行命令，没有内置工具，读文件也经逐次过门禁的 MCP 工具；可读写所在 Inbox 的 Memory、只读查询本项目的会话与事件。能路由到哪些 Inbox 和 Agent 由 Runtime 每次唤醒时现拼的路由清单（routing manifest）给出。
