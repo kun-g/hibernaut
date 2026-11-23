@@ -9,7 +9,6 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from queue import SimpleQueue
 from typing import Final
 
 from switchboard.check import config_problems, config_summary
@@ -52,6 +51,8 @@ __all__ = ["EnvCredentialBroker", "Switchboard", "build_switchboard", "main"]
 _log = logging.getLogger(__name__)
 # After a timeout: for pushes cut with their connection to record "offline", and for a statement to finish.
 _SETTLE_SEC: Final = 0.5
+# On the wakeup pipe, where every other byte is a signal number.
+_DRAINED: Final = b"\0"
 
 
 @dataclass(slots=True)
@@ -295,13 +296,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     logging.basicConfig(format="%(levelname)s %(message)s")
-    # SimpleQueue.put is reentrant, so a handler may call it whatever the main thread is doing. The drain runs on its
-    # own thread and reports through the same queue, which keeps the main thread free for a second signal. That one
-    # is handled in Python because PID 1 of a container ignores signals left at their default action.
-    wakeups: SimpleQueue[int | None] = SimpleQueue()
+    # The kernel may hand a signal to any thread (on Linux, to one that is just creating another), but Python handlers
+    # run on the main thread only, and nothing would wake it from a lock or queue. The wakeup pipe is written by the
+    # C handler, on whichever thread that runs. The drain runs on its own thread and reports through the same pipe,
+    # which keeps the main thread free for a second signal. That one is handled here because PID 1 of a container
+    # ignores signals left at their default action.
+    wakeup_read, wakeup_write = os.pipe()
+    os.set_blocking(wakeup_write, False)
+    signal.set_wakeup_fd(wakeup_write)
 
     def _on_signal(signum: int, frame: object) -> None:
-        wakeups.put(signum)
+        pass
 
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
@@ -316,7 +321,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"[switchboard] relay endpoint {board.relay_url} (transport={board.config.relay.transport})",
             file=sys.stderr,
         )
-    wakeups.get()
+    os.read(wakeup_read, 1)
     print(
         f"[switchboard] stopping, waiting up to {config.shutdown_timeout_seconds:g}s for work in flight; "
         "a second signal exits at once",
@@ -327,13 +332,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             board.stop()
         finally:
-            wakeups.put(None)
+            os.write(wakeup_write, _DRAINED)
 
     threading.Thread(target=_drain, name="switchboard-shutdown", daemon=True).start()
-    again = wakeups.get()
-    if again is not None:
+    again = os.read(wakeup_read, 1)
+    if again != _DRAINED:
         sys.stderr.flush()
-        os._exit(128 + again)
+        os._exit(128 + again[0])
     return 0
 
 

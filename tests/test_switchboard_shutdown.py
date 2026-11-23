@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from concurrent.futures import thread as futures_thread
 from dataclasses import replace
 from datetime import timedelta
@@ -568,6 +568,21 @@ class TimeoutTests(ShutdownHarness):
             lock.release()
 
 
+# Linux lets a thread that is just creating another one take a signal sent to the process, and Python runs handlers on
+# the main thread only. Each byte on stdin is a signal that this helper thread takes.
+SIGNALLED_OFF_MAIN = """
+import os, signal, sys, threading
+import switchboard.app
+
+def take() -> None:
+    while data := os.read(0, 1):
+        signal.pthread_kill(threading.get_ident(), data[0])
+
+threading.Thread(target=take, daemon=True).start()
+sys.exit(switchboard.app.main(sys.argv[1:]))
+"""
+
+
 class SignalTests(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory(prefix="sb_signal_")
@@ -576,7 +591,9 @@ class SignalTests(unittest.TestCase):
         self.db = self.root / "switchboard.db"
         self.log = self.root / "stderr.log"
 
-    def start(self, timeout: float) -> tuple[subprocess.Popen[bytes], int]:
+    def start(
+        self, timeout: float, launcher: Sequence[str] = ("-m", "switchboard.app")
+    ) -> tuple[subprocess.Popen[bytes], int]:
         config = self.root / "switchboard.toml"
         config.write_text(
             f'shutdown_timeout_seconds = {timeout}\n[http]\nport = 0\n[sqlite]\npath = "{self.db}"\n'
@@ -590,9 +607,11 @@ class SignalTests(unittest.TestCase):
         )
         with self.log.open("wb") as log:
             proc = subprocess.Popen(
-                [sys.executable, "-m", "switchboard.app", "--config", str(config)],
-                cwd=self.root, env=env, stdout=log, stderr=subprocess.STDOUT,
+                [sys.executable, *launcher, "--config", str(config)],
+                cwd=self.root, env=env, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
             )
+        assert proc.stdin is not None
+        self.addCleanup(proc.stdin.close)
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
         self.assertTrue(wait_until(lambda: "relay endpoint" in self.output(), 20), self.output())
@@ -645,6 +664,21 @@ class SignalTests(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             rows = conn.execute("SELECT status, attempts FROM delivery_log").fetchall()
         self.assertEqual(rows, [("pending", 0)] * 2)
+
+    def test_signals_taken_by_another_thread_are_not_lost(self) -> None:
+        for first, second in ((signal.SIGTERM, None), (signal.SIGTERM, signal.SIGINT), (signal.SIGINT, signal.SIGTERM)):
+            with self.subTest(first=first.name, second=second and second.name):
+                proc, port = self.start(60, ("-c", SIGNALLED_OFF_MAIN))
+                assert proc.stdin is not None
+                if second is not None:
+                    self.hang_request(port)
+                os.write(proc.stdin.fileno(), bytes([first]))
+                if second is None:
+                    self.assertEqual(proc.wait(8), 0, self.output())
+                    continue
+                self.assertTrue(wait_until(lambda: refused(port)), self.output())
+                os.write(proc.stdin.fileno(), bytes([second]))
+                self.assertEqual(proc.wait(8), 128 + second, self.output())
 
     def test_second_signal_exits_at_once(self) -> None:
         for first, second in ((signal.SIGTERM, signal.SIGTERM), (signal.SIGTERM, signal.SIGINT), (signal.SIGINT, signal.SIGTERM)):
