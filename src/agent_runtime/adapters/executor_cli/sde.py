@@ -69,6 +69,7 @@ from agent_runtime.adapters.executor_cli.reviewer import (
     Reviewer,
     ReviewRequest,
     format_blocking,
+    render_terminals,
     review_scope,
     review_title,
     snapshot_diff,
@@ -224,8 +225,11 @@ class _State:
     nudged: bool = False
     # Inbox that owns the task's worktree; empty in checkpoints from before it was recorded.
     inbox_id: str = ""
-    # Orca terminals a CLI reviewer left open for reading; closed with the delivery when close_terminal is on.
+    # Orca terminals CLI reviews ran in. Each is closed when its run ends; with close_terminal the delivery closes
+    # them once more, in case that close failed.
     review_terminals: list[str] = field(default_factory=_no_history)
+    # The terminals and CLI session IDs of each review round, kept for looking a review up later.
+    review_runs: list[str] = field(default_factory=_no_history)
     # Delivery problems sent back to the developer since a person last decided, and what each one was.
     handbacks: int = 0
     handback_log: list[str] = field(default_factory=_no_history)
@@ -835,11 +839,14 @@ class SDEExecutor:
             state.rounds += 1
             counts = [f"{n} {what}" for n, what in
                       ((len(blocking), "blocking"), (review.get("downgraded", 0), "downgraded")) if n]
+            if terminals := [str(h) for h in review.get("cli_terminals", ())]:
+                state.review_terminals += terminals
+                state.review_runs.append(
+                    f"round {_next_round(state)} {render_terminals(terminals, review.get('cli_sessions', {}))}")
             state.history.append(
                 f"round {_next_round(state)} {review['verdict']}" + (f" ({', '.join(counts)})" if counts else "")
             )
             state.review_notes = merge_notes(state.review_notes, review.get("notes", []))
-            state.review_terminals += [str(h) for h in review.get("cli_terminals", ())]
             state.last_review = reviewer.format_review(review)
             state.reviewed_snapshot = snapshot
             state.blocking = blocking
@@ -1084,8 +1091,9 @@ class SDEExecutor:
         return "\n".join(n for n in notes if n)
 
     async def _close_review_terminals(self, state: _State) -> str:
-        # A CLI reviewer's terminal ends with its CLI and holds nothing to read, so no delivery evidence keeps it;
-        # closing only makes sure nothing of it is left (Orca can lose a close, and an ended one counts as closed).
+        # A CLI reviewer's terminal was closed when its run ended and holds nothing to read, so no delivery evidence
+        # keeps it; closing again only makes sure nothing of it is left (that close can fail or be lost, and an ended
+        # terminal counts as closed).
         delivery = self._delivery
         if delivery is None or not state.review_terminals or not delivery.config.close_terminal:
             return ""
@@ -1141,6 +1149,8 @@ class SDEExecutor:
         ]
         if state.history:
             lines.append(f"Review history: {'; '.join(state.history)}")
+        if state.review_runs:
+            lines.append(f"Review runs: {'; '.join(state.review_runs)}")
         if state.last_review:
             lines.append(f"Last review:\n{state.last_review}")
         lines += _review_followups(state)
@@ -1165,6 +1175,8 @@ class SDEExecutor:
             lines.append(f"Test evidence so far:\n{state.test_evidence}")
         if state.history:
             lines.append(f"Review history: {'; '.join(state.history)}")
+        if state.review_runs:
+            lines.append(f"Review runs: {'; '.join(state.review_runs)}")
         lines += _review_followups(state)
         if state.followups:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))

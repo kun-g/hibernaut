@@ -489,6 +489,10 @@ def render_review(review: Mapping[str, Any], *, executor_id: str, settings: str)
     return "\n".join(lines)
 
 
+def render_terminals(handles: Sequence[str], sessions: Mapping[str, str]) -> str:
+    return ", ".join(f"{h} (CLI session {sessions[h]})" if sessions.get(h) else h for h in handles)
+
+
 def format_blocking(blocking: Sequence[Mapping[str, str]]) -> str:
     lines: list[str] = []
     for i, item in enumerate(blocking, 1):
