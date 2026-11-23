@@ -113,6 +113,7 @@ transport = "hybrid"
                     SWITCHBOARD_FEISHU_APP_ID="cli_test",
                     SWITCHBOARD_FEISHU_APP_SECRET="test-app-secret",
                     SWITCHBOARD_MCP_WEBHOOK_SECRET="test-mcp",
+                    SWITCHBOARD_RELAY_WEBHOOK_SECRET="test-relay",
                 ),
                 capture_output=True,
                 text=True,
@@ -129,7 +130,7 @@ transport = "hybrid"
         assert channels is not None
         for channel in ("github", "feishu", "mcp", "relay"):
             self.assertIn(channel, channels.group(1))
-        for secret in ("test-webhook", "test-app-secret", "test-mcp"):
+        for secret in ("test-webhook", "test-app-secret", "test-mcp", "test-relay"):
             self.assertNotIn(secret, result.stdout + result.stderr)
 
     def test_existing_directory_gets_no_database(self) -> None:
@@ -141,7 +142,28 @@ transport = "hybrid"
     def test_shipped_templates_pass_the_check(self) -> None:
         for rel in ("switchboard.example.toml", "deploy/switchboard/switchboard.docker.toml"):
             with self.subTest(rel):
-                code, _, err = self.check((REPO / rel).read_text(encoding="utf-8"))
+                toml = (REPO / rel).read_text(encoding="utf-8")
+                code, _, err = self.check(toml, {"SWITCHBOARD_RELAY_WEBHOOK_SECRET": "test-relay"})
+                self.assertEqual((code, err), (0, ""))
+
+    def test_separate_listeners_that_do_not_overlap(self) -> None:
+        relay = {"SWITCHBOARD_RELAY_WEBHOOK_SECRET": "test-relay"}
+        for http, hub in (("127.0.0.1", "127.0.0.2"), ("localhost", "10.0.0.5")):
+            with self.subTest(http=http, relay=hub):
+                code, _, err = self.check(
+                    f'[http]\nhost = "{http}"\nport = 9000\n'
+                    f'[relay]\nenabled = true\nlisten_host = "{hub}"\nlisten_port = 9000\n',
+                    relay,
+                )
+                self.assertEqual((code, err), (0, ""))
+        # Port 0 is picked by the system, so it never clashes.
+        code, _, err = self.check("[http]\nport = 0\n[relay]\nenabled = true\nlisten_port = 0\n", relay)
+        self.assertEqual((code, err), (0, ""))
+
+    def test_usable_api_bases(self) -> None:
+        for url in ("https://api.github.com", "http://127.0.0.1:9", "https://ghe.example.com:8443/api/v3/", "http://[::1]:80"):
+            with self.subTest(url):
+                code, _, err = self.check(f'[outbound]\ngithub_api_base = "{url}"\n[feishu]\napi_base = "{url}"\n')
                 self.assertEqual((code, err), (0, ""))
 
 
@@ -207,6 +229,73 @@ class InvalidConfigTests(CheckHarness):
                 self.assertEqual(out, "")
                 self.assertIn(field, err)
                 self.assertIn(str(self.path), err)
+
+    def test_unusable_api_bases_name_their_field(self) -> None:
+        bad = (
+            "https://", "https:///path", "https://:443", "https://api.github.com:http", "https://api.github.com:70000",
+            "https://api.github.com:0", "https://[::1", "https://a b.example", "https://a..example",
+            "https://api.github.com?x=1", "https://api.github.com#frag", "ftp://api.github.com", "api.github.com",
+        )
+        for table, name in (("feishu", "api_base"), ("outbound", "github_api_base")):
+            for url in bad:
+                with self.subTest(table=table, url=url):
+                    code, _, err = self.check(f'[{table}]\n{name} = "{url}"\n')
+                    self.assertEqual(code, 1)
+                    self.assertIn(f"{table}.{name}", err)
+
+    def test_sqlite_path_that_can_never_be_a_database_file(self) -> None:
+        data = self.root / "data"
+        data.mkdir()
+        (self.root / "plain").write_text("", encoding="utf-8")
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo)
+        paths = (data, f"{data}/", f"{self.root}/new/", self.root / "plain" / "sb.db", fifo, "sb\\u0000.db")
+        for path in paths:
+            with self.subTest(path=str(path)):
+                code, _, err = self.check(f'[sqlite]\npath = "{path}"\n')
+                self.assertEqual(code, 1)
+                self.assertIn("sqlite.path", err)
+        self.assertEqual(list(data.iterdir()), [])
+        self.assertEqual(self.check(f'[sqlite]\npath = "{data / "new" / "sb.db"}"\n')[0], 0)
+
+    def test_overlapping_listeners_on_one_port(self) -> None:
+        for http, hub in (
+            ("0.0.0.0", "127.0.0.1"),
+            ("127.0.0.1", "0.0.0.0"),
+            ("0.0.0.0", "0.0.0.0"),
+            ("0.0.0.0", "hub.internal"),
+            ("hub.internal", "0.0.0.0"),
+            ("0", "10.0.0.5"),
+            ("localhost", "127.0.0.1"),
+            ("127.0.0.1", "LOCALHOST"),
+            ("127.1", "127.0.0.1"),
+            ("Hub.internal", "hub.internal"),
+        ):
+            with self.subTest(http=http, relay=hub):
+                code, out, err = self.check(
+                    f'[http]\nhost = "{http}"\nport = 8790\n'
+                    f'[relay]\nenabled = true\nlisten_host = "{hub}"\nlisten_port = 8790\n',
+                    {"SWITCHBOARD_RELAY_WEBHOOK_SECRET": "test-relay"},
+                )
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn("relay.listen_port", err)
+
+    def test_listen_addresses_the_ipv4_server_cannot_bind(self) -> None:
+        for host in ("::", "::1", "999.0.0.1", "1.2.3.4.5"):
+            with self.subTest(host):
+                code, _, err = self.check(f'[http]\nhost = "{host}"\n')
+                self.assertEqual(code, 1)
+                self.assertIn("http.host", err)
+
+    def test_enabled_relay_needs_its_token(self) -> None:
+        for toml in ('[relay]\nenabled = true\ntransport = "relay"\n', "[relay]\nenabled = true\n"):
+            for env in ({}, {"SWITCHBOARD_RELAY_WEBHOOK_SECRET": ""}, {"SWITCHBOARD_RELAY_WEBHOOK_SECRET": "  "}):
+                with self.subTest(toml=toml, env=env):
+                    code, out, err = self.check(toml, env)
+                    self.assertEqual((code, out), (1, ""))
+                    self.assertIn("SWITCHBOARD_RELAY_WEBHOOK_SECRET", err)
+                    self.assertIn("relay.enabled", err)
+        self.assertEqual(self.check("[relay]\nenabled = false\n")[0], 0)
 
     def test_every_problem_found_after_parsing_is_reported(self) -> None:
         code, _, err = self.check(

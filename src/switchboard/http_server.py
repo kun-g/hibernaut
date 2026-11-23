@@ -18,6 +18,8 @@ UpgradeHandler = Callable[[WebSocketConnection, str], None]
 
 # During a drain, how long an accepted connection may take to send its request head.
 HEAD_GRACE_SEC: Final = 0.5
+# How long requests cut at the deadline get to leave their handler.
+CUT_SETTLE_SEC: Final = 0.2
 
 
 class _Server(ThreadingHTTPServer):
@@ -48,6 +50,8 @@ class _Server(ThreadingHTTPServer):
         self._waiting: set[object] = set()
         self._active: set[object] = set()
         self._closed = False
+        # Set when a drain ran out of time: the store is about to close, so no request may start a write.
+        self.cut = False
         super().__init__(address, _Handler)
 
     # Counted on the accept thread, so a drain after shutdown() sees every accepted connection.
@@ -62,7 +66,9 @@ class _Server(ThreadingHTTPServer):
 
     # A connection the drain cut fails in its handler; that is not worth a traceback.
     def handle_error(self, request: Any, client_address: Any) -> None:
-        if not (self._closed and isinstance(sys.exception(), OSError)):
+        if self.cut:
+            print(f"[switchboard] request cut off by the shutdown: {sys.exception()!r}", file=sys.stderr)
+        elif not (self._closed and isinstance(sys.exception(), OSError)):
             super().handle_error(request, client_address)
 
     def begin(self, request: object) -> bool:
@@ -89,13 +95,17 @@ class _Server(ThreadingHTTPServer):
                     break
                 self._state.wait((deadline if self._active else head_deadline) - now)
             self._closed = True
-            idle = list(self._waiting)
             drained = not self._active
-        for request in idle:
+            self.cut = not drained
+            cut = [*self._waiting, *self._active]
+        for request in cut:
             try:
                 cast(socket.socket, request).shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+        if not drained:
+            with self._state:
+                self._state.wait_for(lambda: not self._active, CUT_SETTLE_SEC)
         return drained
 
 
@@ -176,6 +186,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(413, {"error": "payload too large"})
             return
         raw_body = self.rfile.read(length)
+        if len(raw_body) < length:
+            # The client left, or the drain cut the connection; a partial body is never handled.
+            self.close_connection = True
+            return
         headers = {key: value for key, value in self.headers.items()}
 
         try:
@@ -185,6 +199,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(500, {"error": "internal error"})
             return
 
+        if self._srv().cut:
+            self.close_connection = True
+            return
         if parsed.event is None:
             if parsed.http_status in (400, 401):
                 reason = str((parsed.response_body or {}).get("error", "rejected"))

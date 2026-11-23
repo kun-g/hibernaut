@@ -42,6 +42,8 @@ from switchboard.relay_protocol import (
 RELAY_CREDENTIAL_CHANNEL: Final = "relay"
 # How long a closed connection may keep sending (its frames are dropped) before we cut it.
 CLOSE_GRACE_SEC: Final = 2.0
+# Enough to put close frames on the wire when a stop has no time left, and for cut connections to end.
+CLOSE_FLUSH_SEC: Final = 0.1
 _UNSENDABLE_CLOSE_CODES: Final = frozenset({1005, 1006, 1015})
 
 
@@ -121,9 +123,9 @@ class RelayHub:
         with self._cond:
             self._cond.notify_all()
 
-    # Returns within about timeout: peers that answer the close frame leave on their own, the rest are cut.
-    def stop(self, timeout: float = CLOSE_GRACE_SEC) -> None:
-        deadline = time.monotonic() + timeout
+    # Returns within about timeout: peers that answer the close frame leave on their own, the rest are cut (False).
+    def stop(self, timeout: float = CLOSE_GRACE_SEC) -> bool:
+        deadline = time.monotonic() + max(timeout, CLOSE_FLUSH_SEC)
         self.drain()
         self._stop.set()
         with self._cond:
@@ -137,12 +139,15 @@ class RelayHub:
             # A peer that stopped reading can block a send, so no close is sent on the calling thread.
             threading.Thread(target=ws.send_close, args=(CLOSE_GOING_AWAY, "relay hub stopping"), daemon=True).start()
         with self._cond:
-            self._cond.wait_for(lambda: not self._sockets, max(0.0, deadline - time.monotonic()))
+            left = self._cond.wait_for(lambda: not self._sockets, max(0.0, deadline - time.monotonic()))
         for ws in sockets:
             ws.abort()
+        with self._cond:
+            self._cond.wait_for(lambda: not self._sockets, CLOSE_FLUSH_SEC)
         if self._thread is not None:
-            self._thread.join(max(0.1, deadline - time.monotonic()))
+            self._thread.join(CLOSE_FLUSH_SEC)
             self._thread = None
+        return left
 
     # Runs on the HTTP handler thread for the whole life of one WebSocket connection.
     def serve(self, ws: WebSocketConnection, peer: str) -> None:

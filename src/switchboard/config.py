@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import threading
 import tomllib
@@ -8,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
+from urllib.parse import urlsplit
 
 from switchboard.envelope import EVENT_TYPES
 
@@ -162,8 +164,7 @@ def parse_config(raw: Mapping[str, Any]) -> SwitchboardConfig:
             base_path=normalize_base_path(http.get("base_path", _HTTP.base_path)),
         ),
         sqlite=SqliteConfig(
-            # "" would open a private temporary database that is gone after a restart.
-            path=_text(sqlite, "sqlite", "path", _SQLITE.path),
+            path=_database_path(sqlite),
             busy_timeout_ms=_integer(sqlite, "sqlite", "busy_timeout_ms", _SQLITE.busy_timeout_ms, 0),
         ),
         routing=RoutingConfig(
@@ -299,9 +300,36 @@ def _text(section: Mapping[str, Any], table: str, name: str, default: str) -> st
 
 def _url(section: Mapping[str, Any], table: str, name: str, default: str) -> str:
     value = _text(section, table, name, default)
-    if not value.startswith(("http://", "https://")):
-        raise ConfigError(f"{table}.{name} must be an http:// or https:// URL")
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+        # Offline part of what a connection would do with the name: empty and over-long labels fail here.
+        host = (parts.hostname or "").encode("idna")
+    except ValueError as exc:
+        raise ConfigError(f"{table}.{name} is not a usable URL: {exc}") from exc
+    if parts.scheme not in ("http", "https") or not host or port == 0 or _BAD_PATH_CHARS.search(value):
+        raise ConfigError(
+            f"{table}.{name} must be an http:// or https:// URL with a host, and no spaces, query or fragment"
+        )
     return value
+
+
+# Read-only: the file and its directories may not exist yet, but what exists must not rule the path out.
+def _database_path(sqlite: Mapping[str, Any]) -> str:
+    # "" would open a private temporary database that is gone after a restart.
+    path = _text(sqlite, "sqlite", "path", _SQLITE.path)
+    if "\0" in path:
+        raise ConfigError("sqlite.path must not contain a NUL character")
+    if path.endswith(os.sep) or os.path.isdir(path):
+        raise ConfigError(f"sqlite.path {path!r} is a directory, not a database file")
+    if os.path.exists(path) and not os.path.isfile(path):
+        raise ConfigError(f"sqlite.path {path!r} is not a regular file")
+    for parent in Path(path).parents:
+        if os.path.exists(parent):
+            if not os.path.isdir(parent):
+                raise ConfigError(f"sqlite.path {path!r} lies below {str(parent)!r}, which is not a directory")
+            break
+    return path
 
 
 # 0/1 and numeric strings were read as meant before validation existed and still load; what was misread

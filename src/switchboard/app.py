@@ -50,8 +50,7 @@ from switchboard.store_sqlite import SwitchboardStore
 __all__ = ["EnvCredentialBroker", "Switchboard", "build_switchboard", "main"]
 
 _log = logging.getLogger(__name__)
-# After the drain, whatever its outcome: for close frames, and for pushes cut off with them to record "offline".
-_CLOSE_SEC: Final = 1.0
+# After a timeout: for pushes cut with their connection to record "offline", and for a statement to finish.
 _SETTLE_SEC: Final = 0.5
 
 
@@ -117,8 +116,8 @@ class Switchboard:
         if not self.gateway.join(left()):
             blocked.append("outbound sends")
 
-        if self.relay is not None:
-            self.relay.stop(_CLOSE_SEC)
+        if self.relay is not None and not self.relay.stop(left()):
+            blocked.append("relay connections")
         if blocked:
             self.worker.join(_SETTLE_SEC)
         if not self.store.close(max(_SETTLE_SEC, left())):

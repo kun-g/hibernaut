@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import os
 import signal
 import socket
@@ -371,15 +372,74 @@ class TimeoutTests(ShutdownHarness):
 
     def test_stuck_http_request(self) -> None:
         gate = Gate()
-        self.addCleanup(gate.opened.set)
         board = self.board(timeout=0.2, credentials=GatedCredentials(gate))
+        before = set(threading.enumerate())
+
         def client() -> None:
             with contextlib.suppress(OSError):
                 send_github(board.http.base_url, issue_payload())
 
-        threading.Thread(target=client, daemon=True).start()
+        sender = threading.Thread(target=client, daemon=True)
+        sender.start()
         self.assertTrue(gate.entered.wait(5))
-        self.assert_forced(board, "HTTP")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assert_forced(board, "HTTP")
+            # Released after the cut: it must leave without touching the closed database.
+            gate.opened.set()
+            self.assertTrue(wait_until(lambda: set(threading.enumerate()) <= before))
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertNotIn("ProgrammingError", stderr.getvalue())
+
+    def test_request_whose_body_never_arrives_is_cut(self) -> None:
+        board = self.board(timeout=0.2)
+        before = set(threading.enumerate())
+        with socket.create_connection(("127.0.0.1", board.http.port), timeout=5) as sock:
+            sock.sendall(b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+            self.assertTrue(wait_until(lambda: bool(set(threading.enumerate()) - before)))
+            time.sleep(0.1)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assert_forced(board, "HTTP")
+                handlers = set(threading.enumerate()) - before
+                self.assertEqual(handlers, set())
+            try:
+                self.assertEqual(sock.recv(1024), b"")
+            except ConnectionResetError:
+                pass
+            # The rest of the body arrives too late to be handled.
+            with contextlib.suppress(OSError):
+                sock.sendall(b" " * 99)
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_silent_relay_peers_are_cut_at_the_same_deadline(self) -> None:
+        board = self.board(timeout=0.3, sections={"relay": {"enabled": True, "transport": "hybrid"}})
+        ws, _ = handshake(board.relay_url)
+        self.addCleanup(ws.close)
+        started = time.monotonic()
+        with self.assertLogs("switchboard", level="WARNING") as logs:
+            self.assertFalse(board.stop())
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.3)
+        self.assertLess(elapsed, 0.9)
+        self.assertIn("relay connections", "\n".join(logs.output))
+        self.assertIsInstance(recv_message(ws), Close)
+        self.assert_store_closed(board)
+
+    def test_cut_pushes_do_not_add_a_second_waiting_period(self) -> None:
+        board = self.board(
+            timeout=0.3, sections={"relay": {"enabled": True, "transport": "hybrid", "ack_timeout_sec": 30}}
+        )
+        ws, _ = handshake(board.relay_url)
+        self.addCleanup(ws.close)
+        board.bus.publish(ready_event(1, "proj:a"))
+        self.assertIsInstance(recv_message(ws), Push)
+        started = time.monotonic()
+        with self.assertLogs("switchboard", level="WARNING"):
+            self.assertFalse(board.stop())
+        self.assertLess(time.monotonic() - started, 0.9)
+        self.assertIsInstance(recv_message(ws), Close)
+        self.assertEqual(self.rows("SELECT status, attempts FROM delivery_log"), [("pending", 0)])
 
     def test_unacked_relay_push_goes_back_to_pending_without_an_attempt(self) -> None:
         board = self.board(
