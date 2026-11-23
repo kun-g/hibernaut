@@ -50,7 +50,9 @@ class ReceiverProcessTests(unittest.TestCase):
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 self.fail(f"receiver exited {proc.returncode}: {proc.communicate()}")
-            if any(s.pid == proc.pid for s in discover([self.cfg])):
+            # receiver.json is written after the registration and still names the previous receiver until then.
+            info = receiver_info(name, self.state)
+            if info is not None and info.pid == proc.pid and any(s.pid == proc.pid for s in discover([self.cfg])):
                 return
             time.sleep(0.05)
         self.fail("receiver never registered")
