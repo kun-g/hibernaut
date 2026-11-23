@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import dataclasses
 import json
@@ -44,14 +45,14 @@ SYNTHETIC = {
 # Set again by the shell, the OS or git between the runner and the recording point, whatever the runner's own value.
 _LOCAL_NAMES = {"PWD", "OLDPWD", "SHLVL", "_", "__CF_USER_TEXT_ENCODING", "GIT_TERMINAL_PROMPT"}
 
-_SHIM = """#!{python} -I
-import json, os, sys
-with open({log!r}, "a") as fp:
-    fp.write(json.dumps({{"argv": sys.argv, "env": dict(os.environ)}}) + "\\n")
+_SHIM = """#!{python} -IS
+import os, sys
+with open({log!r}, "a", encoding="utf-8") as fp:
+    fp.write(repr({{"argv": sys.argv, "env": dict(os.environ)}}) + "\\n")
 """
 _GIT_SHIM = _SHIM + "os.execv({git!r}, [{git!r}, *sys.argv[1:]])\n"
 _ORCA_SHIM = _SHIM + """
-import subprocess
+import json, subprocess
 args = sys.argv[1:]
 def opt(name):
     return args[args.index(name) + 1]
@@ -73,7 +74,7 @@ class _Workspace:
     def calls(self) -> list[dict[str, object]]:
         if not self.calls_log.exists():
             return []
-        return [json.loads(line) for line in self.calls_log.read_text(encoding="utf-8").splitlines()]
+        return [ast.literal_eval(line) for line in self.calls_log.read_text(encoding="utf-8").splitlines()]
 
     def daemon(self, backend: str = "git") -> RunnerDaemon:
         cfg = dataclasses.replace(_config(self.tmp, self.repo), worktree_backend=backend)  # type: ignore[arg-type]
@@ -96,7 +97,7 @@ def ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Workspace:
     repo = tmp_path / "repo"
     _init_repo(repo)
     _git("config", "maintenance.auto", "false", cwd=repo)
-    log = tmp_path / "calls.jsonl"
+    log = tmp_path / "workspace-calls.log"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     orca_root = tmp_path / "orca-worktrees"

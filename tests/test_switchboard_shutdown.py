@@ -132,6 +132,19 @@ class ShutdownHarness(unittest.TestCase):
         thread.start()
         return thread, result
 
+    def stop_waiting_on(self, board: Switchboard, component: Any, method: str) -> tuple[threading.Thread, list[bool]]:
+        entered = threading.Event()
+        operation = getattr(component, method)
+
+        def observe(*args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            return operation(*args, **kwargs)
+
+        with mock.patch.object(component, method, side_effect=observe):
+            thread, result = self.stop_in_thread(board)
+            self.assertTrue(entered.wait(5))
+        return thread, result
+
 
 def refused(port: int) -> bool:
     try:
@@ -184,8 +197,7 @@ class DrainTests(ShutdownHarness):
                 board.bus.subscribe("hibernaut", handler)
                 board.worker.start()
                 self.assertTrue(wait_until(lambda seen=seen, n=max_parallel: len(seen) == n))
-                stopper, result = self.stop_in_thread(board)
-                stopper.join(0.3)
+                stopper, result = self.stop_waiting_on(board, board.worker, "join")
                 self.assertTrue(stopper.is_alive())
                 gate.opened.set()
                 stopper.join(5)
@@ -203,8 +215,7 @@ class DrainTests(ShutdownHarness):
             board.store.insert_outbound(text_message(number), board.pipeline._clock())  # pyright: ignore[reportPrivateUsage]
         board.gateway.wake()
         self.assertTrue(gate.entered.wait(5))
-        stopper, result = self.stop_in_thread(board)
-        stopper.join(0.3)
+        stopper, result = self.stop_waiting_on(board, board.gateway, "join")
         self.assertTrue(stopper.is_alive())
         gate.opened.set()
         stopper.join(5)
@@ -218,6 +229,9 @@ class DrainTests(ShutdownHarness):
 
     def test_write_in_flight_finishes_before_the_database_closes(self) -> None:
         board = self.board()
+        # Leave only the open write transaction to drain.
+        self.assertTrue(board.worker.stop())
+        self.assertTrue(board.gateway.stop())
         entered, commit = threading.Event(), threading.Event()
         store = board.store
 
@@ -236,8 +250,7 @@ class DrainTests(ShutdownHarness):
         writer = threading.Thread(target=slow_write, daemon=True)
         writer.start()
         self.assertTrue(entered.wait(5))
-        stopper, result = self.stop_in_thread(board)
-        stopper.join(0.3)
+        stopper, result = self.stop_waiting_on(board, store, "close")
         self.assertTrue(stopper.is_alive())
         commit.set()
         stopper.join(5)
@@ -253,9 +266,8 @@ class DrainTests(ShutdownHarness):
         board.bus.publish(event)
         push = recv_message(ws)
         assert isinstance(push, Push)
-        stopper, result = self.stop_in_thread(board)
+        stopper, result = self.stop_waiting_on(board, board.worker, "join")
         self.assertTrue(wait_until(lambda: refused(board.relay_port)))
-        stopper.join(0.2)
         self.assertTrue(stopper.is_alive())
         ws.send_text(encode_message(Ack(conn_epoch=welcome.conn_epoch, event_id=event.event_id)))
         closed = recv_message(ws)

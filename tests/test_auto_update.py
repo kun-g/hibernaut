@@ -108,28 +108,20 @@ class SupervisorSignalTests(unittest.TestCase):
 
 
 
-class AutoUpdateTests(unittest.TestCase):
+class SupervisorFixture(unittest.TestCase):
     stop_grace = 5.0
+    update_interval = 300.0
 
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.origin = self.root / "source"
         self.checkout = self.root / "checkout"
-        self.git(self.root, "init", "-b", "main", str(self.origin))
-        repo = run_updating.ROOT
-        for folder in ("src", "scripts"):
-            shutil.copytree(repo / folder, self.origin / folder, ignore=shutil.ignore_patterns("__pycache__"))
-        shutil.copyfile(repo / ".gitignore", self.origin / ".gitignore")
-        self.commit(self.origin)
-        self.git(self.root, "clone", str(self.origin), str(self.checkout))
+        self.prepare_checkout()
 
-    # maintenance.auto=false: the detached repack a commit may start races the local clone that follows it.
-    def git(self, cwd, *args):
-        return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgSign=false", "-c", "maintenance.auto=false", *args], cwd=cwd, text=True, stderr=subprocess.PIPE).strip()
-
-    def commit(self, cwd):
-        self.git(cwd, "add", ".")
-        self.git(cwd, "commit", "-qm", "fixture")
+    def prepare_checkout(self):
+        # A shutdown test needs the real supervisor and daemon, but never publishes an update.
+        scripts = self.checkout / "scripts"
+        scripts.mkdir(parents=True)
+        shutil.copyfile(SUPERVISOR, scripts / "run_updating.py")
 
     def start_supervisor(self, daemon_args: list[str] | None = None, env: dict[str, str] | None = None,
                          stderr: int | None = None) -> subprocess.Popen:
@@ -143,13 +135,14 @@ class AutoUpdateTests(unittest.TestCase):
             [
                 sys.executable,
                 str(self.checkout / "scripts/run_updating.py"),
-                "--interval", "0.1",
+                "--interval", str(self.update_interval),
                 "--outbox-interval", "0.02",
                 *(daemon_args if daemon_args is not None else ["--port", str(self.port), "--db", str(self.db)]),
             ],
             stdout=log, stderr=stderr,
             cwd=self.checkout,
-            env={**os.environ, **(env or {}), "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"},
+            env={**os.environ, **(env or {}), "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
+                 "PYTHONPATH": str(run_updating.ROOT / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")},
         )
         self.addCleanup(stop_supervisor, proc, self.root, self.stop_grace)
         return proc
@@ -173,6 +166,28 @@ class AutoUpdateTests(unittest.TestCase):
                         return
             time.sleep(.03)
         self.fail(f"Missing reply for {prefix!r}; last request error: {last_error!r}")
+
+
+class AutoUpdateTests(SupervisorFixture):
+    update_interval = 0.1
+
+    def prepare_checkout(self):
+        self.origin = self.root / "source"
+        self.git(self.root, "init", "-b", "main", str(self.origin))
+        repo = run_updating.ROOT
+        for folder in ("src", "scripts"):
+            shutil.copytree(repo / folder, self.origin / folder, ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copyfile(repo / ".gitignore", self.origin / ".gitignore")
+        self.commit(self.origin)
+        self.git(self.root, "clone", str(self.origin), str(self.checkout))
+
+    # maintenance.auto=false: the detached repack a commit may start races the local clone that follows it.
+    def git(self, cwd, *args):
+        return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgSign=false", "-c", "maintenance.auto=false", *args], cwd=cwd, text=True, stderr=subprocess.PIPE).strip()
+
+    def commit(self, cwd):
+        self.git(cwd, "add", ".")
+        self.git(cwd, "commit", "-qm", "fixture")
 
     def test_skips_dirty_diverged_and_non_main(self):
         with patch.object(run_updating, "ROOT", self.checkout):
@@ -342,14 +357,14 @@ class AutoUpdateTests(unittest.TestCase):
 
 
 class AutoUpdateCleanupTests(unittest.TestCase):
-    def run_case(self, case: AutoUpdateTests) -> Path:
+    def run_case(self, case: SupervisorFixture) -> Path:
         result = unittest.TestResult()
         case.run(result)
         self.assertEqual((len(result.errors), len(result.failures)), (0, 1), result.errors + result.failures)
         return case.root
 
     def test_a_case_that_fails_mid_run_leaves_no_process(self):
-        class FailsMidRun(AutoUpdateTests):
+        class FailsMidRun(SupervisorFixture):
             def fail_after_the_first_reply(self):
                 self.send_until_reply(self.start_supervisor(), "收到事件：")
                 self.fail("deliberate failure while the supervisor runs")
@@ -357,8 +372,8 @@ class AutoUpdateCleanupTests(unittest.TestCase):
         self.assertEqual(processes_under(self.run_case(FailsMidRun("fail_after_the_first_reply"))), [])
 
     def test_a_case_whose_daemon_stalls_past_the_stop_grace_leaves_no_process(self):
-        class DaemonStalls(AutoUpdateTests):
-            stop_grace = 1.0
+        class DaemonStalls(SupervisorFixture):
+            stop_grace = 0.1
 
             def stall_the_daemon_then_fail(self):
                 self.send_until_reply(self.start_supervisor(), "收到事件：")
