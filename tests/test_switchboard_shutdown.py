@@ -350,11 +350,11 @@ class TimeoutTests(ShutdownHarness):
         with self.assertLogs("switchboard", level="WARNING") as logs:
             self.assertFalse(board.stop())
         elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertGreaterEqual(elapsed, board.config.shutdown_timeout_seconds)
         self.assertLess(elapsed, 2.5)
         self.assertEqual({r.levelname for r in logs.records}, {"WARNING"})
         self.assertIn(component, "\n".join(logs.output))
-        self.assertIn("0.2", "\n".join(logs.output))
+        self.assertIn(f"timed out after {board.config.shutdown_timeout_seconds:g}s", "\n".join(logs.output))
         with self.assertRaises(sqlite3.ProgrammingError):
             board.store.count_inbound()
 
@@ -446,7 +446,7 @@ class TimeoutTests(ShutdownHarness):
     # A board with one dead letter and an MCP call held in its token check.
     def stuck_mcp_call(self, tool: str, arguments: dict[str, str]) -> tuple[Switchboard, Gate, set[threading.Thread]]:
         gate = Gate()
-        board = self.board(timeout=0.2, credentials=GatedCredentials(gate, "mcp"))
+        board = self.board(timeout=0.05, credentials=GatedCredentials(gate, "mcp"))
         self.addCleanup(gate.opened.set)
         dead = ready_event(1, "proj:a")
         # Not due, so the worker leaves it alone.
@@ -495,9 +495,9 @@ class TimeoutTests(ShutdownHarness):
                 board, gate, before = self.stuck_mcp_call(tool, arguments)
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
-                    with board.store._lock:  # pyright: ignore[reportPrivateUsage]
-                        with self.assertLogs("switchboard", level="WARNING") as logs:
-                            self.assertFalse(board.stop())
+                    with mock.patch.object(board.store, "close", return_value=False) as close, self.assertLogs("switchboard", level="WARNING") as logs:
+                        self.assertFalse(board.stop())
+                        close.assert_called_once()
                     self.assertIn("SQLite write", "\n".join(logs.output))
                     conn = RecordingConnection(board.store._conn)  # pyright: ignore[reportPrivateUsage]
                     board.store._conn = conn  # type: ignore[assignment]  # pyright: ignore

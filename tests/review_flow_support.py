@@ -51,13 +51,13 @@ class ReviewFlowCase(unittest.IsolatedAsyncioTestCase):
     def diff(self, workdir, before, after):
         return self.evidence[before.split(":")[1], after.split(":")[1]][0]
 
-    async def run_flow(self, *, snapshots, diffs, deliveries=(CONFLICT, DONE), reviews=(PASS, PASS), reports=None):
+    async def run_flow(self, *, snapshots, diffs, deliveries=(CONFLICT, DONE), reviews=(PASS, PASS), reports=None, prompt="divide"):
         self.evidence = diffs
         self.delivery.deliver.side_effect = deliveries
         self.reviewer.review.side_effect = reviews
         self.develop.side_effect = [(r, "native") for r in (reports if reports is not None else [REPORT] * len(reviews))]
         self.fingerprint.side_effect = [f"head-{tree}:{tree}" for tree in snapshots]
-        return await self.executor._run("session", None, self.state, self.caps, "divide")
+        return await self.executor._run("session", None, self.state, self.caps, prompt)
 
     def request(self, index=-1):
         return self.reviewer.review.await_args_list[index].args[0]

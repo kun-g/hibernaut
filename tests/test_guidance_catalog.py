@@ -26,6 +26,7 @@ from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.core.models import Emit, Event, SessionRef, Suspend
 from tests.fakes import InMemoryPermission
+from tests.review_flow_support import DONE, ReviewFlowCase
 from tests.test_coder_reviewer import fake_command, git
 
 GENERAL = "# rules\nGENERAL-RULE: run `make check` before committing.\nDetailed rules: guidance.toml.\n"
@@ -345,23 +346,6 @@ class TestDevelopmentAndBuiltInReview(_Harness):
             self.assertIn(f"Source: {self.start}:AGENTS.md", guidance)
             self.assertIn(f"Pinned to commit {self.start}", guidance)
 
-    async def test_rework_round_resends_cited_guidance_once_with_its_clause(self):
-        # Pure test task; the diff touches VERSION, the reviewer cites the versioning document.
-        self.set_plan(sde=[dev({**NEW_TEST, "VERSION": "2.0.0\n"}), dev(), dev(VERSION_BUMP)],
-                      reviewer=[CITES_VERSIONING, CITES_VERSIONING, PASS])
-        outcome = await self.run_sde(tags=["tests"])
-        self.assertIn("review=pass after 3 round(s)", outcome.messages[0])
-        first, fix1, fix2 = self.calls("sde")
-        self.assertEqual(bodies(first["prompt"]), {"TESTING-BODY"})
-        self.assertIn("Guidance: docs/versioning.md", fix1["prompt"])
-        self.assertIn('Clause: "bump VERSION and src/pkg/__init__.py in the same commit"', fix1["prompt"])
-        self.assertIn("VERSIONING-BODY", fix1["prompt"])
-        self.assertIn(f"Source: {self.start}:docs/versioning.md", fix1["prompt"])
-        self.assertIn("Selected because: cited by blocking item 1", fix1["prompt"])
-        # The developer session already holds it: the next round cites it again without resending the body.
-        self.assertIn("Guidance: docs/versioning.md", fix2["prompt"])
-        self.assertNotIn("VERSIONING-BODY", fix2["prompt"])
-
     async def test_resumed_review_retry_keeps_the_pinned_commit(self):
         self.set_plan(sde=[dev(VERSION_BUMP)], reviewer=[{"error": "reviewer crashed"}, PASS])
         executor = self.sde()
@@ -380,18 +364,44 @@ class TestDevelopmentAndBuiltInReview(_Harness):
         self.assertIn(f"Source: {self.start}:docs/versioning.md", last)
 
     async def test_a_later_task_on_the_same_work_key_reuses_the_recorded_commit(self):
-        self.set_plan(sde=[dev(VERSION_BUMP, commit="bump")], reviewer=[PASS])
-        await self.run_sde(review=False, activities=["versioning"])
+        executor = self.sde(review=False)
+        first_events = [event(self.payload(activities=["versioning"]))]
+        await executor._new_state(first_events, first_events, None)
         (self.repo / "docs/versioning.md").write_text("LATER-VERSIONING\n")
         git(self.repo, "commit", "-qam", "later guidance")
-        self.set_plan(sde=[dev()])
-        await self.run_sde(review=False, activities=["release"])
-        second = self.calls("sde")[-1]["prompt"]
+        next_events = [event(self.payload(activities=["release"]))]
+        state = await executor._new_state(next_events, next_events, None)
+        second = await executor._first_prompt(state, self.caps)
         self.assertIn("VERSIONING-BODY", second)
         self.assertNotIn("LATER-VERSIONING", second)
         record = self.tasks.get("task:1")
         assert record is not None
         self.assertEqual((record.guidance_commit, record.activities), (self.start, ("release",)))
+
+
+class TestCitedGuidance(ReviewFlowCase):
+    async def test_rework_round_resends_cited_guidance_once_with_its_clause(self):
+        repo = make_project(Path(self.enterContext(tempfile.TemporaryDirectory())))
+        pin = pin_head(repo, origin="task start")
+        self.state.workdir = str(repo)
+        self.state.project = {**pin.to_dict(), "tags": ["tests"]}
+        self.executor._delivery = None
+        self.caps.memory.load_baseline.return_value = {}
+        first = await self.executor._first_prompt(self.state, self.caps)
+        outcome = await self.run_flow(snapshots=["changed", "fix1", "fix2"],
+                                      diffs={("changed", "fix1"): ("", []), ("fix1", "fix2"): ("bump", list(VERSION_BUMP))},
+                                      reviews=[CITES_VERSIONING, CITES_VERSIONING, PASS], deliveries=[DONE], prompt=first)
+        self.assertIn("review=pass after 3 round(s)", outcome.messages[0])
+        first, fix1, fix2 = (c.args[3] for c in self.develop.await_args_list)
+        self.assertEqual(bodies(first), {"TESTING-BODY"})
+        self.assertIn("Guidance: docs/versioning.md", fix1)
+        self.assertIn('Clause: "bump VERSION and src/pkg/__init__.py in the same commit"', fix1)
+        self.assertIn("VERSIONING-BODY", fix1)
+        self.assertIn(f"Source: {pin.commit}:docs/versioning.md", fix1)
+        self.assertIn("Selected because: cited by blocking item 1", fix1)
+        # The developer session already holds it: the next round cites it again without resending the body.
+        self.assertIn("Guidance: docs/versioning.md", fix2)
+        self.assertNotIn("VERSIONING-BODY", fix2)
 
 
 class TestIndependentReview(_Harness):
