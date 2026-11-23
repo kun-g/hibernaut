@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from agent_runtime.adapters.executor_cli.claude_code import child_env
 from agent_runtime.adapters.executor_cli.role_skills import builtin_skill
 from agent_runtime.app.config import HibernautConfig, config_changes, load_config, parse_config
 from agent_runtime.app.projects import build_routing_manifest
@@ -127,7 +128,9 @@ class AgentsTableTests(unittest.TestCase):
             ({"role": "boss", "executor": "claude-code"}, "agents.x: unsupported role 'boss'"),
             ({"role": "sde", "executor": "grok"}, "agents.x: role 'sde' needs a Claude Code executor"),
             ({"executor": "grok", "model": "opus"}, "agents.x: model not supported"),
-            ({"role": "sde", "executor": "claude-code", "model": "gpt-5"}, "agents.x: model 'gpt-5'"),
+            ({"role": "sde", "executor": "claude-code", "model": " "}, "agents.x: model must be a non-empty string"),
+            ({"role": "sde", "executor": "claude-code", "max_concurrency": 1}, "agents.x: max_concurrency not supported"),
+            ({"executor": "grok", "max_concurrency": 1}, "agents.x: max_concurrency not supported"),
             ({"role": "sde", "executor": "claude-code", "launcher": "sg"}, "agents.x: launcher not supported"),
             ({"role": "steward", "executor": "claude-code", "review": True}, "agents.x: review not supported"),
             ({"role": "steward", "executor": "claude-code", "checkout_access": "write"}, "agents.x: checkout_access"),
@@ -139,6 +142,25 @@ class AgentsTableTests(unittest.TestCase):
         for item, message in cases:
             with self.subTest(item=item), self.assertRaisesRegex(ValueError, message.replace("(", r"\(")):
                 parse(lambda raw, item=item: raw["agents"].update(x=item))
+
+    def test_an_agent_runs_any_model_through_its_executors_gateway(self) -> None:
+        def change(raw: dict[str, Any]) -> None:
+            raw["executors"]["gateway"] = {
+                "billing": "subscription",
+                "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:3425", "ANTHROPIC_AUTH_TOKEN": "t"},
+            }
+            for role in ("sde", "code-reviewer", "steward"):
+                raw["agents"][f"gw-{role}"] = {"role": role, "executor": "gateway", "model": "codex/gpt-6.2"}
+
+        roles = parse(change).roles
+        for role in ("sde", "code-reviewer", "steward"):
+            with self.subTest(role=role):
+                profile = roles[f"gw-{role}"].profile
+                env = child_env(profile, {"ANTHROPIC_BASE_URL": "http://inherited", "ANTHROPIC_API_KEY": "inherited"})
+                self.assertEqual(profile.model, "codex/gpt-6.2")
+                self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:3425")
+                self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "t")
+                self.assertNotIn("ANTHROPIC_API_KEY", env)
 
     def test_an_agent_cannot_take_the_name_of_another_executor(self) -> None:
         with self.assertRaisesRegex(ValueError, "agents.grok"):

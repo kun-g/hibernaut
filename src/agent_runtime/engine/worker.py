@@ -20,6 +20,7 @@ from agent_runtime.core.models import (
     FailureRoute,
     ForwardSpec,
     HeldReturn,
+    InboxBinding,
     InboxRoute,
     NewEventPolicy,
     OpenRun,
@@ -127,6 +128,8 @@ class ExecutorFailed(RuntimeError):
         super().__init__(*args)
         # The run ledger's classification of the last failed attempt; None without a ledger.
         self.route = route
+        # True once the failed batch is marked failed; otherwise it is still pending and would fail again at once.
+        self.batch_settled = False
 
 
 class _RunInterrupted(Exception):
@@ -246,6 +249,16 @@ def _emit_task_fields(link: TaskLink, emit: Emit) -> dict[str, Any]:
         # Still in progress until the PR is merged; the issue or PR closing (work.closed) marks it done.
         return _task_fields(link, "update_stage", "waiting_pr_merge")
     return _task_fields(link, "complete")
+
+
+def _routed_agent(
+    event: Event, named: str | None, session: SessionRef | None, binding: InboxBinding | None,
+    project_default: str | None, global_default: str,
+) -> str:
+    return resolve_agent_id(
+        named, session, binding, project_default, global_default,
+        source=event.source, event_type=event_type(event), tags=event_tags(event),
+    )
 
 
 def _end_kind(outcome: RunOutcome) -> RunEndKind:
@@ -799,6 +812,33 @@ class AgentWorker:
     def _route(self, inbox_id: str) -> InboxRoute | None:
         return self._routes(inbox_id) if self._routes is not None else None
 
+    @classmethod
+    def expected_executor_id(
+        cls,
+        event: Event,
+        sessions: SessionStorePort,
+        *,
+        binding: InboxBinding | None = None,
+        project_default: str | None,
+        global_default: str | None,
+    ) -> str | None:
+        # The agent _select_executor picks for this event's batch, known before it is claimed; None when the event
+        # runs no agent (a close request, a cancelled return, a held result, a refused agent) or none can be told.
+        if event.source == RETURN_CANCELLED_SOURCE or cls._is_close_session_batch([event]):
+            return None
+        event = own_task(event, sessions)
+        session = cls._session_for(event, sessions)
+        if session is not None and session.forward is not None and session.forward.held is not None:
+            return None
+        if cls._resumes_suspended([event], session):
+            return cls._suspended_holder([event], session)
+        try:
+            return _routed_agent(
+                event, event_agent_id(event), session, binding, project_default, global_default or ""
+            ) or None
+        except AgentNotAllowed:
+            return None
+
     def _select_executor(
         self,
         inbox_id: str,
@@ -832,15 +872,9 @@ class AgentWorker:
         self, inbox_id: str, event: Event, named: str | None, session_ref: SessionRef | None
     ) -> str:
         route = self._route(inbox_id)
-        return resolve_agent_id(
-            named,
-            session_ref,
-            route.binding if route is not None else None,
-            self._project_default_executor,
-            self._global_default_executor,
-            source=event.source,
-            event_type=event_type(event),
-            tags=event_tags(event),
+        return _routed_agent(
+            event, named, session_ref, route.binding if route is not None else None,
+            self._project_default_executor, self._global_default_executor,
         )
 
     def _refuse_batch(
@@ -1240,6 +1274,7 @@ class AgentWorker:
             ledger_error = exc
             all_failed_ids = batch_ids + [e.event_id for e in folded_events]
             self._inbox.mark_failed(all_failed_ids, str(exc.__cause__ or exc))
+            exc.batch_settled = True
             _drop_registration()
             failed_spec = run_spec(batch + folded_events, active_session)
             failed_metadata = self._report_metadata(
@@ -1638,12 +1673,13 @@ class AgentWorker:
             evt.payload.get("approval_request_id") == session_ref.pending_request_id for evt in batch
         )
 
+    @classmethod
     def _suspended_holder(
-        self,
+        cls,
         batch: list[Event],
         session_ref: SessionRef | None,
     ) -> str | None:
-        if not self._resumes_suspended(batch, session_ref):
+        if not cls._resumes_suspended(batch, session_ref):
             return None
         assert session_ref is not None
         if session_ref.executor_id:
@@ -1699,16 +1735,20 @@ class AgentWorker:
         )
 
     def _resolve_session(self, event: Event) -> SessionRef | None:
+        return self._session_for(event, self._sessions)
+
+    @staticmethod
+    def _session_for(event: Event, sessions: SessionStorePort) -> SessionRef | None:
         # 4-level priority: approval_request_id -> explicit session_id -> (inbox_id, correlation_key) -> new.
         request_id = event.payload.get("approval_request_id")
         if isinstance(request_id, str) and request_id:
-            suspended = self._sessions.find_by_request_id(request_id)
+            suspended = sessions.find_by_request_id(request_id)
             if suspended is not None:
                 return suspended
         if event.session_id:
-            return self._sessions.get(event.session_id)
+            return sessions.get(event.session_id)
         if event.correlation_key:
-            return self._sessions.find_by_correlation_key(event.inbox_id, event.correlation_key)
+            return sessions.find_by_correlation_key(event.inbox_id, event.correlation_key)
         return None
 
     async def _execute_with_retry(

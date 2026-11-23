@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,7 +18,6 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 DEFAULT_LAUNCHER = "claude"
 # Stands in for the key the external credential proxy injects; the real key never reaches the harness.
 PROXY_PLACEHOLDER_KEY = "hibernaut-credential-proxy"
-_CLAUDE_MODEL_RE = re.compile(r"(claude-[a-z0-9][a-z0-9.-]*(\[1m\])?|opus|sonnet|haiku|fable)")
 # Any of these makes Claude Code bill an API key or a cloud provider instead of the subscription.
 _PAID_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
@@ -28,10 +26,9 @@ _PAID_ENV_KEYS = (
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
 )
-# Billing alone decides the account and endpoint: a daemon-wide token or base URL would override the
-# launcher's own login, or send the subscription token to a gateway the operator did not pick for it.
+# Never inherited: a daemon-wide token or base URL would override the launcher's own login, or send the
+# subscription token to a gateway the operator did not pick for it. The deployment file may set them explicitly.
 _ROUTING_ENV_KEYS = (*_PAID_ENV_KEYS, "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN")
-_CREDENTIAL_ENV_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD)", re.IGNORECASE)
 _STREAM_LIMIT = 16 * 1024 * 1024
 PROFILE_KEYS = frozenset({"harness", "launcher", "billing", "model", "effort", "timeout_seconds", "env", "skills"})
 
@@ -42,15 +39,6 @@ def _empty_env() -> dict[str, str]:
 
 def _no_skills() -> tuple[Path, ...]:
     return ()
-
-
-def _check_env(where: str, env: Mapping[str, str]) -> None:
-    for key in env:
-        if key in _ROUTING_ENV_KEYS or _CREDENTIAL_ENV_RE.search(key):
-            raise ValueError(
-                f"{where}: env.{key} looks like a credential or billing switch; credentials stay in the "
-                "launcher or the credential proxy and never in hibernaut.toml"
-            )
 
 
 def _str_env(where: str, raw: object) -> dict[str, str]:
@@ -74,7 +62,6 @@ class ClaudeCodeLauncher:
             raise ValueError(f"{where}: unsupported harness '{self.harness}' (supported: {', '.join(HARNESSES)})")
         if not self.command.strip():
             raise ValueError(f"{where}: command must not be empty")
-        _check_env(where, self.env)
 
 
 BUILTIN_LAUNCHERS: dict[str, ClaudeCodeLauncher] = {
@@ -115,11 +102,19 @@ class ClaudeCodeProfile:
             raise ValueError(f"{where}: billing 'api' needs [credential_proxy] url; real keys never reach the harness")
         if self.effort not in EFFORTS:
             raise ValueError(f"{where}: unsupported effort '{self.effort}' (supported: {', '.join(EFFORTS)})")
-        if not _CLAUDE_MODEL_RE.fullmatch(self.model):
-            raise ValueError(f"{where}: model '{self.model}' is not a Claude model, which harness '{self.harness}' requires")
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ValueError(f"{where}: model must be a non-empty string")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError(f"{where}: timeout_seconds must be finite and positive")
-        _check_env(where, self.env)
+        if self.billing == "api":
+            # The init check cannot see a second token or a cloud switch beside the proxy's placeholder key.
+            for source, env in ((f"launchers.{self.launcher.name}", self.launcher.env), (where, self.env)):
+                for key in _ROUTING_ENV_KEYS:
+                    if key in env:
+                        raise ValueError(
+                            f"{where}: billing 'api' sends every request through [credential_proxy] and conflicts "
+                            f"with {source}.env.{key}; remove it or set billing = \"subscription\""
+                        )
 
 
 # Keys a pure [executors.<id>] (no role, no command) may set; an agent picks its own model, effort and skills.
@@ -173,7 +168,7 @@ def parse_profile(
         harness=str(item.get("harness", defaults.harness)),
         launcher=launcher,
         billing=str(item.get("billing", defaults.billing)),
-        model=str(item.get("model", defaults.model)),
+        model=item.get("model", defaults.model),
         effort=str(item.get("effort", defaults.effort)),
         timeout_seconds=float(item.get("timeout_seconds", defaults.timeout_seconds)),
         env=_str_env(where, item.get("env", {})),
@@ -192,9 +187,13 @@ def role_system_prompt(profile: ClaudeCodeProfile, *, role: str, contract: str) 
     return f"{contract}\n\n{body}"
 
 
+def configured_env(profile: ClaudeCodeProfile) -> dict[str, str]:
+    return {**profile.launcher.env, **profile.env}
+
+
 def env_overrides(profile: ClaudeCodeProfile) -> tuple[tuple[str, ...], dict[str, str]]:
-    # (keys to remove, values to set) on top of whatever environment starts the launcher.
-    values = {**profile.launcher.env, **profile.env}
+    # (keys to remove, then values to set) on top of whatever environment starts the launcher.
+    values = configured_env(profile)
     if profile.billing == "api":
         values["ANTHROPIC_BASE_URL"] = profile.credential_proxy_url
         values["ANTHROPIC_API_KEY"] = PROXY_PLACEHOLDER_KEY
@@ -336,10 +335,12 @@ async def _read_stream(
 def check_init(profile: ClaudeCodeProfile, init: Mapping[str, Any]) -> None:
     source = str(init.get("apiKeySource", ""))
     launcher = profile.launcher.name
-    if profile.billing == "subscription" and source != "none":
+    # Claude Code names the variable it authenticates with; one the deployment file sets is the operator's choice.
+    if profile.billing == "subscription" and source != "none" and not configured_env(profile).get(source):
         raise ClaudeCodeError(
             f"billing is 'subscription' but Claude Code (launcher '{launcher}') would authenticate with "
-            f"'{source}'; stopped at session start. Remove that credential source or set billing = \"api\""
+            f"'{source}', which the launcher and executor env do not set; stopped at session start. Remove that "
+            "credential source, set it in the executor's env or set billing = \"api\""
         )
     if profile.billing == "api" and source != "ANTHROPIC_API_KEY":
         raise ClaudeCodeError(

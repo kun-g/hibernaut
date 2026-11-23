@@ -151,6 +151,7 @@ class IngestionService:
                     result.task,
                     trace_id=trace_id or new_trace_id(),
                     hop_count=hop_count,
+                    replay=True,
                 )
                 if dispatched is not None:
                     return dispatched
@@ -581,7 +582,9 @@ class IngestionService:
         # downstream work undispatched; repeating the same terminal transition finishes it.
         self._safe_audit("terminal_fanout_replayed", task_id=task.task_id, detail={"status": task.status})
         if task.status == "done":
-            self._dispatcher.on_task_completed(task.task_id, trace_id=trace_id, hop_count=hop_count)
+            self._dispatcher.on_task_completed(
+                task.task_id, trace_id=trace_id, hop_count=hop_count, replay=True
+            )
         elif task.status == "cancelled":
             self._dispatcher.on_task_cancelled(task.task_id, trace_id=trace_id, hop_count=hop_count)
 

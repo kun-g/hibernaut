@@ -4,6 +4,9 @@
 [runtime]
 db_path = "./hibernaut.db"
 memory_root = "./agent_memory"
+# 分级并发上限，单位是同时在跑的 Inbox 数，三级同时满足才派发：这里是全局上限；[executors.<id>]（按执行器合计引用它的各 agent）与 [projects.<name>] 各可再写
+# 可选的 max_concurrency（整数，>= 1；不写 = 只受上层限制；大于全局值时以全局为准并记一条 WARNING）。
+# 某一级满额只让受它限制的 Inbox 排队（先到先跑），后面配额有余的 Inbox 照常派发。
 max_concurrency = 4
 new_event_policy = "defer"   # defer | fold | interrupt
 default_agent = "claude"         # [agents.<id>]，或旧写法里作为 agent 的 [executors.<id>]。旧键 default_executor 仍可读
@@ -41,7 +44,8 @@ timeout_seconds = 300.0
 # ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
 
 # Claude Code 启动器：只能在本部署文件里声明，事件无法指定。内置 claude（command = "claude"）。
-# 启动器自管配置目录、账号、网关或代理，并原样转交模型、effort 与角色参数。env 不得包含凭据或计费开关。
+# 启动器自管配置目录、账号、网关或代理，并原样转交模型、effort 与角色参数。
+# env 原样传给 Claude Code，写什么网关、token 由运营者决定；daemon 自身环境里的付费凭据与路由变量先剥离，再叠加启动器、执行器的 env。
 # [launchers.claude-sg]
 # harness = "claude-code"
 # command = "claude-sg"         # 部署机 PATH 上的命令名或绝对路径
@@ -49,6 +53,8 @@ timeout_seconds = 300.0
 # HTTPS_PROXY = "http://127.0.0.1:7890"
 
 # billing = "api" 必填：付费调用全部发往外置凭据代理，harness 只拿到占位 key，真实 key 由代理注入。
+# 此时启动器或执行器 env 里再写 ANTHROPIC_BASE_URL、ANTHROPIC_API_KEY、ANTHROPIC_AUTH_TOKEN、CLAUDE_CODE_OAUTH_TOKEN
+# 或 CLAUDE_CODE_USE_* 云厂商开关，会按配置冲突报错。
 # [credential_proxy]
 # url = "http://127.0.0.1:9000"   # Claude Code 请求 <url>/proxy/<anthropic_service>/v1/messages
 # anthropic_service = "anthropic"
@@ -58,8 +64,9 @@ timeout_seconds = 300.0
 [executors.claude-code]
 harness = "claude-code"         # 目前仅支持 claude-code
 launcher = "claude"             # [launchers.<name>] 之一
-billing = "subscription"        # subscription（用启动器自己的登录，剥离付费凭据，发现付费来源即中止）| api（经 [credential_proxy]）
+billing = "subscription"        # subscription（用启动器自己的登录，剥离继承来的付费凭据，发现 env 没写明的付费来源即中止）| api（经 [credential_proxy]）
 timeout_seconds = 1800.0        # 交互模式下含等人回答的时间
+# max_concurrency = 2           # 可选：同时跑这个执行器的 Inbox 上限，跨项目、跨引用它的 agent 合计；普通 CLI 执行器同样可写。SDE 内置评审算在 SDE 那次 Run 的名额里
 # model / effort 也可写在这里作默认值，agent 里写的优先
 
 # 独立评审 agent：派单时设 payload.agent_id = "code-reviewer"（旧键 executor_id 仍可用）。只读评审，返回 pass / changes_requested。
@@ -68,13 +75,26 @@ timeout_seconds = 1800.0        # 交互模式下含等人回答的时间
 role = "code-reviewer"
 executor = "claude-code"
 description = "只读评审实际 diff 与测试证据，给出 pass / changes_requested"   # 可选：写进 Steward 的路由清单
-model = "claude-opus-5-5"       # Claude 模型全名或别名 opus / sonnet / haiku / fable
+model = "claude-opus-5-5"       # 任意非空字符串，原样经 --model 传给 harness：Claude 模型全名、别名 opus / sonnet / haiku / fable，或网关认识的模型名
 effort = "high"                 # low | medium | high | xhigh | max
 interactive = true              # 需要人可接入的交互会话，由项目的 terminal_backend 打开；缺后端则报告原因、不改走后台。false 走非交互。旧名 visible 仍可读，不可与 interactive 同写
 # 可选：本角色的有序 Skill（本地 SKILL.md 或含该文件的目录；相对路径以本文件所在目录为准，可用 ~）。
 # 省略时用安装包内置的 "builtin:code-reviewer"；写了则只用所列各项，可把 "builtin:code-reviewer" 列进去再追加。
 # 正文与资源目录经 --append-system-prompt 传给评审者；只读权限、结论 schema 与契约由程序控制，Skill 改不了。
 # skills = ["builtin:code-reviewer", "./skills/team-review"]
+
+# 经本机模型网关跑非 Claude 模型：执行器的 env 写网关地址与 token，billing 仍用 subscription（不经 [credential_proxy]）。SDE 与 Steward 同样可用。
+[executors.model-gateway]
+harness = "claude-code"
+billing = "subscription"
+[executors.model-gateway.env]
+ANTHROPIC_BASE_URL = "http://127.0.0.1:3425"
+ANTHROPIC_AUTH_TOKEN = "magpie"   # 网关占位 token，真凭据在网关里
+
+[agents.gpt-reviewer]
+role = "code-reviewer"
+executor = "model-gateway"
+model = "codex/gpt-6.2-astra"
 
 # SDE agent：派单时设 payload.agent_id = "sde"。在任务 worktree 内按测试先行开发，交付实现、红绿测试证据与仓库检查结果。
 # executor / model / effort 与评审者各自独立配置；review 为运行时开关，保存后下一次执行即使用新值。
@@ -153,6 +173,8 @@ orca_create_terminal = false    # agent launch opens its own terminal
 handoff = "mcp"              # mcp | peer；Claude Code 角色会话取任务、交结果的方式。peer 需要下面 [peer] 的接收端常驻（hb 启动时检查，不在则启动失败）
 # 可选：项目级默认 agent（未设置时回退到 runtime.default_agent）。旧键 executor 仍可读
 default_agent = "steward"
+# 可选：本项目同时在跑的 Inbox 上限（见 [runtime] max_concurrency）
+# max_concurrency = 2
 
 # 可选：Inbox 与 agent 的绑定（M:N）。第一个整串匹配 inbox_id 的绑定生效，选 agent 的顺序：
 #   ① payload.agent_id（旧键 executor_id），须在该绑定的 agents 里，否则明确拒绝、不回退  ② 会话已绑定的 agent
@@ -173,7 +195,6 @@ rules = [
 pattern = "proj:hibernaut:sde(:.*)?"
 default_agent = "sde"
 agents = ["sde", "code-reviewer"]
-
 
 # 可选：SDE 任务的交付步骤（由 Hibernaut 执行，SDE 只在任务分支本地提交）。不写本节则任务以本地提交结束。
 # 授权只来自本部署文件，被改动的仓库改不了；开 PR 与合并分开授权，权限门禁分别是 delivery.open_pr 与 delivery.merge。

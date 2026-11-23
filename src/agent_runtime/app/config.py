@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 import math
 import re
 import sys
@@ -41,6 +42,8 @@ from agent_runtime.app.projects import (
     validate_project_rules,
 )
 from agent_runtime.core.models import InboxRoute, NewEventPolicy
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +101,8 @@ class ProjectConfig:
     inbox_bindings: tuple[ProjectBinding, ...] = ()
     # Every declared agent, for the routing manifest.
     agents: tuple[AgentConfig, ...] = ()
+    # Inboxes of this project running at once; None leaves only runtime.max_concurrency.
+    max_concurrency: int | None = None
 
     def route(self, inbox_id: str) -> InboxRoute:
         bound = next((b.binding for b in self.inbox_bindings if b.rule.matches(inbox_id)), None)
@@ -122,8 +127,10 @@ class ProjectConfig:
 ROLES = (CODE_REVIEWER_ROLE, SDE_ROLE, STEWARD_ROLE)
 # Before code-reviewer the review role and its usual executor were both named coder-reviewer.
 _LEGACY_REVIEWER = "coder-reviewer"
-# Deployment mode shared by every role executor; visible is the old name of interactive.
+# Deployment mode shared by every role, as an executor or an agent; visible is the old name of interactive.
 ROLE_DEPLOYMENT_KEYS = frozenset({"interactive", "visible"})
+# A limit belongs to the [executors.<id>] table, whichever agents run on it; an [agents.<id>] cannot set one.
+EXECUTOR_LIMIT_KEYS = frozenset({"max_concurrency"})
 READONLY_CHECKOUT = "readonly"
 
 
@@ -137,6 +144,16 @@ class RoleConfig:
     interactive: bool = True
     # "readonly": the role works in the main checkout, writes nothing there and never gets a worktree.
     checkout_access: str = ""
+    max_concurrency: int | None = None
+
+
+def _max_concurrency(where: str, item: Mapping[str, Any]) -> int | None:
+    value = item.get("max_concurrency")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{where}.max_concurrency must be a positive integer, got {value!r}")
+    return value
 
 
 def _role_options(role: str) -> frozenset[str]:
@@ -165,9 +182,11 @@ def _parse_role(
             raise ValueError(f"executors.{name}: checkout_access must be \"{READONLY_CHECKOUT}\" for role '{role}'")
         if _interactive(name, {"interactive": False, **item} if "visible" not in item else item):
             raise ValueError(f"executors.{name}: interactive is not supported for role '{role}'; leave it out")
-        return RoleConfig(role=role, profile=profile, interactive=False, checkout_access=access)
+        return RoleConfig(role=role, profile=profile, interactive=False, checkout_access=access,
+                          max_concurrency=_max_concurrency(f"executors.{name}", item))
     return RoleConfig(role=role, profile=profile, sde=_sde_options(name, item) if role == SDE_ROLE else None,
-                      interactive=_interactive(name, item))
+                      interactive=_interactive(name, item),
+                      max_concurrency=_max_concurrency(f"executors.{name}", item))
 
 
 _AGENT_KEYS = frozenset({"role", "executor", "description"})
@@ -193,7 +212,9 @@ def _parse_agent(
         unknown = sorted(set(item) - _AGENT_KEYS)
         if unknown:
             raise ValueError(f"executors.{name}: {', '.join(unknown)} not supported on CLI executor '{driver}'")
-        return dataclasses.replace(templates[driver], name=name)
+        template = templates[driver]
+        return dataclasses.replace(template, name=name,
+                                   max_concurrency=template.max_concurrency if name == driver else None)
     if driver not in bases:
         raise ValueError(f"executors.{name}: executor '{driver}' is not declared as a role-less [executors.{driver}] "
                          f"(declared: {', '.join(sorted({*bases, *templates})) or 'none'})")
@@ -328,6 +349,8 @@ class HibernautConfig:
     roles: dict[str, RoleConfig] = field(default_factory=dict)
     # Every agent an inbox can run: [agents], plus [executors] that carry a role or a command (the old form).
     agents: dict[str, AgentConfig] = field(default_factory=dict)
+    # max_concurrency of the [executors.<id>] that are neither, and only run through agents.
+    driver_limits: dict[str, int] = field(default_factory=dict)
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     gdrive: GDriveConfig = field(default_factory=GDriveConfig)
     switchboard: SwitchboardLinkConfig = field(default_factory=SwitchboardLinkConfig)
@@ -561,18 +584,23 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
     roles: dict[str, RoleConfig] = {}
     # Pure drivers: no role and no command, so nothing to run until an agent picks them.
     bases: dict[str, dict[str, Any]] = {}
+    base_limits: dict[str, int] = {}
     for name, item in raw.get("executors", {}).items():
         if item.get("role") is not None:
             roles[str(name)] = _parse_role(str(name), item, launchers=launchers, anthropic_url=anthropic_url,
-                                           base_dir=base_dir)
+                                           base_dir=base_dir, extra_keys=EXECUTOR_LIMIT_KEYS)
             continue
         if "command" not in item:
-            unknown = sorted(set(item) - EXECUTOR_KEYS)
+            unknown = sorted(set(item) - EXECUTOR_KEYS - EXECUTOR_LIMIT_KEYS)
             if unknown:
                 raise ValueError(f"executors.{name}: {', '.join(unknown)} not supported without a role or a command")
-            parse_profile(str(name), item, role=CODE_REVIEWER_ROLE, launchers=launchers,
+            profile_item = {k: v for k, v in item.items() if k not in EXECUTOR_LIMIT_KEYS}
+            parse_profile(str(name), profile_item, role=CODE_REVIEWER_ROLE, launchers=launchers,
                           credential_proxy_url=anthropic_url, base_dir=base_dir)
-            bases[str(name)] = dict(item)
+            bases[str(name)] = profile_item
+            base_limit = _max_concurrency(f"executors.{name}", item)
+            if base_limit is not None:
+                base_limits[str(name)] = base_limit
             continue
         env_raw = item.get("env", {})
         resume_raw = item.get("resume_args")
@@ -598,6 +626,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             timeout_seconds=timeout,
             orca_agent=orca_agent,
             terminal=cli_terminal,
+            max_concurrency=_max_concurrency(f"executors.{name}", item),
         )
 
     agents: dict[str, AgentConfig] = {
@@ -684,9 +713,21 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             inbox_bindings=parse_inbox_bindings(str(name), item.get("inbox_bindings"), inbox_rules=rules,
                                                 declared=agents.keys()),
             agents=tuple(agents.values()),
+            max_concurrency=_max_concurrency(f"projects.{name}", item),
         )
     validate_project_rules(projects.values())
     validate_project_bindings(projects.values())
+
+    for where, limit in (
+        *((f"executors.{n}", e.max_concurrency) for n, e in {**executors, **roles}.items()),
+        *((f"executors.{n}", value) for n, value in base_limits.items()),
+        *((f"projects.{n}", p.max_concurrency) for n, p in projects.items()),
+    ):
+        if limit is not None and limit > runtime.max_concurrency:
+            _log.warning(
+                "%s.max_concurrency = %d is above runtime.max_concurrency = %d, which caps it",
+                where, limit, runtime.max_concurrency,
+            )
 
     gd_raw = raw.get("gdrive", {})
     gd_interval = float(gd_raw.get("poll_interval_seconds", 30.0))
@@ -743,6 +784,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         credential_proxy=credential_proxy,
         roles=roles,
         agents=agents,
+        driver_limits=base_limits,
         projects=projects,
         gdrive=gdrive,
         switchboard=parse_switchboard_link(raw.get("switchboard"), base_dir=base_dir),
