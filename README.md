@@ -13,7 +13,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 多 Agent 选路 | Agent（角色、Skill、模型、权限边界）与底层执行器（claude / cursor-agent / grok / dsh 等 CLI、Claude Code 启动器）分开配置；Inbox 与 Agent 多对多绑定，按事件指定、会话、Inbox 规则、Inbox 默认、项目与全局默认五级选择；事件指定的 Agent 不在 Inbox 白名单里就明确拒绝 |
 | Steward 与转投 | 项目前台 `steward`：在主检出里只读运行，自己答复或用 `forward_to_inbox` 转投给别的 Agent（同项目、最多主动转投 3 次、回投不计、逐次过权限门禁）；单步活由接手的 Agent 直接回复来源，多步活的结果回投给 Steward 汇总 |
 | SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `agent_id = "sde"`（Drive 任务 frontmatter 写 `agent_id: sde`，旧键 `executor_id: sde` 仍可用），项目或 Inbox 也可设为默认 Agent；GitHub Issue 以 `# 标题` + 正文为需求、标题为 PR 标题 |
-| 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok，模板写 `terminal = "orca"` 可在 Orca 终端里旁观评审）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested`；SDE 内置评审第 1 轮通审，第 2 轮起只做增量复核：只有上一轮没修好的项和之后改动引入的新问题能打回，其余由程序降为跟进，交付时列在 PR 正文「跟进」小节和完成消息里 |
+| 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok，模板写 `terminal = "orca"` 可在 Orca 终端里旁观评审，命令结束、结果读回后立即关闭该终端，且不让 Orca 登记并续接这次会话，评审记录留终端句柄与 CLI 会话 ID）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested`；SDE 内置评审第 1 轮通审，第 2 轮起只做增量复核：只有上一轮没修好的项和之后改动引入的新问题能打回，其余由程序降为跟进，交付时列在 PR 正文「跟进」小节和完成消息里 |
 | PR 交付 | SDE 完成后由 Hibernaut 合入主干、按改动类型定版本号、跑检查、推分支、开 PR，可选在评审通过且 CI 绿后自动合并；合入主干冲突（版本号以外）或合入后检查失败时交回同一开发会话解决，已通过评审且只解了冲突的（逐块核对解法只由两侧内容组成）直接重跑检查续交付，另有改动的只评审开发者自己的增量（不含主干带进来的改动），超过次数上限才挂起等人；合并后删除源分支并结案；与任务来源无关 |
 | 可见终端 | 运行在 Orca 终端里打开，人可以旁观、回答提问，后续事件回到同一对话；项目设 `handoff = "peer"` 时任务、返工与结果经 ccpeer 消息往来，结果落在 launchd 常驻接收端的收件箱，hb 重启不丢 |
 | 工作区管理 | 按任务自动建 `hb-*` worktree、复用，证据齐全（PR 已合并、无未提交改动等）后才回收；交付合并 PR 后自动关闭会话并回收 worktree 和本地分支；当时被排队事件或在线会话挡住的，由后台清扫（启动时一轮，之后默认每 5 分钟，`[runtime] worktree_sweep_interval_seconds`）在其结束后回收；目录已被人手或 Orca 删掉的记录，在没有排队事件、未结束的 Run 等占用时清除，并关闭引用它的会话、发一条告警 |

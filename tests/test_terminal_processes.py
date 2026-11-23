@@ -29,6 +29,16 @@ from tests.test_visible_roles import FakeOrcaTerminals
 # that never reaches them, so the wrapper scripts end them on their own.
 
 
+# What Orca sets in a terminal for agent hooks to report the session; a one-shot run must not have any of it.
+ORCA_SESSION_ENV = {name: f"value of {name}" for name in (
+    "ORCA_AGENT_HOOK_ENDPOINT", "ORCA_AGENT_HOOK_ENV", "ORCA_AGENT_HOOK_PORT", "ORCA_AGENT_HOOK_TOKEN",
+    "ORCA_AGENT_HOOK_TRANSPORT", "ORCA_AGENT_HOOK_VERSION", "ORCA_AGENT_LAUNCH", "ORCA_AGENT_LAUNCH_TOKEN",
+    "ORCA_AGENT_PANE", "ORCA_PANE_KEY", "ORCA_TAB_ID",
+)}
+OTHER_ENV = {"ORCA_WORKTREE_ID": "wt-1", "ORCA_TERMINAL_HANDLE": "term_1", "ORCA_TAB_ID_OF_OTHERS": "t",
+             "ORCA_PANE_KEYS": "k", "MY_ORCA_PANE_KEY": "mine", "REVIEW_MARK": "kept"}
+
+
 def alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -96,11 +106,31 @@ class TestCLITerminalProcesses(Case):
         run = await self.run_cli(["/bin/sh", "-c", f'echo verdict; sleep 60 & echo $! > "{self.pids}"'])
         self.assertEqual((run.exit_code, run.stdout), (0, b"verdict\n"))
         handle, wrapper = self.wrapper()
-        self.assertEqual(await asyncio.wait_for(wrapper.wait(), 8), 0)
+        # The close can reach the wrapper after it wrote the result but before it exited.
+        self.assertIn(await asyncio.wait_for(wrapper.wait(), 8), (0, 128 + signal.SIGTERM))
         await self.all_gone(self.recorded())
-        self.assertNotIn("terminal close", self.orca.verbs())
-        # Delivery still closes it; a terminal that already ended counts as closed.
+        self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
+        # Delivery closes it once more; a terminal that already ended counts as closed.
         self.assertEqual(await close_terminals([handle], self.repo), f"closed {handle}")
+
+    async def test_the_cli_does_not_get_the_variables_orca_tracks_agent_sessions_by(self):
+        # With them the CLI's hooks report its session to Orca, which resumes it in a new tab once the run is over.
+        script = "import json, os; print(json.dumps(dict(os.environ)))"
+        with patch.dict(os.environ, {**ORCA_SESSION_ENV, **OTHER_ENV}):
+            run = await self.terminal.run(
+                title="t", workdir=self.repo, argv=[sys.executable, "-I", "-c", script],
+                env={"FROM_TEMPLATE": "yes", "ORCA_PANE_KEY": "from the template"}, timeout_seconds=20.0,
+                is_interrupted=lambda: False)
+            terminal_env = dict(os.environ)
+        env = json.loads(run.stdout)
+        self.assertEqual(set(ORCA_SESSION_ENV) & set(env), set())
+        self.assertEqual((env["FROM_TEMPLATE"], {k: env.get(k) for k in OTHER_ENV}), ("yes", OTHER_ENV))
+        # Everything else arrives as it was. Only names are compared in the message: the values are the machine's own,
+        # and the shell that starts the wrapper sets a few itself.
+        dropped = {k for k in terminal_env if k.startswith(("ORCA_AGENT_HOOK_", "ORCA_AGENT_LAUNCH"))}
+        self.assertEqual(sorted(k for k, v in terminal_env.items() if env.get(k) != v and k not in dropped
+                                and k not in ("ORCA_AGENT_PANE", "ORCA_PANE_KEY", "ORCA_TAB_ID")
+                                and k not in ("PWD", "OLDPWD", "SHLVL", "_")), [])
 
     async def test_closing_the_terminal_while_the_cli_runs_ends_the_cli_and_its_children(self):
         task = asyncio.create_task(self.run_cli(self.busy_cli()))
@@ -284,6 +314,16 @@ class TestGateProcesses(Case):
         self.assertEqual(await self.runner.release("s1", self.repo), f"closed {handle}")
         self.assertEqual(await asyncio.wait_for(gate.wait(), 8), 1)
         await self.all_gone(pids)
+
+    async def test_an_interactive_agent_keeps_the_variables_orca_tracks_it_by(self):
+        log = self.root / "calls.jsonl"
+        # --add-dir makes the fake agent record itself and exit with code 4.
+        _, gate = await self.start_gate(args=("--add-dir", str(self.repo), "--session-id", "s1"),
+                                        FAKE_CLAUDE_LOG=str(log), **ORCA_SESSION_ENV)
+        self.assertEqual(await asyncio.wait_for(gate.wait(), 8), 4)
+        interactive = json.loads(log.read_text().splitlines()[-1])
+        self.assertEqual(interactive["mode"], "interactive")
+        self.assertLessEqual(set(ORCA_SESSION_ENV), set(interactive["orca_env"]))
 
     async def test_an_agent_that_exits_ends_the_gate_with_its_code(self):
         # --add-dir makes the fake agent stop at a trust dialog and exit with code 4.

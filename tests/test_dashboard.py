@@ -158,6 +158,40 @@ def _seed_hb_db(db_path: Path, run_dir: Path, workdir: Path) -> None:
         ),
     )
     conn.execute(
+        "INSERT INTO event_inbox (event_id, inbox_id, source, external_id, occurred_at, payload_json, session_id, correlation_key, status, attempts, last_error) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "ev_2",
+            "proj:demo:sub",
+            "gdrive:task",
+            "gdrive:abc:2026-11-23T03:01:00Z",
+            "2026-11-23T03:01:00+00:00",
+            json.dumps({"title": "Deploy follow-up", "drive_file_name": "deploy.md"}),
+            None,
+            "gdrive:abc",
+            "pending",
+            0,
+            None,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO event_inbox (event_id, inbox_id, source, external_id, occurred_at, payload_json, session_id, correlation_key, status, attempts, last_error) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "ev_3",
+            "proj:demo",
+            "webhook",
+            "wh:new",
+            "2026-11-23T03:02:00+00:00",
+            json.dumps({"subject": "Brand new task"}),
+            None,
+            "new-corr-key",
+            "pending",
+            0,
+            None,
+        ),
+    )
+    conn.execute(
         "INSERT INTO sessions (session_id, inbox_id, checkpoint, pending_request_id, updated_at, correlation_key, executor_id, work_key, status) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
@@ -582,6 +616,20 @@ auto_ready_sources = ["github"]
         assert snap["tb"]["tasks_total"] == 1
         assert snap["sb"]["health"]["ok"] is True
         assert len(snap["sb"]["observed_events"]) == 1
+
+        # Verify event -> related_sessions linkage: populated only for processing events
+        ev_by_id = {e["event_id"]: e for e in snap["hb"]["events"]}
+        ev1_sessions = ev_by_id["ev_1"]["related_sessions"]
+        assert len(ev1_sessions) == 1
+        assert ev1_sessions[0]["session_id"] == "sess_run1"
+        assert ev1_sessions[0]["status"] == "active"
+        assert ev1_sessions[0]["match_by"] == "session_id"
+        assert ev1_sessions[0]["has_open_run"] is True
+        assert ev1_sessions[0]["open_run"]["branch"] == "hb/issue-1"
+
+        assert ev_by_id["ev_2"]["drive_file_name"] == "deploy.md"
+        assert ev_by_id["ev_2"]["related_sessions"] == []
+        assert ev_by_id["ev_3"]["related_sessions"] == []
 
         # Path traversal checks
         assert read_outbox_file(cfg, "../secret.md") is None
