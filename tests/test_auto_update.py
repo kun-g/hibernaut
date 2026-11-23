@@ -9,15 +9,29 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from agent_runtime import __version__
 from scripts import run_updating
+from switchboard.app import build_switchboard
+from switchboard.ports import RecordingAuditSink
+from switchboard.relay_hub import RelayHub
 from tests.process_cleanup import processes_under, stop_supervisor
+from tests.switchboard_support import (
+    MCP_TOKEN,
+    RELAY_TOKEN,
+    FakeHttpClient,
+    StaticCredentials,
+    make_config,
+    mcp_call,
+    tool_result,
+)
 
 SUPERVISOR = run_updating.ROOT / "scripts/run_updating.py"
 
@@ -116,8 +130,9 @@ class AutoUpdateTests(unittest.TestCase):
         self.git(cwd, "add", ".")
         self.git(cwd, "commit", "-qm", "fixture")
 
-    def start_supervisor(self) -> subprocess.Popen:
-        self.port = free_port()
+    def start_supervisor(self, daemon_args: list[str] | None = None, env: dict[str, str] | None = None,
+                         stderr: int | None = None) -> subprocess.Popen:
+        self.port = getattr(self, "port", None) or free_port()
         self.db = self.root / "events.db"
         self.log_path = self.root / "daemon.log"
         log = self.enterContext(self.log_path.open("w"))
@@ -129,11 +144,11 @@ class AutoUpdateTests(unittest.TestCase):
                 str(self.checkout / "scripts/run_updating.py"),
                 "--interval", "0.1",
                 "--outbox-interval", "0.02",
-                "--port", str(self.port),
-                "--db", str(self.db),
+                *(daemon_args if daemon_args is not None else ["--port", str(self.port), "--db", str(self.db)]),
             ],
-            stdout=log,
-            cwd=self.checkout, env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"},
+            stdout=log, stderr=stderr,
+            cwd=self.checkout,
+            env={**os.environ, **(env or {}), "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"},
         )
         self.addCleanup(stop_supervisor, proc, self.root, self.stop_grace)
         return proc
@@ -190,6 +205,139 @@ class AutoUpdateTests(unittest.TestCase):
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "HEAD"))
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             self.assertTrue(conn.execute("SELECT 1 FROM outbox WHERE content = '收到事件：收到事件：'").fetchone())
+
+    def bump_origin_version(self) -> str:
+        major, minor, patch_number = __version__.split(".")
+        next_version = f"{major}.{minor}.{int(patch_number) + 1}"
+        version_file = self.origin / "src/agent_runtime/__init__.py"
+        version_file.write_text(version_file.read_text().replace(__version__, next_version))
+        self.commit(self.origin)
+        return next_version
+
+    def start_relay_hub(self) -> RelayHub:
+        sb_tmp = self.enterContext(tempfile.TemporaryDirectory())
+        config = make_config(sb_tmp, relay={"enabled": True, "transport": "hybrid", "heartbeat_sec": 2},
+                             delivery={"retry_backoff_seconds": [0.2, 0.2, 0.2, 0.2, 0.2]})
+        board = build_switchboard(replace(config, http=replace(config.http, port=0)),
+                                  credentials=StaticCredentials(), audit=RecordingAuditSink(),
+                                  http_client=FakeHttpClient())
+        board.start()
+        self.addCleanup(board.stop)
+        self.board = board
+        assert board.relay is not None
+        return board.relay
+
+    def test_a_restart_queues_ingress_instead_of_refusing_it_and_the_relay_reconnects_at_once(self):
+        hub = self.start_relay_hub()
+        self.port = free_port()
+        config = self.root / "hibernaut.toml"
+        config.write_text(
+            f'[runtime]\ndb_path = "{self.root / "events.db"}"\nmemory_root = "{self.root / "memory"}"\n'
+            'default_executor = "demo"\n'
+            f'[channels]\nhost = "127.0.0.1"\nport = {self.port}\n'
+            '[switchboard]\nenabled = true\nmode = "relay"\nconsumer_id = "hibernaut"\n'
+            f'relay_url = "{self.board.relay_url}"\nmcp_url = "{self.board.http.base_url}/mcp"\n'
+        )
+
+        # Online/offline transitions of the relay consumer, and one Switchboard event sent while it is offline.
+        transitions: list[tuple[float, bool]] = []
+        offline_event: list[str] = []
+        watching = threading.Event()
+
+        def watch() -> None:
+            online = False
+            while not watching.is_set():
+                now_online = hub.is_online("hibernaut")
+                if now_online != online:
+                    online = now_online
+                    transitions.append((time.monotonic(), online))
+                    if not online and not offline_event:
+                        status, response = mcp_call(self.board.http.base_url, "post_message", {
+                            "correlation_key": "github:kun-g/hibernaut#7", "body": "sent while offline",
+                            "scope": "proj:hibernaut", "channel": "github", "external_id": "offline-1",
+                        })
+                        offline_event.append(str(tool_result(response)["event_id"]) if status == 200 else repr(response))
+                time.sleep(0.002)
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        self.addCleanup(watcher.join)
+        self.addCleanup(watching.set)
+
+        stderr_path = self.root / "stderr.log"
+        stderr = self.enterContext(stderr_path.open("w"))
+        proc = self.start_supervisor(
+            ["--config", str(config), "--demo", "--config-poll-interval", "0.5"],
+            env={"SWITCHBOARD_RELAY_TOKEN": RELAY_TOKEN, "SWITCHBOARD_MCP_TOKEN": MCP_TOKEN},
+            stderr=stderr.fileno(),
+        )
+        self.db = self.root / "events.db"
+        self.send_until_reply(proc, "收到事件：")
+        deadline = time.monotonic() + 15
+        while not hub.is_online("hibernaut"):
+            self.assertLess(time.monotonic(), deadline, stderr_path.read_text())
+            time.sleep(0.02)
+
+        # (sent, answered, status or error) for every request; each waits up to 60s, as a queued request would.
+        results: list[tuple[float, float, object]] = []
+        posting = threading.Event()
+
+        def post_continuously() -> None:
+            n = 0
+            while not posting.is_set():
+                n += 1
+                body = {"external_id": f"restart-{n}", "payload": {"text": f"restart-{n}"}}
+                req = urllib.request.Request(f"http://127.0.0.1:{self.port}/events", data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                sent = time.monotonic()
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as response:
+                        outcome: object = response.status
+                except (OSError, http.client.HTTPException) as exc:
+                    outcome = repr(exc)
+                results.append((sent, time.monotonic(), outcome))
+                time.sleep(0.01)
+
+        poster = threading.Thread(target=post_continuously, daemon=True)
+        poster.start()
+        self.addCleanup(poster.join)
+        self.addCleanup(posting.set)
+
+        next_version = self.bump_origin_version()
+        deadline = time.monotonic() + 30
+        while not (f"Hibernaut {next_version}" in self.log_path.read_text()
+                   and len(transitions) >= 3 and transitions[-1][1]
+                   and results and results[-1][0] > transitions[-1][0]):
+            self.assertLess(time.monotonic(), deadline, stderr_path.read_text())
+            self.assertIsNone(proc.poll(), stderr_path.read_text())
+            time.sleep(0.05)
+        posting.set()
+        poster.join(60)
+
+        log = stderr_path.read_text()
+        self.assertEqual([outcome for _, _, outcome in results if outcome != 202], [], log)
+        waits = [answered - sent for sent, answered, _ in results]
+        offline = [(transitions[i + 1][0] - at) for i, (at, online) in enumerate(transitions[:-1]) if not online]
+        print(f"\n[restart] {len(results)} requests, longest wait {max(waits):.3f}s; "
+              f"relay offline {', '.join(f'{s:.3f}s' for s in offline)}", file=sys.stderr)
+        # Proves the requests actually spanned the handover rather than all landing on one daemon.
+        self.assertGreater(max(waits), 0.1)
+        self.assertEqual(log.count("Serving HTTP on the listener inherited"), 1, log)
+        self.assertEqual(len(offline), 1, transitions)
+        self.assertNotIn("connect to", log)
+
+        external_ids = {f"restart-{n}" for n in range(1, len(results) + 1)}
+        deadline = time.monotonic() + 15
+        while True:
+            with contextlib.closing(sqlite3.connect(self.db)) as conn:
+                stored = {row[0] for row in conn.execute("SELECT external_id FROM event_inbox WHERE source = 'webhook'")}
+                relayed = conn.execute("SELECT 1 FROM event_inbox WHERE source = 'sb:mcp' AND external_id = ?",
+                                       (offline_event[0] if offline_event else "",)).fetchone()
+            if external_ids <= stored and relayed:
+                break
+            self.assertLess(time.monotonic(), deadline, f"missing {sorted(external_ids - stored)}; "
+                                                        f"offline event {offline_event} relayed={relayed}\n{log}")
+            time.sleep(0.05)
 
 
 class AutoUpdateCleanupTests(unittest.TestCase):

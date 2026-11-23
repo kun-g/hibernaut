@@ -1,5 +1,6 @@
 from agent_runtime.adapters.channels.channels import (
     ConsoleChannelAdapter,
+    ListenerHandover,
     WebhookChannelAdapter,
     WebhookHTTPServer,
     create_webhook_server,
@@ -38,6 +39,7 @@ __all__ = [
     "DriveResultWriter",
     "DriveTaskPoller",
     "FileOutboxChannel",
+    "ListenerHandover",
     "MCPServerAdapter",
     "OutboxContext",
     "ProxiedDriveClient",

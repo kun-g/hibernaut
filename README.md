@@ -72,7 +72,7 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 | `[launchers.<name>]`、`[credential_proxy]` | Claude Code 启动命令；`billing = "api"` 时经外置凭据代理 |
 | `[projects.<name>]` | 仓库、检出路径、服务的 `inbox_id`（字符串或正则数组）、默认 `executor`、worktree 与终端后端 |
 | `[projects.<name>.delivery]` | PR 交付：开 PR、自动合并、版本文件、检查命令、是否要求评审和 CI、冲突与检查失败交回开发的次数上限（`max_handbacks`）、合并后是否删除源分支（`delete_branch`）、来自 GitHub Issue 的任务在 PR 正文里怎么写这个 Issue（`issue_link`：`closes` 合并后关闭 / `refs` 只关联，默认 / `none` 不写） |
-| `[gdrive]` | Drive 任务队列，部署见 [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md)。任务可引用队列根下 `附件/` 里的文件（frontmatter `attachments` 写文件 ID 或原名，或正文里写该文件的 Drive ID），Run 开始时下载到 `attachments_dir`（默认数据库旁的 `attachments/`，在 worktree 之外），任务正文末尾附上路径、大小和 sha256，会话结案后删除。上传 `.md` 任务文件时关掉 Drive「将上传的文件转换为 Google 文档格式」 |
+| `[gdrive]` | Drive 任务队列，部署见 [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md)。任务可引用队列根下 `附件/` 里的文件（frontmatter `attachments` 写文件 ID 或原名，逗号分隔、`[a, b]` 或逐行 `- a` 均可，或正文里写该文件的 Drive ID），Run 开始时下载到 `attachments_dir`（默认数据库旁的 `attachments/`，在 worktree 之外），任务正文末尾附上路径、大小和 sha256，会话结案后删除。上传 `.md` 任务文件时关掉 Drive「将上传的文件转换为 Google 文档格式」 |
 | `[switchboard]` | 同进程运行 Switchboard 或经 Relay 连接远程 Switchboard；公网 VPS 容器部署见 [`deploy/switchboard/`](deploy/switchboard/README.md) |
 
 GitHub 入站只经 Switchboard。把 GitHub Webhook 指向 Switchboard 的 `/webhooks/github`，在 `switchboard.toml` 里设置 `[github] require_label` 和仓库路由，使路由目标匹配 Hibernaut 项目的 `inbox_id`，再启用同进程桥接或 Relay。未部署 Taskboard 时，按 `switchboard.example.toml` 的 `[routing.event_consumers]` 示例把 `work.opened`、`work.updated`、`work.closed` 路由到 Hibernaut。部署 Taskboard 时保持默认路由，按 [`taskboard.example.toml`](taskboard.example.toml) 写 `taskboard.toml`，设置 `SWITCHBOARD_RELAY_TOKEN`、`SWITCHBOARD_MCP_TOKEN`、`TASKBOARD_MCP_TOKEN` 后运行 `python -m taskboard.app --config taskboard.toml`；`[intake] auto_ready_sources`（默认 `["github"]`）来源的 Issue / PR（包括后贴触发标签的旧 Issue）直接进入 `ready`，由 Taskboard 发 `work.ready` 给 Hibernaut。升级前使用本机 Issue 轮询或 daemon Webhook 的部署需要先切换入口。
@@ -99,7 +99,11 @@ python3 scripts/run_updating.py --config hibernaut.toml
 
 除 `--interval` 与 `--wait-log-interval` 外的参数原样传给 daemon。它每 300 秒检查一次 `origin/main`，能快进时让旧 daemon 停机排空，旧 daemon 退出后再更新代码并重启；检出不干净、不在 `main` 或历史分叉时保持现状，排空期间检出被改动则跳过这次更新。origin 必须是你信任其提供可执行代码的来源。
 
-停机（SIGINT / SIGTERM，自动更新也走这条路）分两步：先只停止认领新事件，进行中的 Run 照常跑完并写回结果（正在等 Orca 终端里 agent 结果的 Run 例外：旧进程不等它、不关终端，登记和 `runs/` 下的状态目录留给新进程接着等，agent 不会收到重复任务），期间 HTTP 入口（`/events`、`/mcp`）照常接收入库并返回 202、留给下一个进程处理，Outbox 投递、定时器和 Drive 轮询照常运行（worktree 回收清扫不再开始新一轮）；Run 全部结束后才关闭 HTTP（等已接收的请求写完）、停后台服务并退出。新进程启动后先接回这些 Run，再处理同一 Inbox 的新事件。入口只在旧进程退出到新进程开始监听之间中断，以秒计。再发一次 SIGINT / SIGTERM（直接发给 daemon，或发给 `run_updating.py`，它会转给 daemon）则不再等待：进行中的 Run 按中断处理，不写半成品，事件回到 `pending`，由下一个进程重跑。
+停机（SIGINT / SIGTERM，自动更新也走这条路）分两步：先只停止认领新事件，进行中的 Run 照常跑完并写回结果（正在等 Orca 终端里 agent 结果的 Run 例外：旧进程不等它、不关终端，登记和 `runs/` 下的状态目录留给新进程接着等，agent 不会收到重复任务），期间 HTTP 入口（`/events`、`/mcp`）照常接收入库并返回 202、留给下一个进程处理，Outbox 投递、定时器和 Drive 轮询照常运行（worktree 回收清扫不再开始新一轮）；Run 全部结束后才关闭 HTTP（等已接收的请求写完）、停后台服务并退出。新进程启动后先接回这些 Run，再处理同一 Inbox 的新事件。
+
+经 `run_updating.py` 重启时 HTTP 入口不拒绝连接：旧 daemon 停止接收后把监听 socket 交还监督进程，监督进程带着它快进、`execv`，再交给新 daemon 直接使用；这段时间到达的连接在内核 backlog（128）里排队，新 daemon 开始监听后按序处理。实测排队最长约 0.3 秒（不跑 Run 的测试实例；生产上取决于新进程的导入与组装耗时），客户端超时须长于这段时间。Switchboard 中继（`mode = "relay"`）在旧 daemon 退出前主动断开，新 daemon 组装时立即重连（实测断开约 0.3 秒），断开期间的事件由 Switchboard 暂存，重连后立即重投。不经监督进程直接运行 daemon、或第一次启动时，daemon 照旧自己绑定端口；进程内 Switchboard（`mode = "in_process"`）自己的 HTTP 端口不在交接范围内，重启期间仍会拒绝连接。
+
+再发一次 SIGINT / SIGTERM（直接发给 daemon，或发给 `run_updating.py`，它会转给 daemon）则不再等待：进行中的 Run 按中断处理，不写半成品，事件回到 `pending`，由下一个进程重跑。
 
 `run_updating.py` 把 daemon 放在独立会话里运行，终端的 Ctrl-C 只到监督进程、由它转给 daemon。监督进程收到 SIGHUP（如关闭终端、断开 SSH）也按停机处理，排空后连同 daemon 一起退出。SIGKILL 无法捕获：监督进程被 `kill -9` 时 daemon 不会收到信号，会继续运行，需另行停止（`pgrep -f agent_runtime.app.main` 查找）。监督进程等 daemon 退出不设上限（不会因排空太久而强杀），但每 `--wait-log-interval` 秒（默认 60）在 stderr 记一行监督进程 PID、daemon PID 与已等待秒数；daemon 卡住不退时据此找到它，再发一次信号或手动处理。
 

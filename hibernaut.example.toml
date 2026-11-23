@@ -182,7 +182,8 @@ gh_command = "gh"
 # done_folder_id = ""
 # failed_folder_id = ""
 # attachments_folder_id = ""
-# 任务附件（frontmatter attachments 或正文里 附件/ 内文件的 Drive ID）在 Run 开始时下载到这里：
+# 任务附件（frontmatter attachments 或正文里 附件/ 内文件的 Drive ID）在 Run 开始时下载到这里。attachments 写文件 ID 或
+# 原名，写法三选一、结果相同：a, b；[a, "b"]；attachments: 下逐行 - a。下载位置：
 # <目录>/<任务文件 ID>/<附件文件 ID>/<文件名>，目录 0700、文件 0600，任务会话结案或失败后删除。
 # 须在所有 worktree 之外；不填 = runtime.db_path 所在目录下的 attachments/。相对路径以本文件目录为准
 # attachments_dir = "~/.local/share/hibernaut/attachments"
