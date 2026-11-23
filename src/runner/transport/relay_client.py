@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import urllib.parse
 from typing import Any, Mapping, cast
 
@@ -21,6 +22,8 @@ from runner.transport.ws_protocol import (
     send_close,
     send_json,
 )
+
+_log = logging.getLogger(__name__)
 
 
 class RunnerRelayAgent:
@@ -59,6 +62,11 @@ class RunnerRelayAgent:
     async def wait_superseded(self, timeout: float = 5.0) -> None:
         await asyncio.wait_for(self._superseded_event.wait(), timeout=timeout)
 
+    async def wait_finished(self) -> None:
+        # Returns when the agent gave up by itself (superseded); stop() is the normal end.
+        if self._task is not None:
+            await asyncio.wait({self._task})
+
     async def stop(self) -> None:
         self._stop_event.set()
         if self._writer is not None:
@@ -73,19 +81,29 @@ class RunnerRelayAgent:
     async def _run_loop(self) -> None:
         attempt = 0
         while not self._stop_event.is_set():
+            epoch = self._conn_epoch
+            reason = "connection ended"
             try:
                 await self._session_once()
-                attempt = 0
             except WSConnectionClosed as exc:
-                self._connected_event.clear()
                 if exc.code == CLOSE_SUPERSEDED:
                     self._superseded_event.set()
+                    _log.error("relay connection superseded by another runner with this runner_id")
                     return
-            except (WSProtocolError, OSError, asyncio.TimeoutError):
+                reason = f"{type(exc).__name__}: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                # Anything else ends this connection only (a hub that goes away mid-handshake raises EOFError, a bad
+                # frame ValueError or KeyError): a loop that died here would leave the node offline for good.
+                reason = f"{type(exc).__name__}: {exc}"
+            finally:
                 self._connected_event.clear()
             if self._stop_event.is_set():
                 return
+            if self._conn_epoch != epoch:
+                attempt = 0
             delay = self._reconnect_delays[min(attempt, len(self._reconnect_delays) - 1)]
+            # Once per outage, not once per retry.
+            _log.log(logging.WARNING if attempt == 0 else logging.DEBUG, "relay connection lost (%s); retrying", reason)
             attempt += 1
             await asyncio.sleep(delay)
 
@@ -123,6 +141,7 @@ class RunnerRelayAgent:
                 raise WSProtocolError("expected welcome frame")
             self._conn_epoch = int(welcome["conn_epoch"])
             self._connected_event.set()
+            _log.info("relay connected (conn_epoch %s)", self._conn_epoch)
 
             while not self._stop_event.is_set():
                 frame = await recv_json(reader, writer, expect_masked=False, send_masked=True)
@@ -166,7 +185,9 @@ class RunnerRelayAgent:
                     )
 
                     async def _exec_and_reply(r: RunRequest = req, cid: str = caller_id) -> None:
+                        _log.info("run %s accepted (executor %s, owner %s)", r.run_id, r.executor_id, r.owner_scope)
                         res = await self._daemon.run(r, caller_id=cid)
+                        _log.info("run %s ended: %s in %d ms", r.run_id, res.status, res.duration_ms)
                         try:
                             await _send(
                                 {

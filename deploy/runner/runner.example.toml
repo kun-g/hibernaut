@@ -1,0 +1,24 @@
+# 只读试点的独立 Runner（docs/runner.md §8）。复制到部署目录，改成 runner.toml；相对路径以本文件所在目录为准。
+# 多出的表或键、放宽的取值都会让服务拒绝启动。
+
+[runner]
+runner_id = "mac-pilot"              # 与 hibernaut.toml 的 [runner_pilot] runner_id 相同
+max_concurrent = 1                   # 固定：单槽位
+readonly_only = true                 # 固定：拒绝写工作区
+worktree_backend = "git"             # 固定
+interactive_surface = "none"         # 固定
+state_dir = "state"                  # 工作区登记与单实例锁
+logs_dir = "logs"                    # 每个 Run 一份 <日期>/<run_id>.log
+
+[namespaces.hb]
+prefix = "hb"
+allowed_callers = ["hibernaut"]      # 固定
+
+# 恰好一个项目；键与 [runner_pilot] project_key 相同。checkout_path 用专门的克隆，不要用 Hibernaut 项目的主检出。
+[projects.hibernaut]
+checkout_path = "/Users/YOU/runner-pilot/hibernaut"
+default_base_ref = "origin/main"     # 只决定只读 worktree 从哪里建；校验内容只取自任务指定的提交
+
+[relay]
+url = "ws://127.0.0.1:8791/ws/runner" # 固定为 127.0.0.1，端口与 [runner_pilot] port 相同
+token_file = "/Users/YOU/.config/hibernaut/runner-relay.token"

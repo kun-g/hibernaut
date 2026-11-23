@@ -54,6 +54,13 @@ STATIC_DEPS: dict[str, tuple[str, ...]] = {
     # Both start `python -m taskboard.app`; the dual-process test also `python -m switchboard.app`.
     "tests/taskboard/test_m7_service.py": ("src/taskboard/app/__main__.py",),
     "tests/test_taskboard_dual_process_e2e.py": ("src/taskboard/app/__main__.py", "src/switchboard/app.py"),
+    # Both start `python -m runner.service`; the pilot test also Hibernaut main(). The check program runs as a script.
+    "tests/test_runner_service.py": ("src/runner/service.py", "src/runner/protocol_check.py"),
+    "tests/test_runner_pilot.py": (
+        "src/runner/service.py",
+        "src/runner/protocol_check.py",
+        "src/agent_runtime/app/main.py",
+    ),
     # Starts all three: switchboard.app, taskboard.app and Hibernaut main() through dual_process_hibernaut.py.
     "tests/test_taskboard_triple_process_e2e.py": (
         "src/taskboard/app/__main__.py",
@@ -66,7 +73,7 @@ STATIC_DEPS: dict[str, tuple[str, ...]] = {
 RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("src/agent_runtime/adapters/executor_cli/skills/**", ("src/agent_runtime/adapters/executor_cli/role_skills.py",)),
     ("src/dashboard/static/**", ("src/dashboard/server.py",)),
-    ("hibernaut.example.toml", ("tests/test_bootstrap_loop.py", "tests/test_sde_delivery.py")),
+    ("hibernaut.example.toml", ("tests/test_bootstrap_loop.py", "tests/test_sde_delivery.py", "tests/test_runner_pilot.py")),
     ("switchboard.example.toml", ("tests/test_switchboard_core.py",)),
     ("taskboard.example.toml", ("tests/taskboard/test_m7_service.py",)),
     ("deploy/gdrive-proxy/**", ("tests/test_gdrive_credential_proxy.py",)),
@@ -86,7 +93,8 @@ RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/test_taskboard_hibernaut_loop.py",
         ),
     ),
-    ("schemas/runner/**", ("tests/test_runner_stage1.py",)),
+    ("schemas/runner/**", ("tests/test_runner_stage1.py", "tests/test_runner_service.py", "tests/test_runner_pilot.py")),
+    ("deploy/runner/**", ("tests/test_runner_service.py",)),
     ("schemas/v1/**", ("tests/test_ledger_all.py",)),
     ("docs/dispatch/**", ("tests/test_sde_delivery.py",)),
     ("docs/process/versioning.md", ("tests/test_sde_delivery.py",)),

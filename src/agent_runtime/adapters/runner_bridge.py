@@ -20,6 +20,7 @@ from agent_runtime.core.models import (
 )
 from agent_runtime.core.ports import RunCapabilities
 from runner.protocol import InterruptReason, InterruptRequest, RunRequest, RunResult, RunnerPort
+from runner.transport.relay_hub import RunnerConnectionLostError
 
 
 class RunnerExecutorBridge:
@@ -64,12 +65,32 @@ class RunnerExecutorBridge:
                 status="refused",
             )
         run_id = new_id("run")
+        req = self._build_request(events, session, run_id)
+        run_task = asyncio.create_task(self._runner.run(req))
+        interrupt_accepted = False
+        try:
+            while not run_task.done():
+                if not interrupt_accepted and caps.is_interrupted():
+                    interrupt_accepted = await self._try_interrupt(run_id, "new_event")
+                await asyncio.wait({run_task}, timeout=self._interrupt_poll_interval)
+        except asyncio.CancelledError:
+            # The worker cancels execute() on interrupt or shutdown; the run must not outlive this Run, or the next
+            # Run on the same work_key would start a second CLI in the same worktree.
+            await _uncancellable(self._stop_run(run_task, run_id))
+            telemetry = _stopped_telemetry(run_task)
+            if telemetry is not None:
+                # It says which node ran (and stopped) the Run; the worker records it.
+                raise RunCancelled(telemetry.stderr or "interrupted", telemetry=telemetry) from None
+            raise
+        return self._translate(run_task.result(), session, events)
+
+    def _build_request(self, events: Sequence[Event], session: SessionRef, run_id: str) -> RunRequest:
         work_key = session.work_key or session.correlation_key or session.session_id
         readonly = any(bool(ev.payload.get("readonly")) for ev in events)
         interactive = any(bool(ev.payload.get("interactive")) for ev in events)
         name_hint = _derive_hb_name_hint(work_key)
 
-        req = RunRequest(
+        return RunRequest(
             run_id=run_id,
             namespace="hb",
             project_key=self._project_key,
@@ -89,23 +110,7 @@ class RunnerExecutorBridge:
             },
         )
 
-        run_task = asyncio.create_task(self._runner.run(req))
-        interrupt_accepted = False
-        try:
-            while not run_task.done():
-                if not interrupt_accepted and caps.is_interrupted():
-                    interrupt_accepted = await self._try_interrupt(run_id, "new_event")
-                await asyncio.wait({run_task}, timeout=self._interrupt_poll_interval)
-        except asyncio.CancelledError:
-            # The worker cancels execute() on interrupt or shutdown; the run must not outlive this Run, or the next
-            # Run on the same work_key would start a second CLI in the same worktree.
-            await _uncancellable(self._stop_run(run_task, run_id))
-            if not run_task.cancelled() and run_task.exception() is None:
-                # The runner's own result says which node ran (and stopped) the Run; the worker records it.
-                result = run_task.result()
-                raise RunCancelled(result.error_summary or "interrupted", telemetry=_run_telemetry(result)) from None
-            raise
-        result = run_task.result()
+    def _translate(self, result: RunResult, session: SessionRef, events: Sequence[Event]) -> RunOutcome:
         return translate_run_result(result, session_id=session.session_id)
 
     async def _try_interrupt(self, run_id: str, reason: InterruptReason) -> bool:
@@ -136,7 +141,21 @@ async def _uncancellable(coro: Coroutine[Any, Any, None]) -> None:
     task.result()
 
 
-def _run_telemetry(result: RunResult) -> RunTelemetry:
+def _stopped_telemetry(run_task: asyncio.Task[RunResult]) -> RunTelemetry | None:
+    if run_task.cancelled():
+        return None
+    exc = run_task.exception()
+    if exc is None:
+        return run_telemetry(run_task.result())
+    return lost_run_telemetry(exc) if isinstance(exc, RunnerConnectionLostError) else None
+
+
+def lost_run_telemetry(exc: RunnerConnectionLostError) -> RunTelemetry:
+    # The node reaps its runs when the connection goes; its result and log reference did not arrive.
+    return RunTelemetry(stderr=str(exc), error_kind="network", runner_id=exc.runner_id)
+
+
+def run_telemetry(result: RunResult) -> RunTelemetry:
     # The worker's run ledger logs, prices and classifies a Run from its telemetry, as it does for LocalCLIExecutor.
     return RunTelemetry(
         stdout=result.stdout_excerpt,
@@ -144,16 +163,26 @@ def _run_telemetry(result: RunResult) -> RunTelemetry:
         exit_code=result.exit_code,
         error_kind=result.error_kind,
         runner_id=result.runner_id,
+        runner_log=_runner_log(result),
     )
 
 
+def _runner_log(result: RunResult) -> str | None:
+    ref = result.log_ref
+    if ref is None:
+        return None
+    # The path below the node's logs_dir (<day>/<run>.log); where that directory is stays on the node.
+    tail = "/".join(ref.path.replace("\\", "/").split("/")[-2:])
+    return f"runner://{ref.runner_id}/{tail} run_id={result.run_id} sha256={ref.sha256} bytes={ref.bytes}"
+
+
 def translate_run_result(result: RunResult, *, session_id: str) -> RunOutcome:
-    return replace(_translate_status(result, session_id=session_id), telemetry=_run_telemetry(result))
+    return replace(_translate_status(result, session_id=session_id), telemetry=run_telemetry(result))
 
 
 def _translate_status(result: RunResult, *, session_id: str) -> RunOutcome:
     if result.status == "interrupted":
-        raise RunCancelled(result.error_summary or "interrupted", telemetry=_run_telemetry(result))
+        raise RunCancelled(result.error_summary or "interrupted", telemetry=run_telemetry(result))
 
     if result.status == "refused":
         return Emit(

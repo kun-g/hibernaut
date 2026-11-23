@@ -21,6 +21,7 @@ class AutoModePermissionAdapter:
             "orca.agent.launch",
             "code_reviewer.launch",
             "sde.launch",
+            "runner.protocol_check.launch",
             # Each is granted per project in [projects.<name>.delivery] (open_pr, auto_merge); move one to the
             # defer list to also ask a person every time.
             "delivery.open_pr",

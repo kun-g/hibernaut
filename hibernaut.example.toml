@@ -226,3 +226,15 @@ gh_command = "gh"
 # mcp_url = "https://switchboard.example.com/mcp"
 # consumer_id = "hibernaut"
 # ca_file = "private-ca.pem"         # optional, relative to this file
+
+# Runner 只读试点（默认关闭，docs/runner.md §8；启用、验证与回退步骤见 deploy/runner/README.md）。打开后只有 inbox_id 这一个
+# 任务级 Inbox 改由独立 Runner 上的固定校验程序执行，任务须带 payload.candidate_commit；其他 Inbox 不受影响。
+# Relay 只监听 127.0.0.1。令牌文件须为本用户所有、权限 0600。运行中只能改 enabled，改其他项先关闭。
+# [runner_pilot]
+# enabled = false
+# inbox_id = "hibernaut:runner-pilot"
+# runner_id = "mac-pilot"
+# project_key = "hibernaut"
+# port = 8791
+# token_file = "~/.config/hibernaut/runner-relay.token"
+# timeout_seconds = 120              # 单次校验上限，最多 600

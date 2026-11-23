@@ -69,6 +69,7 @@ from agent_runtime.adapters.executor_whitebox import (
 )
 from agent_runtime.adapters.memory_fs import WorkspacePartitionRegistry
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter, CredentialProxyClient, read_private_token
+from agent_runtime.adapters.runner_pilot import ClosedRouteExecutor, ProtocolCheckExecutor, RunnerPilotRelay
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.adapters.storage_sqlite.open_runs import SQLiteOpenRunStore
 from agent_runtime.adapters.storage_sqlite import (
@@ -94,6 +95,7 @@ from agent_runtime.app.concurrency import (
 from agent_runtime.app.config import (
     HibernautConfig,
     RoleConfig,
+    RunnerPilotConfig,
     SwitchboardLinkConfig,
     config_changes,
     load_config,
@@ -110,6 +112,7 @@ from agent_runtime.engine import (
 )
 from agent_runtime.engine.worker import ExecutorFailed
 from agent_runtime.adapters.ledger_bridge import RunLedger
+from runner.protocol_check import PROTOCOL_CHECK_EXECUTOR_ID
 from switchboard.ports import AuditSinkPort
 from switchboard.app import EnvCredentialBroker, Switchboard, build_switchboard
 from switchboard.config import load_config as load_switchboard_config
@@ -823,6 +826,64 @@ def build_daemon(
     )
 
 
+def open_runner_pilot(pilot: RunnerPilotConfig) -> RunnerPilotRelay | None:
+    # Reads the Relay token (ValueError when it cannot be used) and listens on nothing yet.
+    if not pilot.enabled:
+        return None
+    return RunnerPilotRelay(
+        runner_id=pilot.runner_id,
+        project_key=pilot.project_key,
+        port=pilot.port,
+        token_file=Path(pilot.token_file),
+    )
+
+
+async def start_runner_pilot(relay: RunnerPilotRelay | None) -> bool:
+    if relay is None or relay.listening:
+        return relay is not None
+    try:
+        await relay.start()
+    except OSError as exc:
+        print(f"[runner_pilot] Relay cannot listen: {exc.strerror}; the pilot inbox stays held.",
+              file=sys.stderr, flush=True)
+        return False
+    return True
+
+
+async def next_runner_pilot(
+    current: RunnerPilotRelay | None, before: RunnerPilotConfig, after: RunnerPilotConfig
+) -> RunnerPilotRelay | None:
+    # The Relay after a reload. A route being turned on has to open, or the reload is refused; one that was on already
+    # but could not open is tried again without holding up the other settings.
+    if not after.enabled:
+        return None
+    try:
+        relay = current if current is not None else open_runner_pilot(after)
+    except ValueError as exc:
+        print(f"[runner_pilot] {exc}; the pilot inbox stays held.", file=sys.stderr, flush=True)
+        if not before.enabled:
+            raise
+        return None
+    if not await start_runner_pilot(relay) and not before.enabled:
+        raise OSError("the pilot relay cannot listen")
+    return relay
+
+
+def pilot_hold(
+    relay: RunnerPilotRelay | None, executor_of: Callable[[Event], str | None]
+) -> Callable[[Event], str | None]:
+    # The pilot inbox never runs on another executor, so whatever cannot run on the route waits for a person.
+    def hold(event: Event) -> str | None:
+        executor = executor_of(event)
+        if executor is None:
+            return None
+        if executor != PROTOCOL_CHECK_EXECUTOR_ID:
+            return f"the pilot inbox only runs {PROTOCOL_CHECK_EXECUTOR_ID}"
+        return None if relay is not None and relay.listening else "the pilot relay is not listening"
+
+    return hold
+
+
 def build_daemon_from_config(
     config: HibernautConfig,
     *,
@@ -832,7 +893,10 @@ def build_daemon_from_config(
     gdrive_client: DriveClientProtocol | None = None,
     switchboard: SwitchboardHandle | None = None,
     ledger: RunLedger | None = None,
+    runner_pilot: RunnerPilotRelay | None = None,
 ) -> AlwaysOnDaemon:
+    if demo and config.runner_pilot.enabled:
+        raise ValueError("runner_pilot.enabled cannot be used with --demo")
     # Every inbox -> project lookup goes through the router, so pattern-matched inboxes get their project's settings
     # and an inbox matching two projects raises AmbiguousProjectMatch instead of picking one.
     router = ProjectRouter(config.projects.values())
@@ -1049,6 +1113,8 @@ def build_daemon_from_config(
             for exec_name in config.executors
         }
         fallback_executors.update(_role_executors(default_mgr, "the inbox matches no [projects] entry"))
+        for registry in (*executors_by_project.values(), fallback_executors):
+            registry[PROTOCOL_CHECK_EXECUTOR_ID] = ClosedRouteExecutor()
 
         def _manager_for(inbox_id: str | None, work_key: str) -> OrcaWorktreeManager:
             if inbox_id is not None:
@@ -1077,7 +1143,23 @@ def build_daemon_from_config(
         # One per config generation, so a held event is logged once each time it enters the wait.
         unmatched_hold = UnmatchedProjectHold(daemon.sessions)
 
+        pilot = config.runner_pilot
+
+        def _pilot_executor(event: Event) -> str | None:
+            return AgentWorker.expected_executor_id(
+                event, daemon.sessions, project_default=PROTOCOL_CHECK_EXECUTOR_ID, global_default=None,
+            )
+
+        pilot_route = InboxRoute(
+            default_executor=PROTOCOL_CHECK_EXECUTOR_ID, hold=pilot_hold(runner_pilot, _pilot_executor)
+        )
+
+        def _on_pilot_route(inbox_id: str) -> bool:
+            return pilot.enabled and inbox_id == pilot.inbox_id
+
         def _cli_route(inbox_id: str) -> InboxRoute:
+            if _on_pilot_route(inbox_id):
+                return pilot_route
             project = router.resolve(inbox_id)
             if project is None:
                 return InboxRoute(hold=unmatched_hold)
@@ -1088,7 +1170,48 @@ def build_daemon_from_config(
             global_default_executor=config.runtime.default_executor,
         )
 
+        def _pilot_worker(inbox_id: str, worker_id: str) -> AgentWorker:
+            # Detached Runs of another executor belong to the worker that can resume them, so nothing runs meanwhile.
+            detached = daemon.open_runs.list_open(inbox_id) if daemon.open_runs is not None else []
+            if detached:
+                raise ExecutorFailed(
+                    f"Inbox {inbox_id} still has detached Runs of "
+                    f"{', '.join(sorted({run.executor_id for run in detached}))}; "
+                    "turn runner_pilot off to let them finish first"
+                )
+            executor: ExecutorPort = (
+                ProtocolCheckExecutor(
+                    runner=runner_pilot, inbox_id=pilot.inbox_id, project_key=pilot.project_key,
+                    timeout_seconds=pilot.timeout_seconds,
+                )
+                if runner_pilot is not None
+                else ClosedRouteExecutor()
+            )
+            return AgentWorker(
+                worker_id=worker_id,
+                inbox=daemon.inbox,
+                timers=daemon.timers,
+                memory=daemon.partitions.memory_for(inbox_id),
+                permissions=AutoModePermissionAdapter(),
+                outbox=daemon.outbox,
+                executors={PROTOCOL_CHECK_EXECUTOR_ID: executor},
+                project_default_executor=PROTOCOL_CHECK_EXECUTOR_ID,
+                # The runner reclaims its own read-only worktrees; no worktree of this process is involved.
+                on_worktree_reclaim=None,
+                hold=executor_quota_hold(inbox_id, pool=daemon.pool, limits=limits, keys=limit_keys, route=pilot_route),
+                run_start_listener=daemon.gdrive_result_writer,
+                open_runs=daemon.open_runs,
+                run_ledger=daemon.ledger.recorder if daemon.ledger is not None else None,
+                code_version=__version__,
+                lock=daemon.lock,
+                sessions=daemon.sessions,
+                # A check has no side effects to protect, and a new event is the controlled way to interrupt it.
+                new_event_policy="interrupt",
+            )
+
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
+            if _on_pilot_route(inbox_id):
+                return _pilot_worker(inbox_id, worker_id)
             # Raises AmbiguousProjectMatch before any lease, executor or workspace exists for the inbox.
             project = router.resolve(inbox_id)
             wt_mgr = wt_mgr_by_project[project.name] if project is not None else default_mgr
@@ -1256,6 +1379,7 @@ async def serve_configured(
     reload_interval: float = 1.0,
     outbox_interval_seconds: float = 1.0,
     listeners: ListenerHandover | None = None,
+    runner_pilot: RunnerPilotRelay | None = None,
 ) -> None:
     # A reload never waits for Runs in progress: the listener stays up and takes the new handler, services restart
     # within one tick, and the old worker pool is retired (no new claims) while its last Runs finish in the
@@ -1268,15 +1392,25 @@ async def serve_configured(
         else WebhookHTTPServer(address, daemon.http_handler())
     )
     changes = config_changes(path, stop, interval=reload_interval)
+    # Before the first pool scans its inbox: held events are not looked at again until the next wake.
+    await start_runner_pilot(runner_pilot)
 
     async with asyncio.TaskGroup() as tasks:
         generation = _Generation.start(daemon, tasks, outbox_interval_seconds=outbox_interval_seconds, halt=stop)
         # Every generation whose pool may still hold Runs: the current one and those retired by reloads.
         generations = [generation]
+        # Relays a reload took out of service, each stopping once the Runs that were using it have ended.
+        closing: list[asyncio.Task[None]] = []
         server_thread = _serve_in_thread(server)
 
         def wake_current(inbox_id: str) -> None:
             generation.daemon.pool.wake(inbox_id)
+
+        async def close_relay(relay: RunnerPilotRelay, users: list[asyncio.Task[None]]) -> None:
+            if users:
+                await asyncio.wait(users)
+            await relay.stop()
+            print("[runner_pilot] Relay closed.", file=sys.stderr, flush=True)
 
         try:
             async for candidate in changes:
@@ -1300,15 +1434,27 @@ async def serve_configured(
                         flush=True,
                     )
                     continue
+                if config.runner_pilot.enabled and candidate.runner_pilot.enabled and (
+                    candidate.runner_pilot != config.runner_pilot
+                ):
+                    print(
+                        "[config] [runner_pilot] changes need enabled = false first; keeping current settings.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
                 address = (candidate.channels.host, candidate.channels.port)
                 next_server: WebhookHTTPServer | None = None
+                next_pilot: RunnerPilotRelay | None = None
                 try:
+                    next_pilot = await next_runner_pilot(runner_pilot, config.runner_pilot, candidate.runner_pilot)
                     replacement = build_daemon_from_config(
                         candidate,
                         database=daemon.db,
                         demo=demo,
                         switchboard=switchboard,
                         ledger=daemon.ledger,
+                        runner_pilot=next_pilot,
                     )
                     handler = replacement.http_handler()
                     if address != (config.channels.host, config.channels.port):
@@ -1320,6 +1466,8 @@ async def serve_configured(
                         file=sys.stderr,
                         flush=True,
                     )
+                    if next_pilot is not None and next_pilot is not runner_pilot:
+                        await next_pilot.stop()
                     continue
 
                 previous = generation
@@ -1331,6 +1479,12 @@ async def serve_configured(
                 # From here every wake reaching the old pool, from its in-flight requests or released leases,
                 # is forwarded to the new one.
                 previous.retire_pool(wake_current)
+                if runner_pilot is not None and next_pilot is not runner_pilot:
+                    closing.append(tasks.create_task(close_relay(
+                        runner_pilot,
+                        [g.runs for g in generations if g is not generation and g.runs is not None],
+                    )))
+                runner_pilot = next_pilot
                 if next_server is None:
                     server.RequestHandlerClass = handler
                 else:
@@ -1351,6 +1505,10 @@ async def serve_configured(
             )
             for g in generations:
                 g.pool_stop.set()
+            # Every Run has ended, and an interrupted one was stopped on the node first.
+            await asyncio.gather(*closing)
+            if runner_pilot is not None:
+                await runner_pilot.stop()
             await _close_server(server, server_thread, release=listeners.release if listeners is not None else None)
             await generation.stop_services()
 
@@ -1451,7 +1609,16 @@ def main() -> None:
             if args.mcp_stdio
             else start_switchboard(cfg.switchboard, audit=ledger.switchboard_audit() if ledger is not None else None)
         )
-        daemon = build_daemon_from_config(cfg, demo=args.demo, switchboard=board, ledger=ledger)
+        runner_pilot: RunnerPilotRelay | None = None
+        if not args.mcp_stdio:
+            try:
+                runner_pilot = open_runner_pilot(cfg.runner_pilot)
+            except ValueError as exc:
+                # The rest of the daemon runs; the pilot inbox is held, never run on another executor.
+                print(f"[runner_pilot] {exc}; the pilot inbox stays held.", file=sys.stderr, flush=True)
+        daemon = build_daemon_from_config(
+            cfg, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot
+        )
         host = cfg.channels.host
         port = cfg.channels.port
     else:
@@ -1508,6 +1675,7 @@ def main() -> None:
                     reload_interval=args.config_poll_interval,
                     outbox_interval_seconds=args.outbox_interval,
                     listeners=listeners,
+                    runner_pilot=runner_pilot,
                 )
             else:
                 server = listeners.server((host, port), daemon.http_handler())

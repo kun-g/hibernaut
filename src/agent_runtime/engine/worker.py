@@ -1022,6 +1022,9 @@ class AgentWorker:
         try:
             outcome = await exec_task
             if interrupted_flag.is_set():
+                # Finished in the same instant: the result is dropped, its Run is still recorded where it ran.
+                if outcome.telemetry is not None and cancel_telemetry is not None:
+                    cancel_telemetry.append(outcome.telemetry)
                 raise _RunInterrupted()
             return outcome
         except RunDetached:

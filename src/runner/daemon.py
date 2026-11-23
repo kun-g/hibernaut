@@ -172,6 +172,11 @@ class RunnerDaemon:
         if (in_flight := self._active_runs.get(req.run_id)) is not None:
             return await asyncio.shield(in_flight.future)
 
+        if self._config.readonly_only and not req.readonly:
+            return self._refused(
+                req, started_at, start_mono, "permission_denied", f"runner {self._config.runner_id!r} only takes readonly runs"
+            )
+
         project = self._config.projects.get(req.project_key)
         if project is None:
             return self._refused(req, started_at, start_mono, "config_error", f"unknown project_key: {req.project_key}")

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Mapping, cast
+from typing import Any, Callable, Mapping, cast
 
 from runner.protocol import (
     InterruptRequest,
@@ -37,8 +38,14 @@ from runner.transport.ws_protocol import (
 )
 
 
+_log = logging.getLogger(__name__)
+
+
 class RunnerConnectionLostError(ConnectionError):
-    pass
+    def __init__(self, runner_id: str, run_id: str, reason: str) -> None:
+        super().__init__(f"runner {runner_id!r} {reason}; run {run_id} was not completed")
+        self.runner_id = runner_id
+        self.run_id = run_id
 
 
 class RunIdConflictError(ValueError):
@@ -76,9 +83,12 @@ class RunnerRelayHub:
         auth_timeout_seconds: float = 5.0,
         heartbeat_seconds: float = 20.0,
         ack_timeout_seconds: float = 10.0,
+        admit: Callable[[RunnerCapabilities], str | None] | None = None,
     ) -> None:
         if not shared_token:
             raise ValueError("shared_token must be non-empty")
+        # Says why an authenticated node may not serve here, or None; asked for the hello and every heartbeat report.
+        self._admit = admit
         self._token = shared_token
         self._affinity = affinity
         self._registry = registry or NodeRegistry()
@@ -104,6 +114,7 @@ class RunnerRelayHub:
         self._dispatch_gates: dict[tuple[str, str, str, str], _DispatchGate] = {}
         self._hb_task: asyncio.Task[None] | None = None
         self._rpc_seq = 0
+        self._stopping = False
 
     @property
     def registry(self) -> NodeRegistry:
@@ -127,11 +138,14 @@ class RunnerRelayHub:
                 await self._hb_task
             except asyncio.CancelledError:
                 pass
+        # No new connection from here on, one still in its handshake included: wait_closed() waits for every handler.
+        self._stopping = True
+        if self._server is not None:
+            self._server.close()
         for conn in list(self._conns.values()):
             await send_close(conn.writer, CLOSE_NORMAL, "hub shutdown", mask=False)
         self._conns.clear()
         if self._server is not None:
-            self._server.close()
             await self._server.wait_closed()
 
     async def capabilities(self) -> RunnerCapabilities:
@@ -262,6 +276,8 @@ class RunnerRelayHub:
                 self._pending_ack.pop(req.run_id, None)
                 self._forget_run(req.run_id)
                 self._registry.release_slot(runner_id)
+                if res_fut.done():
+                    res_fut.exception()  # a lost connection failed it together with ack_fut; nobody else awaits it
                 raise
 
             if not ack.get("accepted"):
@@ -330,7 +346,7 @@ class RunnerRelayHub:
         for rid, rnode in list(self._run_to_runner.items()):
             if rnode != conn.runner_id or self._run_epoch.get(rid) != conn.conn_epoch:
                 continue
-            err = RunnerConnectionLostError(f"runner {conn.runner_id!r} {reason}; run {rid} was not completed")
+            err = RunnerConnectionLostError(conn.runner_id, rid, reason)
             for pending in (self._pending_ack.pop(rid, None), self._pending_result.get(rid)):
                 if pending is not None and not pending.done():
                     pending.set_exception(err)
@@ -426,11 +442,21 @@ class RunnerRelayHub:
                 await send_close(writer, CLOSE_AUTH_FAILED, "expected hello", mask=False)
                 return
             token = str(hello.get("token", ""))
-            if not hmac.compare_digest(token, self._token):
+            # As bytes: compare_digest raises on a str that is not ASCII.
+            if not hmac.compare_digest(token.encode("utf-8", "surrogatepass"), self._token.encode("utf-8")):
+                _log.warning("relay refused a connection: invalid token")
                 await send_close(writer, CLOSE_AUTH_FAILED, "invalid token", mask=False)
                 return
             caps = RunnerCapabilities.from_dict(cast(Mapping[str, Any], hello["capabilities"]))
             runner_id = caps.runner_id
+            if self._stopping:
+                await send_close(writer, CLOSE_NORMAL, "hub shutdown", mask=False)
+                return
+            refusal = self._admit(caps) if self._admit is not None else None
+            if refusal is not None:
+                _log.warning("relay refused runner %r: %s", runner_id, refusal)
+                await send_close(writer, CLOSE_AUTH_FAILED, refusal, mask=False)
+                return
             epoch = self._registry.next_epoch(runner_id)
 
             old = self._conns.get(runner_id)
@@ -467,7 +493,11 @@ class RunnerRelayHub:
                 if frame.get("conn_epoch") != epoch:
                     continue
                 self._dispatch_inbound(runner_id, epoch, frame)
-        except (WSConnectionClosed, WSProtocolError, asyncio.TimeoutError, KeyError, ValueError, OSError):
+        except (
+            WSConnectionClosed, WSProtocolError, asyncio.TimeoutError, KeyError, ValueError, OSError,
+            # A peer that hangs up mid-frame or sends an endless header.
+            EOFError, asyncio.LimitOverrunError,
+        ):
             pass
         finally:
             if conn is not None:
@@ -483,9 +513,12 @@ class RunnerRelayHub:
         if ftype == "pong":
             caps_raw = frame.get("capabilities")
             if isinstance(caps_raw, Mapping):
-                self._registry.calibrate_heartbeat(
-                    runner_id, epoch, RunnerCapabilities.from_dict(cast(Mapping[str, Any], caps_raw))
-                )
+                caps = RunnerCapabilities.from_dict(cast(Mapping[str, Any], caps_raw))
+                refusal = self._admit(caps) if self._admit is not None else None
+                if caps.runner_id != runner_id or refusal is not None:
+                    # Ends the connection, like any other frame that breaks the protocol.
+                    raise ValueError(refusal or "heartbeat reports another runner_id")
+                self._registry.calibrate_heartbeat(runner_id, epoch, caps)
         # Replies only count on the connection the request went out on: another node, or an older connection of the
         # same node, may answer late with a matching id, and must neither acknowledge, finish nor answer it.
         elif ftype == "run.accepted":

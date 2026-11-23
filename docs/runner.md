@@ -59,3 +59,21 @@
 - `.importlinter` 契约 `runner-zero-business-deps` 禁止 `runner` 导入 `agent_runtime`、`taskboard`、`switchboard`、`workshop`、`memory_hub`、`ledger`；
 - `pyrightconfig.json` 将 `src/runner` 纳入 strict 类型检查；
 - `tests/test_runner_stage1.py` 与 `tests/test_runner_stage2.py` 覆盖协议、AST 隔离、Worktree 三道保险、看门狗、跨网反向 WS 调度与 `conn_epoch` 防脑裂；`tests/test_runner_safety.py` 覆盖第 6 节的不变量：取消后进程组（含忽略 `SIGTERM` 的孙进程）被回收、`workspace_busy`、Bridge 被取消时中断并等待、只读 Run 的独立 worktree 与还原、顶替连接时在途 Run 失败并释放槽位、Orca 回执路径与非法回执、槽位满时重复提交同一 `run_id` 仍被接受且只执行一次、ack 迟到仍返回结果、同一 `run_id` 的重叠等待只提交一次、worktree 创建不阻塞事件循环、并发解析同名提示得到不同目录；`tests/test_runner_stage1.py` 另覆盖 Bridge 在 `block` 与 `defer` 策略下对可调工具或工具能力未知的执行器不调用 `runner.run()`；`tests/test_runner_hardening.py` 覆盖子进程环境不带凭据（含驱动附加变量）、输入背压下超时与中断仍生效、交互请求被拒且不启动 CLI、握手后静默的节点被断开且在途 Run 失败、未绑定工作区在首个 ACK 前已认领（延迟 ACK 的双节点）且被拒后释放、多槽节点拒绝首单时次单不会派到别的节点、带凭据的代理 URL（继承与驱动两条路径）被拒且错误信息不含密码、重试已结束的 `run_id` 返回缓存结果不再执行、Hub 与 Daemon 拒绝把 `run_id` 复用于别的调用方或工作区、别的连接发来的回复被忽略、回收与被取消的 Run 在 worktree 线程跑完前不放开工作区、只读 Run 结束后删除其 detached worktree；名称撞上只读目录的写工作区与被指向写目录的只读 Run 都不受影响（后者被拒）、断线时仍在创建工作区的节点重连后亲和不变、改了 prompt / `interactive` / 原生会话 ID 的同一 `run_id` 在 Hub 与 Daemon 都被拒、`workspace_busy` 后同一 `run_id` 重试会执行、其他调用方不能中断或查询别人的 Run（同进程与 Relay）、日志打不开时不留进程、超过流读取上限的单行完整读出、输出读取失败时 Run 失败。`tests/test_runner_workspace_env.py` 以记录环境的 git / orca 垫片与合成凭据覆盖工作区命令：白名单、hook、正常的创建 / 校验 / 回收、带凭据代理的拒绝与恢复。`tests/test_runner_ledger.py` 经 Bridge、`AgentWorker` 与真实 `RunLedger` 端到端校验：真实 `slots_full` 拒绝记为 `rate_limit` 且仍按已交付结果处理，`RunRecord.runner_id` 是执行节点，新事件中断的 Run 也记在执行节点上、原批次与新事件合并重跑且被中断的 Run 不产生交付消息。
+- `tests/test_runner_service.py` 覆盖第 8 节的 Runner 侧：校验程序的结果可用 git 与 SHA-256 独立复算、异常提交与请求一律失败、服务配置与令牌文件的限制、单实例锁、Relay 重启后重连、`SIGTERM` 退出、握手中断不终止重连、节点接纳与错误令牌；`tests/test_runner_pilot.py` 覆盖 Hibernaut 侧，并以 Hibernaut 与 Runner 两个真实进程端到端验证：账本追溯、受控中断、强制停止、Runner 停止、热加载关闭与恢复、遗留事件、Relay 不可用时的原路径。
+
+## 8. 只读试点（默认关闭）
+
+一条真实任务经本机独立 Runner 核验候选提交里的五份 `schemas/runner/v1` 协议文件。用途是验证「派发 → 执行 → 账本 → 中断 → 回退」整条链路，不引入会调工具的执行器。部署、验证、回退步骤与异常处理见 [`deploy/runner/README.md`](../deploy/runner/README.md)，均由人执行。
+
+- **路由**：`hibernaut.toml` 的 `[runner_pilot]`，`enabled` 默认 `false`。打开后只有 `inbox_id` 指定的任务级 Inbox（`<项目>:<任务>`，不能是 `proj:` / `user:`、任一项目的主 Inbox 或 Drive 默认 Inbox）走试点；该 Inbox 里指名其他执行器、或会话仍绑定其他执行器的事件保持 `pending`，其他 Inbox 指名 `runner-protocol-check` 的事件以「未执行」结束。主机地址不可配置。Inbox 仍有其他执行器被停机摘下的 Run 时，试点 Worker 拒绝开工，等那些 Run 了结。
+- **任务输入**：`payload.candidate_commit`（40 位小写提交号）与可选的 `payload.hold_seconds`（0–60 的整数，只用于中断演练，不影响结果）。同批事件只能指向一个提交，`hold_seconds` 以最后一条为准。发给 Runner 的 prompt 只由这两项构成；载荷里的正文、工作目录、执行器参数、`readonly`、`interactive` 都不采用，派发固定为只读、非交互、不续接。
+- **校验程序**：`src/runner/protocol_check.py`，以 `python -I -S -B` 运行，只用标准库，文件清单写死；从指定提交的 git 对象读取（`--no-replace-objects`、`GIT_NO_LAZY_FETCH=1`，不联网，不读工作区文件）。提交须存在且是 commit；目录里恰好这五个文件、模式 `100644`、不超过 1 MiB、合法 JSON 对象且无重复键、声明 Draft 2020-12、`$id` 指向自身。任何一项不符即退出码 1、不输出摘要。
+- **结果可复算**：报告含提交号、逐文件 SHA-256 与汇总摘要（清单格式同 `shasum -a 256`，按路径排序）。Hibernaut 收到后核对提交号、五个路径，并重算汇总摘要，不符记 `bad_output`；Outbox 消息附复算命令。
+- **Runner 服务**：`python -m runner.service --config runner.toml`，由 launchd 监管。配置只接受试点形状：一个槽位、`readonly_only = true`、git 后端、无交互、只认 `hibernaut` 调用、恰好一个项目、Relay 地址固定为 `ws://127.0.0.1:<端口>/ws/runner`；唯一的驱动是校验程序，没有配置项能加第二个。`readonly_only` 的节点拒绝写工作区（`permission_denied`）。`state_dir/runner.lock` 保证单实例。`SIGTERM` 先结束在途 Run 的进程组并删除只读 worktree。子进程环境按 §6 的白名单。
+- **Relay**：Hibernaut 进程内的 `RunnerPilotRelay`，绑定 `127.0.0.1`。两端从同一份 0600 令牌文件读取共享令牌（不经环境变量）；令牌不符、`runner_id` 不符、槽位不是 1、执行器不是恰好校验程序、命名空间或项目不符的连接以 4001 关闭，心跳里改报也会断开。令牌不写入日志。只读 Run 不产生亲和绑定，Relay 不落盘。
+- **权限**：每次派发前经 `PermissionPort.check("runner.protocol_check.launch")`，非 `allow` 不派发。
+- **账本**：`runner_id` 为节点；终态为 `emit` / `done`、`emit` / `failed` 或 `interrupted`；`log_ref` 指向本机账本日志，其中 `=== runner log ===` 一行记录节点上的日志位置、Runner `run_id`、SHA-256 与字节数。
+- **中断**：试点 Worker 用 `interrupt` 策略。新事件到达或强制停机时，Bridge 让节点结束 Run 并等到终态（进程组已回收、只读 worktree 已删）才放手；账本记 `interrupted`，Outbox 不写任何内容，原批次回到 `pending` 与新事件合并重跑。尚未派发（在等节点）的 Run 直接取消，账本不写节点。
+- **失败不会卡住**：节点 30 秒内不可用、连接中断、校验不通过、结果不符都以 `Emit(status="failed")` 结束并关闭会话；不自动重试，由人重放。
+- **关闭与回退**：热加载改 `enabled = false` 后，在途 Run 用完 Relay 再关，新事件回到原路由；会话已随每个结果关闭，同一 `correlation_key` 的后续事件走原执行器。遗留的试点事件由占位执行器了结。Relay 打不开（令牌、端口）时只影响试点 Inbox：冷启动保持 `pending`，热加载开启则拒绝本次配置。
+- **不做**：写工作区、会调工具的 CLI、多节点、非回环地址、自动 fetch 候选提交。
