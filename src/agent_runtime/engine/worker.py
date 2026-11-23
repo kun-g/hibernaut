@@ -32,6 +32,7 @@ from agent_runtime.core.models import (
     RunTelemetry,
     TASK_CONTEXT_KEY,
     TASK_SYNC_KIND,
+    TRACE_METADATA_KEY,
     SessionRef,
     Silent,
     Suspend,
@@ -75,12 +76,15 @@ from agent_runtime.engine.forwarding import (
     return_refusal,
     returned_piece,
     returned_pieces,
+    run_lineage,
     run_spec,
     same_piece,
     settled_return,
     task_hop_count,
+    task_trace_id,
     withdrawn,
     withdrawn_forward,
+    with_lineage,
 )
 
 
@@ -124,6 +128,7 @@ class RunReport:
     outcome: RunOutcome
     # Kept on the report: a session closed after its Run no longer carries it.
     correlation_key: str | None = None
+    trace_id: str | None = None
     # The batch never ran: routing refused the agent its events named.
     rejected: str | None = None
     # The Run handed the work to another agent or sent its result back to one: the external task is not finished.
@@ -214,7 +219,7 @@ def _task_link(events: list[Event], session_ref: SessionRef | None) -> TaskLink 
     for evt in reversed(events):
         task_id = evt.payload.get("task_id")
         if isinstance(task_id, str) and task_id:
-            trace_id = evt.payload.get("trace_id")
+            trace_id = task_trace_id(evt)
             hop_count = task_hop_count(evt)
             return TaskLink(
                 task_id=task_id,
@@ -222,6 +227,10 @@ def _task_link(events: list[Event], session_ref: SessionRef | None) -> TaskLink 
                 hop_count=hop_count if isinstance(hop_count, int) and not isinstance(hop_count, bool) else None,
             )
     return session_ref.task_link if session_ref is not None else None
+
+
+def _run_trace_id(events: Sequence[Event], session: SessionRef | None) -> str:
+    return run_lineage(events, session)[0]
 
 
 def _task_fields(link: TaskLink, action: str, stage: str | None = None) -> dict[str, Any]:
@@ -524,6 +533,7 @@ class AgentWorker:
                                     session_id=closed_sid,
                                     event_ids=tuple(batch_ids),
                                     outcome=Silent(),
+                                    trace_id=_run_trace_id(batch, session_ref),
                                 )
                             )
                             continue
@@ -777,7 +787,7 @@ class AgentWorker:
             close_session(session, self._sessions, self._queue_event, cause=event.event_id, closed_parent=parent)
             self._reclaim(session)
             report = RunReport(inbox_id=inbox_id, session_id=session.session_id, event_ids=(event.event_id,),
-                               outcome=Silent())
+                               outcome=Silent(), trace_id=_run_trace_id([event], session))
         self._inbox.mark_done([event.event_id])
         return report
 
@@ -857,7 +867,8 @@ class AgentWorker:
                 spec = replace(spec, pending_returns=tuple(p for p in spec.pending_returns if p != piece),
                                cancelled_returns=(*spec.cancelled_returns, piece))
             report = RunReport(inbox_id=inbox_id, session_id=session.session_id, event_ids=(event.event_id,),
-                               outcome=Silent(), pending_elsewhere=bool(spec.pending_returns))
+                               outcome=Silent(), trace_id=_run_trace_id([event], session),
+                               pending_elsewhere=bool(spec.pending_returns))
             # A suspended session goes on once its own request is decided.
             if not spec.pending_returns and session.status == "active" and not spec.handed_on:
                 report = self._end_without_return(inbox_id, event, session, spec, repeated=repeated)
@@ -877,7 +888,8 @@ class AgentWorker:
             f"come back: {payload.get('reason')}. This task ended without it."
         )
         key = self._reported_key(session.correlation_key, spec)
-        metadata = self._report_metadata([event], key, session.agent_id or "", new_id("run"), spec)
+        trace_id = _run_trace_id([event], session)
+        metadata = self._report_metadata([event], key, session.agent_id or "", new_id("run"), trace_id, spec)
         owed = spec.return_to is not None
         # Results first: a crash before the session is saved repeats them, one after it does not.
         if not repeated:
@@ -902,6 +914,7 @@ class AgentWorker:
             event_ids=(event.event_id,),
             outcome=Emit(messages=(text,), status="refused"),
             correlation_key=key,
+            trace_id=trace_id,
             rejected=text,
             pending_elsewhere=owed,
         )
@@ -1014,7 +1027,10 @@ class AgentWorker:
         ongoing = saved is not None and (saved.return_to is not None or bool(saved.pending_returns))
         told = saved is not None and all(event_id in saved.owed_failures for event_id in ids)
         key = self._reported_key(self._extract_correlation_key(batch, session_ref), spec)
-        metadata = self._with_status(self._report_metadata(batch, key, "", new_id("run"), spec), "refused")
+        trace_id = _run_trace_id(batch, session_ref)
+        metadata = self._with_status(
+            self._report_metadata(batch, key, "", new_id("run"), trace_id, spec), "refused"
+        )
         if session_ref is not None:
             metadata["session_id"] = session_ref.session_id
         if told:
@@ -1042,6 +1058,7 @@ class AgentWorker:
             event_ids=tuple(ids),
             outcome=Emit(messages=(reason,), status="refused"),
             correlation_key=key,
+            trace_id=trace_id,
             rejected=reason,
             # The task goes on: with the agent that asked for it, or in this very session.
             pending_elsewhere=bool(pieces) or ongoing,
@@ -1151,7 +1168,8 @@ class AgentWorker:
             return None
         approved = answers[-1].payload.get("approved") is True
         key = self._reported_key(None, spec)
-        metadata = self._report_metadata(answers, key, held.agent_id, new_id("run"), spec)
+        trace_id = _run_trace_id(answers, holder)
+        metadata = self._report_metadata(answers, key, held.agent_id, new_id("run"), trace_id, spec)
         payload = held.payload
         if not approved:
             # Only that it was withheld: the result itself stays here.
@@ -1200,6 +1218,7 @@ class AgentWorker:
             event_ids=tuple(ids),
             outcome=outcome,
             correlation_key=key,
+            trace_id=trace_id,
             pending_elsewhere=True,
         )
 
@@ -1365,7 +1384,9 @@ class AgentWorker:
             superseded = _superseded([previous_link], claimed_link, released)
             released.update(link.task_id for link in superseded)
             if not resuming:
-                extra = self._report_metadata(batch, start_key, executor.executor_id, run_id, start_spec)
+                extra = self._report_metadata(
+                    batch, start_key, executor.executor_id, run_id, _run_trace_id(batch, active_session), start_spec
+                )
                 self._sync_task_switch(inbox_id, extra, active_session.session_id, superseded, claimed_link)
 
         def _drop_registration() -> None:
@@ -1418,7 +1439,7 @@ class AgentWorker:
             failed_spec = run_spec(batch + folded_events, active_session)
             failed_metadata = self._report_metadata(
                 batch + folded_events, self._reported_key(batch_correlation_key, failed_spec), executor.executor_id,
-                run_id, failed_spec,
+                run_id, _run_trace_id(batch + folded_events, active_session), failed_spec,
             )
             inside = failed_spec is not None and (failed_spec.return_to is not None or failed_spec.handed_on)
             # Owed to the agent that asked for it, by this session or by the one it handed the work on to: the details
@@ -1504,7 +1525,9 @@ class AgentWorker:
                 handed_over = forwards.hand_over(final_link)
             sent = forwards.own_returns()
             if sent:
-                known = final_spec or ForwardSpec(target_inbox=inbox_id, origin_key=final_corr)
+                known = final_spec or with_lineage(
+                    ForwardSpec(target_inbox=inbox_id, origin_key=final_corr), consumed, active_session
+                )
                 # A Run repeated after a crash sends the same pieces: one that is settled by now is not awaited again.
                 settled = {*known.cancelled_returns, *returned_pieces(consumed)}
                 final_spec = replace(known, pending_returns=tuple(dict.fromkeys(
@@ -1513,8 +1536,14 @@ class AgentWorker:
         if final_spec is not None and forwards.passes_on(final_spec):
             # From here on only the receiver owes it.
             final_spec = replace(final_spec, return_to=None, delegation_id=None, handed_on=True)
+        if isinstance(outcome, Suspend) and final_spec is None:
+            # The approval that resumes it carries no lineage of its own.
+            final_spec = with_lineage(ForwardSpec(target_inbox=inbox_id), consumed, active_session)
         awaiting = final_spec is not None and bool(final_spec.pending_returns)
-        report_metadata = self._report_metadata(consumed, final_key, executor.executor_id, run_id, final_spec)
+        trace_id = _run_trace_id(consumed, active_session)
+        report_metadata = self._report_metadata(
+            consumed, final_key, executor.executor_id, run_id, trace_id, final_spec
+        )
         # What is said about work handed on stays in the Run's own records.
         handed_on = final_spec is not None and final_spec.handed_on
         returned = handed_on and isinstance(outcome, Emit)
@@ -1568,6 +1597,7 @@ class AgentWorker:
             event_ids=tuple(all_done_ids),
             outcome=held[1] if held is not None else outcome,
             correlation_key=final_key,
+            trace_id=trace_id,
             pending_elsewhere=bool(forwards.staged) or awaiting or returned or handed_on,
         )
         if isinstance(outcome, Emit) and outcome.close_session and final_session_id is not None:
@@ -1705,11 +1735,12 @@ class AgentWorker:
         correlation_key: str | None,
         executor_id: str,
         run_id: str,
+        trace_id: str,
         spec: ForwardSpec | None = None,
     ) -> dict[str, Any]:
         # Routing hints a channel needs to answer where the work came from; extra keys are ignored by
         # channels that do not read them.
-        meta: dict[str, Any] = {"run_id": run_id}
+        meta: dict[str, Any] = {"run_id": run_id, TRACE_METADATA_KEY: trace_id}
         if correlation_key:
             meta["correlation_key"] = correlation_key
         if spec is not None:
@@ -1724,7 +1755,11 @@ class AgentWorker:
                     meta[key] = value
                     break
         task_events = [e for e in events if not cls._is_approval_decision(e)] or events
-        context: dict[str, Any] = {"source": task_events[0].source, "executor_id": executor_id}
+        context: dict[str, Any] = {
+            "source": task_events[0].source,
+            "executor_id": executor_id,
+            "trace_id": trace_id,
+        }
         title = _task_title(events)
         if title:
             context["title"] = title
@@ -1995,7 +2030,6 @@ class AgentWorker:
                 route = self._route_failure(executor_id, telemetry=telemetry)
                 error_kind = route.error_kind if route is not None else None
                 error_summary = outcome.messages[0] if outcome.messages else None
-            link = _task_link(events, session)
             ledger.record_run(
                 RunLedgerEntry(
                     run_id=run_id,
@@ -2009,7 +2043,7 @@ class AgentWorker:
                     outcome_kind=end_kind,
                     emit_status=emit_status,
                     correlation_key=self._extract_correlation_key(events, session),
-                    trace_id=link.trace_id if link is not None else None,
+                    trace_id=_run_trace_id(events, session),
                     work_key=session.work_key,
                     parent_session_id=session.parent_session_id,
                     replay_of_run_id=_replay_of_run_id(events),
