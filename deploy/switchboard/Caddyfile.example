@@ -1,6 +1,8 @@
 # Copy to Caddyfile and replace sb.example.com with the domain whose A/AAAA record points at this VPS.
 # Caddy obtains and renews the TLS certificate itself (ports 80 and 443 must be reachable).
 # reverse_proxy passes WebSocket upgrades through, so wss://<domain>/ws/relay needs no extra rule.
+# Switchboard and Taskboard on one domain under /switchboard and /taskboard: see deploy/taskboard/Caddyfile.example
+# and deploy/taskboard/README.md.
 sb.example.com {
 	encode gzip
 	reverse_proxy switchboard:8790

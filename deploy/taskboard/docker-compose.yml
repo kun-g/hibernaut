@@ -1,0 +1,67 @@
+# Switchboard + Taskboard on one compose network, served under one domain by sub-path (see README.md).
+# Run from deploy/taskboard/ after preparing the instance files (README.md, "部署"):
+#   docker compose up -d --build                          # whole stack
+#   docker compose --profile caddy up -d --build          # plus Caddy, when nothing else holds 80/443
+# Each service builds from its own commit (SWITCHBOARD_REF / TASKBOARD_REF) and carries its own config hash label,
+# so changing one service's ref or config never recreates the other. To touch only one of them:
+#   docker compose up -d --build --no-deps taskboard
+#   docker compose up -d --build --no-deps switchboard
+# Only Caddy publishes host ports; 8790 and 8791 stay on the compose network.
+name: hub
+
+services:
+  switchboard:
+    build:
+      context: ${HIBERNAUT_GIT_URL:-https://github.com/kun-g/hibernaut.git}#${SWITCHBOARD_REF:?set SWITCHBOARD_REF to the commit Switchboard runs}
+      dockerfile: deploy/switchboard/Dockerfile
+    image: hibernaut-switchboard:${SWITCHBOARD_REF:?set SWITCHBOARD_REF}
+    restart: unless-stopped
+    # A list, not a mapping: Dokploy only injects its Traefik labels into list-form labels.
+    labels: ["switchboard.config-sha=${SWITCHBOARD_CONFIG_SHA:?run scripts/prepare_taskboard_deploy.py render --switchboard-toml}"]
+    env_file: ["../switchboard/.env"]
+    volumes:
+      - ../switchboard/switchboard.toml:/etc/switchboard/switchboard.toml:ro
+      - switchboard_data:/data
+
+  taskboard:
+    build:
+      context: ${HIBERNAUT_GIT_URL:-https://github.com/kun-g/hibernaut.git}#${TASKBOARD_REF:?set TASKBOARD_REF to the commit Taskboard runs}
+      dockerfile: deploy/taskboard/Dockerfile
+    image: hibernaut-taskboard:${TASKBOARD_REF:?set TASKBOARD_REF}
+    restart: unless-stopped
+    labels: ["taskboard.config-sha=${TASKBOARD_CONFIG_SHA:?run scripts/prepare_taskboard_deploy.py render}"]
+    environment:
+      SWITCHBOARD_RELAY_TOKEN: ${SWITCHBOARD_RELAY_TOKEN:?equal to Switchboard's SWITCHBOARD_RELAY_WEBHOOK_SECRET}
+      SWITCHBOARD_MCP_TOKEN: ${SWITCHBOARD_MCP_TOKEN:?equal to Switchboard's SWITCHBOARD_MCP_WEBHOOK_SECRET}
+      TASKBOARD_MCP_TOKEN: ${TASKBOARD_MCP_TOKEN:?unset would reject every /taskboard/mcp request}
+    depends_on:
+      switchboard:
+        condition: service_healthy
+    volumes:
+      - ./taskboard.toml:/etc/taskboard/taskboard.toml:ro
+      - taskboard_data:/data
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["caddy"]
+    restart: unless-stopped
+    depends_on:
+      switchboard:
+        condition: service_healthy
+      taskboard:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  switchboard_data:
+    # The volume deploy/switchboard's stack created: moving to this stack keeps Switchboard's database.
+    name: switchboard_switchboard_data
+  taskboard_data:
+  caddy_data:
+  caddy_config:
