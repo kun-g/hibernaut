@@ -26,11 +26,18 @@ class _Server(ThreadingHTTPServer):
         routes: Mapping[str, InboundAdapter],
         max_body_bytes: int,
         upgrades: Mapping[str, UpgradeHandler],
+        base_path: str = "",
     ) -> None:
         self.pipeline = pipeline
         self.routes = dict(routes)
         self.max_body_bytes = max_body_bytes
         self.upgrades = dict(upgrades)
+        self.health_paths = frozenset({"/healthz", f"{base_path}/healthz"})
+        if base_path:
+            # Both forms are served: the bare paths for probes, old hostnames and proxies that strip the prefix,
+            # the prefixed ones for a proxy that keeps it (Traefik PathPrefix without StripPrefix).
+            self.routes.update({f"{base_path}{path}": adapter for path, adapter in routes.items()})
+            self.upgrades.update({f"{base_path}{path}": handler for path, handler in upgrades.items()})
         super().__init__(address, _Handler)
 
 
@@ -42,7 +49,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = self._path()
-        if path == "/healthz":
+        if path in self._srv().health_paths:
             self._reply(200, {"status": "ok"})
             return
         upgrade = self._srv().upgrades.get(path)
@@ -155,8 +162,9 @@ class SwitchboardHTTPServer:
         port: int = 0,
         max_body_bytes: int = 1_048_576,
         upgrades: Mapping[str, UpgradeHandler] | None = None,
+        base_path: str = "",
     ) -> None:
-        self._server = _Server((host, port), pipeline, routes, max_body_bytes, upgrades or {})
+        self._server = _Server((host, port), pipeline, routes, max_body_bytes, upgrades or {}, base_path)
         self._thread: threading.Thread | None = None
 
     @property

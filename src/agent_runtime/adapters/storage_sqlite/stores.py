@@ -16,6 +16,7 @@ from agent_runtime.core.models import (
     OutboxStatus,
     SessionRef,
     SessionStatus,
+    TaskLink,
     TimerKind,
     TimerSpec,
     TimerStatus,
@@ -503,6 +504,29 @@ class SQLiteLeaseLockAdapter:
             )
 
 
+def _task_link_to_json(link: TaskLink | None) -> str | None:
+    if link is None:
+        return None
+    return json.dumps({"task_id": link.task_id, "trace_id": link.trace_id, "hop_count": link.hop_count})
+
+
+def _task_link_from_json(raw: object) -> TaskLink | None:
+    if not raw:
+        return None
+    data = json.loads(str(raw))
+    if not isinstance(data, dict):
+        return None
+    fields = cast(dict[str, Any], data)
+    task_id, trace_id, hop_count = fields.get("task_id"), fields.get("trace_id"), fields.get("hop_count")
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    return TaskLink(
+        task_id=task_id,
+        trace_id=trace_id if isinstance(trace_id, str) else None,
+        hop_count=hop_count if isinstance(hop_count, int) and not isinstance(hop_count, bool) else None,
+    )
+
+
 class SQLiteSessionStoreAdapter:
     def __init__(self, db: SQLiteDatabase) -> None:
         self._db = db
@@ -520,13 +544,15 @@ class SQLiteSessionStoreAdapter:
             pending_request_id=row["pending_request_id"],
             updated_at=str(row["updated_at"]),
             parent_session_id=row["parent_session_id"],
+            task_link=_task_link_from_json(row["task_link"]),
         )
 
     def get(self, session_id: str) -> SessionRef | None:
         row = self._db.fetchone(
             """
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
-                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id
+                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id,
+                   task_link
             FROM sessions
             WHERE session_id = ?
             """,
@@ -538,7 +564,8 @@ class SQLiteSessionStoreAdapter:
         row = self._db.fetchone(
             """
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
-                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id
+                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id,
+                   task_link
             FROM sessions
             WHERE pending_request_id = ?
             LIMIT 1
@@ -551,7 +578,8 @@ class SQLiteSessionStoreAdapter:
         row = self._db.fetchone(
             """
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
-                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id
+                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id,
+                   task_link
             FROM sessions
             WHERE inbox_id = ? AND correlation_key = ? AND status IN ('active', 'suspended')
             ORDER BY updated_at DESC
@@ -635,7 +663,8 @@ class SQLiteSessionStoreAdapter:
         rows = self._db.fetchall(
             f"""
             SELECT session_id, inbox_id, correlation_key, executor_id, executor_session_id,
-                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id
+                   status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id,
+                   task_link
             FROM sessions
             {where}
             ORDER BY updated_at DESC
@@ -664,9 +693,9 @@ class SQLiteSessionStoreAdapter:
                 """
                 INSERT INTO sessions (
                     session_id, inbox_id, correlation_key, executor_id, executor_session_id,
-                    status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id
+                    status, work_key, checkpoint, pending_request_id, updated_at, parent_session_id, task_link
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     inbox_id = excluded.inbox_id,
                     correlation_key = excluded.correlation_key,
@@ -677,7 +706,8 @@ class SQLiteSessionStoreAdapter:
                     checkpoint = excluded.checkpoint,
                     pending_request_id = excluded.pending_request_id,
                     updated_at = excluded.updated_at,
-                    parent_session_id = excluded.parent_session_id
+                    parent_session_id = excluded.parent_session_id,
+                    task_link = excluded.task_link
                 """,
                 (
                     session.session_id,
@@ -691,5 +721,6 @@ class SQLiteSessionStoreAdapter:
                     session.pending_request_id,
                     session.updated_at,
                     session.parent_session_id,
+                    _task_link_to_json(session.task_link),
                 ),
             )

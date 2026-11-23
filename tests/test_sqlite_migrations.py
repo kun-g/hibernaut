@@ -4,7 +4,10 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteOutboxAdapter
+from dataclasses import replace
+
+from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteOutboxAdapter, SQLiteSessionStoreAdapter
+from agent_runtime.core.models import TaskLink
 
 
 class TestSQLiteMigrations(unittest.TestCase):
@@ -34,6 +37,28 @@ class TestSQLiteMigrations(unittest.TestCase):
                     self.assertEqual(tuple(session), ('saved', 'r1', None))
                     index = db.fetchall("PRAGMA index_info(idx_sessions_correlation)")
                     self.assertEqual([col['name'] for col in index], ['inbox_id', 'correlation_key', 'updated_at'])
+
+    def test_legacy_sessions_gain_task_link_and_round_trip_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.db"
+            with closing(sqlite3.connect(path)) as conn:
+                conn.executescript("""
+                    CREATE TABLE sessions (
+                        session_id TEXT PRIMARY KEY, inbox_id TEXT, checkpoint TEXT,
+                        pending_request_id TEXT, updated_at TEXT
+                    );
+                    INSERT INTO sessions VALUES ('s1', 'i1', 'saved', 'r1', 'now');
+                """)
+            with closing(SQLiteDatabase(path)) as db:
+                store = SQLiteSessionStoreAdapter(db)
+                legacy = store.get("s1")
+                assert legacy is not None
+                self.assertIsNone(legacy.task_link)
+                link = TaskLink(task_id="tb_tsk_1", trace_id="trace-1", hop_count=2)
+                store.save(replace(legacy, task_link=link))
+                self.assertEqual(store.get("s1").task_link, link)  # type: ignore[union-attr]
+                store.save(replace(legacy, task_link=TaskLink(task_id="tb_tsk_2")))
+                self.assertEqual(store.get("s1").task_link, TaskLink(task_id="tb_tsk_2"))  # type: ignore[union-attr]
 
 
 class TestOutboxBackoffMigration(unittest.TestCase):

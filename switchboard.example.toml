@@ -9,6 +9,8 @@
 host = "127.0.0.1"
 port = 8790
 max_body_bytes = 1048576
+# Also serve every route under this prefix (hub.example.com/switchboard behind a prefix-keeping proxy).
+# base_path = "/switchboard"
 
 [sqlite]
 path = "switchboard.db"
@@ -49,6 +51,10 @@ rate_limit_per_target_rpm = 30
 max_retry_attempts = 5
 approval_channel = "feishu"
 # approval_target = "oc_xxx"
+# Taskboard human_todo / upstream_cancelled / dependency_invalidated notices with no reply target and no
+# origin that takes replies go here; unset falls back to approval_channel/approval_target.
+# notify_channel = "feishu"
+# notify_target = "oc_xxx"
 
 [relay]
 enabled = false
