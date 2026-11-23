@@ -718,19 +718,38 @@ class Deployment:
         self.write(enabled=enabled)
         self.until(lambda: self.hb_log.read_text().count(expect) > seen)
 
-    def start_hb(self) -> None:
+    def start_hb(self, *, fast_retry: bool = False) -> None:
+        entry = ("-m", "agent_runtime.app.main")
+        if fast_retry:
+            entry = ("-c", "from agent_runtime.adapters import runner_bridge; runner_bridge._NODE_POLL_SECONDS = 0.02; "
+                           "from agent_runtime.app.main import main; main()")
         with self.hb_log.open("ab") as stream:
             self.hb = subprocess.Popen(
-                [sys.executable, "-m", "agent_runtime.app.main", "--config", str(self.config),
+                [sys.executable, *entry, "--config", str(self.config),
                  "--config-poll-interval", "0.05", "--outbox-interval", "0.05"],
                 cwd=self.root, env={**os.environ, "PYTHONPATH": str(SRC)}, stdout=stream, stderr=stream,
             )
-        self.until(lambda: self._post({"inbox_id": "warmup", "external_id": "0", "payload": {}}) is not None)
+        self.until(self.http_ready)
 
-    def start_runner(self) -> None:
-        self.runner = start_service(self.runner_config, self.runner_log)
+    def http_ready(self) -> bool:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+        try:
+            conn.request("POST", "/readiness-probe")
+            return conn.getresponse().status == 404
+        except ConnectionRefusedError:
+            return False
+        finally:
+            conn.close()
 
-    def start_gated_runner(self, monkeypatch: pytest.MonkeyPatch) -> Path:
+    def start_runner(self, *, fast_retry: bool = False) -> None:
+        entry = ("-m", "runner.service")
+        if fast_retry:
+            entry = ("-c", "from functools import partial; from runner import service; "
+                           "service.RunnerRelayAgent = partial(service.RunnerRelayAgent, reconnect_delays=(0.02,)); "
+                           "raise SystemExit(service.main())")
+        self.runner = start_service(self.runner_config, self.runner_log, entry=entry)
+
+    def start_gated_runner(self, monkeypatch: pytest.MonkeyPatch, *, fast_retry: bool = False) -> Path:
         gate = self.root / "hold-check"
         real_git = shutil.which("git")
         assert real_git is not None
@@ -747,7 +766,7 @@ class Deployment:
         shim.chmod(0o755)
         with monkeypatch.context() as env:
             env.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
-            self.start_runner()
+            self.start_runner(fast_retry=fast_retry)
         return gate
 
     def force_stop_hb(self) -> None:
@@ -1004,8 +1023,8 @@ def test_turning_the_route_off_drains_it_and_restores_the_original_path(
     pilot: Deployment, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pilot.write(enabled=False)
-    pilot.start_hb()
-    gate = pilot.start_gated_runner(monkeypatch)
+    pilot.start_hb(fast_retry=True)
+    gate = pilot.start_gated_runner(monkeypatch, fast_retry=True)
     assert not pilot.relay_open()
     pilot.assert_original_path(PILOT)  # off: the pilot inbox is an ordinary inbox
 

@@ -89,17 +89,19 @@ def runner_toml(path: Path, *, repo: Path, port: int, token_file: Path, runner_i
     return path
 
 
-def start_service(config: Path, log: Path) -> subprocess.Popen[bytes]:
+def start_service(config: Path, log: Path, *, entry: tuple[str, ...] = ("-m", "runner.service")) -> subprocess.Popen[bytes]:
+    # A restarted service appends to the same log. Wait for the new process to publish its own ready line.
+    previous = log.stat().st_size if log.exists() else 0
     with log.open("ab") as stream:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "runner.service", "--config", str(config)],
+            [sys.executable, *entry, "--config", str(config)],
             cwd=config.parent,
             env={**os.environ, "PYTHONPATH": str(SRC), "GH_TOKEN": "synthetic-service-token"},
             stdout=stream,
             stderr=stream,
         )
     deadline = time.monotonic() + 20
-    while " serving " not in log.read_text(encoding="utf-8"):
+    while b" serving " not in log.read_bytes()[previous:]:
         assert proc.poll() is None and time.monotonic() < deadline, log.read_text(encoding="utf-8")
         time.sleep(0.05)
     return proc
