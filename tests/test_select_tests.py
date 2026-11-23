@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import unittest
+from functools import cache
+from unittest.mock import patch
 
-from scripts.select_tests import select_tests
+from scripts.select_tests import build_reverse_graph, select_tests
 
 
 class TestSelectTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # All cases query the same unmodified checkout. Build its real import graph once per worker.
+        cls.enterClassContext(patch("scripts.select_tests.build_reverse_graph", cache(build_reverse_graph)))
+
     def test_switchboard_change_selects_only_switchboard_and_bridge_tests(self) -> None:
         res = select_tests(["src/switchboard/relay_hub.py"])
         self.assertFalse(res.full_suite)

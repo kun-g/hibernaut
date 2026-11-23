@@ -32,7 +32,13 @@ class TestConflictResolution(unittest.TestCase):
         run_git(self.repo, "config", "user.email", "t@example.invalid")
         run_git(self.repo, "config", "user.name", "t")
         self.commit({"f.py": self.BASE, "keep.py": "k = 1\n"}, "base")
+        run_git(self.repo, "tag", "fixture-base")
         run_git(self.repo, "checkout", "-qb", "task")
+
+    def reset_branches(self):
+        # Subcases end with all files committed. Restore both tips before building the next history.
+        run_git(self.repo, "reset", "--hard", "fixture-base")
+        run_git(self.repo, "branch", "-f", "main", "fixture-base")
 
     def commit(self, files, message="work"):
         for rel, text in files.items():
@@ -61,7 +67,7 @@ class TestConflictResolution(unittest.TestCase):
     def test_resolutions_made_of_both_sides_are_only_resolutions(self):
         for name, text in {"combined": self.MERGED, "ours": self.OURS, "theirs": self.THEIRS}.items():
             with self.subTest(name):
-                self.setUp()
+                self.reset_branches()
                 self.assertTrue(self.resolve({"f.py": text})[0])
 
     def test_any_other_change_is_not(self):
@@ -78,7 +84,7 @@ class TestConflictResolution(unittest.TestCase):
         }
         for name, files in cases.items():
             with self.subTest(name):
-                self.setUp()
+                self.reset_branches()
                 self.assertFalse(self.resolve(files)[0])
 
     def block(self, base, ours, theirs, resolved):
@@ -86,11 +92,9 @@ class TestConflictResolution(unittest.TestCase):
         def text(lines):
             return "".join(f"{ln}\n" for ln in ["top = 1", "", *lines, "", "end = 1"])
 
-        self.setUp()
+        self.reset_branches()
         self.commit({"f.py": text(base)}, "base file")
-        run_git(self.repo, "checkout", "-q", "main")
-        run_git(self.repo, "merge", "-q", "task")
-        run_git(self.repo, "checkout", "-q", "task")
+        run_git(self.repo, "branch", "-f", "main", "task")
         return self.resolve({"f.py": text(resolved)}, ours={"f.py": text(ours)}, theirs={"f.py": text(theirs)})[0]
 
     def test_a_block_may_combine_what_the_sides_have(self):
@@ -171,7 +175,7 @@ class TestConflictResolution(unittest.TestCase):
         # main deleted a file the task changed: restoring the task's copy changes nothing, removing it is a decision.
         for remove, expected in (((), True), (("keep.py",), False)):
             with self.subTest(remove=remove):
-                self.setUp()
+                self.reset_branches()
                 self.commit({"keep.py": "k = 3\n"}, "task")
                 reviewed = worktree_fingerprint(self.repo)
                 run_git(self.repo, "checkout", "-q", "main")
