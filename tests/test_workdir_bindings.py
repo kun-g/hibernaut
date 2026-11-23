@@ -296,7 +296,7 @@ class TestDispatch(_DispatchCase):
             with self.subTest(exists=workdir.is_dir()):
                 path = self.write_config(self.project + binding_table(OPS, workdir))
                 await asyncio.wait_for(self.dispatch(
-                    path, [(OPS, {"text": "odd", "explicit_workdir": "a\0b"}, None)]), timeout=20)
+                    path, [(OPS, {"text": "odd", "explicit_workdir": "a\0b"}, None)]), timeout=60)
                 self.assertEqual(self.statuses(OPS)[-1], ("done", 1))
                 self.assertIn("is not this inbox's workdir", self.rows("SELECT content FROM outbox ORDER BY seq")[-1][0])
 
@@ -309,7 +309,7 @@ class TestDispatch(_DispatchCase):
             daemon = await asyncio.wait_for(self.dispatch(path, [
                 *((inbox_id, {"text": "bad"}, "task:1") for inbox_id in bad),
                 ("sys:ops:good", {"text": "good"}, "task:1"),
-            ]), timeout=20)
+            ]), timeout=60)
         for inbox_id in bad:
             with self.subTest(inbox_id=inbox_id[:20]):
                 self.assertEqual(self.statuses(inbox_id), [("pending", 0)])

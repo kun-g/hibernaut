@@ -378,7 +378,8 @@ class TestPeerTurnSurvivesDetach(PeerCase):
         recorder = Recorder()
         task = asyncio.ensure_future(self.converse_with(self.runner, TurnSlot(run, None, recorder)))
         run.task = task
-        session = await until(lambda: self.orca.terminals and self.orca.session().received and self.orca.session(),
+        # Never the list itself: one that is empty here may have its message by the time until() looks at it.
+        session = await until(lambda: self.orca.session() if self.orca.terminals and self.orca.session().received else None,
                               what="the task")
         await until(lambda: recorder.turn and recorder.turn["sent"] and run.parked, what="the parked wait")
         run.stop()

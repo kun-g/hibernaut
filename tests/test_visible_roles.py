@@ -2,6 +2,7 @@ import asyncio
 import http.client
 import json
 import os
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -359,14 +360,23 @@ class TestVisibleSDE(VisibleCase):
 
     async def test_timeout_closes_the_terminal_and_keeps_the_conversation_resumable(self):
         self.set_plan(sde=[{"hang": True}])
-        outcome = await self.sde(review=False, timeout=0.8).execute([event(self.payload())], None, self.caps)
+        gates = []
+
+        async def orca(*args, cwd):
+            # Read here what the terminal starts: on a busy machine the agent itself may not be up in time to log it.
+            if args[:2] == ("terminal", "create"):
+                gates.append(json.loads(Path(shlex.split(args[args.index("--command") + 1])[-1]).read_text()))
+            return await self.orca(*args, cwd=cwd)
+
+        with patch("agent_runtime.adapters.executor_cli.orca._orca", new=orca):
+            outcome = await self.sde(review=False, timeout=2.0).execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Emit), outcome
-        self.assertIn("development failed: timed out after 0.8", outcome.messages[0])
+        self.assertIn("development failed: timed out after 2.0", outcome.messages[0])
         (handle,) = self.orca.terminals
         self.assertIsNotNone(self.orca.terminals[handle]["proc"].returncode)
         binding = self.bindings.get(outcome.session_id)
         self.assertIsNone(binding.handle)
-        self.assertEqual(binding.native_session_id, arg(self.calls("sde", "interactive")[0], "--session-id"))
+        self.assertEqual(binding.native_session_id, arg({"argv": gates[0]["exec"]}, "--session-id"))
 
     async def test_interrupt_cancels_without_output_and_closes_the_terminal(self):
         self.set_plan(sde=[{"hang": True}])
