@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -57,3 +58,16 @@ class SafeAuditAdapter:
             self._inner.emit(event_name, task_id=task_id, detail=detail)
         except Exception as exc:  # noqa: BLE001
             print(f"[taskboard] audit sink failed on {event_name}: {exc!r}", file=sys.stderr)
+
+
+# The service's default sink: one JSON line per audit record on stderr, next to the process log.
+class StderrAuditSink:
+    def emit(
+        self,
+        event_name: str,
+        *,
+        task_id: str | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> None:
+        record = {"audit": event_name, "task_id": task_id, "detail": dict(detail or {})}
+        print(f"[taskboard] {json.dumps(record, ensure_ascii=False, default=str)}", file=sys.stderr, flush=True)

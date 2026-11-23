@@ -1,0 +1,30 @@
+# Taskboard service config (python -m taskboard.app --config taskboard.toml).
+# Secrets never go here; they come from the environment:
+#   SWITCHBOARD_RELAY_TOKEN  relay token presented to Switchboard (its SWITCHBOARD_RELAY_WEBHOOK_SECRET)
+#   SWITCHBOARD_MCP_TOKEN    bearer for Switchboard /mcp, used to publish work.ready and notifications
+#                            (its SWITCHBOARD_MCP_WEBHOOK_SECRET)
+#   TASKBOARD_MCP_TOKEN      bearer clients must send to this service's HTTP /mcp; unset rejects every request
+# The service refuses to start without the first two; --mcp-stdio needs neither.
+
+[http]
+host = "127.0.0.1"
+port = 8791
+# Same-domain sub-path behind a reverse proxy, e.g. "/taskboard" serves /taskboard/mcp and /taskboard/healthz.
+# /mcp and /healthz always answer too, for proxies that strip the prefix and for in-container probes.
+base_path = ""
+max_body_bytes = 1048576
+
+[sqlite]
+path = "taskboard.db"
+busy_timeout_ms = 5000
+
+[switchboard]
+relay_url = "wss://switchboard.example.com/ws/relay"
+mcp_url = "https://switchboard.example.com/mcp"
+consumer_id = "taskboard"
+# ca_file = "certs/ca.pem"  # private CA, relative to this file
+
+[intake]
+# work.opened (and a first work.updated, e.g. a trigger label on an old issue) from these sources starts
+# in ready and is dispatched at once unless the event sets metadata.initial_status.
+auto_ready_sources = ["github"]

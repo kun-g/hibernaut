@@ -51,12 +51,16 @@ STATIC_DEPS: dict[str, tuple[str, ...]] = {
     "tests/test_mcp_server.py": ("src/agent_runtime/adapters/channels/mcp_server.py",),
     "tests/test_gdrive_tasks.py": ("src/agent_runtime/adapters/channels/gdrive_tasks.py",),
     "tests/test_gdrive_credential_proxy.py": ("src/agent_runtime/adapters/channels/gdrive_tasks.py",),
+    # Both start `python -m taskboard.app`; the dual-process test also `python -m switchboard.app`.
+    "tests/taskboard/test_m7_service.py": ("src/taskboard/app/__main__.py",),
+    "tests/test_taskboard_dual_process_e2e.py": ("src/taskboard/app/__main__.py", "src/switchboard/app.py"),
 }
 
 RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("src/agent_runtime/adapters/executor_cli/skills/**", ("src/agent_runtime/adapters/executor_cli/role_skills.py",)),
     ("hibernaut.example.toml", ("tests/test_bootstrap_loop.py", "tests/test_sde_delivery.py")),
     ("switchboard.example.toml", ("tests/test_switchboard_core.py",)),
+    ("taskboard.example.toml", ("tests/taskboard/test_m7_service.py",)),
     ("deploy/gdrive-proxy/**", ("tests/test_gdrive_credential_proxy.py",)),
     ("deploy/switchboard/**", ("tests/test_switchboard_deploy.py",)),
     ("deploy/ccpeer/**", ("tests/test_ccpeer.py",)),
@@ -66,6 +70,9 @@ RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/taskboard/test_m3_engine_and_switchboard.py",
             "tests/taskboard/test_m4_architecture_and_schemas.py",
             "tests/taskboard/test_m5_publish_replay.py",
+            "tests/taskboard/test_m6_switchboard_contract.py",
+            "tests/taskboard/test_m7_service.py",
+            "tests/test_taskboard_dual_process_e2e.py",
         ),
     ),
     ("docs/dispatch/**", ("tests/test_sde_delivery.py",)),

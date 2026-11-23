@@ -6,7 +6,7 @@
   "properties": {
     "work_kind": {
       "type": "string",
-      "enum": ["issue", "pr", "task"]
+      "enum": ["issue", "pr", "pull_request", "task"]
     },
     "state": {
       "type": "string"

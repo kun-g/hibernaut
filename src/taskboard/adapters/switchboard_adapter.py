@@ -1,20 +1,20 @@
 from __future__ import annotations
 
-import json
-import re
 import sys
-from collections.abc import Mapping
-from functools import lru_cache
+from collections.abc import Collection, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from switchboard.envelope import CanonicalEvent, parse_utc, validate_envelope
 from switchboard.ports import DeliverStatus, EventBusPort
+from taskboard.adapters.json_schema import load_schema, validate_against_schema
 from taskboard.core.errors import (
     IllegalTransitionError,
     MaxHopsExceededError,
     PublishFailedError,
     SchemaValidationError,
+    TaskNotFoundError,
 )
 from taskboard.core.merge import MergeResult
 from taskboard.core.models import (
@@ -26,89 +26,7 @@ from taskboard.core.models import (
 from taskboard.engine.ingestion import IngestionService
 from taskboard.ports import AuditSinkPort
 
-_DEFAULT_SCHEMAS_DIR = Path(__file__).resolve().parents[3] / "schemas" / "taskboard"
-
-
-@lru_cache(maxsize=16)
-def load_schema(schema_name: str, schemas_dir: Path | None = None) -> dict[str, Any]:
-    root = schemas_dir or _DEFAULT_SCHEMAS_DIR
-    path = root / schema_name
-    return cast(dict[str, Any], json.loads(path.read_text(encoding="utf-8")))
-
-
-def _validate_node(
-    value: Any,
-    schema: Mapping[str, Any],
-    path: str,
-    problems: list[str],
-) -> None:
-    expected_type = schema.get("type")
-    if expected_type == "object":
-        if not isinstance(value, Mapping):
-            problems.append(f"{path}: expected object, got {type(value).__name__}")
-            return
-        mapping_value = cast(Mapping[str, Any], value)
-        required = schema.get("required") or ()
-        for req_key in required:
-            if req_key not in mapping_value or mapping_value[req_key] is None:
-                problems.append(f"{path}.{req_key}: required property missing")
-        props = cast(Mapping[str, Mapping[str, Any]], schema.get("properties") or {})
-        if schema.get("additionalProperties") is False:
-            extra = sorted(set(mapping_value.keys()) - set(props.keys()))
-            for key in extra:
-                problems.append(f"{path}.{key}: additional property not allowed")
-        for key, item_val in mapping_value.items():
-            if key in props:
-                _validate_node(item_val, props[key], f"{path}.{key}", problems)
-        return
-
-    if expected_type == "string":
-        if not isinstance(value, str):
-            problems.append(f"{path}: expected string, got {type(value).__name__}")
-            return
-        if "minLength" in schema and len(value) < int(schema["minLength"]):
-            problems.append(f"{path}: length {len(value)} < minLength {schema['minLength']}")
-        if "enum" in schema and value not in schema["enum"]:
-            problems.append(f"{path}: {value!r} not in enum {schema['enum']}")
-        if "pattern" in schema and not re.match(str(schema["pattern"]), value):
-            problems.append(f"{path}: {value!r} does not match pattern {schema['pattern']!r}")
-        return
-
-    if expected_type == "integer":
-        # bool is a subclass of int in Python; JSON Schema integer excludes booleans.
-        if isinstance(value, bool) or not isinstance(value, int):
-            problems.append(f"{path}: expected integer, got {type(value).__name__}")
-            return
-        if "minimum" in schema and value < int(schema["minimum"]):
-            problems.append(f"{path}: {value} < minimum {schema['minimum']}")
-        if "maximum" in schema and value > int(schema["maximum"]):
-            problems.append(f"{path}: {value} > maximum {schema['maximum']}")
-        return
-
-    if expected_type == "array":
-        if not isinstance(value, (list, tuple)):
-            problems.append(f"{path}: expected array, got {type(value).__name__}")
-            return
-        seq_val = cast(list[Any] | tuple[Any, ...], value)
-        if "minItems" in schema and len(seq_val) < int(schema["minItems"]):
-            problems.append(f"{path}: length {len(seq_val)} < minItems {schema['minItems']}")
-        item_schema = schema.get("items")
-        if isinstance(item_schema, Mapping):
-            for idx, elem in enumerate(seq_val):
-                _validate_node(elem, cast(Mapping[str, Any], item_schema), f"{path}[{idx}]", problems)
-
-
-def validate_against_schema(
-    schema_name: str,
-    payload: Mapping[str, Any],
-    *,
-    schemas_dir: Path | None = None,
-) -> None:
-    schema = load_schema(schema_name, schemas_dir)
-    problems: list[str] = []
-    _validate_node(payload, schema, "$", problems)
-    if problems:
-        raise SchemaValidationError(schema_name, problems)
+__all__ = ["SwitchboardAdapter", "load_schema", "validate_against_schema"]
 
 
 def _occurred_at_to_ms(event: CanonicalEvent) -> int:
@@ -119,6 +37,23 @@ def _occurred_at_to_ms(event: CanonicalEvent) -> int:
     return int(dt.timestamp() * 1000)
 
 
+def _source_ref(event: CanonicalEvent) -> str:
+    return str(event.metadata.get("source_ref") or event.correlation_key or event.external_id)
+
+
+# GitHub webhooks and plain submit_work calls carry no trace fields. Defaults go on a copy; a value the
+# caller did send is kept as is, so a wrong type or range still fails the schema.
+def _with_trace_defaults(event: CanonicalEvent) -> CanonicalEvent:
+    missing: dict[str, Any] = {}
+    if event.metadata.get("trace_id") is None:
+        missing["trace_id"] = event.event_id
+    if event.metadata.get("hop_count") is None:
+        missing["hop_count"] = 0
+    if not missing:
+        return event
+    return replace(event, metadata={**event.metadata, **missing})
+
+
 class SwitchboardAdapter:
     def __init__(
         self,
@@ -127,11 +62,13 @@ class SwitchboardAdapter:
         ingestion: IngestionService | None = None,
         audit: AuditSinkPort | None = None,
         schemas_dir: Path | None = None,
+        auto_ready_sources: Collection[str] = (),
     ) -> None:
         self._bus = bus
         self._ingestion = ingestion
         self._audit = audit
         self._schemas_dir = schemas_dir
+        self._auto_ready_sources = frozenset(auto_ready_sources)
 
     def bind_ingestion(self, ingestion: IngestionService) -> None:
         self._ingestion = ingestion
@@ -283,7 +220,8 @@ class SwitchboardAdapter:
         if event.source == "taskboard":
             return None
 
-        raw_hop = event.metadata.get("hop_count", 0)
+        event = _with_trace_defaults(event)
+        raw_hop = event.metadata["hop_count"]
         hop_count = raw_hop if isinstance(raw_hop, int) and not isinstance(raw_hop, bool) else 0
         if hop_count >= MAX_HOPS:
             self._safe_audit(
@@ -294,38 +232,11 @@ class SwitchboardAdapter:
             raise MaxHopsExceededError(hop_count, MAX_HOPS)
 
         trace_id = str(event.metadata.get("trace_id") or event.event_id)
-        source_ref = str(event.metadata.get("source_ref") or event.correlation_key or event.external_id)
+        source_ref = _source_ref(event)
         occurred_at_ms = _occurred_at_to_ms(event)
 
         if event.event_type == "work.opened":
-            validate_against_schema(
-                "work_opened.metadata.schema.json",
-                event.metadata,
-                schemas_dir=self._schemas_dir,
-            )
-            raw_initial = str(event.metadata.get("initial_status") or "backlog")
-            initial_status: Literal["backlog", "ready"] = (
-                "ready" if raw_initial == "ready" else "backlog"
-            )
-            depends_on = tuple(str(x) for x in (event.metadata.get("depends_on") or ()))
-            return self._ingestion.handle_work_opened(
-                source=event.source,
-                source_ref=source_ref,
-                scope=event.scope,
-                title=event.subject,
-                description=event.body,
-                occurred_at_ms=occurred_at_ms,
-                initial_status=initial_status,
-                assignee=str(event.metadata.get("assignee") or "agent:default"),
-                task_type=str(event.metadata.get("task_type") or "general"),
-                priority=int(event.metadata.get("priority", 2)),
-                depends_on=depends_on,
-                preferred_executor=str(event.metadata.get("preferred_executor") or ""),
-                artifact_ref=cast(str | None, event.metadata.get("artifact_ref")),
-                reply_target=cast(str | None, event.metadata.get("reply_target")),
-                trace_id=trace_id,
-                hop_count=hop_count,
-            )
+            return self._open_work(event, hop_count=hop_count)
 
         if event.event_type == "work.updated":
             patch: dict[str, Any] = {}
@@ -336,25 +247,48 @@ class SwitchboardAdapter:
             for key in ("priority", "assignee", "preferred_executor", "scope", "task_type", "artifact_ref", "reply_target"):
                 if key in event.metadata and event.metadata[key] is not None:
                     patch[key] = event.metadata[key]
-            return self._ingestion.handle_work_updated(
-                source_ref=source_ref,
-                patch=patch,
-                occurred_at_ms=occurred_at_ms,
-                trace_id=trace_id,
-                hop_count=hop_count,
-            )
+            try:
+                updated = self._ingestion.handle_work_updated(
+                    source_ref=source_ref,
+                    patch=patch,
+                    occurred_at_ms=occurred_at_ms,
+                    trace_id=trace_id,
+                    hop_count=hop_count,
+                )
+            except TaskNotFoundError:
+                if event.source not in self._auto_ready_sources:
+                    raise
+                # A closed or untitled item will never get a work.opened, so a retry cannot succeed: ack it.
+                if not event.subject or event.metadata.get("state") == "closed":
+                    self._ignore_untracked(event, source_ref)
+                    return None
+                # GitHub reports a trigger label added to an existing issue as work.updated, so the first
+                # event Taskboard sees for it is an update; handle_work_opened is idempotent on source_ref.
+                self._safe_audit(
+                    "work_updated_opened_task",
+                    detail={"event_id": event.event_id, "source_ref": source_ref},
+                )
+                return self._open_work(event, hop_count=hop_count)
+            return self._replay_ready_dispatch(updated, trace_id=trace_id, hop_count=hop_count)
 
         if event.event_type == "work.closed":
             raw_state = str(event.metadata.get("state") or "cancelled")
             state: Literal["closed", "cancelled"] = "closed" if raw_state == "closed" else "cancelled"
-            return self._ingestion.handle_work_closed(
-                source_ref=source_ref,
-                state=state,
-                reason=str(event.metadata.get("close_reason") or event.body or ""),
-                occurred_at_ms=occurred_at_ms,
-                trace_id=trace_id,
-                hop_count=hop_count,
-            )
+            try:
+                return self._ingestion.handle_work_closed(
+                    source_ref=source_ref,
+                    state=state,
+                    reason=str(event.metadata.get("close_reason") or event.body or ""),
+                    occurred_at_ms=occurred_at_ms,
+                    trace_id=trace_id,
+                    hop_count=hop_count,
+                )
+            except TaskNotFoundError:
+                # Closing an item Taskboard never tracked (e.g. older than the deployment) has nothing to do.
+                if event.source not in self._auto_ready_sources:
+                    raise
+                self._ignore_untracked(event, source_ref)
+                return None
 
         if event.event_type == "execution.reported":
             validate_against_schema(
@@ -377,6 +311,61 @@ class SwitchboardAdapter:
             )
 
         return None
+
+    # The first delivery may have committed the ready task and claimed its dispatch, then failed to
+    # publish; the redelivery lands here as an update. Replaying republishes the same external_id
+    # (tb:<task_id>:d<seq>), which Switchboard dedupes when the first publish did get through.
+    def _replay_ready_dispatch(self, result: MergeResult, *, trace_id: str, hop_count: int) -> MergeResult:
+        assert self._ingestion is not None
+        if result.task.status != "ready":
+            return result
+        dispatched = self._ingestion.dispatcher.dispatch_ready_task(
+            result.task, trace_id=trace_id, hop_count=hop_count
+        )
+        return result if dispatched is None else replace(result, task=dispatched)
+
+    def _ignore_untracked(self, event: CanonicalEvent, source_ref: str) -> None:
+        self._safe_audit(
+            "untracked_work_ignored",
+            detail={
+                "event_id": event.event_id,
+                "event_type": event.event_type,
+                "source_ref": source_ref,
+                "state": event.metadata.get("state"),
+            },
+        )
+
+    def _open_work(self, event: CanonicalEvent, *, hop_count: int) -> TaskItem:
+        assert self._ingestion is not None
+        validate_against_schema(
+            "work_opened.metadata.schema.json",
+            event.metadata,
+            schemas_dir=self._schemas_dir,
+        )
+        explicit = event.metadata.get("initial_status")
+        if explicit is not None:
+            initial_status: Literal["backlog", "ready"] = "ready" if explicit == "ready" else "backlog"
+        else:
+            initial_status = "ready" if event.source in self._auto_ready_sources else "backlog"
+        depends_on = tuple(str(x) for x in (event.metadata.get("depends_on") or ()))
+        return self._ingestion.handle_work_opened(
+            source=event.source,
+            source_ref=_source_ref(event),
+            scope=event.scope,
+            title=event.subject,
+            description=event.body,
+            occurred_at_ms=_occurred_at_to_ms(event),
+            initial_status=initial_status,
+            assignee=str(event.metadata.get("assignee") or "agent:default"),
+            task_type=str(event.metadata.get("task_type") or "general"),
+            priority=int(event.metadata.get("priority", 2)),
+            depends_on=depends_on,
+            preferred_executor=str(event.metadata.get("preferred_executor") or ""),
+            artifact_ref=cast(str | None, event.metadata.get("artifact_ref")),
+            reply_target=cast(str | None, event.metadata.get("reply_target")),
+            trace_id=str(event.metadata.get("trace_id") or event.event_id),
+            hop_count=hop_count,
+        )
 
     def handle_canonical_event(self, event: CanonicalEvent) -> DeliverStatus:
         try:

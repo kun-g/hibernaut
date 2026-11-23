@@ -53,6 +53,13 @@ class OptimisticLockError(TaskboardError):
         self.expected_version = expected_version
 
 
+class SourceRefConflictError(TaskboardError):
+    def __init__(self, source_ref: str, task_id: str) -> None:
+        super().__init__(f"source_ref {source_ref} already belongs to task {task_id}")
+        self.source_ref = source_ref
+        self.task_id = task_id
+
+
 class SchemaValidationError(TaskboardError):
     def __init__(self, schema_name: str, problems: Sequence[str]) -> None:
         items = tuple(problems)

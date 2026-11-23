@@ -83,6 +83,41 @@ class MCPToolTests(unittest.TestCase):
         self.assertEqual(tool_result(again)["status"], "duplicate")
         self.assertEqual(tool_result(again)["event_id"], result["event_id"])
 
+    def test_report_execution_source_defaults_to_hibernaut_and_keeps_taskboard(self) -> None:
+        tools = {tool["name"]: tool for tool in post(
+            f"{self.h.url}/mcp",
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            {"Authorization": f"Bearer {MCP_TOKEN}"},
+        )[1]["result"]["tools"]}
+        self.assertEqual(
+            tools["report_execution"]["inputSchema"]["properties"]["source"],
+            {"type": "string", "enum": ["hibernaut", "taskboard"], "default": "hibernaut"},
+        )
+        base = {
+            "scope": "proj:hibernaut",
+            "correlation_key": "tb_tsk_1",
+            "subject": "[human_todo] Review",
+            "metadata": {"run_id": "tb_run_1", "session_id": "tb_sess_1", "outcome_kind": "emit"},
+        }
+        _, default = mcp_call(self.h.url, "report_execution", {**base, "external_id": "tb:notify:1"})
+        event = self.h.board.store.get_inbound(tool_result(default)["event_id"])
+        assert event is not None
+        self.assertEqual((event.source, event.actor), ("hibernaut", "hibernaut"))
+
+        _, from_taskboard = mcp_call(
+            self.h.url, "report_execution", {**base, "external_id": "tb:notify:1", "source": "taskboard"}
+        )
+        result = tool_result(from_taskboard)
+        # (source, external_id) is the dedup key, so the same id from Taskboard is a new event.
+        self.assertEqual(result["status"], "accepted")
+        event = self.h.board.store.get_inbound(result["event_id"])
+        assert event is not None
+        self.assertEqual((event.source, event.actor), ("taskboard", "taskboard"))
+
+        _, bad = mcp_call(self.h.url, "report_execution", {**base, "external_id": "x", "source": "github"})
+        self.assertTrue(bad["result"]["isError"])
+        self.assertIn("source must be one of", tool_result(bad)["error"])
+
     def test_report_execution_rejects_incomplete_reports(self) -> None:
         _, missing = mcp_call(
             self.h.url,

@@ -16,6 +16,7 @@ from switchboard.store_sqlite import DeliveryRow, ReplayError
 _PROTOCOL_VERSION: Final = "2024-11-05"
 _WORK_TYPES: Final = ("work.opened", "work.updated", "work.closed", "work.ready")
 _SUBMIT_SOURCES: Final = ("mcp", "timer", "taskboard", "hibernaut")
+_REPORT_SOURCES: Final = ("hibernaut", "taskboard")
 
 TOOLS: Final[list[dict[str, Any]]] = [
     {
@@ -31,6 +32,7 @@ TOOLS: Final[list[dict[str, Any]]] = [
                 "event_type": {"type": "string", "enum": list(_WORK_TYPES)},
                 "scope": {"type": "string"},
                 "correlation_key": {"type": "string"},
+                "actor": {"type": "string"},
                 "work_kind": {"type": "string"},
                 "state": {"type": "string"},
                 "task_id": {"type": "string"},
@@ -74,11 +76,12 @@ TOOLS: Final[list[dict[str, Any]]] = [
     },
     {
         "name": "report_execution",
-        "description": "Report a Hibernaut node's run outcome as execution.reported (emit, suspend, error or done); "
-        "repeated reports with one external_id are dropped.",
+        "description": "Report a Hibernaut node's run outcome, or a Taskboard notification, as execution.reported "
+        "(emit, suspend, error or done); repeated reports with one (source, external_id) are dropped.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "source": {"type": "string", "enum": list(_REPORT_SOURCES), "default": "hibernaut"},
                 "external_id": {"type": "string"},
                 "scope": {"type": "string"},
                 "correlation_key": {"type": "string"},
@@ -268,15 +271,19 @@ class MCPInboundAdapter:
 
     # No default_scope fallback: the report belongs to the node's inbox, and a missing scope fails validation.
     def _report_execution(self, args: dict[str, Any]) -> dict[str, Any]:
+        # Taskboard's notifications keep source="taskboard", so Taskboard can drop them as its own.
+        source = text(args.get("source")) or "hibernaut"
+        if source not in _REPORT_SOURCES:
+            raise ToolError(f"source must be one of {list(_REPORT_SOURCES)}")
         return self._ingest(
             CanonicalEvent(
-                source="hibernaut",
+                source=cast(Source, source),
                 event_type="execution.reported",
                 external_id=text(args.get("external_id")),
                 occurred_at=normalize_utc(text(args.get("occurred_at")) or None, self._clock()),
                 scope=text(args.get("scope")),
                 correlation_key=text(args.get("correlation_key")) or None,
-                actor=text(args.get("actor")) or "hibernaut",
+                actor=text(args.get("actor")) or source,
                 subject=text(args.get("subject")),
                 body=text(args.get("body")),
                 metadata=dict(obj(args.get("metadata"))),
