@@ -378,8 +378,11 @@ class TestPeerTurnSurvivesDetach(PeerCase):
         recorder = Recorder()
         task = asyncio.ensure_future(self.converse_with(self.runner, TurnSlot(run, None, recorder)))
         run.task = task
-        session = await until(lambda: self.orca.terminals and self.orca.session().received and self.orca.session(),
-                              what="the task")
+        # Never the terminals dict itself: it may fill between the check here and the one in until().
+        session = await until(
+            lambda: self.orca.session() if self.orca.terminals and self.orca.session().received else None,
+            what="the task",
+        )
         await until(lambda: recorder.turn and recorder.turn["sent"] and run.parked, what="the parked wait")
         run.stop()
         with self.assertRaises(asyncio.CancelledError):

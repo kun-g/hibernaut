@@ -2,6 +2,7 @@ import asyncio
 import http.client
 import json
 import os
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -58,6 +59,8 @@ class FakeOrcaTerminals:
         if verb == "terminal create":
             worktree = flags["--worktree"].removeprefix("path:")
             handle = f"term_{uuid.uuid4().hex[:8]}"
+            # Read now: the runner removes it with the turn.
+            spec = json.loads(Path(shlex.split(flags["--command"])[-1]).read_text())
             screen = (self.root / f"{handle}.screen").open("wb")
             proc = await asyncio.create_subprocess_exec(
                 "/bin/sh", "-c", flags["--command"], cwd=worktree,
@@ -65,7 +68,7 @@ class FakeOrcaTerminals:
             )
             screen.close()
             self.terminals[handle] = {"proc": proc, "title": flags["--title"], "worktree": worktree,
-                                      "incarnation": uuid.uuid4().hex, "command": flags["--command"]}
+                                      "incarnation": uuid.uuid4().hex, "command": flags["--command"], "exec": spec.get("exec")}
             return {"terminal": {"handle": handle, "incarnationId": self.terminals[handle]["incarnation"],
                                  "title": flags["--title"]}}
         if verb == "terminal list":
@@ -366,7 +369,8 @@ class TestVisibleSDE(VisibleCase):
         self.assertIsNotNone(self.orca.terminals[handle]["proc"].returncode)
         binding = self.bindings.get(outcome.session_id)
         self.assertIsNone(binding.handle)
-        self.assertEqual(binding.native_session_id, arg(self.calls("sde", "interactive")[0], "--session-id"))
+        # From the launch: on a loaded machine the CLI itself may not have started yet.
+        self.assertEqual(binding.native_session_id, arg({"argv": self.orca.terminals[handle]["exec"]}, "--session-id"))
 
     async def test_interrupt_cancels_without_output_and_closes_the_terminal(self):
         self.set_plan(sde=[{"hang": True}])
