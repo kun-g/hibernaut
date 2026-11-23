@@ -32,11 +32,12 @@ class TestConfig(unittest.TestCase):
         self.checkout = self.root / "repo"
         (self.checkout / "sub").mkdir(parents=True)
 
-    def parse(self, *bindings, project=None, base_dir=None):
+    def parse(self, *bindings, project=None, base_dir=None, steward=None):
         raw = {
             "runtime": {"inbox_bindings": list(bindings)},
             "executors": {"cli": {"command": "x"}, "claude-code": {"harness": "claude-code"}},
-            "agents": {"ops": {"executor": "cli"}, "asker": {"executor": "cli"}, "steward": {"role": "steward", "executor": "claude-code"},
+            "agents": {"ops": {"executor": "cli"}, "asker": {"executor": "cli"}, 
+                       "steward": {"role": "steward", "executor": "claude-code", **(steward or {})},
                        "sde": {"role": "sde", "executor": "claude-code", "review": False},
                        "reviewer": {"role": "code-reviewer", "executor": "claude-code"}},
             "projects": {"p": {"repo": "o/r", "checkout": str(self.checkout), "worktree_backend": "git",
@@ -119,6 +120,23 @@ class TestConfig(unittest.TestCase):
                 self.refused("checkout of projects.p", self.binding(workdir=str(workdir)))
                 self.parse(self.binding(workdir=str(workdir), checkout_access="readonly"))
         self.parse(self.binding(workdir=str(self.root)))
+
+    def test_a_writable_workdir_is_not_a_stewards(self):
+        own = self.root / "steward"
+        (own / "sub").mkdir(parents=True)
+        for workdir in (own, own / "sub", self.root / "link" / "sub"):
+            with self.subTest(workdir=str(workdir)):
+                if not (self.root / "link").exists():
+                    (self.root / "link").symlink_to(own)
+                self.refused("workdir of agents.steward", self.binding(workdir=str(workdir)),
+                             steward={"workdir": str(own)})
+                self.parse(self.binding(workdir=str(workdir), checkout_access="readonly"),
+                           steward={"workdir": str(own)})
+        self.parse(self.binding(), steward={"workdir": str(own)})
+
+    def test_a_writable_workdir_is_not_a_checkout_found_through_orca(self):
+        with patch("agent_runtime.app.config.registered_checkout", return_value=str(self.checkout)):
+            self.refused("checkout of projects.p", self.binding(workdir=str(self.checkout)), project={"checkout": ""})
 
     def test_a_binding_may_not_cover_a_projects_inbox(self):
         for pattern, inbox_id in (

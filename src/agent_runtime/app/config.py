@@ -901,7 +901,8 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
     runtime = dataclasses.replace(runtime, inbox_bindings=parse_workdir_bindings(
         rt_raw.get("inbox_bindings"), declared=agents, resolve=lambda path: _resolve_path(path, base_dir),
     ))
-    validate_workdir_bindings(runtime.inbox_bindings, projects.values())
+    validate_workdir_bindings(runtime.inbox_bindings, projects.values(),
+                              {name: role.workdir for name, role in roles.items() if role.workdir})
 
     for where, limit in (
         *((f"executors.{n}", e.max_concurrency) for n, e in {**executors, **roles}.items()),

@@ -291,10 +291,15 @@ class _CheckedOut(Protocol):
     def inbox_rules(self) -> tuple[InboxRule, ...]: ...
 
 
-def validate_workdir_bindings(bindings: Sequence[WorkdirBinding], projects: Iterable[_CheckedOut]) -> None:
+def validate_workdir_bindings(
+    bindings: Sequence[WorkdirBinding], projects: Iterable[_CheckedOut],
+    # Agent id -> the directory of its own it works in for a project (a steward's workdir).
+    agent_workdirs: Mapping[str, str],
+) -> None:
     listed = list(projects)
     writers: dict[object, WorkdirBinding] = {}
-    checkouts = {directory_key(Path(p.checkout).expanduser()): p for p in listed}
+    in_use = {directory_key(Path(path)): f"workdir of agents.{name}" for name, path in agent_workdirs.items()}
+    in_use |= {directory_key(Path(p.checkout).expanduser()): f"checkout of projects.{p.name}" for p in listed}
     for bound in bindings:
         where = f"runtime.inbox_bindings pattern {bound.binding.inbox!r}"
         for proj in listed:
@@ -312,9 +317,9 @@ def validate_workdir_bindings(bindings: Sequence[WorkdirBinding], projects: Iter
             raise ValueError(f"{where} and {other.binding.inbox!r} have the same writable workdir {bound.workdir}; "
                              "give each its own or set checkout_access = \"readonly\"")
         for directory in (workdir, *workdir.parents):
-            project = checkouts.get(directory_key(directory))
-            if project is not None:
-                raise ValueError(f"{where}: writable workdir {bound.workdir} is in the checkout of projects.{project.name}")
+            use = in_use.get(directory_key(directory))
+            if use is not None:
+                raise ValueError(f"{where}: writable workdir {bound.workdir} is in the {use}")
 
 
 def _require_apart(where: str, rule: InboxRule, project: str, theirs: InboxRule) -> None:

@@ -74,7 +74,7 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 | 配置段 | 管什么 |
 | :--- | :--- |
 | `[runtime]` | 数据库与记忆目录、全局并发上限 `max_concurrency`、新事件策略（`defer` / `fold` / `interrupt`）、全局默认 Agent（`default_agent`，旧键 `default_executor`）；`ledger_db_path` 是执行账本的独立数据库（默认 `db_path` 同目录的 `ledger.db`，运行日志在它旁边的 `logs/runs/`） |
-| `[[runtime.inbox_bindings]]` | 不属于项目的 Inbox（`sys:*` / `user:*`）：键同项目绑定，另须写启动目录 `workdir`，可选 `checkout_access`（`readwrite` / `readonly`）；可写目录只能给一个 Inbox，不能是项目检出，只能用 CLI agent。规范见 [`docs/inbox-conventions.md`](docs/inbox-conventions.md) |
+| `[[runtime.inbox_bindings]]` | 不属于项目的 Inbox（`sys:*` / `user:*`）：键同项目绑定，另须写启动目录 `workdir`，可选 `checkout_access`（`readwrite` / `readonly`）；可写目录只能给一个 Inbox，不能是项目检出或 Steward 的 `workdir`，只能用 CLI agent。规范见 [`docs/inbox-conventions.md`](docs/inbox-conventions.md) |
 | `[channels]` | HTTP 端口、MCP 的密钥环境变量名；`outbox_dir` 设置后每条 Outbox 消息另存为该目录下一个带任务上下文的 Markdown 文件；配置了 `auto_merge` 却停在 PR 未合并时，状态为「待合并」并写明 PR 链接与未合并原因 |
 | `[executors.<id>]` | 底层驱动：CLI 模板（写 `command`），或供 Agent 引用的 Claude Code 启动器与计费（都不写）。旧写法仍可用：写 `role` 或 `command` 即同时是同名 Agent。可选 `max_concurrency` 限制同时跑该执行器的 Inbox 数（跨项目、跨引用它的 Agent 合计；只限某个 Agent 就写在 `[agents.<id>]`） |
 | `[agents.<id>]` | Agent：`executor` 指向驱动，`role` 为 `sde` / `code-reviewer` / `steward`，另有 `model`、`effort`、`skills`、`description`，可选 `max_concurrency` 只限这个 Agent（不影响共用同一驱动的别的 Agent）。SDE 的 `review`、`reviewer` 决定评审开关和评审者；`steward` 有 `checkout_access = "readonly"`（唯一取值）、可选 `workdir`（工作目录，未写用项目检出）与 `branch`（每次运行前核对该目录的分支，不一致则挂起，不切换） |

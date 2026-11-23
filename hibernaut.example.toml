@@ -168,7 +168,7 @@ description = "巡检与例行检查"
 
 # 可选：不属于任何项目的 Inbox（sys:* / user:*）。没有项目检出，启动目录 workdir 必填（支持 ~，相对路径以本文件所在目录为准，不自动创建，
 # 不存在则事件保持 pending）。键同 [[projects.<name>.inbox_bindings]]，第一个整串匹配的生效；不能与项目的 inbox_id 重叠。
-# 可写目录只给一个 Inbox：pattern 须是精确 ID，两条绑定不能指向同一可写目录，也不能在项目检出里。
+# 可写目录只给一个 Inbox：pattern 须是精确 ID，两条绑定不能指向同一可写目录，也不能在项目检出或 steward 的 workdir 里。
 # 只能用不带 role 的 CLI agent。没有绑定也不匹配项目的 Inbox，事件保持 pending。规范见 docs/inbox-conventions.md。
 [[runtime.inbox_bindings]]
 pattern = "sys:hb-ops"

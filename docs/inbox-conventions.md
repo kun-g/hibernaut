@@ -41,7 +41,7 @@ checkout_access = "readwrite"   # readonly | readwrite，默认 readwrite
 ```
 
 - `workdir` 必填；`~` 与相对路径（以配置文件所在目录为准）都可以。目录不会自动创建，不存在时事件保持 `pending`（含 `review_of`、审批回复、关闭请求、挂起会话的后续和指向该目录的 `explicit_workdir`，换一种写法也算）；只有 `explicit_workdir` 指向别的目录的事件照样在本轮拒绝。
-- 可写的 `workdir` 只给一个 Inbox 用：`pattern` 须是单个精确 ID，两条绑定不能指向同一个可写目录（已存在的按 inode 比较；尚不存在的部分不分大小写比较，区分大小写的卷上也一样），也不能落在某个项目的检出里。`checkout_access = "readonly"` 可以共享目录、可以用正则。
+- 可写的 `workdir` 只给一个 Inbox 用：`pattern` 须是单个精确 ID，两条绑定不能指向同一个可写目录（已存在的按 inode 比较；尚不存在的部分不分大小写比较，区分大小写的卷上也一样），也不能落在某个项目的检出或某个 Steward 的 `workdir` 里。`checkout_access = "readonly"` 可以共享目录、可以用正则。
 - `readonly` 对 CLI agent 是声明：运行时据此放行共享，并在提示里写明不改文件，但不拦 CLI 的写操作。真正只读由该 CLI 自己的参数保证（如 `--permission-mode plan`）。
 - 这些 Inbox 总是在 Hibernaut 进程本机起 CLI，`[runner]` 的 `executors` 只作用于项目 Inbox，Runner 的逐次工具授权在这里不生效。
 - 只能用不带 `role` 的 CLI agent。`sde`、`code-reviewer`、`steward` 依赖项目检出，加载时拒绝。
