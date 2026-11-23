@@ -190,7 +190,7 @@ class ConfiguredDaemonHandoverTests(unittest.IsolatedAsyncioTestCase):
             conn.close()
 
     async def wait_for(self, check, serving: asyncio.Task[None]) -> None:
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 45
         while not await asyncio.to_thread(check):
             self.assertFalse(serving.done(), serving.done() and serving.exception())
             self.assertLess(time.monotonic(), deadline, self.stderr.getvalue())

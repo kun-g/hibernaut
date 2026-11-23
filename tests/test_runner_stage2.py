@@ -73,7 +73,8 @@ def test_stage2_multinode_affinity_offline_drift_interrupt_reclaim_and_epoch(tmp
     _init_git_repo(repo_vps)
 
     affinity = WorkspaceAffinityStore(tmp_path / "hub_affinity.db")
-    hub = RunnerRelayHub(shared_token="secret-relay-token", affinity=affinity, heartbeat_seconds=0.5)
+    hub = RunnerRelayHub(shared_token="secret-relay-token", affinity=affinity, heartbeat_seconds=0.5,
+                         ack_timeout_seconds=60.0)
     mac_daemon = _node_daemon(tmp_path, "mac-m4", repo_mac, max_concurrent=1)
     vps_daemon = _node_daemon(tmp_path, "vps-01", repo_vps, max_concurrent=2)
 

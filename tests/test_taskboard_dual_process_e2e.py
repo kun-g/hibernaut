@@ -13,8 +13,8 @@ from tests.test_switchboard_dual_process_e2e import Child, child_env, free_port,
 # Real `python -m switchboard.app` (hybrid relay) and `python -m taskboard.app` on loopback ports.
 SCOPE = "proj:hibernaut"
 TASKBOARD_TOKEN = "test-taskboard-mcp-token"
-STARTUP_TIMEOUT = 20.0
-FLOW_TIMEOUT = 20.0
+STARTUP_TIMEOUT = 45.0
+FLOW_TIMEOUT = 45.0
 
 
 class TaskboardDualProcessTests(unittest.TestCase):

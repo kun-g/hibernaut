@@ -107,6 +107,8 @@ from agent_runtime.app.config import (
 from agent_runtime.app.projects import (
     AmbiguousProjectMatch,
     ProjectRouter,
+    InboxRefused,
+    MissingWorkdirHold,
     UnmatchedProjectHold,
     build_routing_manifest,
 )
@@ -224,13 +226,14 @@ class AsyncWorkerPool:
         for inbox_id in () if self._limiter.saturated() else tuple(self._queue):
             cached = self._queued_keys.get(inbox_id)
             if cached is not None and not self._limiter.available(
-                    inbox_id, project_key=cached.project, executor_key=cached.executor):
+                    inbox_id, project_key=cached.project, executor_key=cached.executor, agent_key=cached.agent):
                 continue
             # Cached keys only rule an inbox out; it is admitted on fresh ones. Another thread may have stored a
             # change (an event replayed for another executor) whose wake has not reached the loop yet.
             keys = self._limit_keys(inbox_id) if self._limit_keys is not None else LimitKeys()
             self._queued_keys[inbox_id] = keys
-            if self._limiter.try_acquire(inbox_id, project_key=keys.project, executor_key=keys.executor):
+            if self._limiter.try_acquire(inbox_id, project_key=keys.project, executor_key=keys.executor,
+                                         agent_key=keys.agent):
                 self._queue.remove(inbox_id)
                 self._queued.discard(inbox_id)
                 del self._queued_keys[inbox_id]
@@ -264,6 +267,13 @@ class AsyncWorkerPool:
         for worker in self._active.values():
             worker.detach()
 
+    def _make_worker(self, inbox_id: str, worker_id: str) -> AgentWorker:
+        # Anyone who can post an event chooses its inbox_id: one that has no memory directory must not end the loop.
+        try:
+            return self._worker_factory(inbox_id, worker_id)
+        except (ValueError, OSError) as exc:
+            raise InboxRefused(inbox_id, exc) from exc
+
     async def _worker_loop(self, worker_idx: int, stop_event: asyncio.Event) -> None:
         worker_id = f"{self._pool_id}-worker-{worker_idx}"
         while self._handoff is None and (not stop_event.is_set() or self._queue):
@@ -277,7 +287,7 @@ class AsyncWorkerPool:
             settled = False
             try:
                 # Inside the try: a factory that refuses the inbox (AmbiguousProjectMatch) leaves its events pending.
-                worker = self._worker_factory(inbox_id, worker_id)
+                worker = self._make_worker(inbox_id, worker_id)
                 self._active[inbox_id] = worker
                 batch_reports = await worker.process_inbox(inbox_id)
                 settled = True
@@ -290,6 +300,8 @@ class AsyncWorkerPool:
                             "Post-run callback failed for inbox %s",
                             inbox_id,
                         )
+            except InboxRefused as exc:
+                logging.getLogger(__name__).warning("%s; its events stay pending", exc)
             except ExecutorFailed as exc:
                 settled = exc.batch_settled
                 logging.getLogger(__name__).exception(
@@ -613,6 +625,7 @@ def concurrency_limits(config: HibernautConfig) -> ConcurrencyLimits:
             **config.driver_limits,
             **{n: e.max_concurrency for n, e in executors.items() if e.max_concurrency is not None},
         },
+        agents={n: a.max_concurrency for n, a in config.agents.items() if a.max_concurrency is not None},
     )
 
 
@@ -624,10 +637,15 @@ def executor_quota_hold(
     keys: LimitKeyResolver,
     route: LimitRoute,
 ) -> Callable[[Event], str | None] | None:
-    if not limits.executors:
+    if not limits.executors and not limits.agents:
         return route.hold
     return ExecutorQuotaHold(inbox_id, limiter=pool.limiter, on_defer=pool.defer, inner=route.hold,
-                             executor_of=lambda event: keys.event_executor(event, route))
+                             keys_of=lambda event: keys.event_keys(event, route))
+
+
+def batch_counter(pool: AsyncWorkerPool, keys: LimitKeyResolver) -> Callable[[str, str], None]:
+    return lambda inbox_id, agent_id: pool.limiter.count(
+        inbox_id, executor_key=keys.driver(agent_id), agent_key=agent_id)
 
 
 def build_daemon(
@@ -732,6 +750,7 @@ def build_daemon(
                     wk, notify_outbox=outbox, inbox_id=_iid
                 ),
                 hold=_quota_hold(inbox_id),
+                on_batch_start=batch_counter(pool, limit_keys),
                 lock=lock,
                 sessions=sessions,
                 run_start_listener=gdrive_writer,
@@ -755,6 +774,7 @@ def build_daemon(
                 wk, notify_outbox=outbox, inbox_id=_iid
             ),
             hold=_quota_hold(inbox_id),
+            on_batch_start=batch_counter(pool, limit_keys),
             lock=lock,
             sessions=sessions,
             run_start_listener=gdrive_writer,
@@ -808,7 +828,7 @@ def build_daemon(
 
     resolved_limits = limits or ConcurrencyLimits()
     limit_keys = LimitKeyResolver(
-        limits=resolved_limits, inbox=inbox, sessions=sessions, open_runs=open_runs, route=_route,
+        inbox=inbox, sessions=sessions, open_runs=open_runs, route=_route,
         global_default_executor=global_default_executor or (
             default_executor.executor_id if executors_factory is None and executor_factory is None else None
         ),
@@ -1024,7 +1044,9 @@ def build_daemon_from_config(
         deliveries = SQLiteDeliveryStore(daemon.db)
         usage = SQLiteWorkUsage(daemon.db)
 
-        def _steward(role: RoleConfig, project: ProjectConfig | None) -> StewardExecutor:
+        def _steward(
+            role: RoleConfig, project: ProjectConfig | None, no_terminal: str | None
+        ) -> StewardExecutor:
             def in_project(inbox_id: str) -> bool:
                 try:
                     return project is not None and router.resolve(inbox_id) is project
@@ -1038,6 +1060,9 @@ def build_daemon_from_config(
                 events=daemon.inbox,
                 manifest=lambda: build_routing_manifest(project) if project is not None else "",
                 in_project=in_project,
+                terminal=cli_terminal if no_terminal is None else TerminalUnavailable(no_terminal),
+                workdir=role.workdir,
+                branch=role.branch,
             )
 
         def _role_executors(
@@ -1076,7 +1101,7 @@ def build_daemon_from_config(
             built: dict[str, ExecutorPort] = dict(reviewers)
             for name, role in config.roles.items():
                 if role.role == STEWARD_ROLE:
-                    built[name] = _steward(role, project)
+                    built[name] = _steward(role, project, no_terminal)
                 if role.sde is None:
                     continue
                 built[name] = SDEExecutor(
@@ -1143,6 +1168,24 @@ def build_daemon_from_config(
             for exec_name in config.executors
         }
         fallback_executors.update(_role_executors(default_mgr, "the inbox matches no [projects] entry"))
+        # Only the agents that can work outside a project are registered for an inbox bound to a workdir.
+        bound_executors: dict[str, dict[str, ExecutorPort]] = {
+            bound.rule.pattern: {
+                exec_name: LocalCLIExecutor(
+                    worktree_manager=default_mgr,
+                    inbox_checkout_map=inbox_checkout_map,
+                    templates=config.executors,
+                    default_executor=exec_name,
+                    bound_workdir=bound.workdir,
+                    readonly=bound.readonly,
+                )
+                for exec_name in config.executors
+            }
+            for bound in config.runtime.inbox_bindings
+        }
+        for bound in config.runtime.inbox_bindings:
+            if not bound.readonly and bound.rule.literal is not None:
+                daemon.partitions.register(bound.rule.literal, bound.workdir)
 
         def _manager_for(inbox_id: str | None, work_key: str) -> OrcaWorktreeManager:
             if inbox_id is not None:
@@ -1175,27 +1218,42 @@ def build_daemon_from_config(
                 project = router.resolve(inbox_id)
             except (ValueError, AmbiguousProjectMatch):
                 return None
-            return project.route(inbox_id) if project is not None else None
+            if project is not None:
+                return project.route(inbox_id)
+            bound = config.runtime.workdir_binding(inbox_id)
+            return bound.route() if bound is not None else None
 
         # One per config generation, so a held event is logged once each time it enters the wait.
         unmatched_hold = UnmatchedProjectHold(daemon.sessions)
+        workdir_holds = {b.rule.pattern: MissingWorkdirHold(daemon.sessions, b.workdir)
+                         for b in config.runtime.inbox_bindings}
 
         def _cli_route(inbox_id: str) -> LimitRoute:
             project = router.resolve(inbox_id)
             if project is None:
-                return LimitRoute(hold=unmatched_hold)
+                bound = config.runtime.workdir_binding(inbox_id)
+                if bound is None:
+                    return LimitRoute(hold=unmatched_hold)
+                return LimitRoute(binding=bound.binding, hold=workdir_holds[bound.rule.pattern])
             return LimitRoute(project=project.name, default_executor=project.default_agent,
                               binding=project.route(inbox_id).binding)
 
         limit_keys = LimitKeyResolver(
-            limits=limits, inbox=daemon.inbox, sessions=daemon.sessions, open_runs=daemon.open_runs, route=_cli_route,
+            inbox=daemon.inbox, sessions=daemon.sessions, open_runs=daemon.open_runs, route=_cli_route,
             global_default_executor=config.runtime.default_agent,
             drivers={name: agent.executor for name, agent in config.agents.items()},
         )
 
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
-            # Raises AmbiguousProjectMatch before any lease, executor or workspace exists for the inbox.
+            # Both raise (InboxRefused by way of the pool, AmbiguousProjectMatch) before any lease, executor or
+            # workspace exists for the inbox.
+            check_inbox_id(inbox_id)
             project = router.resolve(inbox_id)
+            bound = config.runtime.workdir_binding(inbox_id) if project is None else None
+            if project is not None:
+                executors = executors_by_project[project.name]
+            else:
+                executors = bound_executors[bound.rule.pattern] if bound is not None else fallback_executors
             wt_mgr = wt_mgr_by_project[project.name] if project is not None else default_mgr
             reclaim = worktree_reclaimer(wt_mgr, outbox=daemon.outbox, inbox_id=inbox_id,
                                          delivery=project.delivery if project is not None else None,
@@ -1207,7 +1265,7 @@ def build_daemon_from_config(
                 memory=daemon.partitions.memory_for(inbox_id),
                 permissions=_permissions(config.runner),
                 outbox=daemon.outbox,
-                executors=executors_by_project[project.name] if project is not None else fallback_executors,
+                executors=executors,
                 project_default_executor=project.default_agent if project is not None else None,
                 global_default_executor=config.runtime.default_agent,
                 routes=_route,
@@ -1215,6 +1273,7 @@ def build_daemon_from_config(
                 on_worktree_reclaim=reclaim,
                 hold=executor_quota_hold(inbox_id, pool=daemon.pool, limits=limits, keys=limit_keys,
                                          route=_cli_route(inbox_id)),
+                on_batch_start=batch_counter(daemon.pool, limit_keys),
                 run_start_listener=daemon.gdrive_result_writer,
                 open_runs=daemon.open_runs,
                 run_ledger=daemon.ledger.recorder if daemon.ledger is not None else None,

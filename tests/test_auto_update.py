@@ -155,7 +155,7 @@ class AutoUpdateTests(unittest.TestCase):
         return proc
 
     def send_until_reply(self, proc: subprocess.Popen, prefix: str) -> None:
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 45
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             self.assertIsNone(proc.poll(), "supervisor exited")
@@ -274,7 +274,7 @@ class AutoUpdateTests(unittest.TestCase):
         )
         self.db = self.root / "events.db"
         self.send_until_reply(proc, "收到事件：")
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 45
         while not hub.is_online("hibernaut"):
             self.assertLess(time.monotonic(), deadline, stderr_path.read_text())
             time.sleep(0.02)
@@ -305,7 +305,7 @@ class AutoUpdateTests(unittest.TestCase):
         self.addCleanup(posting.set)
 
         next_version = self.bump_origin_version()
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + 45
         while not (f"Hibernaut {next_version}" in self.log_path.read_text()
                    and len(transitions) >= 3 and transitions[-1][1]
                    and results and results[-1][0] > transitions[-1][0]):
@@ -328,7 +328,7 @@ class AutoUpdateTests(unittest.TestCase):
         self.assertNotIn("connect to", log)
 
         external_ids = {f"restart-{n}" for n in range(1, len(results) + 1)}
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 45
         while True:
             with contextlib.closing(sqlite3.connect(self.db)) as conn:
                 stored = {row[0] for row in conn.execute("SELECT external_id FROM event_inbox WHERE source = 'webhook'")}

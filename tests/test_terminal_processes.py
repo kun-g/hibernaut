@@ -19,6 +19,7 @@ from agent_runtime.adapters.executor_cli.orca import (
     TerminalRunFailed,
     _close_quietly,  # pyright: ignore[reportPrivateUsage]
     close_terminals,
+    session_gate,
 )
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore, TerminalBinding
@@ -54,6 +55,7 @@ def running(pid: int) -> bool:
 
 
 async def until(condition, seconds: float = 30.0) -> bool:
+    # Less than the 60s the processes under test sleep, so one left behind cannot end by itself in time.
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         if condition():
@@ -81,7 +83,8 @@ class Case(unittest.IsolatedAsyncioTestCase):
         return [int(p) for p in self.pids.read_text().split()] if self.pids.exists() else []
 
     async def started(self, count: int) -> list[int]:
-        self.assertTrue(await until(lambda: len(self.recorded()) == count), "the CLI did not start")
+        # The processes can be up before `terminal create` has returned to the runner.
+        self.assertTrue(await until(lambda: self.orca.terminals and len(self.recorded()) == count), "the CLI did not start")
         return self.recorded()
 
     async def all_gone(self, pids):
@@ -162,6 +165,16 @@ class TestCLITerminalProcesses(Case):
         self.assertEqual(await asyncio.wait_for(wrapper.wait(), 8), 1)
         await self.all_gone(pids)
 
+    async def test_input_reaches_the_cli(self):
+        text = "a prompt, é\n" * 30_000
+        run = await self.terminal.run(title="t", workdir=self.repo, argv=["/bin/cat"], env={}, timeout_seconds=20,
+                                      is_interrupted=lambda: False, stdin=text)
+        self.assertEqual((run.exit_code, run.stdout.decode()), (0, text))
+        handle, wrapper = self.wrapper()
+        self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
+        self.assertIsNotNone(wrapper.returncode)
+        self.assertEqual(list((self.root / "runs").iterdir()), [])
+
 
 class TestCLITerminalScript(unittest.IsolatedAsyncioTestCase):
     # The wrapper on its own, without Hibernaut watching: its deadline and the signals of a closing terminal.
@@ -226,6 +239,62 @@ class TestCLITerminalScript(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proc.returncode, 128 + signal.SIGHUP)
 
 
+class TestSessionCheckBeforeACommand(Case):
+    # A one-off Claude Code command: the gate checks the session first and then becomes the command, so the wrapper
+    # ends it like any other.
+    def setUp(self):
+        super().setUp()
+        self.terminal = OrcaCommandTerminal(root=self.root / "runs", poll_interval=0.02, liveness_interval=0.2)
+        self.interrupted = False
+
+    def run_checked(self, argv, env):
+        profile = ClaudeCodeProfile(name="steward", env=env,
+                                    launcher=ClaudeCodeLauncher(name="fake", command=fake_command(self.root)))
+        return self.terminal.run(title="t", workdir=self.repo, argv=argv, env={}, timeout_seconds=20,
+                                 is_interrupted=lambda: self.interrupted, gate=session_gate(profile))
+
+    async def test_stopping_during_the_session_check_ends_the_probe(self):
+        for lose in (False, True):
+            with self.subTest(lose_closes=lose):
+                self.pids.unlink(missing_ok=True)
+                self.orca.lose_closes, self.interrupted = lose, False
+                task = asyncio.create_task(self.run_checked(["/bin/echo", "ran"], {"FAKE_PROBE_PIDFILE": str(self.pids)}))
+                pids = await self.started(2)
+                self.interrupted = True
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                await self.all_gone(pids)
+
+    async def test_the_command_takes_the_gates_place_and_ends_with_its_terminal(self):
+        task = asyncio.create_task(self.run_checked(self.busy_cli(), {}))
+        pids = await self.started(2)
+        self.interrupted = True
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self.all_gone(pids)
+
+    async def test_a_failed_check_never_starts_the_command(self):
+        run = await self.run_checked(["/bin/sh", "-c", f"touch {self.root}/ran"],
+                                     {"FAKE_API_KEY_SOURCE": "ANTHROPIC_API_KEY"})
+        self.assertNotEqual(run.exit_code, 0)
+        self.assertIn(b"billing is 'subscription'", run.stderr)
+        self.assertEqual(run.stdout, b"")
+        self.assertFalse((self.root / "ran").exists())
+
+    async def test_configured_variables_orca_tracks_sessions_by_do_not_come_back(self):
+        # The gate applies the configured environment after the wrapper removed Orca's variables.
+        script = "import json, os; print(json.dumps(dict(os.environ)))"
+        with patch.dict(os.environ, ORCA_SESSION_ENV):
+            run = await self.run_checked([sys.executable, "-I", "-c", script], {**ORCA_SESSION_ENV, **OTHER_ENV})
+        env = json.loads(run.stdout)
+        self.assertEqual(set(ORCA_SESSION_ENV) & set(env), set())
+        self.assertEqual({k: env.get(k) for k in OTHER_ENV}, OTHER_ENV)
+
+    async def test_only_the_commands_own_output_is_returned(self):
+        run = await self.run_checked(["/bin/sh", "-c", "echo out; echo err >&2; exit 5"], {})
+        self.assertEqual((run.exit_code, run.stdout, run.stderr), (5, b"out\n", b"err\n"))
+
+
 # Runs one wrapper script with stop signals delivered at one exact point. The CLI reports its pids through a FIFO, which
 # the script reads at that point, so it goes on only once the CLI and its child really run.
 SIGNALLED_WRAPPER = """
@@ -235,6 +304,10 @@ from agent_runtime.adapters.executor_cli import claude_gate, cli_terminal
 
 start, window, root = sys.argv[1], sys.argv[2], Path(sys.argv[3])
 argv = ["/bin/sh", "-c", f'sleep 60 & echo "$$ $!" > "{root / "started"}"; wait']
+if start == "once":
+    # cli_terminal.py kills a one-off gate after its own grace, so the gate must spend none on a probe that ignores TERM.
+    argv[2] = "trap '' TERM; " + argv[2]
+    cli_terminal.GRACE_SECONDS = 3600
 lease = root / "lease"
 lease.touch()
 pids = []
@@ -274,7 +347,7 @@ def popen(*args, **kwargs):
         sys.setprofile(after_the_body)
     return proc
 
-body = {"cli": "_run", "probe": "_probe", "agent": "_supervise"}[start]
+body = {"cli": "_run", "probe": "_probe", "once": "_probe", "agent": "_supervise"}[start]
 ended = False
 
 def after_the_body(frame, event, arg):
@@ -312,7 +385,7 @@ def run(spec, running):
         stop(signal.SIGHUP)
     if start == "cli":
         return real_run(spec, running)
-    if start == "probe":
+    if start in ("probe", "once"):
         return claude_gate._probe(argv, dict(os.environ), 30.0, lease, running)
     return claude_gate._supervise(argv, dict(os.environ), lease, running)
 
@@ -331,7 +404,7 @@ class TestStopAtEveryStage(Case):
         # The CLI reaches its deadline at once where the wrapper is to end it by itself.
         spec = {"title": "t", "cwd": str(self.root), "env": {}, "timeout_seconds": 0 if "cleanup" in window else 30.0,
                 "argv": ["/bin/sh", "-c", f'sleep 60 & echo "$$ $!" > "{self.root / "started"}"; wait'],
-                **{name: str(self.root / name) for name in ("stdout", "stderr", "exit.json")}}
+                "once": start == "once", **{name: str(self.root / name) for name in ("stdout", "stderr", "exit.json")}}
         (self.root / "spec.json").write_text(json.dumps(spec))
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-c", SIGNALLED_WRAPPER, start, window, str(self.root),
@@ -347,7 +420,7 @@ class TestStopAtEveryStage(Case):
         return pids
 
     async def each_start(self, window: str, started: int = 2):
-        for start in ("cli", "probe", "agent"):
+        for start in ("cli", "probe", "once", "agent"):
             with self.subTest(start):
                 self.assertEqual(len(await self.stopped(start, window)), started)
 

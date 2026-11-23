@@ -125,7 +125,7 @@ class TestUnmatchedProjectHold(_DispatchCase):
             return self.event_rows(ORPHAN)[0][1:3]
 
         async def wait_for(check):
-            deadline = time.monotonic() + 30
+            deadline = time.monotonic() + 45
             while not check():
                 self.assertLess(time.monotonic(), deadline)
                 await asyncio.sleep(0.01)

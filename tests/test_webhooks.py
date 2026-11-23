@@ -12,7 +12,7 @@ from pathlib import Path
 
 from agent_runtime.adapters.channels import WebhookHTTPServer, create_webhook_server
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteInboxAdapter
-from agent_runtime.app.main import build_daemon
+from agent_runtime.app.main import AlwaysOnDaemon, build_daemon
 from agent_runtime.core.models import Emit, Event, Suspend
 from agent_runtime.engine.handler import EventHandler
 from tests.fakes import InMemoryInbox, RecordingChannel
@@ -31,6 +31,13 @@ class _GatedInbox(InMemoryInbox):
         else:
             self._gate.wait(timeout=5.0)
         return super().append(event)
+
+
+async def _until_reported(daemon: AlwaysOnDaemon, kind: type[Emit] | type[Suspend]) -> None:
+    # The pool still counts as idle until a worker has picked the new event up.
+    async with asyncio.timeout(30.0):
+        while not any(isinstance(r.outcome, kind) for r in daemon.pool.reports):
+            await asyncio.sleep(0.02)
 
 
 def _post_event(port: int, external_id: str) -> tuple[int, dict[str, object]]:
@@ -157,7 +164,7 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
                 ).encode("utf-8"),
             )
             self.assertEqual(status, 202)
-            await daemon.pool.wait_until_idle(timeout_seconds=3.0)
+            await _until_reported(daemon, Suspend)
 
             suspend_reports = [r for r in daemon.pool.reports if isinstance(r.outcome, Suspend)]
             self.assertEqual(len(suspend_reports), 1)
@@ -170,7 +177,7 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
             }).encode("utf-8")
             status, _ = await asyncio.to_thread(_post, "/events", approval)
             self.assertEqual(status, 202)
-            await daemon.pool.wait_until_idle(timeout_seconds=3.0)
+            await _until_reported(daemon, Emit)
             await daemon.dispatcher.dispatch_once()
 
             emit_reports = [r for r in daemon.pool.reports if isinstance(r.outcome, Emit)]

@@ -164,6 +164,8 @@ class StewardTools:
     events: EventLister
     in_project: Callable[[str], bool]
     calls: int = 0
+    # Forwards this Run took; they go out once it ends in anything but a failure.
+    forwarded: int = 0
     # forward_to_inbox arguments a person has to approve before they go out.
     deferred: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
 
@@ -266,9 +268,11 @@ class StewardTools:
 
     def forward(self, wanted: dict[str, Any], approved_request_id: str | None = None) -> Event:
         options = {k: v for k, v in wanted.items() if k not in ("target_inbox", "text")}
-        return self.caps.forward_to_inbox(
+        event = self.caps.forward_to_inbox(
             wanted["target_inbox"], wanted["text"], **options, approved_request_id=approved_request_id
         )
+        self.forwarded += 1
+        return event
 
     async def _read_file(self, arguments: dict[str, Any]) -> str:
         path = _real_path(self.checkout, _required(arguments, "path"))
