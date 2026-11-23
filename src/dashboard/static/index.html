@@ -135,6 +135,7 @@ const state = {
   eventSearch: "",
   tbStatusFilter: "all",
   topoExpanded: false,
+  expandedEvents: new Set(),
 };
 
 function applyRoute(view, tab, push = false) {
@@ -424,6 +425,70 @@ function renderMiniBar(snap) {
   `;
 }
 
+function toggleEventExpand(key) {
+  if (state.expandedEvents.has(key)) state.expandedEvents.delete(key);
+  else state.expandedEvents.add(key);
+  if (state.snap) {
+    renderEventsTab(state.snap);
+    renderSbTab(state.snap);
+  }
+}
+
+function renderEventDetailRow(e, colSpan) {
+  const sessions = e.related_sessions || [];
+  const sessHtml = sessions.length
+    ? `<div class="ev-sess-list">${sessions.map(s => {
+        const matchTag = s.match_by === "session_id"
+          ? `<span class="pill blue">直接绑定 session_id</span>`
+          : `<span class="pill purple">按 correlation_key 关联</span>`;
+        const runTag = s.has_open_run && s.open_run
+          ? `<span class="pill cyan">● 运行中: ${esc(s.open_run.phase)}${s.open_run.stage ? " / " + esc(s.open_run.stage) : ""} (${fmtDurSec(s.open_run.elapsed_s)})</span>`
+          : "";
+        const inspectBtn = s.has_open_run
+          ? `<button type="button" onclick="event.stopPropagation(); openRunDetail('${esc(s.session_id)}');">查看运行详情</button>`
+          : "";
+        return `
+          <div class="ev-sess-card st-${esc(s.status)}">
+            <div class="ev-sess-head">
+              <div class="pill-row" style="align-items:center;">
+                <span class="mono" style="font-weight:600;color:#f8fafc;">${esc(s.session_id)}</span>
+                ${statusPill(s.status)}
+                ${matchTag}
+                ${runTag}
+              </div>
+              ${inspectBtn}
+            </div>
+            <div class="ev-sess-meta">
+              <span>executor: <b>${esc(s.executor_id || "-")}</b></span>
+              <span>inbox: ${esc(s.inbox_id || "-")}</span>
+              ${s.work_key ? `<span>work_key: ${esc(s.work_key)}</span>` : ""}
+              ${s.open_run?.branch ? `<span>branch: ${esc(s.open_run.branch)}</span>` : ""}
+              ${s.pending_request_id ? `<span style="color:#fbbf24;">pending_req: ${esc(s.pending_request_id)}</span>` : ""}
+              ${s.parent_session_id ? `<span>parent: ${esc(s.parent_session_id)}</span>` : ""}
+              <span>更新: ${fmtTime(s.updated_at)} (${fmtAgo(s.updated_at)})</span>
+            </div>
+          </div>
+        `;
+      }).join("")}</div>`
+    : `<div class="ev-sess-empty">尚未关联到 Session（${e.status === "pending" ? "排队等待 Worker 认领" : "无对应会话记录"}）</div>`;
+
+  return `
+    <tr class="ev-detail-row">
+      <td colspan="${colSpan}">
+        <div class="ev-detail-box">
+          <div class="ev-detail-meta">
+            <span><b>event_id:</b> ${esc(e.event_id)}</span>
+            <span><b>external_id:</b> ${esc(e.external_id)}</span>
+            <span><b>attempts:</b> ${esc(e.attempts)}</span>
+            ${e.drive_file_name ? `<span><b>drive_file:</b> ${esc(e.drive_file_name)}</span>` : ""}
+          </div>
+          ${sessHtml}
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
 function renderEventsTab(snap) {
   const all = snap.hb.events || [];
   document.getElementById("cnt-events").textContent = snap.hb.counts.events_total || all.length;
@@ -446,7 +511,7 @@ function renderEventsTab(snap) {
     if (state.eventStatusFilter !== "all" && e.status !== state.eventStatusFilter) return false;
     if (state.eventSearch) {
       const q = state.eventSearch.toLowerCase();
-      const hay = `${e.inbox_id} ${e.source} ${e.subject} ${e.correlation_key} ${e.last_error || ""}`.toLowerCase();
+      const hay = `${e.inbox_id} ${e.source} ${e.subject} ${e.correlation_key} ${e.session_id || ""} ${e.last_error || ""}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -456,20 +521,26 @@ function renderEventsTab(snap) {
     <table>
       <thead><tr><th>#</th><th>时间</th><th>状态</th><th>Inbox</th><th>来源</th><th>内容 / Correlation</th><th>错误</th></tr></thead>
       <tbody>
-        ${filtered.length ? filtered.map(e => `
-          <tr>
-            <td class="mono">${e.seq}</td>
-            <td class="mono" style="white-space:nowrap;">${fmtTime(e.occurred_at)}<br><span style="color:var(--text-muted)">${fmtAgo(e.occurred_at)}</span></td>
-            <td>${statusPill(e.status)}</td>
-            <td class="mono">${esc(e.inbox_id)}</td>
-            <td class="mono">${esc(e.source)}</td>
-            <td class="cell-wrap">
-              <div>${esc(e.subject || "-")}</div>
-              <div class="mono" style="color:var(--text-muted);font-size:11px;">${esc(e.correlation_key || e.external_id)}</div>
-            </td>
-            <td class="cell-wrap" style="color:#fca5a5;">${esc(e.last_error || "")}</td>
-          </tr>
-        `).join("") : `<tr><td colspan="7" class="empty">没有匹配的事件</td></tr>`}
+        ${filtered.length ? filtered.map(e => {
+          const canExpand = e.status === "processing";
+          const key = `ev:${e.seq}`;
+          const expanded = canExpand && state.expandedEvents.has(key);
+          return `
+            <tr ${canExpand ? `class="ev-row ${expanded ? "expanded" : ""}" onclick="toggleEventExpand('${key}')"` : ""}>
+              <td class="mono" style="white-space:nowrap;">${canExpand ? `<span class="ev-caret">▸</span>` : ""}${e.seq}</td>
+              <td class="mono" style="white-space:nowrap;">${fmtTime(e.occurred_at)}<br><span style="color:var(--text-muted)">${fmtAgo(e.occurred_at)}</span></td>
+              <td>${statusPill(e.status)}</td>
+              <td class="mono">${esc(e.inbox_id)}</td>
+              <td class="mono">${esc(e.source)}</td>
+              <td class="cell-wrap">
+                <div>${esc(e.subject || "-")}</div>
+                <div class="mono" style="color:var(--text-muted);font-size:11px;">${esc(e.correlation_key || e.external_id)}</div>
+              </td>
+              <td class="cell-wrap" style="color:#fca5a5;">${esc(e.last_error || "")}</td>
+            </tr>
+            ${expanded ? renderEventDetailRow(e, 7) : ""}
+          `;
+        }).join("") : `<tr><td colspan="7" class="empty">没有匹配的事件</td></tr>`}
       </tbody>
     </table>
   `;
@@ -612,17 +683,23 @@ function renderSbTab(snap) {
         <table>
           <thead><tr><th>#</th><th>时间</th><th>状态</th><th>来源</th><th>Inbox</th><th>内容 / Correlation</th><th>说明</th></tr></thead>
           <tbody>
-            ${evs.length ? evs.map(e => `
-              <tr>
-                <td class="mono">${e.seq}</td>
-                <td class="mono" style="white-space:nowrap;">${fmtTime(e.occurred_at)} (${fmtAgo(e.occurred_at)})</td>
-                <td>${statusPill(e.status)}</td>
-                <td class="mono">${esc(e.source)}</td>
-                <td class="mono">${esc(e.inbox_id)}</td>
-                <td class="cell-wrap">${esc(e.subject || e.correlation_key || "-")}</td>
-                <td class="cell-wrap" style="color:var(--text-dim);">${esc(e.last_error || "")}</td>
-              </tr>
-            `).join("") : `<tr><td colspan="7" class="empty">最近 50 条事件里还没有 sb:* 来源</td></tr>`}
+            ${evs.length ? evs.map(e => {
+              const canExpand = e.status === "processing";
+              const key = `sb:${e.seq}`;
+              const expanded = canExpand && state.expandedEvents.has(key);
+              return `
+                <tr ${canExpand ? `class="ev-row ${expanded ? "expanded" : ""}" onclick="toggleEventExpand('${key}')"` : ""}>
+                  <td class="mono" style="white-space:nowrap;">${canExpand ? `<span class="ev-caret">▸</span>` : ""}${e.seq}</td>
+                  <td class="mono" style="white-space:nowrap;">${fmtTime(e.occurred_at)} (${fmtAgo(e.occurred_at)})</td>
+                  <td>${statusPill(e.status)}</td>
+                  <td class="mono">${esc(e.source)}</td>
+                  <td class="mono">${esc(e.inbox_id)}</td>
+                  <td class="cell-wrap">${esc(e.subject || e.correlation_key || "-")}</td>
+                  <td class="cell-wrap" style="color:var(--text-dim);">${esc(e.last_error || "")}</td>
+                </tr>
+                ${expanded ? renderEventDetailRow(e, 7) : ""}
+              `;
+            }).join("") : `<tr><td colspan="7" class="empty">最近 50 条事件里还没有 sb:* 来源</td></tr>`}
           </tbody>
         </table>
       </div>
