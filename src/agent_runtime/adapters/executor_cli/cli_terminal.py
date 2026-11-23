@@ -36,8 +36,31 @@ class Stopped(Exception):
         self.signum = signum
 
 
+_starting = False
+_stop_held: int | None = None
+
+
 def _on_signal(signum: int, _frame: object) -> None:
+    global _stop_held
+    if _starting:
+        _stop_held = _stop_held or signum
+        return
     raise Stopped(signum)
+
+
+@contextmanager
+def starting() -> Iterator[None]:
+    # A stop raised inside Popen would lose the process it just started, so it waits until the caller has recorded
+    # it. The signals are not blocked for this: the started process would inherit the mask and ignore SIGTERM.
+    global _starting, _stop_held
+    _starting = True
+    try:
+        yield
+    finally:
+        _starting = False
+        held, _stop_held = _stop_held, None
+        if held is not None:
+            raise Stopped(held)
 
 
 def stop_on_signals() -> None:
@@ -70,28 +93,6 @@ def _signals_held() -> Iterator[None]:
         yield
     finally:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
-
-
-@contextmanager
-def _stop_deferred() -> Iterator[None]:
-    # Handlers rather than a blocked mask: the started process would inherit the mask.
-    caught: list[int] = []
-    previous = {sig: signal.signal(sig, lambda signum, _frame: caught.append(signum)) for sig in STOP_SIGNALS}
-    try:
-        yield
-    finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
-        if caught:
-            raise Stopped(caught[0])
-
-
-def start_child(running: list[subprocess.Popen[bytes]], argv: list[str], **options: Any) -> subprocess.Popen[bytes]:
-    # A stop signal must not land between the process starting and its entry in `running`: the cleanup would miss it.
-    with _stop_deferred():
-        proc = subprocess.Popen(argv, **options)
-        running.append(proc)
-    return proc
 
 
 def end_group(proc: subprocess.Popen[bytes], grace: float | None = None) -> None:
@@ -155,9 +156,11 @@ def _run(spec_path: Path, running: list[subprocess.Popen[bytes]]) -> int:
     try:
         # A session of its own: the group can be ended as a whole, and a CLI that opens /dev/tty fails instead of
         # stopping in the background.
-        proc = start_child(running, argv, cwd=spec["cwd"], env=_one_shot_env({**os.environ, **spec["env"]}),
-                           start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE)
+        with starting():
+            proc = subprocess.Popen(argv, cwd=spec["cwd"], env=_one_shot_env({**os.environ, **spec["env"]}),
+                                    start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            running.append(proc)
     except OSError as exc:
         _write_atomic(exit_path, {"exit": None, "error": f"cannot start '{argv[0]}': {exc.strerror or exc}"})
         print(f"[hibernaut] cannot start {argv[0]}: {exc.strerror or exc}", file=sys.stderr, flush=True)

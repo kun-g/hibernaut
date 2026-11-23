@@ -225,6 +225,8 @@ class LocalCLIExecutor:
             session is not None
             and session.executor_id == template.name
             and bool(session.executor_session_id)
+            # "<driver>:<id>" is a session of the Runner, held in the Runner's own worktree.
+            and not str(session.executor_session_id).startswith(f"{template.name}:")
             and bool(template.resume_args)
         )
         raw_args = template.resume_args if can_resume else template.args

@@ -104,6 +104,7 @@ def test_schemas_v1_valid_json_and_roundtrip() -> None:
         "runner.run_result.schema.json",
         "runner.interrupt.schema.json",
         "runner.reclaim.schema.json",
+        "runner.tool_authorize.schema.json",
     }
     found = {p.name for p in schema_dir.glob("*.schema.json")}
     assert expected == found

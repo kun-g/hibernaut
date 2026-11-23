@@ -15,6 +15,9 @@ from runner.protocol import (
     RunnerCapabilities,
     RunnerPort,
     SlotSnapshot,
+    ToolAuthorizer,
+    ToolCall,
+    ToolDecision,
     WorktreeRef,
 )
 
@@ -37,6 +40,9 @@ __all__ = [
     "RunnerDaemon",
     "RunnerPort",
     "SlotSnapshot",
+    "ToolAuthorizer",
+    "ToolCall",
+    "ToolDecision",
     "WorktreeRef",
     "load_runner_config",
     "parse_runner_config",
