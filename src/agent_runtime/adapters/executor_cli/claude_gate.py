@@ -35,6 +35,7 @@ from agent_runtime.adapters.executor_cli.cli_terminal import (  # noqa: E402
     end_group,
     exited,
     ignore_signals,
+    starting,
     stop_on_signals,
 )
 
@@ -99,11 +100,12 @@ def _probe(argv: list[str], env: dict[str, str], timeout: float, lease: Path,
            running: list[subprocess.Popen[bytes]]) -> dict[str, Any]:
     # Starts the harness headless and stops it at its init message, before any model request matters.
     try:
-        proc = subprocess.Popen(argv, env=env, start_new_session=True,
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with starting():
+            proc = subprocess.Popen(argv, env=env, start_new_session=True,
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            running.append(proc)
     except OSError as exc:
         raise ClaudeCodeError(f"cannot start launcher ({argv[0]}): {exc.strerror or exc}") from exc
-    running.append(proc)
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
     try:
         proc.stdin.write(PROBE_PROMPT.encode())
@@ -154,11 +156,12 @@ def _probe(argv: list[str], env: dict[str, str], timeout: float, lease: Path,
 
 def _supervise(argv: list[str], env: dict[str, str], lease: Path, running: list[subprocess.Popen[bytes]]) -> int:
     try:
-        proc = subprocess.Popen(argv, env=env, process_group=0)
+        with starting():
+            proc = subprocess.Popen(argv, env=env, process_group=0)
+            running.append(proc)
     except OSError as exc:
         print(f"[hibernaut] cannot start {argv[0]}: {exc.strerror or exc}", file=sys.stderr, flush=True)
         return 127
-    running.append(proc)
     if sys.stdin.isatty():
         # The agent's group takes the terminal's foreground, as a shell hands it to a job; it may already have
         # stopped on reading the terminal before that, so it is continued.
