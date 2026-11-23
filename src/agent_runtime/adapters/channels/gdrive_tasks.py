@@ -810,6 +810,9 @@ class DriveResultWriter:
         if event.source == FORWARD_SOURCE and event.payload.get("return_to"):
             # The failure went back to the agent that forwarded the work; the task goes on there.
             return False
+        session = self._sessions.get(event.session_id) if event.session_id else None
+        if session is not None and session.forward is not None and event.event_id in session.forward.owed_failures:
+            return False
         origin = event.payload.get("origin_key")
         file_id = extract_gdrive_file_id(origin if isinstance(origin, str) else event.correlation_key)
         if not file_id:

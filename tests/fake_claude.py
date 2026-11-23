@@ -10,7 +10,7 @@ from pathlib import Path
 
 argv = sys.argv[1:]
 interactive = "-p" not in argv
-probe = not interactive and "--tools" in argv and argv[argv.index("--tools") + 1] == ""
+probe = not interactive and "--tools" in argv and argv[argv.index("--tools") + 1] == "" and "--mcp-config" not in argv
 prompt = "" if interactive else sys.stdin.read()
 schema = argv[argv.index("--json-schema") + 1] if "--json-schema" in argv else ""
 allowed = argv[argv.index("--allowedTools") + 1] if "--allowedTools" in argv else ""

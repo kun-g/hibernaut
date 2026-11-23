@@ -19,6 +19,9 @@ _STATUSES: tuple[SessionStatus, ...] = ("active", "suspended", "archived", "clos
 _MAX_LIST = 100
 _MAX_TEXT = 100_000
 _SNIPPET = 500
+_MAX_LINES = 2000
+_MAX_MATCHES = 200
+_MAX_FILE = 10 * 1024 * 1024
 _GIT_TIMEOUT = 30.0
 # Longest Unix socket path every supported system accepts (macOS allows 104 bytes).
 _MAX_SOCKET_PATH = 100
@@ -75,20 +78,69 @@ def check_git_args(args: Sequence[str]) -> None:
 def _git(checkout: Path, args: Sequence[str]) -> str:
     check_git_args(args)
     plain = ("--no-ext-diff", "--no-textconv") if args[0] in ("diff", "log", "show", "blame") else ()
+    return _exec_git(checkout, [args[0], *plain, *args[1:]])
+
+
+def _exec_git(checkout: Path, args: Sequence[str], ok: Sequence[int] = (0,)) -> str:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     # Without optional locks `git status` does not even refresh the index.
     env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
     try:
         done = subprocess.run(
-            ["git", "--no-pager", *(part for item in _GIT_CONFIG for part in ("-c", item)), args[0], *plain, *args[1:]],
+            ["git", "--no-pager", *(part for item in _GIT_CONFIG for part in ("-c", item)), *args],
             cwd=checkout, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
             timeout=_GIT_TIMEOUT,
         )
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise ToolError(f"git: {exc}") from exc
-    if done.returncode != 0:
+    if done.returncode not in ok:
         raise ToolError(f"git {args[0]} exited {done.returncode}: {done.stderr.strip()[-2000:]}")
     return done.stdout
+
+
+def _outside(path: str) -> bool:
+    return path.startswith(("/", "~")) or ".." in path.split("/")
+
+
+def _real_path(checkout: Path, path: str) -> str:
+    # The path the permission gate judges and that is read: no other spelling or link leads round a rule for it.
+    target = (checkout / path).resolve()
+    if _outside(path) or not target.is_relative_to(checkout):
+        raise ToolError(f"{path} is outside the checkout")
+    return target.relative_to(checkout).as_posix()
+
+
+def _list_files(checkout: Path, pathspec: str) -> list[str]:
+    # What git tracks or would track: neither .git nor ignored files (.env and the like).
+    out = _exec_git(checkout, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", pathspec])
+    return list(dict.fromkeys(name for name in out.split("\0") if name))
+
+
+def _read_file(checkout: Path, path: str, offset: int, limit: int) -> str:
+    target = checkout / path
+    if path not in _list_files(checkout, f":(literal){path}") or not target.is_file():
+        raise ToolError(f"{path} is not a file of the checkout")
+    if target.stat().st_size > _MAX_FILE:
+        raise ToolError(f"{path} is larger than {_MAX_FILE} bytes; use search_files")
+    data = target.read_bytes()
+    if b"\0" in data:
+        raise ToolError(f"{path} is a binary file")
+    lines = data.decode("utf-8", errors="replace").split("\n")
+    if not lines[-1]:
+        lines.pop()
+    end = min(len(lines), offset - 1 + limit)
+    shown = "".join(f"{n}\t{lines[n - 1]}\n" for n in range(offset, end + 1))
+    return shown + (f"[{len(lines) - end} more lines: go on with offset {end + 1}]\n" if end < len(lines) else "")
+
+
+def _search(checkout: Path, pattern: str, pathspec: str) -> list[tuple[str, str, str]]:
+    # (path, line number, line); links are not followed, ignored files are left out.
+    out = _exec_git(checkout, [
+        "grep", "-n", "-I", "-E", "-z", "--no-color", "--no-column", "--no-textconv", "--no-recurse-submodules",
+        "--untracked", "-e", pattern, "--", pathspec,
+    ], ok=(0, 1))
+    found = (re.fullmatch(r"([^\0]+)\0(\d+)[\0:](.*)", line) for line in out.split("\n"))
+    return [(m[1], m[2], m[3]) for m in found if m is not None]
 
 
 def _clip(text: str) -> str:
@@ -109,6 +161,21 @@ def _optional(arguments: dict[str, Any], key: str) -> str | None:
     if not isinstance(value, str):
         raise ToolError(f"{key} must be a string")
     return value.strip() or None
+
+
+def _pathspec(arguments: dict[str, Any]) -> tuple[str | None, str]:
+    # (the glob as given, the git pathspec for it)
+    glob = _optional(arguments, "glob")
+    if glob is not None and _outside(glob):
+        raise ToolError(f"{glob} is outside the checkout")
+    return glob, f":(glob){glob or '**'}"
+
+
+def _count(arguments: dict[str, Any], key: str, default: int) -> int:
+    value = arguments.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ToolError(f"{key} must be a positive integer")
+    return value
 
 
 def _strings(arguments: dict[str, Any], key: str) -> list[str]:
@@ -144,6 +211,7 @@ class StewardTools:
     @staticmethod
     def definitions() -> list[dict[str, Any]]:
         inbox = {**_TEXT, "description": "An inbox of this project; leave out for the default."}
+        glob = {**_TEXT, "description": "Limit to these paths, e.g. src/**/*.py or docs/**."}
         return [
             {"name": "forward_to_inbox",
              "description": "Hand work to another agent through its inbox. Nothing waits for it: end your turn after "
@@ -157,6 +225,18 @@ class StewardTools:
                  target_agent={**_TEXT, "description": "Leave out to let the inbox's rules pick the agent."},
                  return_to=_TEXT,
              )},
+            {"name": "read_file",
+             "description": f"Read a file of the checkout, with line numbers, at most {_MAX_LINES} lines at a time. "
+                            "Ignored files cannot be read.",
+             "inputSchema": _schema(
+                 ("path",), path={**_TEXT, "description": "Relative to the checkout, e.g. src/app.py."},
+                 offset={"type": "integer", "description": "First line, from 1."}, limit={"type": "integer"},
+             )},
+            {"name": "search_files",
+             "description": "Search the checkout's files for a POSIX extended regular expression. Files you may not "
+                            "read are left out.",
+             "inputSchema": _schema(("pattern",), pattern=_TEXT, glob=glob)},
+            {"name": "list_files", "description": "List the checkout's files.", "inputSchema": _schema(glob=glob)},
             {"name": "read_memory", "description": "Read a file of the project memory, e.g. notes/release.md.",
              "inputSchema": _schema(("path",), path=_TEXT)},
             {"name": "write_memory", "description": "Replace a file of the project memory.",
@@ -173,6 +253,9 @@ class StewardTools:
         # (answer, is_error)
         handlers: dict[str, Callable[[dict[str, Any]], Awaitable[str]]] = {
             "forward_to_inbox": self._forward,
+            "read_file": self._read_file,
+            "search_files": self._search_files,
+            "list_files": self._list_files,
             "read_memory": self._read_memory,
             "write_memory": self._write_memory,
             "list_sessions": self._list_sessions,
@@ -219,6 +302,37 @@ class StewardTools:
         return self.caps.forward_to_inbox(
             wanted["target_inbox"], wanted["text"], **options, approved_request_id=approved_request_id
         )
+
+    async def _read_file(self, arguments: dict[str, Any]) -> str:
+        path = _real_path(self.checkout, _required(arguments, "path"))
+        offset, limit = _count(arguments, "offset", 1), min(_count(arguments, "limit", _MAX_LINES), _MAX_LINES)
+        self._allow("read_file", {"path": path})
+        return await asyncio.to_thread(_read_file, self.checkout, path, offset, limit)
+
+    async def _search_files(self, arguments: dict[str, Any]) -> str:
+        pattern, (glob, pathspec) = _required(arguments, "pattern"), _pathspec(arguments)
+        self._allow("search_files", {"pattern": pattern, "glob": glob})
+        readable: dict[str, bool] = {}
+        shown: list[str] = []
+        for path, number, line in await asyncio.to_thread(_search, self.checkout, pattern, pathspec):
+            # A match shows a file's content, so each file passes the gate as a read. Saying how many were left out
+            # would tell whether the pattern matches in them.
+            if path not in readable:
+                readable[path] = self.caps.permissions.check("read_file", {"path": path}).action == "allow"
+            if not readable[path]:
+                continue
+            if len(shown) == _MAX_MATCHES:
+                shown.append("[more matches: narrow the pattern or the glob]\n")
+                break
+            shown.append(f"{path}:{number}:{line[:_SNIPPET]}\n")
+        return "".join(shown)
+
+    async def _list_files(self, arguments: dict[str, Any]) -> str:
+        glob, pathspec = _pathspec(arguments)
+        self._allow("list_files", {"glob": glob})
+        found = await asyncio.to_thread(_list_files, self.checkout, pathspec)
+        more = [f"[{len(found) - _MAX_LINES} more files: narrow the glob]"] if len(found) > _MAX_LINES else []
+        return "".join(f"{name}\n" for name in [*found[:_MAX_LINES], *more])
 
     async def _read_memory(self, arguments: dict[str, Any]) -> str:
         path = _required(arguments, "path")

@@ -31,6 +31,8 @@ MAX_FORWARD_HOPS = 3
 FORWARD_TOOL = "inbox.forward"
 FORWARD_SOURCE = "agent:forward"
 RETURN_SOURCE = "agent:return"
+# Ends one wait of the session it names. It carries no result, and the worker handles it without running an agent.
+RETURN_CANCELLED_SOURCE = "agent:return_cancelled"
 
 
 def utc_now_iso() -> str:
@@ -122,7 +124,11 @@ class ForwardSpec:
     origin_key: str | None = None
     # Results this session still waits for from work it forwarded with a return to its own inbox.
     pending_returns: int = 0
-    # Set only on the suspended session that keeps a refused return until a person decides on it.
+    # Returns this session no longer waits for, by external id, so one withheld result ends one wait once.
+    cancelled_returns: tuple[str, ...] = ()
+    # Events of this session whose failure or refusal went back to the agent it owed a result, not outside.
+    owed_failures: tuple[str, ...] = ()
+    # Set only on the session that keeps a refused return; the result stays there after the decision.
     held: HeldReturn | None = None
 
 

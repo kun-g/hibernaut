@@ -10,6 +10,7 @@ from typing import Any, Never, assert_never, cast
 
 from agent_runtime.core.models import (
     FORWARD_SOURCE,
+    RETURN_CANCELLED_SOURCE,
     AgentNotAllowed,
     DeliveryOutcome,
     Emit,
@@ -52,11 +53,15 @@ from agent_runtime.core.ports import (
 )
 from agent_runtime.engine.forwarding import (
     ForwardStage,
+    cancel_event,
     carries_forwards,
     chain_external_id,
+    closing_event,
     event_agent_id,
     event_tags,
     event_type,
+    is_open,
+    out_of_hops,
     return_event,
     return_payload,
     return_refusal,
@@ -427,6 +432,14 @@ class AgentWorker:
                     if not claimed:
                         continue
 
+                # Before any batch: the last return may be in this claim too, and its Run then ends the task.
+                cancelled = [e for e in claimed if e.source == RETURN_CANCELLED_SOURCE]
+                if cancelled:
+                    reports += [self._end_wait(inbox_id, event) for event in cancelled]
+                    claimed = [e for e in claimed if e.source != RETURN_CANCELLED_SOURCE]
+                    if not claimed:
+                        continue
+
                 restarted = False
                 snapshot_ids = {evt.event_id for evt in claimed}
                 batches = self._group_into_batches(claimed)
@@ -442,6 +455,14 @@ class AgentWorker:
                         wake_signal.clear()
                         batch_ids = [evt.event_id for evt in batch]
 
+                        if session_ref is not None and session_ref.forward is not None and session_ref.forward.held:
+                            # No agent runs for it: a person decides, and the worker hands the result on.
+                            completed_or_failed_ids.update(batch_ids)
+                            decided = self._decide_return(inbox_id, batch, session_ref)
+                            if decided is not None:
+                                reports.append(decided)
+                            continue
+
                         if self._is_close_session_batch(batch):
                             closed_sid = self._handle_close_session(batch, session_ref)
                             if closed_sid is not None:
@@ -456,14 +477,6 @@ class AgentWorker:
                                     outcome=Silent(),
                                 )
                             )
-                            continue
-
-                        if session_ref is not None and session_ref.forward is not None and session_ref.forward.held:
-                            # No agent runs for it: a person decides, and the worker hands the result on.
-                            completed_or_failed_ids.update(batch_ids)
-                            decided = self._decide_return(inbox_id, batch, session_ref)
-                            if decided is not None:
-                                reports.append(decided)
                             continue
 
                         try:
@@ -680,11 +693,17 @@ class AgentWorker:
                         break
         if target is None:
             return None
+        ending = closing_event(target, self._sessions)
         self._close_and_reclaim(target)
+        if ending is not None:
+            self._queue_event(ending)
         # Work forwarded to other inboxes closes with it, each child under its own inbox's lease.
         for child in self._sessions.list_sessions(parent_session_id=target.session_id):
             if child.inbox_id == target.inbox_id and child.forward is not None and child.forward.held is not None:
+                ending = closing_event(child, self._sessions)
                 self._sessions.close_session(child.session_id)
+                if ending is not None:
+                    self._queue_event(ending)
             if child.inbox_id != target.inbox_id and child.status in ("active", "suspended"):
                 self._queue_event(Event(
                     inbox_id=child.inbox_id,
@@ -699,6 +718,66 @@ class AgentWorker:
         _, duplicate = self._inbox.append(event)
         if not duplicate and self._on_forward is not None:
             self._on_forward(event.inbox_id)
+
+    def _end_wait(self, inbox_id: str, event: Event) -> RunReport:
+        # Under the waiting inbox's own lease, so it never races the Runs that count the same returns.
+        session = self._resolve_session(event)
+        spec = session.forward if session is not None else None
+        report = RunReport(inbox_id=inbox_id, session_id=event.session_id, event_ids=(event.event_id,), outcome=Silent())
+        if session is not None and spec is not None and is_open(session):
+            repeated = event.external_id in spec.cancelled_returns
+            waited = repeated or spec.pending_returns > 0
+            if not repeated:
+                spec = replace(spec, pending_returns=max(0, spec.pending_returns - 1),
+                               cancelled_returns=(*spec.cancelled_returns, event.external_id))
+            report = replace(report, session_id=session.session_id, pending_elsewhere=spec.pending_returns > 0)
+            # A suspended session goes on once its own request is decided.
+            if waited and spec.pending_returns == 0 and session.status == "active":
+                report = self._end_without_return(inbox_id, event, session, spec, repeated=repeated)
+            elif not repeated:
+                self._sessions.save(replace(session, forward=spec, updated_at=utc_now_iso()))
+            self._inbox.bind_session([event.event_id], session.session_id)
+        self._inbox.mark_done([event.event_id])
+        return report
+
+    def _end_without_return(
+        self, inbox_id: str, event: Event, session: SessionRef, spec: ForwardSpec, *, repeated: bool
+    ) -> RunReport:
+        # Nothing else will wake this session for the task, so the worker ends it; no agent is told by a side door.
+        payload = event.payload
+        text = (
+            f"The result of agent '{payload.get('forwarded_by')}' in inbox '{payload.get('forwarded_from')}' will not "
+            f"come back: {payload.get('reason')}. This task ended without it."
+        )
+        key = self._reported_key(session.correlation_key, spec)
+        metadata = self._report_metadata([event], key, session.agent_id or "", new_id("run"), spec)
+        owed = spec.return_to is not None
+        # Results first: a crash before the session is saved repeats them, one after it does not.
+        if not repeated:
+            if owed:
+                self._give_back(inbox_id, session.agent_id or "", session, spec, [event], text=text, status="refused",
+                                metadata=metadata)
+            else:
+                self._outbox.enqueue(
+                    inbox_id=inbox_id,
+                    content=f"[hibernaut] {text}",
+                    metadata={**self._with_status(metadata, "refused"), "kind": "return_withheld",
+                              "outcome_kind": "error", "session_id": session.session_id},
+                )
+            if session.task_link is not None:
+                self._enqueue_task_sync(inbox_id, metadata, session.session_id,
+                                        _task_fields(session.task_link, "release", "failed"), "error")
+            self._sessions.save(replace(session, task_link=None, forward=replace(spec, return_to=None),
+                                        updated_at=utc_now_iso()))
+        return RunReport(
+            inbox_id=inbox_id,
+            session_id=session.session_id,
+            event_ids=(event.event_id,),
+            outcome=Emit(messages=(text,), status="refused"),
+            correlation_key=key,
+            rejected=text,
+            pending_elsewhere=owed,
+        )
 
     def _close_and_reclaim(self, target: SessionRef) -> None:
         self._sessions.close_session(target.session_id)
@@ -777,14 +856,18 @@ class AgentWorker:
         metadata = self._with_status(self._report_metadata(batch, key, "", new_id("run"), spec), "refused")
         if session_ref is not None:
             metadata["session_id"] = session_ref.session_id
-        self._outbox.enqueue(
-            inbox_id=inbox_id,
-            content=f"[hibernaut] Refused {len(ids)} event(s) in inbox {inbox_id}: {reason}.",
-            metadata={**metadata, "kind": "agent_refused", "outcome_kind": "error"},
-        )
         owed = spec is not None and spec.return_to is not None
         if spec is not None and owed:
             self._give_back(inbox_id, "", session_ref, spec, batch, text=reason, status="refused", metadata=metadata)
+            if session_ref is not None and session_ref.forward is not None:
+                kept = replace(session_ref.forward, owed_failures=(*session_ref.forward.owed_failures, *ids))
+                self._sessions.save(replace(session_ref, forward=kept, updated_at=utc_now_iso()))
+        else:
+            self._outbox.enqueue(
+                inbox_id=inbox_id,
+                content=f"[hibernaut] Refused {len(ids)} event(s) in inbox {inbox_id}: {reason}.",
+                metadata={**metadata, "kind": "agent_refused", "outcome_kind": "error"},
+            )
         return RunReport(
             inbox_id=inbox_id,
             session_id=session_ref.session_id if session_ref is not None else None,
@@ -839,22 +922,34 @@ class AgentWorker:
         if known is not None and known.status != "suspended":
             return None
         if known is not None and known.pending_request_id:
-            return holder.session_id, Suspend(known.pending_request_id, self._return_prompt(spec, held), "")
+            return holder.session_id, Suspend(
+                known.pending_request_id, self._return_prompt(holder, known.pending_request_id), ""
+            )
         return holder.session_id, self._ask_about_return(holder, metadata)
 
     @staticmethod
-    def _return_prompt(spec: ForwardSpec, held: HeldReturn) -> str:
+    def _return_prompt(holder: SessionRef, request_id: str) -> str:
+        # It may be answered into the conversation the work came from, so it never carries the result.
+        spec, held = holder.forward, holder.forward.held if holder.forward is not None else None
+        assert spec is not None and held is not None
+        choices = (
+            f"It cannot go back any more. Approve to record it as settled here, reject to drop it; {spec.return_to} "
+            "stops waiting for it either way."
+            if out_of_hops(spec)
+            else f"Approve to check again and hand it back; reject to withhold it ({spec.return_to} is then told only "
+            "that it was withheld)."
+        )
         return (
             f"[{held.agent_id or 'hibernaut'}] has a result ({held.payload['status']}) for {spec.return_to} that may "
-            f"not go back by itself: {held.reason}.\n"
-            f"Approve to check again and hand it back; reject to withhold it ({spec.return_to} is then told only that "
-            f"it was withheld).\n\n{held.payload['text']}"
+            f"not go back by itself: {held.reason}.\n{choices}\nRequest {request_id}; the result is kept in session "
+            f"{holder.session_id} (hibernaut_get_held_return shows it)."
         )
 
     def _ask_about_return(self, holder: SessionRef, metadata: dict[str, Any]) -> Suspend:
-        spec, held = holder.forward, holder.forward.held if holder.forward is not None else None
-        assert spec is not None and held is not None
-        asked = Suspend(new_id("req"), self._return_prompt(spec, held), "")
+        held = holder.forward.held if holder.forward is not None else None
+        assert held is not None
+        request_id = new_id("req")
+        asked = Suspend(request_id, self._return_prompt(holder, request_id), "")
         fields = held.task_fields
         # The card first: a crash in between asks again, instead of leaving a result nobody was asked about.
         self._outbox.enqueue(
@@ -876,7 +971,8 @@ class AgentWorker:
     def _decide_return(self, inbox_id: str, batch: list[Event], holder: SessionRef) -> RunReport | None:
         spec, held = holder.forward, holder.forward.held if holder.forward is not None else None
         assert spec is not None and held is not None
-        answers = [e for e in batch if e.payload.get("approval_request_id") == holder.pending_request_id]
+        pending = holder.pending_request_id
+        answers = [e for e in batch if pending and e.payload.get("approval_request_id") == pending]
         others = [e.event_id for e in batch if e not in answers]
         if others:
             self._inbox.mark_failed(others, "This session only holds a result that waits for approval")
@@ -897,18 +993,17 @@ class AgentWorker:
                                  permissions=self._permissions, routes=self._routes)
         blocked = refusal is not None and refusal.action == "block"
         outcome: RunOutcome = Silent()
-        if blocked and approved:
+        if blocked and approved and not out_of_hops(spec):
             retry = replace(holder, forward=replace(spec, held=replace(held, reason=str(refusal))))
             outcome = self._ask_about_return(retry, metadata)
         else:
             if blocked:
-                self._outbox.enqueue(
-                    inbox_id=inbox_id,
-                    content=f"[hibernaut] A result for {spec.return_to} was withheld, and {spec.return_to} could not "
-                            f"be told: {refusal}.",
-                    metadata={**self._with_status(metadata, "refused"), "kind": "return_withheld",
-                              "outcome_kind": "error", "session_id": holder.session_id},
-                )
+                # Nothing may go back, so the waiting session only stops waiting for it.
+                how = "it was settled there" if approved else "it was withheld"
+                ending = cancel_event(spec, inbox_id=inbox_id, agent_id=held.agent_id, external_id=held.external_id,
+                                      reason=f"{how} ({refusal})", reply=held.payload, sessions=self._sessions)
+                if ending is not None:
+                    self._queue_event(ending)
             else:
                 self._queue_event(return_event(
                     spec, external_id=held.external_id, payload=payload, sessions=self._sessions
@@ -920,8 +1015,8 @@ class AgentWorker:
                 )
                 failed = fields["task_action"] == "release"
                 self._enqueue_task_sync(inbox_id, metadata, holder.session_id, fields, "error" if failed else "done")
-            self._sessions.save(replace(holder, status="closed", pending_request_id=None,
-                                        forward=replace(spec, held=None), updated_at=utc_now_iso()))
+            # The result stays in the closed session.
+            self._sessions.save(replace(holder, status="closed", pending_request_id=None, updated_at=utc_now_iso()))
         ids = [e.event_id for e in answers]
         self._inbox.bind_session(ids, holder.session_id)
         self._inbox.mark_done(ids)
@@ -1030,7 +1125,7 @@ class AgentWorker:
                 return []
             newly_folded: list[Event] = []
             for candidate in self._runnable(self._inbox.fetch_pending(inbox_id)):
-                if candidate.event_id in consumed_ids:
+                if candidate.event_id in consumed_ids or candidate.source == RETURN_CANCELLED_SOURCE:
                     continue
                 cand_session = self._resolve_session(candidate)
                 if self._batch_key(candidate, cand_session) != target_batch_key:
@@ -1138,7 +1233,9 @@ class AgentWorker:
                 batch + folded_events, self._reported_key(batch_correlation_key, failed_spec), executor.executor_id,
                 run_id, failed_spec,
             )
-            if exc.route is not None:
+            owed = failed_spec is not None and failed_spec.return_to is not None
+            # Owed to the agent that asked for it: its details go there, and stay in the Run's own records.
+            if exc.route is not None and not owed:
                 self._alert_failed_run(
                     inbox_id, active_session.session_id, executor.executor_id, exc, len(all_failed_ids),
                     failed_metadata,
@@ -1151,7 +1248,13 @@ class AgentWorker:
                         text=f"{executor.executor_id} failed: {str(cause) or type(cause).__name__}", status="failed",
                         metadata=failed_metadata,
                     )
-                    failed_spec = replace(failed_spec, return_to=None)
+                    failed_spec = replace(failed_spec, return_to=None,
+                                          owed_failures=(*failed_spec.owed_failures, *all_failed_ids))
+                elif failed_spec.owed_failures:
+                    # Replayed after it was given back; this failure is answered here.
+                    failed_spec = replace(failed_spec, owed_failures=tuple(
+                        event_id for event_id in failed_spec.owed_failures if event_id not in all_failed_ids
+                    ))
                 current = self._sessions.get(active_session.session_id)
                 if current is not None and current.forward != failed_spec:
                     self._sessions.save(replace(current, forward=failed_spec, updated_at=utc_now_iso()))
@@ -1353,7 +1456,7 @@ class AgentWorker:
     ) -> None:
         while not exec_task.done():
             has_new = self._interruptible and any(
-                evt.event_id not in known_ids
+                evt.event_id not in known_ids and evt.source != RETURN_CANCELLED_SOURCE
                 for evt in self._runnable(self._inbox.fetch_pending(inbox_id))
             )
             if has_new:

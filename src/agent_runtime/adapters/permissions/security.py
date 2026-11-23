@@ -29,6 +29,9 @@ class AutoModePermissionAdapter:
             "list_sessions",
             "list_events",
             "git_read",
+            "read_file",
+            "search_files",
+            "list_files",
             # Each is granted per project in [projects.<name>.delivery] (open_pr, auto_merge); move one to the
             # defer list to also ask a person every time.
             "delivery.open_pr",

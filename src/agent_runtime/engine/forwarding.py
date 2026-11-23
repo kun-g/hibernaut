@@ -8,6 +8,7 @@ from agent_runtime.core.models import (
     FORWARD_SOURCE,
     FORWARD_TOOL,
     MAX_FORWARD_HOPS,
+    RETURN_CANCELLED_SOURCE,
     RETURN_SOURCE,
     DeliveryOutcome,
     Emit,
@@ -104,7 +105,11 @@ def run_spec(events: Sequence[Event], session: SessionRef | None) -> ForwardSpec
             hops = max(hops, saved.hop_count)
         forwards = [spec for evt, spec in carried if evt.source == FORWARD_SOURCE]
         if forwards:
-            return replace(forwards[-1], hop_count=hops, pending_returns=waiting)
+            return replace(
+                forwards[-1], hop_count=hops, pending_returns=waiting,
+                cancelled_returns=saved.cancelled_returns if saved is not None else (),
+                owed_failures=saved.owed_failures if saved is not None else (),
+            )
         returned = carried[-1][1]
         if saved is None:
             # The parent session is gone: this one answers outside and starts no new parent.
@@ -150,17 +155,24 @@ def chain_external_id(kind: str, events: Sequence[Event], index: int) -> str:
     return f"{kind}:{first.event_id}{f':{replay}' if replay else ''}:{index}"
 
 
-def return_session(sessions: SessionStorePort, spec: ForwardSpec) -> str | None:
-    # The open session up the parent chain that belongs to the inbox the result goes back to.
+def is_open(session: SessionRef) -> bool:
+    return session.status in ("active", "suspended")
+
+
+def _asking_session(sessions: SessionStorePort, spec: ForwardSpec) -> SessionRef | None:
+    # The session up the parent chain that belongs to the inbox the result goes back to.
     current = spec.parent_session_id
     for _ in range(MAX_FORWARD_HOPS):
         session = sessions.get(current) if current else None
-        if session is None:
-            return None
-        if session.inbox_id == spec.return_to:
-            return session.session_id if session.status in ("active", "suspended") else None
+        if session is None or session.inbox_id == spec.return_to:
+            return session
         current = session.parent_session_id
     return None
+
+
+def return_session(sessions: SessionStorePort, spec: ForwardSpec) -> str | None:
+    session = _asking_session(sessions, spec)
+    return session.session_id if session is not None and is_open(session) else None
 
 
 def return_payload(
@@ -178,8 +190,7 @@ def return_payload(
     payload: dict[str, Any] = {
         "text": text,
         "status": status,
-        # Never past the limit: whoever gets a result at the limit can answer it but not forward again.
-        "hop_count": min(spec.hop_count + 1, MAX_FORWARD_HOPS),
+        "hop_count": spec.hop_count + 1,
         "forwarded_from": inbox_id,
         "forwarded_by": agent_id,
         **_reply_fields(spec, events),
@@ -211,6 +222,50 @@ def return_event(
     )
 
 
+def cancel_event(
+    spec: ForwardSpec, *, inbox_id: str, agent_id: str, external_id: str, reason: str, reply: Mapping[str, Any],
+    sessions: SessionStorePort,
+) -> Event | None:
+    # Tells the session that waits for a return that none will come: no result, no hop, no agent runs for it.
+    waiting = _asking_session(sessions, spec)
+    if spec.return_to is None or waiting is None:
+        return None
+    if not is_open(waiting) and (waiting.status != "archived" or spec.origin_key is None):
+        return None
+    return Event(
+        inbox_id=spec.return_to,
+        source=RETURN_CANCELLED_SOURCE,
+        external_id=external_id,
+        payload={
+            "reason": reason,
+            "forwarded_from": inbox_id,
+            "forwarded_by": agent_id,
+            **_reply_fields(spec, ()),
+            **{key: reply[key] for key in ("reply_channel", "reply_target") if reply.get(key)},
+        },
+        session_id=waiting.session_id if is_open(waiting) else None,
+        # An archived session handed its conversation on to another one.
+        correlation_key=None if is_open(waiting) else spec.origin_key,
+    )
+
+
+def closing_event(session: SessionRef, sessions: SessionStorePort) -> Event | None:
+    # For an open session about to close that owes a result, or keeps one a person has yet to decide on.
+    spec = session.forward
+    if spec is None or spec.return_to is None or not is_open(session):
+        return None
+    held = spec.held
+    return cancel_event(
+        spec, inbox_id=session.inbox_id, agent_id=session.agent_id or "",
+        external_id=held.external_id if held is not None else f"return:{session.session_id}:closed",
+        reason="its session was closed", reply=held.payload if held is not None else {}, sessions=sessions,
+    )
+
+
+def out_of_hops(spec: ForwardSpec) -> bool:
+    return spec.hop_count >= MAX_FORWARD_HOPS
+
+
 def return_refusal(
     spec: ForwardSpec,
     *,
@@ -226,6 +281,10 @@ def return_refusal(
         here, there = routes(inbox_id), routes(spec.return_to)
         if here is None or there is None or here.project != there.project:
             return ForwardRefused(f"return_to '{spec.return_to}' is not an inbox of this project", "block")
+    if out_of_hops(spec):
+        return ForwardRefused(
+            f"this work already made {spec.hop_count} hop(s) between agents (limit {MAX_FORWARD_HOPS})", "block"
+        )
     decision = permissions.check(FORWARD_TOOL, {
         "inbox_id": inbox_id,
         "agent_id": agent_id,
@@ -238,10 +297,6 @@ def return_refusal(
     })
     if decision.action == "block":
         return ForwardRefused(decision.reason, "block")
-    if spec.hop_count >= MAX_FORWARD_HOPS:
-        return ForwardRefused(
-            f"this work already made {spec.hop_count} hop(s) between agents (limit {MAX_FORWARD_HOPS})", "defer"
-        )
     if decision.action == "defer":
         return ForwardRefused(decision.reason, "defer")
     return None

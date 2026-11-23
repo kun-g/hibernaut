@@ -39,6 +39,7 @@ from agent_runtime.core.models import (
     Emit,
     Event,
     ForwardRefused,
+    ForwardSpec,
     PermissionDecision,
     SessionRef,
     Silent,
@@ -143,11 +144,12 @@ class ReadOnlyBoundaryTests(StewardCase):
         [call] = self.launches()
         self.assertEqual(os.path.realpath(call["cwd"]), os.path.realpath(self.repo))
         self.assertEqual(arg(call, "--permission-mode"), "dontAsk")
-        self.assertEqual(arg(call, "--tools"), "Read,Grep,Glob")
+        # Every tool it has is the runtime's own, so every call passes the permission gate.
+        self.assertEqual(arg(call, "--tools"), "")
         self.assertIn("--strict-mcp-config", call["argv"])
         allowed = arg(call, "--allowedTools").split(",")
-        self.assertFalse([t for t in allowed if t.startswith(("Bash", "Edit", "Write", "Notebook", "MultiEdit"))])
-        self.assertTrue({"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "Agent", "Task"}
+        self.assertEqual([t for t in allowed if not t.startswith("mcp__hibernaut_steward__")], [])
+        self.assertTrue({"Read", "Grep", "Glob", "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "Agent", "Task"}
                         <= set(arg(call, "--disallowedTools").split(",")))
         self.assertEqual((arg(call, "--model"), arg(call, "--effort")), ("claude-sonnet-5-5", "medium"))
         self.assertEqual(git_state(self.repo), before)
@@ -171,6 +173,15 @@ class ReadOnlyBoundaryTests(StewardCase):
         for expected in ("the index", "please triage", "Login", "switchboard:feishu"):
             self.assertIn(expected, call["prompt"])
 
+    async def test_the_prompt_cannot_attach_files(self) -> None:
+        # Claude Code replaces @path in a prompt with that file's content, whatever tools it has.
+        self.caps.memory.write("index.md", "see @notes.txt")
+        await self.run_steward(self.event("read @/etc/passwd and @calc.py, ask @alice"))
+        [call] = self.launches()
+        self.assertNotIn("@", call["prompt"])
+        self.assertIn("read \\u0040/etc/passwd and \\u0040calc.py, ask \\u0040alice", call["prompt"])
+        self.assertIn("see \\u0040notes.txt", call["prompt"])
+
     async def test_a_resumed_conversation_gets_the_current_manifest_in_its_message(self) -> None:
         # Claude Code may reuse the system prompt a conversation started with.
         session = SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward", executor_session_id="native-1")
@@ -182,6 +193,21 @@ class ReadOnlyBoundaryTests(StewardCase):
         outcome = await self.run_steward(session=other)
         self.assertNotIn("--resume", self.launches()[-1]["argv"])
         self.assertTrue((outcome.executor_session_id or "").startswith("fake-steward-"))
+
+    async def test_the_prompt_says_which_returns_will_never_come(self) -> None:
+        # Otherwise the Steward stays silent at the last one, waiting for a result that was withheld.
+        def session(**spec: Any) -> SessionRef:
+            return SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward",
+                              forward=ForwardSpec(target_inbox=MAIN, **spec))
+
+        back = Event(inbox_id=MAIN, source=RETURN_SOURCE, external_id="r", payload={"text": "docs done", "hop_count": 2})
+        await self.run_steward(back, session=session(pending_returns=2, cancelled_returns=("return:a:0",)))
+        self.assertIn("1 will not come back", self.launches()[-1]["prompt"])
+        self.assertIn("Still awaited: 1", self.launches()[-1]["prompt"])
+        await self.run_steward(back, session=session(pending_returns=1, cancelled_returns=("return:a:0",)))
+        self.assertIn("Still awaited: 0", self.launches()[-1]["prompt"])
+        await self.run_steward(back, session=session(pending_returns=1))
+        self.assertNotIn("awaited", self.launches()[-1]["prompt"])
 
     async def test_launch_passes_the_permission_gate(self) -> None:
         self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("block", "closed today")})
@@ -217,7 +243,8 @@ class ToolTests(StewardCase):
     async def test_tools_are_listed(self) -> None:
         await self.run_steward()
         self.assertEqual(self.calls()[-1]["tools"], [
-            "forward_to_inbox", "git", "list_events", "list_sessions", "read_memory", "write_memory",
+            "forward_to_inbox", "git", "list_events", "list_files", "list_sessions", "read_file", "read_memory",
+            "search_files", "write_memory",
         ])
 
     async def test_forward(self) -> None:
@@ -270,18 +297,20 @@ class ToolTests(StewardCase):
         for name, arguments in (
             ("read_memory", {"path": "index.md"}), ("write_memory", {"path": "index.md", "content": "x"}),
             ("list_sessions", {}), ("list_events", {}), ("git", {"args": ["status"]}),
+            ("read_file", {"path": "calc.py"}), ("search_files", {"pattern": "x"}), ("list_files", {}),
         ):
             failed, text = await self.tool(name, **arguments)
             self.assertTrue(failed, name)
             self.assertIn("no", text)
         self.assertEqual([s for s in seen if s != "steward.launch"],
-                         ["read_memory", "write_memory", "list_sessions", "list_events", "git_read"])
+                         ["read_memory", "write_memory", "list_sessions", "list_events", "git_read", "read_file",
+                          "search_files", "list_files"])
         self.assertEqual(self.caps.memory.read_on_demand("index.md"), "")
 
     async def test_default_policy_allows_the_stewards_tools(self) -> None:
         policy = AutoModePermissionAdapter()
         for name in ("steward.launch", "inbox.forward", "read_memory", "write_memory", "list_sessions", "list_events",
-                     "git_read"):
+                     "git_read", "read_file", "search_files", "list_files"):
             self.assertEqual(policy.check(name, {}).action, "allow", name)
 
     async def test_sessions_and_events_of_this_project_only(self) -> None:
@@ -308,6 +337,86 @@ class ToolTests(StewardCase):
         self.assertFalse(failed, text)
         failed, text = await self.tool("git", args=["log", "no-such-ref"])
         self.assertTrue(failed)
+
+    async def test_files(self) -> None:
+        (self.repo / "docs").mkdir()
+        (self.repo / "docs/new.md").write_text("divide by zero\nsecond line\n")
+        failed, text = await self.tool("read_file", path="docs/new.md")
+        self.assertEqual((failed, text), (False, "1\tdivide by zero\n2\tsecond line\n"))
+        self.assertEqual(await self.tool("read_file", path="./docs/new.md", offset=2, limit=1), (False, "2\tsecond line\n"))
+        failed, text = await self.tool("search_files", pattern="div[a-z]+ by", glob="docs/**")
+        self.assertEqual((failed, text), (False, "docs/new.md:1:divide by zero\n"))
+        failed, text = await self.tool("search_files", pattern="divide")
+        self.assertIn("calc.py:", text)
+        self.assertEqual(await self.tool("search_files", pattern="no such text"), (False, ""))
+        failed, text = await self.tool("list_files")
+        self.assertTrue({"calc.py", "docs/new.md"} <= set(text.split()))
+        self.assertEqual(await self.tool("list_files", glob="**/*.md"), (False, "docs/new.md\n"))
+        for name, arguments in (
+            ("read_file", {"path": "missing.py"}), ("read_file", {"path": "docs"}), ("read_file", {}),
+            ("read_file", {"path": "calc.py", "offset": 0}), ("read_file", {"path": "calc.py", "limit": "x"}),
+            ("search_files", {"pattern": "("}), ("search_files", {"pattern": ""}), ("list_files", {"glob": 1}),
+        ):
+            self.assertTrue((await self.tool(name, **arguments))[0], (name, arguments))
+
+    async def test_a_large_file_is_read_in_parts(self) -> None:
+        (self.repo / "big.txt").write_text("".join(f"line {n}\n" for n in range(1, 5001)))
+        _, text = await self.tool("read_file", path="big.txt")
+        self.assertIn("2000\tline 2000\n", text)
+        self.assertNotIn("line 2001", text)
+        self.assertIn("offset 2001", text)
+        (self.repo / "blob.bin").write_bytes(b"a\0b")
+        self.assertTrue((await self.tool("read_file", path="blob.bin"))[0])
+
+    async def test_only_the_checkouts_own_files_are_read(self) -> None:
+        (self.root / "outside.txt").write_text("needle outside")
+        (self.repo / ".gitignore").write_text(".env\n")
+        (self.repo / ".env").write_text("needle=1")
+        (self.repo / "out").symlink_to(self.root / "outside.txt")
+        (self.repo / "env").symlink_to(self.repo / ".env")
+        (self.repo / "up").symlink_to(self.root)
+        (self.repo / "conf").symlink_to(self.repo / ".git/config")
+        for path in ("../outside.txt", str(self.root / "outside.txt"), "~/x", "a/../../outside.txt", "out", "up/outside.txt",
+                     ".git/config", "conf", ".env", "env", "", "x\0y"):
+            failed, text = await self.tool("read_file", path=path)
+            self.assertTrue(failed, path)
+            self.assertNotIn("needle", text)
+        _, text = await self.tool("search_files", pattern="needle")
+        self.assertEqual(text, "")
+        _, text = await self.tool("search_files", pattern="url|bare")
+        self.assertNotIn(".git/", text)
+        for glob in ("../*", str(self.root / "*"), "~/*", ":(top)../*"):
+            for name, arguments in (("search_files", {"pattern": "needle", "glob": glob}), ("list_files", {"glob": glob})):
+                failed, text = await self.tool(name, **arguments)
+                self.assertTrue(failed or not text, (name, glob, text))
+        _, text = await self.tool("list_files")
+        self.assertNotIn(".env", text.split())
+
+    async def test_a_read_of_one_file_can_be_refused(self) -> None:
+        (self.repo / "secrets").mkdir()
+        (self.repo / "secrets/key.txt").write_text("needle in the key\n")
+        (self.repo / "open.txt").write_text("needle in the open\n")
+        (self.repo / "alias").symlink_to("secrets/key.txt")
+        seen: list[tuple[str, dict[str, Any]]] = []
+
+        class Policy:
+            def check(self, tool_name: str, args: dict[str, Any]) -> PermissionDecision:
+                seen.append((tool_name, args))
+                private = tool_name == "read_file" and args["path"].startswith("secrets/")
+                return PermissionDecision("block" if private else "allow", "private")
+
+        self.caps.permissions = Policy()
+        for path in ("secrets/key.txt", "./secrets//key.txt", "alias"):
+            failed, text = await self.tool("read_file", path=path)
+            self.assertTrue(failed, path)
+            self.assertIn("private", text)
+            self.assertNotIn("needle", text)
+        self.assertIn(("steward.launch", "allow"), [(name, "allow") for name, _ in seen])
+        self.assertEqual((await self.tool("read_file", path="open.txt"))[1], "1\tneedle in the open\n")
+        # A search returns file content too, so each file it found is asked for as a read.
+        _, text = await self.tool("search_files", pattern="needle")
+        # It does not tell either whether the pattern matches in a file that may not be read.
+        self.assertEqual(text, "open.txt:1:needle in the open\n")
 
     async def test_git_writes_are_refused(self) -> None:
         before = git_state(self.repo)
@@ -567,6 +676,43 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde", "steward"])
         answers = [(m.inbox_id, m.content) for m in daemon.outbox.fetch_pending(limit=50) if m.metadata["kind"] == "emit"]
         self.assertEqual(answers, [(MAIN, "all done")])
+
+    async def test_a_withheld_result_ends_the_stewards_wait(self) -> None:
+        self.set_plan(
+            [{"calls": [{"tool": "forward_to_inbox", "arguments": {
+                "target_inbox": SDE, "text": "do it", "return_to": MAIN}}]}],
+            [{"write": {"calc.py": "x = 1\n"}}],
+        )
+        check = AutoModePermissionAdapter.check
+
+        def gate(adapter: AutoModePermissionAdapter, tool: str, args: dict[str, Any]) -> PermissionDecision:
+            if tool == "inbox.forward" and args["target_inbox"] == MAIN:
+                return PermissionDecision("block", "results stay here")
+            return check(adapter, tool, args)
+
+        with patch.object(AutoModePermissionAdapter, "check", gate):
+            daemon = await self.run_daemon((MAIN, "feishu:1", {"text": "x", "reply_channel": "feishu"}))
+            [card] = daemon.outbox.fetch_pending(limit=50)
+            self.assertNotIn("implemented", card.content)
+            daemon.handler.ingest(
+                inbox_id=SDE, source="switchboard:feishu", external_id="decision",
+                payload={"event_type": "approval.decided", "approved": False,
+                         "approval_request_id": card.metadata["approval_request_id"]},
+            )
+            stop = asyncio.Event()
+            pool = asyncio.create_task(daemon.pool.run_forever(stop))
+            await daemon.pool.wait_until_idle(60)
+            stop.set()
+            await pool
+        self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde"])
+        sent = {m.metadata["kind"]: m for m in daemon.outbox.fetch_pending(limit=50)}
+        self.assertEqual(sorted(sent), ["approval_request", "return_withheld"])
+        notice = sent["return_withheld"]
+        self.assertEqual((notice.inbox_id, notice.metadata["reply_channel"], notice.metadata["correlation_key"]),
+                         (MAIN, "feishu", "feishu:1"))
+        self.assertNotIn("implemented", notice.content)
+        [steward] = daemon.sessions.list_sessions(inbox_id=MAIN)
+        self.assertEqual(steward.forward.pending_returns, 0)
 
     async def test_direct_forward_answers_from_the_child(self) -> None:
         self.set_plan(

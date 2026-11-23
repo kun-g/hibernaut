@@ -8,12 +8,14 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from agent_runtime.adapters.channels import create_webhook_server
 from agent_runtime.adapters.executor_cli import CommandResult, OrcaWorktreeManager
 from agent_runtime.app.main import build_daemon
-from agent_runtime.core.models import Emit, Suspend
+from agent_runtime.core.models import RETURN_CANCELLED_SOURCE, Emit, ForwardSpec, HeldReturn, SessionRef, Suspend
 from tests.fakes import RecordingChannel
 
 
@@ -94,6 +96,7 @@ class TestMCPServerAdapter(unittest.IsolatedAsyncioTestCase):
                 "hibernaut_list_sessions",
                 "hibernaut_list_events",
                 "hibernaut_list_workspaces",
+                "hibernaut_get_held_return",
                 "hibernaut_resolve_approval",
                 "hibernaut_reclaim_workspace",
                 "hibernaut_close_session",
@@ -111,6 +114,54 @@ class TestMCPServerAdapter(unittest.IsolatedAsyncioTestCase):
 
         reclaim_res = replies[4]["result"]["structuredContent"]
         self.assertTrue(reclaim_res["reclaimed"])
+
+    def held_return(self) -> tuple[Any, Any]:
+        daemon = build_daemon(db_path=self.root / "held.db", memory_root=self.root / "mem_held")
+        self.addCleanup(daemon.close)
+        daemon.sessions.save(SessionRef(session_id="parent", inbox_id="proj:x", executor_id="steward",
+                                        forward=ForwardSpec(target_inbox="proj:x", pending_returns=1)))
+        owing = ForwardSpec(target_inbox="proj:x:sde", return_to="proj:x", hop_count=1, parent_session_id="parent")
+        daemon.sessions.save(SessionRef(session_id="child", inbox_id="proj:x:sde", executor_id="sde",
+                                        parent_session_id="parent", forward=owing))
+        held = HeldReturn(agent_id="sde", external_id="return:e:0", reason="ask first",
+                          payload={"text": "the result", "status": "done"})
+        daemon.sessions.save(SessionRef(session_id="held:return:e:0", inbox_id="proj:x:sde", executor_id="sde",
+                                        status="suspended", pending_request_id="req_1", parent_session_id="child",
+                                        forward=replace(owing, held=held)))
+        mcp = daemon.mcp_server
+
+        def call(name: str, **arguments: Any) -> Any:
+            assert mcp is not None
+            return mcp.handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                       "params": {"name": name, "arguments": arguments}})
+
+        return daemon, call
+
+    def test_a_person_reads_a_held_result_before_deciding(self) -> None:
+        _daemon, call = self.held_return()
+        for arguments in ({"approval_request_id": "req_1"}, {"session_id": "held:return:e:0"}):
+            self.assertEqual(call("hibernaut_get_held_return", **arguments)["result"]["structuredContent"], {
+                "session_id": "held:return:e:0", "inbox_id": "proj:x:sde", "agent_id": "sde", "return_to": "proj:x",
+                "status": "suspended", "approval_request_id": "req_1", "reason": "ask first",
+                "result": {"text": "the result", "status": "done"},
+            })
+        for arguments in ({"session_id": "child"}, {"session_id": "none"}, {"approval_request_id": "req_2"}, {}):
+            self.assertIn("error", call("hibernaut_get_held_return", **arguments))
+        # Nothing else shows it.
+        for name in ("hibernaut_list_sessions", "hibernaut_list_events"):
+            self.assertNotIn("the result", json.dumps(call(name)))
+
+    def test_closing_a_session_that_owes_a_result_ends_the_wait_for_it(self) -> None:
+        for session_id, external_id in (("held:return:e:0", "return:e:0"), ("child", "return:child:closed")):
+            with self.subTest(session_id):
+                daemon, call = self.held_return()
+                for _ in range(2):
+                    call("hibernaut_close_session", session_id=session_id)
+                [event] = daemon.inbox.fetch_pending("proj:x")
+                self.assertEqual((event.source, event.external_id, event.session_id),
+                                 (RETURN_CANCELLED_SOURCE, external_id, "parent"))
+                daemon.close()
+                (self.root / "held.db").unlink()
 
     async def test_http_mcp_auth_guard_disabled_without_token_and_suspend_resume_e2e(self) -> None:
         # 1. Without bearer token, /mcp endpoint must be disabled (404).

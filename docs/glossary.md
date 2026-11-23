@@ -16,7 +16,7 @@
 | **Run** | Worker 被唤醒后执行的一轮短生命周期推理与工具循环（一次 `ExecutorPort.execute` 调用） | 单次唤醒周期 | 消费同一 `inbox_id` 的一批事件，结束时产出 `RunOutcome` 并落盘休眠 |
 | **Open Run / 脱离（detach）** | 进行中、可在进程重启后接回的 Run：`open_runs` 表里的登记加 `<state_dir>/runs/<session_id>/<run_id>/` 目录（执行器的 `state.json`）。停机时正在等 Orca 终端的 Run 被脱离：旧进程不等它、不关终端，新进程用 `resume()` 接着等结果 | 单个 Run | 正常结束时登记与目录一起删除；同一会话至多 1 个登记 |
 | **Inbox 绑定（`InboxBinding`）** | 项目配置里一条「inbox 正则 → 默认 agent、agent 白名单、选路规则」，写在 `[[projects.<name>.inbox_bindings]]`；第一个整串匹配 `inbox_id` 的生效 | 项目内 | Inbox 与 Agent 是 M:N：同一 Inbox 绑多个 Agent 时共用一把租约串行接力，同一 Agent 服务多个 Inbox 时彼此并发、worktree 隔离 |
-| **转投（forward）/ 回投（return）** | 一个 Agent 经 `RunCapabilities.forward_to_inbox` 把工作排进另一个 Inbox 的事件（`agent:forward`）/ 该工作带 `return_to` 时把结果排回指定 Inbox 的事件（`agent:return`） | 同一项目内 | `hop_count` 记这件工作在 Agent 间走过的跳数，上限 3（`MAX_FORWARD_HOPS`）；两种事件都过 `PermissionPort`。被拒的回投不外发，在单独的挂起会话里等人决定（held return） |
+| **转投（forward）/ 回投（return）** | 一个 Agent 经 `RunCapabilities.forward_to_inbox` 把工作排进另一个 Inbox 的事件（`agent:forward`）/ 该工作带 `return_to` 时把结果排回指定 Inbox 的事件（`agent:return`） | 同一项目内 | `hop_count` 记这件工作在 Agent 间走过的跳数，上限 3（`MAX_FORWARD_HOPS`）；两种事件都过 `PermissionPort`。被拒的回投不外发，在单独的挂起会话里等人决定（held return），审批请求不带正文；不能回去的由 `agent:return_cancelled` 结束上级的这一项等待 |
 | **Worker / Lease** | 消费事件并拉起 Run 的无状态调度协程 / 以 `inbox_id` 为主键的限时互斥租约锁（`worker_leases`） | 每 `inbox_id` 单活 | 保证同一 `inbox_id` 同一时刻最多 1 个活跃 Run；进程崩溃后租约到期自动释放接管 |
 
 ## 2. 五大原语与运行终态
@@ -48,4 +48,4 @@
   - **Executor（驱动）**：没有业务含义的底层 CLI / LLM 驱动（如 `claude`、`grok`、`cursor-agent`、`dsh`，或一个 Claude Code 启动器加计费方式），在 `[executors.<id>]` 声明。一台 Runner 可托管多个 Executor。
   - **Agent（业务主体）**：绑定 Role 与 Skills、权限边界、记忆视角和底层 Executor，在 `[agents.<id>]` 声明，标识为 `agent_id`。同一 Executor 可供多个 Agent 使用。
   - **`agent_id` vs. `executor_id`**：代码与存储沿用的 `executor_id`（`ExecutorPort.executor_id`、`sessions.executor_id`、事件 payload 的旧键）取值就是 `agent_id`；`[executors.<id>]` 写了 `role` 或 `command` 时同时是同名 Agent（旧写法）。
-- **Steward（项目管家）**：`role = "steward"` 的 Agent，项目主 Inbox 的前台：读事件后自己答复、转投给别的 Agent，或汇总回投的结果。在项目主检出里只读运行，不建 worktree，不能编辑文件或执行命令；可读写所在 Inbox 的 Memory、只读查询本项目的会话与事件。能路由到哪些 Inbox 和 Agent 由 Runtime 每次唤醒时现拼的路由清单（routing manifest）给出。
+- **Steward（项目管家）**：`role = "steward"` 的 Agent，项目主 Inbox 的前台：读事件后自己答复、转投给别的 Agent，或汇总回投的结果。在项目主检出里只读运行，不建 worktree，不能编辑文件或执行命令，没有内置工具，读文件也经逐次过门禁的 MCP 工具；可读写所在 Inbox 的 Memory、只读查询本项目的会话与事件。能路由到哪些 Inbox 和 Agent 由 Runtime 每次唤醒时现拼的路由清单（routing manifest）给出。

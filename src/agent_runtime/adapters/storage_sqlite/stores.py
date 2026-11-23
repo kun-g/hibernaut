@@ -607,6 +607,10 @@ def _forward_from_json(raw: object, inbox_id: str) -> ForwardSpec | None:
         value = item.get(key)
         return value if isinstance(value, str) and value else None
 
+    def texts(key: str) -> tuple[str, ...]:
+        value = item.get(key)
+        return tuple(map(str, cast(list[object], value))) if isinstance(value, list) else ()
+
     def count(key: str, fallback: int) -> int:
         value = item.get(key)
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else fallback
@@ -622,6 +626,8 @@ def _forward_from_json(raw: object, inbox_id: str) -> ForwardSpec | None:
         reply_target=text("reply_target"),
         origin_key=text("origin_key"),
         pending_returns=count("pending_returns", 0),
+        cancelled_returns=texts("cancelled_returns"),
+        owed_failures=texts("owed_failures"),
         held=_held_from_json(item.get("held")),
     )
 

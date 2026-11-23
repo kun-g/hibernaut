@@ -16,6 +16,7 @@ from agent_runtime.adapters.storage_sqlite.stores import (
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.core.models import new_id
 from agent_runtime.core.ports import OutboxPort
+from agent_runtime.engine.forwarding import closing_event
 from agent_runtime.engine.handler import EventHandler
 from ledger import ErrorKind, ServiceName, Severity
 
@@ -72,6 +73,17 @@ _TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "hibernaut_list_workspaces",
         "description": "List managed hb-* dynamic worktrees tracked in SQLite workspaces table.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "hibernaut_get_held_return",
+        "description": "Read-only: the result an approval request keeps from going back to another agent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "approval_request_id": {"type": "string"},
+                "session_id": {"type": "string"},
+            },
+        },
     },
     {
         "name": "hibernaut_resolve_approval",
@@ -437,6 +449,26 @@ class MCPServerAdapter:
                 ]
             }
 
+        if tool_name == "hibernaut_get_held_return":
+            request_id, session_id = _opt_str(args, "approval_request_id"), _opt_str(args, "session_id")
+            holder = (
+                self._sessions.find_by_request_id(request_id) if request_id
+                else self._sessions.get(session_id) if session_id else None
+            )
+            spec = holder.forward if holder is not None else None
+            if holder is None or spec is None or spec.held is None:
+                raise ValueError("No held result for that approval_request_id or session_id")
+            return {
+                "session_id": holder.session_id,
+                "inbox_id": holder.inbox_id,
+                "agent_id": spec.held.agent_id,
+                "return_to": spec.return_to,
+                "status": holder.status,
+                "approval_request_id": holder.pending_request_id,
+                "reason": spec.held.reason,
+                "result": spec.held.payload,
+            }
+
         if tool_name == "hibernaut_resolve_approval":
             inbox_id = str(args["inbox_id"])
             approval_request_id = str(args["approval_request_id"])
@@ -474,7 +506,17 @@ class MCPServerAdapter:
             existing = self._sessions.get(session_id)
             if existing is None:
                 raise ValueError(f"Session not found: {session_id}")
+            ending = closing_event(existing, self._sessions)
             self._sessions.close_session(session_id)
+            if ending is not None:
+                self._handler.ingest(
+                    inbox_id=ending.inbox_id,
+                    source=ending.source,
+                    external_id=ending.external_id,
+                    payload=ending.payload,
+                    session_id=ending.session_id,
+                    correlation_key=ending.correlation_key,
+                )
             work_key = existing.work_key
             active_refs = self._sessions.count_active_by_work_key(work_key, existing.inbox_id) if work_key else 0
             reclaim_payload: dict[str, Any] | None = None
