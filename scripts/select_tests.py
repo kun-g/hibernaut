@@ -86,6 +86,7 @@ RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/test_taskboard_hibernaut_loop.py",
         ),
     ),
+    ("schemas/runner/**", ("tests/test_runner_stage1.py",)),
     ("schemas/v1/**", ("tests/test_ledger_all.py",)),
     ("docs/dispatch/**", ("tests/test_sde_delivery.py",)),
     ("docs/process/versioning.md", ("tests/test_sde_delivery.py",)),

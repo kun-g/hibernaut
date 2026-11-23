@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hibernaut.local/schemas/runner/v1/runner.interrupt.schema.json",
+  "title": "RunnerInterrupt",
+  "type": "object",
+  "oneOf": [
+    {
+      "title": "InterruptRequest",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "run_id", "reason"],
+      "properties": {
+        "schema_version": { "const": "runner.v1" },
+        "run_id": { "type": "string", "pattern": "^run_[A-Za-z0-9_-]+$" },
+        "reason": { "enum": ["new_event", "user_cancel", "shutdown", "timeout"] },
+        "grace_seconds": { "type": "number", "minimum": 0 }
+      }
+    },
+    {
+      "title": "InterruptResult",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "run_id", "accepted", "state"],
+      "properties": {
+        "schema_version": { "const": "runner.v1" },
+        "run_id": { "type": "string", "minLength": 1 },
+        "accepted": { "type": "boolean" },
+        "state": { "enum": ["cancelling", "already_finished", "not_found"] }
+      }
+    }
+  ]
+}

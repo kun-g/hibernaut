@@ -5,6 +5,7 @@
     "src/switchboard",
     "src/ccpeer",
     "src/taskboard",
+    "src/runner",
     "src/ledger",
     "src/dashboard"
   ],

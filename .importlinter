@@ -4,6 +4,7 @@ root_packages =
     switchboard
     ccpeer
     taskboard
+    runner
     ledger
     dashboard
 include_external_packages = True
@@ -103,6 +104,19 @@ forbidden_modules =
     taskboard.adapters
     taskboard.engine
     taskboard.ports
+
+[importlinter:contract:runner-zero-business-deps]
+name = Runner must not depend on control-plane or business packages
+type = forbidden
+source_modules =
+    runner
+forbidden_modules =
+    agent_runtime
+    taskboard
+    switchboard
+    workshop
+    memory_hub
+    ledger
 
 [importlinter:contract:dashboard-zero-business-deps]
 name = Dashboard has zero business package dependencies

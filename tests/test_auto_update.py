@@ -123,8 +123,9 @@ class AutoUpdateTests(unittest.TestCase):
         self.commit(self.origin)
         self.git(self.root, "clone", str(self.origin), str(self.checkout))
 
+    # maintenance.auto=false: the detached repack a commit may start races the local clone that follows it.
     def git(self, cwd, *args):
-        return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgSign=false", *args], cwd=cwd, text=True, stderr=subprocess.PIPE).strip()
+        return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgSign=false", "-c", "maintenance.auto=false", *args], cwd=cwd, text=True, stderr=subprocess.PIPE).strip()
 
     def commit(self, cwd):
         self.git(cwd, "add", ".")
