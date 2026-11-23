@@ -18,6 +18,7 @@ from agent_runtime.adapters.executor_cli.sde import (
     SDEExecutor,
     SDEOptions,
 )
+from agent_runtime.adapters.executor_cli.steward import STEWARD_ROLE, StewardExecutor
 from agent_runtime.adapters.executor_cli.worktree import (
     CommandResult,
     OrcaWorktreeManager,
@@ -42,6 +43,8 @@ __all__ = [
     "SDE_ROLE",
     "SDEExecutor",
     "SDEOptions",
+    "STEWARD_ROLE",
+    "StewardExecutor",
     "WorkspaceIsolationError",
     "derive_worktree_names",
 ]

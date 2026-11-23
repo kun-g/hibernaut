@@ -8,7 +8,7 @@ import re
 import sys
 import tomllib
 import warnings
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 
 from agent_runtime.adapters.delivery import DeliveryConfig, parse_delivery
 from agent_runtime.adapters.executor_cli.claude_code import (
+    AGENT_PROFILE_KEYS,
+    EXECUTOR_KEYS,
     ClaudeCodeLauncher,
     ClaudeCodeProfile,
     parse_launchers,
@@ -26,11 +28,20 @@ from agent_runtime.adapters.executor_cli.peer_handoff import PeerHandoffConfig
 from agent_runtime.adapters.executor_cli.reviewer import CODE_REVIEWER_ROLE
 from agent_runtime.adapters.executor_cli.role_skills import ROLE_ALIASES, canonical_role
 from agent_runtime.adapters.executor_cli.sde import SDE_OPTION_KEYS, SDE_ROLE, SDEOptions
+from agent_runtime.adapters.executor_cli.steward import STEWARD_ROLE
 from agent_runtime.adapters.executor_cli.reclaim_sweep import DEFAULT_SWEEP_INTERVAL_SECONDS
 from agent_runtime.adapters.executor_cli.worktree import WorktreeBackend
 from agent_runtime.adapters.permissions.security import proxy_service_url
-from agent_runtime.app.projects import InboxRule, parse_inbox_rules, validate_project_rules
-from agent_runtime.core.models import NewEventPolicy
+from agent_runtime.app.projects import (
+    AgentConfig,
+    InboxRule,
+    ProjectBinding,
+    parse_inbox_bindings,
+    parse_inbox_rules,
+    validate_project_bindings,
+    validate_project_rules,
+)
+from agent_runtime.core.models import InboxRoute, NewEventPolicy
 
 _log = logging.getLogger(__name__)
 
@@ -43,6 +54,8 @@ class RuntimeConfig:
     memory_root: str = "./agent_memory"
     max_concurrency: int = 4
     new_event_policy: NewEventPolicy = "defer"
+    # default_agent; default_executor is its old name and always holds the same value.
+    default_agent: str = "claude"
     default_executor: str = "claude"
     # Background reclaim of merged task worktrees a delivery-time reclaim had to skip; 0 turns it off.
     worktree_sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS
@@ -78,13 +91,26 @@ class ProjectConfig:
     # How interactive Claude Code role sessions get their task and return the result: "mcp" (the launcher's
     # hibernaut_handoff server) or "peer" (peer messages through the [peer] receiver).
     handoff: Handoff = "mcp"
-    executor: str | None = None
+    # Agent of inboxes no binding covers; `executor` is its old name in the file.
+    default_agent: str | None = None
     # Hibernaut's PR delivery step for finished SDE tasks; None ends a task with local commits.
     delivery: DeliveryConfig | None = None
     # Every rule routing an inbox to this project; empty means just the primary inbox_id.
     rules: tuple[InboxRule, ...] = ()
+    # Which agents each inbox of the project may run; the first binding matching an inbox applies.
+    inbox_bindings: tuple[ProjectBinding, ...] = ()
+    # Every declared agent, for the routing manifest.
+    agents: tuple[AgentConfig, ...] = ()
     # Inboxes of this project running at once; None leaves only runtime.max_concurrency.
     max_concurrency: int | None = None
+
+    def route(self, inbox_id: str) -> InboxRoute:
+        bound = next((b.binding for b in self.inbox_bindings if b.rule.matches(inbox_id)), None)
+        return InboxRoute(project=self.name, binding=bound, has_bindings=bool(self.inbox_bindings))
+
+    @property
+    def executor(self) -> str | None:
+        return self.default_agent
 
     @property
     def inbox_rules(self) -> tuple[InboxRule, ...]:
@@ -98,11 +124,14 @@ class ProjectConfig:
         return len(rules) > 1 or any(r.literal is None for r in rules)
 
 
-ROLES = (CODE_REVIEWER_ROLE, SDE_ROLE)
+ROLES = (CODE_REVIEWER_ROLE, SDE_ROLE, STEWARD_ROLE)
 # Before code-reviewer the review role and its usual executor were both named coder-reviewer.
 _LEGACY_REVIEWER = "coder-reviewer"
-# Deployment settings shared by every role executor; visible is the old name of interactive.
-ROLE_DEPLOYMENT_KEYS = frozenset({"interactive", "visible", "max_concurrency"})
+# Deployment mode shared by every role, as an executor or an agent; visible is the old name of interactive.
+ROLE_DEPLOYMENT_KEYS = frozenset({"interactive", "visible"})
+# A limit belongs to the [executors.<id>] table, whichever agents run on it; an [agents.<id>] cannot set one.
+EXECUTOR_LIMIT_KEYS = frozenset({"max_concurrency"})
+READONLY_CHECKOUT = "readonly"
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,16 +142,108 @@ class RoleConfig:
     # True: every run needs a session a person can join, opened by the project's terminal_backend; without one the
     # run stops with the reason. False: runs are non-interactive.
     interactive: bool = True
+    # "readonly": the role works in the main checkout, writes nothing there and never gets a worktree.
+    checkout_access: str = ""
     max_concurrency: int | None = None
 
 
-def _max_concurrency(where: str, item: dict[str, Any]) -> int | None:
+def _max_concurrency(where: str, item: Mapping[str, Any]) -> int | None:
     value = item.get("max_concurrency")
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f"{where}.max_concurrency must be a positive integer, got {value!r}")
     return value
+
+
+def _role_options(role: str) -> frozenset[str]:
+    if role == SDE_ROLE:
+        return SDE_OPTION_KEYS | ROLE_DEPLOYMENT_KEYS
+    if role == STEWARD_ROLE:
+        return ROLE_DEPLOYMENT_KEYS | {"checkout_access"}
+    return ROLE_DEPLOYMENT_KEYS
+
+
+def _parse_role(
+    name: str, item: dict[str, Any], *, launchers: dict[str, ClaudeCodeLauncher], anthropic_url: str,
+    base_dir: Path | None, extra_keys: frozenset[str] = frozenset(),
+) -> RoleConfig:
+    raw_role = item["role"]
+    if raw_role not in ROLES and raw_role not in ROLE_ALIASES:
+        raise ValueError(f"executors.{name}: unsupported role '{raw_role}' (supported: {', '.join(ROLES)})")
+    role = canonical_role(str(raw_role))
+    profile = parse_profile(
+        name, item, role=role, launchers=launchers, credential_proxy_url=anthropic_url,
+        extra_keys=_role_options(role) | extra_keys, base_dir=base_dir,
+    )
+    if role == STEWARD_ROLE:
+        access = item.get("checkout_access", READONLY_CHECKOUT)
+        if access != READONLY_CHECKOUT:
+            raise ValueError(f"executors.{name}: checkout_access must be \"{READONLY_CHECKOUT}\" for role '{role}'")
+        if _interactive(name, {"interactive": False, **item} if "visible" not in item else item):
+            raise ValueError(f"executors.{name}: interactive is not supported for role '{role}'; leave it out")
+        return RoleConfig(role=role, profile=profile, interactive=False, checkout_access=access,
+                          max_concurrency=_max_concurrency(f"executors.{name}", item))
+    return RoleConfig(role=role, profile=profile, sde=_sde_options(name, item) if role == SDE_ROLE else None,
+                      interactive=_interactive(name, item),
+                      max_concurrency=_max_concurrency(f"executors.{name}", item))
+
+
+_AGENT_KEYS = frozenset({"role", "executor", "description"})
+
+
+def _parse_agent(
+    name: str, item: Mapping[str, Any], *, bases: Mapping[str, dict[str, Any]], templates: Mapping[str, CLITemplate],
+    launchers: dict[str, ClaudeCodeLauncher], anthropic_url: str, base_dir: Path | None,
+) -> RoleConfig | CLITemplate:
+    # An agent is a role with its own profile on a pure Claude Code executor, or a CLI template under its own name.
+    driver = item.get("executor")
+    if not isinstance(driver, str) or not driver.strip():
+        raise ValueError(f"executors.{name}: executor is required")
+    description = item.get("description", "")
+    if not isinstance(description, str):
+        raise ValueError(f"executors.{name}: description must be a string")
+    role = item.get("role")
+    if driver in templates:
+        if role is not None:
+            raise ValueError(
+                f"executors.{name}: role '{role}' needs a Claude Code executor; '{driver}' is a CLI template"
+            )
+        unknown = sorted(set(item) - _AGENT_KEYS)
+        if unknown:
+            raise ValueError(f"executors.{name}: {', '.join(unknown)} not supported on CLI executor '{driver}'")
+        template = templates[driver]
+        return dataclasses.replace(template, name=name,
+                                   max_concurrency=template.max_concurrency if name == driver else None)
+    if driver not in bases:
+        raise ValueError(f"executors.{name}: executor '{driver}' is not declared as a role-less [executors.{driver}] "
+                         f"(declared: {', '.join(sorted({*bases, *templates})) or 'none'})")
+    if role is None:
+        raise ValueError(f"executors.{name}: executor '{driver}' needs a role (supported: {', '.join(ROLES)})")
+    if role in ROLES or role in ROLE_ALIASES:
+        unknown = sorted(set(item) - _AGENT_KEYS - AGENT_PROFILE_KEYS - _role_options(canonical_role(str(role))))
+        if unknown:
+            raise ValueError(f"executors.{name}: {', '.join(unknown)} not supported for role '{role}'; "
+                             "the driver's own settings belong in [executors]")
+    merged = {**bases[driver], **{k: v for k, v in item.items() if k not in ("executor", "description")}}
+    return _parse_role(name, merged, launchers=launchers, anthropic_url=anthropic_url, base_dir=base_dir)
+
+
+def _as_agent_error(name: str, exc: ValueError) -> ValueError:
+    # The profile parsers name their [executors.<id>] table; here the mistake is in [agents.<id>].
+    return ValueError(str(exc).replace(f"executors.{name}:", f"agents.{name}:", 1))
+
+
+def _default_agent(where: str, item: Mapping[str, Any], legacy_key: str) -> str | None:
+    found: dict[str, str] = {}
+    for key in ("default_agent", legacy_key):
+        raw = item.get(key)
+        if raw is not None and str(raw).strip():
+            found[key] = str(raw).strip()
+    if len(set(found.values())) > 1:
+        raise ValueError(f"{where}: {legacy_key} is the old name of default_agent and names another agent; keep only "
+                         "default_agent")
+    return next(iter(found.values()), None)
 
 
 def _interactive(name: str, item: dict[str, Any]) -> bool:
@@ -226,6 +347,10 @@ class HibernautConfig:
     launchers: dict[str, ClaudeCodeLauncher] = field(default_factory=dict)
     credential_proxy: CredentialProxyConfig = field(default_factory=CredentialProxyConfig)
     roles: dict[str, RoleConfig] = field(default_factory=dict)
+    # Every agent an inbox can run: [agents], plus [executors] that carry a role or a command (the old form).
+    agents: dict[str, AgentConfig] = field(default_factory=dict)
+    # max_concurrency of the [executors.<id>] that are neither, and only run through agents.
+    driver_limits: dict[str, int] = field(default_factory=dict)
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     gdrive: GDriveConfig = field(default_factory=GDriveConfig)
     switchboard: SwitchboardLinkConfig = field(default_factory=SwitchboardLinkConfig)
@@ -408,13 +533,15 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         raise ValueError(f"Unsupported new_event_policy: {policy}")
     _warn_obsolete(rt_raw, "runtime", "GitHub ingress", "poll_mode", "poll_interval_seconds")
 
+    runtime_default = _default_agent("runtime", rt_raw, "default_executor") or "claude"
     runtime = RuntimeConfig(
         db_path=str(rt_raw.get("db_path", "./hibernaut.db")),
         ledger_db_path=str(rt_raw.get("ledger_db_path", "") or ""),
         memory_root=str(rt_raw.get("memory_root", "./agent_memory")),
         max_concurrency=int(rt_raw.get("max_concurrency", 4)),
         new_event_policy=cast(NewEventPolicy, policy),
-        default_executor=str(rt_raw.get("default_executor", "claude")),
+        default_agent=runtime_default,
+        default_executor=runtime_default,
         worktree_sweep_interval_seconds=float(
             rt_raw.get("worktree_sweep_interval_seconds", DEFAULT_SWEEP_INTERVAL_SECONDS)
         ),
@@ -455,21 +582,25 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
 
     executors: dict[str, CLITemplate] = {}
     roles: dict[str, RoleConfig] = {}
+    # Pure drivers: no role and no command, so nothing to run until an agent picks them.
+    bases: dict[str, dict[str, Any]] = {}
+    base_limits: dict[str, int] = {}
     for name, item in raw.get("executors", {}).items():
-        raw_role = item.get("role")
-        if raw_role is not None:
-            if raw_role not in ROLES and raw_role not in ROLE_ALIASES:
-                raise ValueError(f"executors.{name}: unsupported role '{raw_role}' (supported: {', '.join(ROLES)})")
-            role = canonical_role(str(raw_role))
-            extra = (SDE_OPTION_KEYS if role == SDE_ROLE else frozenset[str]()) | ROLE_DEPLOYMENT_KEYS
-            profile = parse_profile(
-                str(name), item, role=str(role), launchers=launchers, credential_proxy_url=anthropic_url,
-                extra_keys=extra, base_dir=base_dir,
-            )
-            options = _sde_options(str(name), item) if role == SDE_ROLE else None
-            roles[str(name)] = RoleConfig(role=str(role), profile=profile, sde=options,
-                                          interactive=_interactive(str(name), item),
-                                          max_concurrency=_max_concurrency(f"executors.{name}", item))
+        if item.get("role") is not None:
+            roles[str(name)] = _parse_role(str(name), item, launchers=launchers, anthropic_url=anthropic_url,
+                                           base_dir=base_dir, extra_keys=EXECUTOR_LIMIT_KEYS)
+            continue
+        if "command" not in item:
+            unknown = sorted(set(item) - EXECUTOR_KEYS - EXECUTOR_LIMIT_KEYS)
+            if unknown:
+                raise ValueError(f"executors.{name}: {', '.join(unknown)} not supported without a role or a command")
+            profile_item = {k: v for k, v in item.items() if k not in EXECUTOR_LIMIT_KEYS}
+            parse_profile(str(name), profile_item, role=CODE_REVIEWER_ROLE, launchers=launchers,
+                          credential_proxy_url=anthropic_url, base_dir=base_dir)
+            bases[str(name)] = profile_item
+            base_limit = _max_concurrency(f"executors.{name}", item)
+            if base_limit is not None:
+                base_limits[str(name)] = base_limit
             continue
         env_raw = item.get("env", {})
         resume_raw = item.get("resume_args")
@@ -498,11 +629,48 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             max_concurrency=_max_concurrency(f"executors.{name}", item),
         )
 
+    agents: dict[str, AgentConfig] = {
+        name: AgentConfig(name=name, executor=name, role=role_cfg.role, model=role_cfg.profile.model,
+                          effort=role_cfg.profile.effort, checkout_access=role_cfg.checkout_access)
+        for name, role_cfg in roles.items()
+    }
+    agents.update({name: AgentConfig(name=name, executor=name) for name in executors})
+    legacy = frozenset(agents)
+    templates = dict(executors)
+    for name, item in raw.get("agents", {}).items():
+        agent_id = str(name)
+        if not isinstance(item, dict):
+            raise ValueError(f"agents.{agent_id} must be a table")
+        entry = cast(dict[str, Any], item)
+        if agent_id in legacy and entry.get("executor") != agent_id:
+            raise ValueError(f"agents.{agent_id}: [executors.{agent_id}] already declares an agent of that name")
+        try:
+            built = _parse_agent(agent_id, entry, bases=bases, templates=templates, launchers=launchers,
+                                 anthropic_url=anthropic_url, base_dir=base_dir)
+        except ValueError as exc:
+            raise _as_agent_error(agent_id, exc) from exc
+        description = str(entry.get("description", "")).strip()
+        if isinstance(built, CLITemplate):
+            executors[agent_id] = built
+            agents[agent_id] = AgentConfig(name=agent_id, executor=str(entry["executor"]), description=description)
+        else:
+            roles[agent_id] = built
+            agents[agent_id] = AgentConfig(
+                name=agent_id, executor=str(entry["executor"]), role=built.role, model=built.profile.model,
+                effort=built.profile.effort, checkout_access=built.checkout_access, description=description,
+            )
+    if "default_agent" in rt_raw and runtime.default_agent not in agents:
+        raise ValueError(f"runtime.default_agent '{runtime.default_agent}' is not declared in [agents]")
+
     for name, role_cfg in list(roles.items()):
         if role_cfg.sde is None:
             continue
-        explicit = "reviewer" in raw["executors"][name]
-        options = _resolve_reviewer(name, role_cfg.sde, explicit=explicit, roles=roles, executors=executors)
+        source = raw["executors"][name] if name in legacy else raw["agents"][name]
+        try:
+            options = _resolve_reviewer(name, role_cfg.sde, explicit="reviewer" in source, roles=roles,
+                                        executors=executors)
+        except ValueError as exc:
+            raise (exc if name in legacy else _as_agent_error(name, exc)) from exc
         roles[name] = dataclasses.replace(role_cfg, sde=options)
 
     projects: dict[str, ProjectConfig] = {}
@@ -520,8 +688,9 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         handoff = item.get("handoff", "mcp")
         if handoff not in HANDOFFS:
             raise ValueError(f"Unsupported handoff for '{name}': {handoff!r} (supported: {', '.join(HANDOFFS)})")
-        proj_exec_raw = item.get("executor")
-        proj_exec = str(proj_exec_raw).strip() if proj_exec_raw is not None else None
+        default_agent = _default_agent(f"projects.{name}", item, "executor")
+        if "default_agent" in item and default_agent not in agents:
+            raise ValueError(f"projects.{name}.default_agent '{default_agent}' is not declared in [agents]")
         repo = str(item["repo"])
         # Authorization to publish comes only from this deployment file, never from the repository under change.
         delivery = (
@@ -539,20 +708,25 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             terminal_backend=terminal,
             orca_create_terminal=bool(item.get("orca_create_terminal", False)),
             handoff=cast(Handoff, handoff),
-            executor=proj_exec or None,
+            default_agent=default_agent,
             delivery=delivery,
+            inbox_bindings=parse_inbox_bindings(str(name), item.get("inbox_bindings"), inbox_rules=rules,
+                                                declared=agents.keys()),
+            agents=tuple(agents.values()),
             max_concurrency=_max_concurrency(f"projects.{name}", item),
         )
     validate_project_rules(projects.values())
+    validate_project_bindings(projects.values())
 
-    for where, limited in (
-        *((f"executors.{n}", e) for n, e in {**executors, **roles}.items()),
-        *((f"projects.{n}", p) for n, p in projects.items()),
+    for where, limit in (
+        *((f"executors.{n}", e.max_concurrency) for n, e in {**executors, **roles}.items()),
+        *((f"executors.{n}", value) for n, value in base_limits.items()),
+        *((f"projects.{n}", p.max_concurrency) for n, p in projects.items()),
     ):
-        if limited.max_concurrency is not None and limited.max_concurrency > runtime.max_concurrency:
+        if limit is not None and limit > runtime.max_concurrency:
             _log.warning(
                 "%s.max_concurrency = %d is above runtime.max_concurrency = %d, which caps it",
-                where, limited.max_concurrency, runtime.max_concurrency,
+                where, limit, runtime.max_concurrency,
             )
 
     gd_raw = raw.get("gdrive", {})
@@ -609,6 +783,8 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         launchers=launchers,
         credential_proxy=credential_proxy,
         roles=roles,
+        agents=agents,
+        driver_limits=base_limits,
         projects=projects,
         gdrive=gdrive,
         switchboard=parse_switchboard_link(raw.get("switchboard"), base_dir=base_dir),

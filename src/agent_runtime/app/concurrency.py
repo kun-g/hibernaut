@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from agent_runtime.app.projects import AmbiguousProjectMatch
-from agent_runtime.core.models import Event
+from agent_runtime.core.models import Event, InboxBinding
 from agent_runtime.core.ports import InboxPort, OpenRunPort, SessionStorePort
 from agent_runtime.engine import AgentWorker
 
@@ -77,9 +77,10 @@ class ConcurrencyLimiter:
 
 
 @dataclass(frozen=True, slots=True)
-class InboxRoute:
+class LimitRoute:
     project: str | None = None
     default_executor: str | None = None
+    binding: InboxBinding | None = None
     # The worker's hold policy for this inbox, e.g. UnmatchedProjectHold; held events never run, so they need no quota.
     hold: Callable[[Event], str | None] | None = None
 
@@ -92,8 +93,10 @@ class LimitKeyResolver:
         inbox: InboxPort,
         sessions: SessionStorePort,
         open_runs: OpenRunPort | None,
-        route: Callable[[str], InboxRoute],
+        route: Callable[[str], LimitRoute],
         global_default_executor: str | None,
+        # Agent id -> the [executors.<id>] it runs on, whose limit counts it; an id not listed is its own executor.
+        drivers: Mapping[str, str] | None = None,
     ) -> None:
         self._limits = limits
         self._inbox = inbox
@@ -101,6 +104,7 @@ class LimitKeyResolver:
         self._open_runs = open_runs
         self._route = route
         self._global_default = global_default_executor
+        self._drivers = drivers or {}
 
     def __call__(self, inbox_id: str) -> LimitKeys:
         try:
@@ -117,20 +121,24 @@ class LimitKeyResolver:
                          inbox_id, exc_info=True)
             return LimitKeys(route.project)
 
-    def event_executor(self, event: Event, route: InboxRoute) -> str | None:
+    def event_executor(self, event: Event, route: LimitRoute) -> str | None:
         try:
-            return AgentWorker.expected_executor_id(
-                event, self._sessions, project_default=route.default_executor, global_default=self._global_default,
-            )
+            return self._driver(AgentWorker.expected_executor_id(
+                event, self._sessions, binding=route.binding, project_default=route.default_executor,
+                global_default=self._global_default,
+            ))
         except Exception:  # noqa: BLE001
             _log.warning("Executor of event %s in inbox %s cannot be determined; its executor limit is not applied",
                          event.event_id, event.inbox_id, exc_info=True)
             return None
 
-    def _next_executor(self, inbox_id: str, route: InboxRoute) -> str | None:
+    def _driver(self, agent_id: str | None) -> str | None:
+        return self._drivers.get(agent_id, agent_id) if agent_id is not None else None
+
+    def _next_executor(self, inbox_id: str, route: LimitRoute) -> str | None:
         # What the worker runs first: a Run a stopped process detached, else the first event it may claim.
         for run in self._open_runs.list_open(inbox_id) if self._open_runs is not None else ():
-            return run.executor_id
+            return self._driver(run.executor_id)
         for event in self._inbox.fetch_pending(inbox_id):
             if route.hold is None or route.hold(event) is None:
                 return self.event_executor(event, route)

@@ -38,12 +38,14 @@ from agent_runtime.adapters.delivery import DeliveryConfig, PRDelivery, merged_h
 from agent_runtime.adapters.executor_cli import (
     CODE_REVIEWER_ROLE,
     DEFAULT_CLI_TEMPLATES,
+    STEWARD_ROLE,
     CLIReviewer,
     CoderReviewerExecutor,
     LocalCLIExecutor,
     OrcaWorktreeManager,
     Reviewer,
     SDEExecutor,
+    StewardExecutor,
 )
 from agent_runtime.adapters.executor_cli.orca import (
     OrcaCommandTerminal,
@@ -67,7 +69,7 @@ from agent_runtime.adapters.executor_whitebox import (
     RuleBasedDemoLLM,
     WhiteboxExecutor,
 )
-from agent_runtime.adapters.memory_fs import WorkspacePartitionRegistry
+from agent_runtime.adapters.memory_fs import WorkspacePartitionRegistry, check_inbox_id
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter, CredentialProxyClient, read_private_token
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.adapters.storage_sqlite.open_runs import SQLiteOpenRunStore
@@ -87,19 +89,25 @@ from agent_runtime.app.concurrency import (
     ConcurrencyLimiter,
     ConcurrencyLimits,
     ExecutorQuotaHold,
-    InboxRoute,
     LimitKeyResolver,
     LimitKeys,
+    LimitRoute,
 )
 from agent_runtime.app.config import (
     HibernautConfig,
+    ProjectConfig,
     RoleConfig,
     SwitchboardLinkConfig,
     config_changes,
     load_config,
 )
-from agent_runtime.app.projects import ProjectRouter, UnmatchedProjectHold
-from agent_runtime.core.models import Event, NewEventPolicy
+from agent_runtime.app.projects import (
+    AmbiguousProjectMatch,
+    ProjectRouter,
+    UnmatchedProjectHold,
+    build_routing_manifest,
+)
+from agent_runtime.core.models import Event, InboxRoute, NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, OutboxPort, RunCapabilities
 from agent_runtime.engine import (
     AgentWorker,
@@ -559,7 +567,10 @@ def concurrency_limits(config: HibernautConfig) -> ConcurrencyLimits:
     executors = {**config.executors, **config.roles}
     return ConcurrencyLimits(
         projects={n: p.max_concurrency for n, p in config.projects.items() if p.max_concurrency is not None},
-        executors={n: e.max_concurrency for n, e in executors.items() if e.max_concurrency is not None},
+        executors={
+            **config.driver_limits,
+            **{n: e.max_concurrency for n, e in executors.items() if e.max_concurrency is not None},
+        },
     )
 
 
@@ -569,7 +580,7 @@ def executor_quota_hold(
     pool: AsyncWorkerPool,
     limits: ConcurrencyLimits,
     keys: LimitKeyResolver,
-    route: InboxRoute,
+    route: LimitRoute,
 ) -> Callable[[Event], str | None] | None:
     if not limits.executors:
         return route.hold
@@ -659,7 +670,7 @@ def build_daemon(
 
     def _quota_hold(inbox_id: str) -> Callable[[Event], str | None] | None:
         return executor_quota_hold(inbox_id, pool=pool, limits=resolved_limits, keys=limit_keys,
-                                   route=InboxRoute(default_executor=project_default_executor))
+                                   route=LimitRoute(default_executor=project_default_executor))
 
     def _make_worker(inbox_id: str, worker_id: str) -> AgentWorker:
         if executors_factory is not None:
@@ -673,6 +684,7 @@ def build_daemon(
                 executors=executors_factory(inbox_id),
                 project_default_executor=project_default_executor,
                 global_default_executor=global_default_executor,
+                on_forward=pool.wake,
                 on_worktree_reclaim=lambda wk, _iid=inbox_id: resolved_wt_mgr.reclaim(
                     wk, notify_outbox=outbox, inbox_id=_iid
                 ),
@@ -695,6 +707,7 @@ def build_daemon(
             permissions=permissions,
             outbox=outbox,
             executor=executor,
+            on_forward=pool.wake,
             on_worktree_reclaim=lambda wk, _iid=inbox_id: resolved_wt_mgr.reclaim(
                 wk, notify_outbox=outbox, inbox_id=_iid
             ),
@@ -709,7 +722,7 @@ def build_daemon(
             new_event_policy=new_event_policy,
         )
 
-    # Read by _make_worker when the pool builds a worker; a queued Drive file moves to 执行中/ as its Run starts.
+    # Read by _make_worker, like pool, when the pool builds a worker; a queued Drive file moves to 执行中/ as its Run starts.
     gdrive_writer: DriveResultWriter | None = None
     if gdrive_client is not None:
         gdrive_writer = DriveResultWriter(
@@ -746,8 +759,8 @@ def build_daemon(
             return
         _report_failed_events(inbox, gdrive_writer, inbox_id)
 
-    def _route(inbox_id: str) -> InboxRoute:
-        return InboxRoute(project=project_for(inbox_id) if project_for is not None else None,
+    def _route(inbox_id: str) -> LimitRoute:
+        return LimitRoute(project=project_for(inbox_id) if project_for is not None else None,
                           default_executor=project_default_executor)
 
     resolved_limits = limits or ConcurrencyLimits()
@@ -779,6 +792,7 @@ def build_daemon(
         handler=handler,
         sessions=sessions,
         workspaces=workspaces,
+        lock=lock,
         inbox=inbox,
         worktree_manager=resolved_wt_mgr,
         outbox=outbox,
@@ -950,13 +964,29 @@ def build_daemon_from_config(
         deliveries = SQLiteDeliveryStore(daemon.db)
         usage = SQLiteWorkUsage(daemon.db)
 
+        def _steward(role: RoleConfig, project: ProjectConfig | None) -> StewardExecutor:
+            def in_project(inbox_id: str) -> bool:
+                try:
+                    return project is not None and router.resolve(inbox_id) is project
+                except AmbiguousProjectMatch:
+                    return False
+
+            return StewardExecutor(
+                profile=role.profile,
+                checkouts=inbox_checkout_map,
+                sessions=daemon.sessions,
+                events=daemon.inbox,
+                manifest=lambda: build_routing_manifest(project) if project is not None else "",
+                in_project=in_project,
+            )
+
         def _role_executors(
-            wt_mgr: OrcaWorktreeManager, no_terminal: str | None, delivery: DeliveryConfig | None = None,
-            handoff: str = "mcp",
+            wt_mgr: OrcaWorktreeManager, no_terminal: str | None, project: ProjectConfig | None = None,
         ) -> dict[str, ExecutorPort]:
             # no_terminal says why this inbox has no terminal backend; None means Orca opens the sessions.
             # Each SDE run reviews through the reviewer built for the same project and config generation.
-            runner = peer_runner if handoff == "peer" else terminal_runner
+            runner = peer_runner if project is not None and project.handoff == "peer" else terminal_runner
+            delivery = project.delivery if project is not None else None
 
             def terminal(role: RoleConfig) -> OrcaVisibleRunner | TerminalUnavailable | None:
                 if not role.interactive:
@@ -985,6 +1015,8 @@ def build_daemon_from_config(
 
             built: dict[str, ExecutorPort] = dict(reviewers)
             for name, role in config.roles.items():
+                if role.role == STEWARD_ROLE:
+                    built[name] = _steward(role, project)
                 if role.sde is None:
                     continue
                 built[name] = SDEExecutor(
@@ -1030,8 +1062,7 @@ def build_daemon_from_config(
             executors_by_project[proj.name].update(_role_executors(
                 wt_mgr,
                 None if proj.terminal_backend == "orca" else f"project '{proj.name}' has terminal_backend = \"none\"",
-                proj.delivery,
-                proj.handoff,
+                proj,
             ))
 
         default_mgr = OrcaWorktreeManager(
@@ -1074,18 +1105,29 @@ def build_daemon_from_config(
             )
             daemon.worktree_sweep_interval_seconds = config.runtime.worktree_sweep_interval_seconds
 
+        def _route(inbox_id: str) -> InboxRoute | None:
+            # None means nothing may be forwarded there: no project, two projects, or no memory partition of that name.
+            try:
+                check_inbox_id(inbox_id)
+                project = router.resolve(inbox_id)
+            except (ValueError, AmbiguousProjectMatch):
+                return None
+            return project.route(inbox_id) if project is not None else None
+
         # One per config generation, so a held event is logged once each time it enters the wait.
         unmatched_hold = UnmatchedProjectHold(daemon.sessions)
 
-        def _cli_route(inbox_id: str) -> InboxRoute:
+        def _cli_route(inbox_id: str) -> LimitRoute:
             project = router.resolve(inbox_id)
             if project is None:
-                return InboxRoute(hold=unmatched_hold)
-            return InboxRoute(project=project.name, default_executor=project.executor)
+                return LimitRoute(hold=unmatched_hold)
+            return LimitRoute(project=project.name, default_executor=project.default_agent,
+                              binding=project.route(inbox_id).binding)
 
         limit_keys = LimitKeyResolver(
             limits=limits, inbox=daemon.inbox, sessions=daemon.sessions, open_runs=daemon.open_runs, route=_cli_route,
-            global_default_executor=config.runtime.default_executor,
+            global_default_executor=config.runtime.default_agent,
+            drivers={name: agent.executor for name, agent in config.agents.items()},
         )
 
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
@@ -1103,8 +1145,10 @@ def build_daemon_from_config(
                 permissions=AutoModePermissionAdapter(),
                 outbox=daemon.outbox,
                 executors=executors_by_project[project.name] if project is not None else fallback_executors,
-                project_default_executor=project.executor if project is not None else None,
-                global_default_executor=config.runtime.default_executor,
+                project_default_executor=project.default_agent if project is not None else None,
+                global_default_executor=config.runtime.default_agent,
+                routes=_route,
+                on_forward=daemon.pool.wake,
                 on_worktree_reclaim=reclaim,
                 hold=executor_quota_hold(inbox_id, pool=daemon.pool, limits=limits, keys=limit_keys,
                                          route=_cli_route(inbox_id)),
@@ -1147,6 +1191,7 @@ def build_daemon_from_config(
             handler=daemon.handler,
             sessions=daemon.sessions,
             workspaces=daemon.workspaces,
+            lock=daemon.lock,
             inbox=daemon.inbox,
             worktree_manager=default_mgr,
             outbox=daemon.outbox,

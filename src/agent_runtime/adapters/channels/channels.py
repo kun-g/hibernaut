@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from agent_runtime.adapters.channels.mcp_server import MCPServerAdapter
-from agent_runtime.engine.handler import EventHandler
+from agent_runtime.engine.handler import EventHandler, ReservedSource
 
 
 class WebhookHTTPServer(ThreadingHTTPServer):
@@ -212,14 +212,19 @@ def webhook_request_handler(
 
             if self.path == "/events":
                 body = json.loads(raw.decode("utf-8"))
-                result = handler.ingest(
-                    inbox_id=str(body.get("inbox_id", "default")),
-                    source=str(body.get("source", "webhook")),
-                    external_id=str(body["external_id"]),
-                    payload=dict(body.get("payload", {})),
-                    session_id=body.get("session_id"),
-                    correlation_key=body.get("correlation_key"),
-                )
+                source = str(body.get("source", "webhook"))
+                try:
+                    result = handler.ingest(
+                        inbox_id=str(body.get("inbox_id", "default")),
+                        source=source,
+                        external_id=str(body["external_id"]),
+                        payload=dict(body.get("payload", {})),
+                        session_id=body.get("session_id"),
+                        correlation_key=body.get("correlation_key"),
+                    )
+                except ReservedSource as exc:
+                    self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
                 self._write_json(
                     HTTPStatus.ACCEPTED,
                     {

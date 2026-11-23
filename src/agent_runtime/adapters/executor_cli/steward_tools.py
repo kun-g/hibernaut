@@ -1,0 +1,421 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import os
+import re
+import tempfile
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol, cast
+
+from agent_runtime.adapters.executor_cli.steward_git import (
+    GIT_COMMANDS,
+    ToolError,
+    check_git_args,
+    exec_git,
+    file_name,
+    git_names,
+    outside,
+    plan_git,
+    run_git,
+)
+from agent_runtime.core.models import Event, ForwardRefused, SessionStatus
+from agent_runtime.core.ports import RunCapabilities, SessionStorePort
+
+_STATUSES: tuple[SessionStatus, ...] = ("active", "suspended", "archived", "closed")
+_MAX_LIST = 100
+_MAX_TEXT = 100_000
+_SNIPPET = 500
+_MAX_LINES = 2000
+_MAX_MATCHES = 200
+_MAX_FILE = 10 * 1024 * 1024
+# Longest Unix socket path every supported system accepts (macOS allows 104 bytes).
+_MAX_SOCKET_PATH = 100
+_STREAM_LIMIT = 4 * 1024 * 1024
+
+
+class EventLister(Protocol):
+    def list_events(
+        self, *, inbox_id: str | None = None, status: str | None = None, limit: int = 50
+    ) -> list[Event]: ...
+
+
+_MATCH = re.compile(rb"([^\0]+)\0(\d+)[\0:]([^\n]*)\n")
+
+
+def _real_path(checkout: Path, path: str) -> str:
+    # The path the permission gate judges and that is read: no other spelling or link leads round a rule for it.
+    target = (checkout / path).resolve()
+    if outside(path) or not target.is_relative_to(checkout):
+        raise ToolError(f"{path} is outside the checkout")
+    return target.relative_to(checkout).as_posix()
+
+
+def _list_files(checkout: Path, pathspec: str) -> list[str]:
+    # What git tracks or would track: neither .git nor ignored files (.env and the like).
+    return git_names(checkout, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", pathspec],
+                     skip=True)
+
+
+def _read_file(checkout: Path, path: str, offset: int, limit: int) -> str:
+    target = checkout / path
+    if path not in _list_files(checkout, f":(literal){path}") or not target.is_file():
+        raise ToolError(f"{path} is not a file of the checkout")
+    if target.stat().st_size > _MAX_FILE:
+        raise ToolError(f"{path} is larger than {_MAX_FILE} bytes; use search_files")
+    data = target.read_bytes()
+    if b"\0" in data:
+        raise ToolError(f"{path} is a binary file")
+    lines = data.decode("utf-8", errors="replace").split("\n")
+    if not lines[-1]:
+        lines.pop()
+    end = min(len(lines), offset - 1 + limit)
+    shown = "".join(f"{n}\t{lines[n - 1]}\n" for n in range(offset, end + 1))
+    return shown + (f"[{len(lines) - end} more lines: go on with offset {end + 1}]\n" if end < len(lines) else "")
+
+
+def _search(checkout: Path, pattern: str, pathspec: str) -> list[tuple[str, str, str]]:
+    # (path, line number, line); links are not followed, ignored files are left out.
+    out = run_git(checkout, [
+        "grep", "-n", "-I", "-E", "-z", "--no-color", "--no-column", "--no-textconv", "--no-recurse-submodules",
+        "--untracked", "-e", pattern, "--", pathspec,
+    ], ok=(0, 1))
+    # A file name may hold a newline, so each record is read from where the last one ended: the name up to the first
+    # NUL, the number, the line. One that does not fit leaves unknown whose content follows, so nothing is shown.
+    found: list[tuple[str, str, str]] = []
+    at = 0
+    while at < len(out):
+        record = _MATCH.match(out, at)
+        if record is None:
+            raise ToolError("search_files: the result cannot be told apart by file; narrow the glob")
+        path = file_name(record[1])
+        if path is not None:
+            found.append((path, record[2].decode(), record[3].decode("utf-8", errors="replace")))
+        at = record.end()
+    return found
+
+
+def _shown_path(path: str) -> str:
+    return path if path.isprintable() else json.dumps(path, ensure_ascii=False)
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= _MAX_TEXT else f"{text[:_MAX_TEXT]}\n[{len(text) - _MAX_TEXT} more characters cut]"
+
+
+def _required(arguments: dict[str, Any], key: str) -> str:
+    value = arguments.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ToolError(f"{key} must be a non-empty string")
+    return value
+
+
+def _optional(arguments: dict[str, Any], key: str) -> str | None:
+    value = arguments.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ToolError(f"{key} must be a string")
+    return value.strip() or None
+
+
+def _pathspec(arguments: dict[str, Any]) -> tuple[str | None, str]:
+    # (the glob as given, the git pathspec for it)
+    glob = _optional(arguments, "glob")
+    if glob is not None and outside(glob):
+        raise ToolError(f"{glob} is outside the checkout")
+    return glob, f":(glob){glob or '**'}"
+
+
+def _count(arguments: dict[str, Any], key: str, default: int) -> int:
+    value = arguments.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ToolError(f"{key} must be a positive integer")
+    return value
+
+
+def _strings(arguments: dict[str, Any], key: str) -> list[str]:
+    value = arguments.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in cast(list[object], value)):
+        raise ToolError(f"{key} must be an array of strings")
+    return cast(list[str], value)
+
+
+_TEXT = {"type": "string"}
+_TEXTS = {"type": "array", "items": _TEXT}
+
+
+def _schema(required: Sequence[str] = (), **properties: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "object", "properties": properties, "required": list(required)}
+
+
+@dataclass(slots=True)
+class StewardTools:
+    # The tools of one Steward run. Every call passes PermissionPort.check under its own tool name first.
+    caps: RunCapabilities
+    checkout: Path
+    inbox_id: str
+    sessions: SessionStorePort
+    events: EventLister
+    in_project: Callable[[str], bool]
+    calls: int = 0
+    # forward_to_inbox arguments a person has to approve before they go out.
+    deferred: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+
+    @staticmethod
+    def definitions() -> list[dict[str, Any]]:
+        inbox = {**_TEXT, "description": "An inbox of this project; leave out for the default."}
+        glob = {**_TEXT, "description": "Limit to these paths, e.g. src/**/*.py or docs/**."}
+        return [
+            {"name": "forward_to_inbox",
+             "description": "Hand work to another agent through its inbox. Nothing waits for it: end your turn after "
+                            "forwarding. Without return_to that agent answers the person directly; with return_to "
+                            "(normally your own inbox) its result comes back to you as an agent:return event. Work "
+                            "another agent waits for goes on whole: name its return_to, then end your turn with silent.",
+             "inputSchema": _schema(
+                 ("target_inbox", "text"),
+                 target_inbox={**_TEXT, "description": "An inbox id from the routing manifest."},
+                 text={**_TEXT, "description": "The complete task: the receiver sees this, not your conversation."},
+                 title=_TEXT, tags=_TEXTS,
+                 target_agent={**_TEXT, "description": "Leave out to let the inbox's rules pick the agent."},
+                 return_to=_TEXT,
+             )},
+            {"name": "read_file",
+             "description": f"Read a file of the checkout, with line numbers, at most {_MAX_LINES} lines at a time. "
+                            "Ignored files cannot be read.",
+             "inputSchema": _schema(
+                 ("path",), path={**_TEXT, "description": "Relative to the checkout, e.g. src/app.py."},
+                 offset={"type": "integer", "description": "First line, from 1."}, limit={"type": "integer"},
+             )},
+            {"name": "search_files",
+             "description": "Search the checkout's files for a POSIX extended regular expression. Files you may not "
+                            "read are left out.",
+             "inputSchema": _schema(("pattern",), pattern=_TEXT, glob=glob)},
+            {"name": "list_files", "description": "List the checkout's files.", "inputSchema": _schema(glob=glob)},
+            {"name": "read_memory", "description": "Read a file of the project memory, e.g. notes/release.md.",
+             "inputSchema": _schema(("path",), path=_TEXT)},
+            {"name": "write_memory", "description": "Replace a file of the project memory.",
+             "inputSchema": _schema(("path", "content"), path=_TEXT, content=_TEXT)},
+            {"name": "list_sessions", "description": "List this project's sessions, newest first.",
+             "inputSchema": _schema(inbox_id=inbox, status={"type": "string", "enum": list(_STATUSES)})},
+            {"name": "list_events", "description": "List this project's inbox events, newest first.",
+             "inputSchema": _schema(inbox_id=inbox, status=_TEXT, limit={"type": "integer"})},
+            {"name": "git",
+             "description": f"Read the checkout's history: {', '.join(GIT_COMMANDS)}. Spell options out, put paths after "
+                            "--. log gives no patches: use show <commit>, diff or blame, which need every file they show "
+                            "to be readable to you; --stat and --name-only need none.",
+             "inputSchema": _schema(("args",), args={**_TEXTS, "description": 'e.g. ["log", "--oneline", "-10"]'})},
+        ]
+
+    async def call(self, name: object, arguments: object) -> tuple[str, bool]:
+        # (answer, is_error)
+        handlers: dict[str, Callable[[dict[str, Any]], Awaitable[str]]] = {
+            "forward_to_inbox": self._forward,
+            "read_file": self._read_file,
+            "search_files": self._search_files,
+            "list_files": self._list_files,
+            "read_memory": self._read_memory,
+            "write_memory": self._write_memory,
+            "list_sessions": self._list_sessions,
+            "list_events": self._list_events,
+            "git": self._run_git,
+        }
+        handler = handlers.get(name) if isinstance(name, str) else None
+        if handler is None:
+            return f"unknown tool {name}", True
+        if not isinstance(arguments, dict):
+            return "arguments must be an object", True
+        self.calls += 1
+        try:
+            return _clip(await handler(cast(dict[str, Any], arguments))), False
+        except (ToolError, OSError, ValueError) as exc:
+            return str(exc), True
+
+    def _allow(self, tool: str, args: dict[str, Any]) -> None:
+        decision = self.caps.permissions.check(tool, args)
+        if decision.action != "allow":
+            raise ToolError(f"{tool} is not permitted ({decision.action}): {decision.reason}")
+
+    def _readable(self, path: str) -> bool:
+        # Every way a file's content is shown passes the gate as a read of that file.
+        return self.caps.permissions.check("read_file", {"path": path}).action == "allow"
+
+    async def _forward(self, arguments: dict[str, Any]) -> str:
+        wanted: dict[str, Any] = {
+            "target_inbox": _required(arguments, "target_inbox"),
+            "text": _required(arguments, "text"),
+            "title": _optional(arguments, "title") or "",
+            "tags": _strings(arguments, "tags"),
+            "target_agent": _optional(arguments, "target_agent"),
+            "return_to": _optional(arguments, "return_to"),
+        }
+        try:
+            event = self.forward(wanted)
+        except ForwardRefused as exc:
+            if exc.action != "defer":
+                raise ToolError(f"not forwarded: {exc}") from exc
+            self.deferred.append(wanted)
+            return (f"Held for a person's approval: {exc}. Hibernaut asks for it when this turn ends and forwards the "
+                    "work once it is approved; do not forward it again.")
+        return f"Forwarded to {event.inbox_id}; it is queued when this turn ends."
+
+    def forward(self, wanted: dict[str, Any], approved_request_id: str | None = None) -> Event:
+        options = {k: v for k, v in wanted.items() if k not in ("target_inbox", "text")}
+        return self.caps.forward_to_inbox(
+            wanted["target_inbox"], wanted["text"], **options, approved_request_id=approved_request_id
+        )
+
+    async def _read_file(self, arguments: dict[str, Any]) -> str:
+        path = _real_path(self.checkout, _required(arguments, "path"))
+        offset, limit = _count(arguments, "offset", 1), min(_count(arguments, "limit", _MAX_LINES), _MAX_LINES)
+        self._allow("read_file", {"path": path})
+        return await asyncio.to_thread(_read_file, self.checkout, path, offset, limit)
+
+    async def _search_files(self, arguments: dict[str, Any]) -> str:
+        pattern, (glob, pathspec) = _required(arguments, "pattern"), _pathspec(arguments)
+        self._allow("search_files", {"pattern": pattern, "glob": glob})
+        readable: dict[str, bool] = {}
+        shown: list[str] = []
+        for path, number, line in await asyncio.to_thread(_search, self.checkout, pattern, pathspec):
+            # Saying how many were left out would tell whether the pattern matches in them.
+            if path not in readable:
+                readable[path] = self._readable(path)
+            if not readable[path]:
+                continue
+            if len(shown) == _MAX_MATCHES:
+                shown.append("[more matches: narrow the pattern or the glob]\n")
+                break
+            shown.append(f"{_shown_path(path)}:{number}:{line[:_SNIPPET]}\n")
+        return "".join(shown)
+
+    async def _list_files(self, arguments: dict[str, Any]) -> str:
+        glob, pathspec = _pathspec(arguments)
+        self._allow("list_files", {"glob": glob})
+        found = await asyncio.to_thread(_list_files, self.checkout, pathspec)
+        more = [f"[{len(found) - _MAX_LINES} more files: narrow the glob]"] if len(found) > _MAX_LINES else []
+        return "".join(f"{name}\n" for name in [*found[:_MAX_LINES], *more])
+
+    async def _read_memory(self, arguments: dict[str, Any]) -> str:
+        path = _required(arguments, "path")
+        self._allow("read_memory", {"path": path})
+        return self.caps.memory.read_on_demand(path)
+
+    async def _write_memory(self, arguments: dict[str, Any]) -> str:
+        path = _required(arguments, "path")
+        content = arguments.get("content")
+        if not isinstance(content, str):
+            raise ToolError("content must be a string")
+        self._allow("write_memory", {"path": path, "content": content})
+        self.caps.memory.write(path, content)
+        return f"Wrote {path}."
+
+    def _inbox(self, arguments: dict[str, Any]) -> str | None:
+        inbox_id = _optional(arguments, "inbox_id")
+        if inbox_id is not None and not self.in_project(inbox_id):
+            raise ToolError(f"'{inbox_id}' is not an inbox of this project")
+        return inbox_id
+
+    async def _list_sessions(self, arguments: dict[str, Any]) -> str:
+        inbox_id, raw = self._inbox(arguments), _optional(arguments, "status")
+        status = next((s for s in _STATUSES if s == raw), None)
+        if raw is not None and status is None:
+            raise ToolError(f"status must be one of {', '.join(_STATUSES)}")
+        self._allow("list_sessions", {"inbox_id": inbox_id, "status": status})
+        found = [s for s in self.sessions.list_sessions(inbox_id=inbox_id, status=status) if self.in_project(s.inbox_id)]
+        return json.dumps([
+            {"session_id": s.session_id, "inbox_id": s.inbox_id, "agent_id": s.agent_id, "status": s.status,
+             "correlation_key": s.correlation_key, "work_key": s.work_key, "parent_session_id": s.parent_session_id,
+             "waiting_for_approval": s.pending_request_id is not None, "updated_at": s.updated_at}
+            for s in found[:_MAX_LIST]
+        ], ensure_ascii=False)
+
+    async def _list_events(self, arguments: dict[str, Any]) -> str:
+        inbox_id, status = self._inbox(arguments), _optional(arguments, "status")
+        limit = arguments.get("limit", 20)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ToolError("limit must be an integer")
+        self._allow("list_events", {"inbox_id": inbox_id, "status": status, "limit": limit})
+        # Other projects share the table, so without an inbox the newest rows are filtered after reading.
+        rows = self.events.list_events(inbox_id=inbox_id, status=status, limit=500 if inbox_id is None else limit)
+        found = [e for e in rows if self.in_project(e.inbox_id)][: max(1, min(limit, _MAX_LIST))]
+        return json.dumps([self._event_row(e) for e in found], ensure_ascii=False)
+
+    @staticmethod
+    def _event_row(event: Event) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "event_id": event.event_id, "inbox_id": event.inbox_id, "source": event.source, "status": event.status,
+            "occurred_at": event.occurred_at, "session_id": event.session_id, "correlation_key": event.correlation_key,
+        }
+        for key in ("title", "text", "agent_id", "executor_id", "forwarded_from", "forwarded_by", "hop_count",
+                    "return_to"):
+            value = event.payload.get(key)
+            if isinstance(value, str) and value:
+                row[key] = value[:_SNIPPET]
+            elif isinstance(value, int):
+                row[key] = value
+        return row
+
+    async def _run_git(self, arguments: dict[str, Any]) -> str:
+        args = _strings(arguments, "args")
+        call = check_git_args(args)
+        self._allow("git_read", {"args": args})
+        shown, argv = await asyncio.to_thread(plan_git, self.checkout, call)
+        refused = [path for path in shown if not self._readable(path)]
+        if refused:
+            raise ToolError(
+                f"git: this shows the content of files you may not read ({', '.join(refused[:20])}); name other files "
+                "after --, or ask for --stat or --name-only"
+            )
+        return await asyncio.to_thread(exec_git, self.checkout, argv) if argv else ""
+
+    @contextlib.asynccontextmanager
+    async def serve(self) -> AsyncGenerator[str]:
+        # A socket in a fresh 0700 directory, gone with the run: only processes of this user can reach it.
+        base = tempfile.gettempdir()
+        if len(os.fsencode(base)) > _MAX_SOCKET_PATH - 24:
+            base = "/tmp"
+        with tempfile.TemporaryDirectory(prefix="hb-steward-", dir=base) as tmp:
+            path = os.path.join(tmp, "s")
+            connections: set[asyncio.Task[None]] = set()
+
+            async def connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                task = asyncio.current_task()
+                assert task is not None
+                connections.add(cast(asyncio.Task[None], task))
+                try:
+                    while line := await reader.readline():
+                        writer.write((json.dumps(await self._answer(line), ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                except (ConnectionError, ValueError):
+                    pass
+                finally:
+                    connections.discard(cast(asyncio.Task[None], task))
+                    writer.close()
+
+            server = await asyncio.start_unix_server(connected, path, limit=_STREAM_LIMIT)
+            try:
+                yield path
+            finally:
+                # No tool call outlives the run: a late forward would miss the batch the worker queues.
+                server.close()
+                for task in list(connections):
+                    task.cancel()
+                await asyncio.gather(*connections, return_exceptions=True)
+
+    async def _answer(self, line: bytes) -> dict[str, Any]:
+        try:
+            request: object = json.loads(line)
+        except ValueError:
+            request = None
+        if not isinstance(request, dict):
+            return {"text": "malformed request", "error": True}
+        item = cast(dict[str, Any], request)
+        if item.get("op") == "tools":
+            return {"tools": self.definitions()}
+        text, error = await self.call(item.get("name"), item.get("arguments"))
+        return {"text": text, "error": error}

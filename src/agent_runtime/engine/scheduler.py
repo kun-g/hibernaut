@@ -33,9 +33,11 @@ class TimerScheduler:
 
             self._timers.mark_triggered(timer.timer_id, next_due_at=next_due_at)
 
+            # A named timer is a source of its own, so an inbox rule can send it to one agent.
+            name = timer.payload.get("timer_name")
             event = Event(
                 inbox_id=timer.inbox_id,
-                source=f"timer:{timer.kind}",
+                source=f"timer:{name.strip() if isinstance(name, str) and name.strip() else timer.kind}",
                 external_id=f"{timer.timer_id}:{timer.due_at}",
                 payload={
                     "timer_id": timer.timer_id,
