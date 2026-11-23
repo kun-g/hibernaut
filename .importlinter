@@ -7,6 +7,7 @@ root_packages =
     runner
     ledger
     dashboard
+    memory_hub
 include_external_packages = True
 
 [importlinter:contract:clean-layers]
@@ -130,4 +131,29 @@ forbidden_modules =
     ccpeer
     ledger
     runner
+    memory_hub
+
+[importlinter:contract:memory-hub-zero-business-deps]
+name = Memory Hub has zero business dependencies
+type = forbidden
+source_modules =
+    memory_hub
+forbidden_modules =
+    agent_runtime
+    switchboard
+    taskboard
+    runner
+    ledger
+    ccpeer
+    dashboard
+    workshop
+
+[importlinter:contract:business-packages-no-memory-hub]
+name = Switchboard, Runner and Taskboard must not depend on Memory Hub
+type = forbidden
+source_modules =
+    switchboard
+    runner
+    taskboard
+forbidden_modules =
     memory_hub

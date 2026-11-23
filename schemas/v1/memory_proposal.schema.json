@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hibernaut.local/schemas/v1/memory_proposal.schema.json",
+  "title": "MemoryWriteProposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "target_uri",
+    "op",
+    "content",
+    "rationale"
+  ],
+  "properties": {
+    "schema_version": { "const": "memory.v1" },
+    "target_uri": { "type": "string", "minLength": 1 },
+    "op": {
+      "enum": ["append", "replace_section", "upsert_file", "archive", "append_reported"]
+    },
+    "content": { "type": "string" },
+    "rationale": { "type": "string", "minLength": 1 },
+    "section_heading": { "type": ["string", "null"] },
+    "base_sha256": { "type": ["string", "null"] },
+    "evidence_ref": { "type": ["string", "null"] },
+    "supersedes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "force_new": { "type": "boolean" },
+    "author": { "type": ["string", "null"] }
+  }
+}

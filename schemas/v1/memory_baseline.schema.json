@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hibernaut.local/schemas/v1/memory_baseline.schema.json",
+  "title": "MemoryBaselineBundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project_key",
+    "stable_prefix",
+    "volatile_tail",
+    "total_est_tokens",
+    "truncated_blocks"
+  ],
+  "properties": {
+    "schema_version": { "const": "memory.v1" },
+    "project_key": { "type": "string", "minLength": 1 },
+    "stable_prefix": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/BaselineBlock" }
+    },
+    "volatile_tail": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/BaselineBlock" }
+    },
+    "total_est_tokens": { "type": "integer", "minimum": 0 },
+    "truncated_blocks": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "stable_prefix_sha256": { "type": "string" }
+  },
+  "$defs": {
+    "BaselineBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "tier", "content", "sha256", "est_tokens", "truncated"],
+      "properties": {
+        "uri": { "type": "string", "minLength": 1 },
+        "tier": { "enum": ["stable", "volatile"] },
+        "content": { "type": "string" },
+        "sha256": { "type": "string", "minLength": 1 },
+        "est_tokens": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" }
+      }
+    }
+  }
+}

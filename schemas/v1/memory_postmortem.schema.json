@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hibernaut.local/schemas/v1/memory_postmortem.schema.json",
+  "title": "MemoryPostMortemCandidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "project_key",
+    "run_id",
+    "error_kind",
+    "root_cause",
+    "proposed_rule",
+    "recurrence_count"
+  ],
+  "properties": {
+    "schema_version": { "const": "memory.v1" },
+    "project_key": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 },
+    "error_kind": { "type": "string", "minLength": 1 },
+    "root_cause": { "type": "string", "minLength": 1 },
+    "proposed_rule": { "type": "string", "minLength": 1 },
+    "recurrence_count": { "type": "integer", "minimum": 1 },
+    "correlation_key": { "type": ["string", "null"] },
+    "slug": { "type": ["string", "null"] },
+    "force_propose": { "type": "boolean" }
+  }
+}

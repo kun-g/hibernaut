@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hibernaut.local/schemas/v1/memory_search.schema.json",
+  "title": "MemorySearchResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "scope", "query", "mode", "items"],
+  "properties": {
+    "schema_version": { "const": "memory.v1" },
+    "scope": { "type": "string", "minLength": 1 },
+    "query": { "type": "string" },
+    "mode": { "enum": ["fts", "hybrid"] },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "uri",
+          "layer",
+          "heading_path",
+          "snippet",
+          "score",
+          "sha256",
+          "updated_at",
+          "readonly"
+        ],
+        "properties": {
+          "uri": { "type": "string", "minLength": 1 },
+          "layer": { "enum": ["project", "shared", "kb"] },
+          "heading_path": { "type": "string" },
+          "snippet": { "type": "string", "maxLength": 360 },
+          "score": { "type": "number" },
+          "sha256": { "type": "string", "minLength": 1 },
+          "updated_at": { "type": "string" },
+          "readonly": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}
