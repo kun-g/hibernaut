@@ -11,7 +11,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 多入口接单 | `POST /events`、经 Switchboard 转入的 GitHub 和飞书事件、审批卡片回调、MCP、Google Drive 任务队列、定时器；重复事件只执行一次 |
 | 按 Inbox 并发 | 每个 `inbox_id` 一条串行队列，不同 Inbox 并行；同一个 Issue、Drive 文件或飞书话题的事件接着同一会话和 worktree 做 |
 | 多 Agent 选路 | Agent（角色、Skill、模型、权限边界）与底层执行器（claude / cursor-agent / grok / dsh 等 CLI、Claude Code 启动器）分开配置；Inbox 与 Agent 多对多绑定，按事件指定、会话、Inbox 规则、Inbox 默认、项目与全局默认五级选择；事件指定的 Agent 不在 Inbox 白名单里就明确拒绝 |
-| Steward 与转投 | 项目前台 `steward`：在主检出里只读运行，自己答复或用 `forward_to_inbox` 转投给别的 Agent（同项目、最多 3 跳、逐次过权限门禁）；单步活由接手的 Agent 直接回复来源，多步活的结果回投给 Steward 汇总 |
+| Steward 与转投 | 项目前台 `steward`：在主检出（或 `workdir`）的 Orca 终端里一次性只读运行，跑完即关，没有 Orca 终端就挂起等人批准重试，不作 daemon 子进程；自己答复或用 `forward_to_inbox` 转投给别的 Agent（同项目、最多 3 跳、逐次过权限门禁）；单步活由接手的 Agent 直接回复来源，多步活的结果回投给 Steward 汇总 |
 | SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `agent_id = "sde"`（Drive 任务 frontmatter 写 `agent_id: sde`，旧键 `executor_id: sde` 仍可用），项目或 Inbox 也可设为默认 Agent；GitHub Issue 以 `# 标题` + 正文为需求、标题为 PR 标题 |
 | 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok，模板写 `terminal = "orca"` 可在 Orca 终端里旁观评审，命令结束、结果读回后立即关闭该终端，且不让 Orca 登记并续接这次会话，评审记录留终端句柄与 CLI 会话 ID）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested`；SDE 内置评审第 1 轮通审，第 2 轮起只做增量复核：只有上一轮没修好的项和之后改动引入的新问题能打回，其余由程序降为跟进，交付时列在 PR 正文「跟进」小节和完成消息里 |
 | PR 交付 | SDE 完成后由 Hibernaut 合入主干、按改动类型定版本号、跑检查、推分支、开 PR，可选在评审通过且 CI 绿后自动合并；合入主干冲突（版本号以外）或合入后检查失败时交回同一开发会话解决，已通过评审且只解了冲突的（逐块核对解法只由两侧内容组成）直接重跑检查续交付，另有改动的只评审开发者自己的增量（不含主干带进来的改动），超过次数上限才挂起等人；合并后删除源分支并结案；与任务来源无关 |
@@ -76,9 +76,9 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 | `[runtime]` | 数据库与记忆目录、全局并发上限 `max_concurrency`、新事件策略（`defer` / `fold` / `interrupt`）、全局默认 Agent（`default_agent`，旧键 `default_executor`）；`ledger_db_path` 是执行账本的独立数据库（默认 `db_path` 同目录的 `ledger.db`，运行日志在它旁边的 `logs/runs/`） |
 | `[channels]` | HTTP 端口、MCP 的密钥环境变量名；`outbox_dir` 设置后每条 Outbox 消息另存为该目录下一个带任务上下文的 Markdown 文件；配置了 `auto_merge` 却停在 PR 未合并时，状态为「待合并」并写明 PR 链接与未合并原因 |
 | `[executors.<id>]` | 底层驱动：CLI 模板（写 `command`），或供 Agent 引用的 Claude Code 启动器与计费（都不写）。旧写法仍可用：写 `role` 或 `command` 即同时是同名 Agent。可选 `max_concurrency` 限制同时跑该执行器的 Inbox 数（跨项目、跨引用它的 Agent 合计） |
-| `[agents.<id>]` | Agent：`executor` 指向驱动，`role` 为 `sde` / `code-reviewer` / `steward`，另有 `model`、`effort`、`skills`、`description`。SDE 的 `review`、`reviewer` 决定评审开关和评审者；`steward` 只有 `checkout_access = "readonly"` |
+| `[agents.<id>]` | Agent：`executor` 指向驱动，`role` 为 `sde` / `code-reviewer` / `steward`，另有 `model`、`effort`、`skills`、`description`。SDE 的 `review`、`reviewer` 决定评审开关和评审者；`steward` 有 `checkout_access = "readonly"`（唯一取值）、可选 `workdir`（工作目录，未写用项目检出）与 `branch`（每次运行前核对该目录的分支，不一致则挂起，不切换） |
 | `[launchers.<name>]`、`[credential_proxy]` | Claude Code 启动命令；`billing = "api"` 时经外置凭据代理。启动器与执行器的 `env` 原样传给 Claude Code，`model` 可写任意模型名，例如经本机网关跑非 Claude 模型（示例见模板里的 `gpt-reviewer`） |
-| `[projects.<name>]` | 仓库、检出路径、服务的 `inbox_id`（字符串或正则数组；两个项目的范围有交集时拒绝加载，正则只用可比较的语法，见 `docs/architecture.md`）、`default_agent`（旧键 `executor`）、worktree 与终端后端；可选 `max_concurrency` 限制本项目同时在跑的 Inbox 数 |
+| `[projects.<name>]` | 仓库、检出路径（`checkout` 不写时按 `repo` 在 Orca 已登记的仓库里找主检出，找不到则加载报错）、服务的 `inbox_id`（字符串或正则数组；两个项目的范围有交集时拒绝加载，正则只用可比较的语法，见 `docs/architecture.md`）、`default_agent`（旧键 `executor`）、worktree 与终端后端；可选 `max_concurrency` 限制本项目同时在跑的 Inbox 数 |
 | `[[projects.<name>.inbox_bindings]]` | Inbox 与 Agent 的绑定：`pattern`（整串匹配的正则）、`default_agent`、`agents` 白名单、`rules`（按 `source` / `event_type` / `tags` 选 Agent；具名定时器的来源是 `timer:<timer_name>`）。写了绑定的项目，转投只能到有绑定覆盖的 Inbox |
 | `[projects.<name>.delivery]` | PR 交付：开 PR、自动合并、版本文件、检查命令、是否要求评审和 CI、冲突与检查失败交回开发的次数上限（`max_handbacks`）、合并后是否删除源分支（`delete_branch`）、来自 GitHub Issue 的任务在 PR 正文里怎么写这个 Issue（`issue_link`：`closes` 合并后关闭 / `refs` 只关联，默认 / `none` 不写） |
 | `[gdrive]` | Drive 任务队列，部署见 [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md)。任务可引用队列根下 `附件/` 里的文件（frontmatter `attachments` 写文件 ID 或原名，逗号分隔、`[a, b]` 或逐行 `- a` 均可，或正文里写该文件的 Drive ID），Run 开始时下载到 `attachments_dir`（默认数据库旁的 `attachments/`，在 worktree 之外），任务正文末尾附上路径、大小和 sha256，会话结案后删除。上传 `.md` 任务文件时关掉 Drive「将上传的文件转换为 Google 文档格式」 |
