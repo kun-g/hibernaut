@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -121,6 +122,22 @@ class TestCLITerminalProcesses(Case):
         self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
         # Delivery closes it once more; a terminal that already ended counts as closed.
         self.assertEqual(await close_terminals([handle], self.repo), f"closed {handle}")
+
+    async def test_a_close_that_meets_an_exited_wrapper_leaves_its_exit_code_to_be_read(self):
+        # The fake's close comes between the wrapper's exit and asyncio reading its status, as a late close does under
+        # load. The wrapper exits only once the event loop is blocked, so on Linux asyncio cannot have read it yet.
+        for stop in ("close", "kill"):
+            with self.subTest(stop):
+                created = await self.orca("terminal", "create", "--worktree", f"path:{self.repo}", "--title", "t",
+                                          "--command", "read -r line; exit 7", cwd=self.repo)
+                handle = created["terminal"]["handle"]
+                proc = self.orca.terminals[handle]["proc"]
+                proc.stdin.write(b"go\n")
+                # Where asyncio waits in a thread of its own (macOS) that thread may have reaped the process already.
+                with contextlib.suppress(ChildProcessError):
+                    os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+                await getattr(self.orca, stop)(handle)
+                self.assertEqual(await proc.wait(), 7)
 
     async def test_the_cli_does_not_get_the_variables_orca_tracks_agent_sessions_by(self):
         # With them the CLI's hooks report its session to Orca, which resumes it in a new tab once the run is over.
