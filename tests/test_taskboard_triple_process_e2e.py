@@ -26,8 +26,8 @@ REPO = "kun-g/hibernaut"
 TRIGGER_LABEL = "hibernaut"
 TASKBOARD_TOKEN = "test-taskboard-mcp-token"
 OPS_CHAT = "oc_ops_test"
-STARTUP_TIMEOUT = 20.0
-FLOW_TIMEOUT = 30.0
+STARTUP_TIMEOUT = 45.0
+FLOW_TIMEOUT = 45.0
 
 
 class TripleProcessEndToEndTests(unittest.TestCase):

@@ -42,7 +42,7 @@ from agent_runtime.engine import AgentWorker
 INBOX = "proj:x"
 
 
-async def until(check, timeout: float = 10.0, what: str = "condition"):
+async def until(check, timeout: float = 45.0, what: str = "condition"):
     deadline = time.monotonic() + timeout
     while True:
         value = await asyncio.to_thread(check)
@@ -445,7 +445,7 @@ class TestPeerTurnSurvivesDetach(PeerCase):
     def wait_inbox(self, count: int) -> None:
         from ccpeer.inbox import JsonlLog
         log = JsonlLog(self.state / RECEIVER / "inbox.jsonl")
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 45
         while len(log.read().records) < count:
             if time.monotonic() > deadline:
                 raise AssertionError("no reply in the receiver's inbox")

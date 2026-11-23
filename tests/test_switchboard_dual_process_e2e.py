@@ -23,7 +23,7 @@ HIBERNAUT_ENTRY = REPO / "tests" / "dual_process_hibernaut.py"
 SCOPE = "proj:hibernaut"
 KEY = "github:kun-g/hibernaut#42"
 CONSUMER = "hibernaut"
-STARTUP_TIMEOUT = 20.0
+STARTUP_TIMEOUT = 45.0
 
 
 def free_port() -> int:

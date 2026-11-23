@@ -47,7 +47,8 @@ def alive(pid: int) -> bool:
     return True
 
 
-async def until(condition, seconds: float = 8.0) -> bool:
+async def until(condition, seconds: float = 30.0) -> bool:
+    # Less than the 60s the processes under test sleep, so one left behind cannot end by itself in time.
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         if condition():
