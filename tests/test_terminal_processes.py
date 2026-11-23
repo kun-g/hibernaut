@@ -96,10 +96,11 @@ class TestCLITerminalProcesses(Case):
         run = await self.run_cli(["/bin/sh", "-c", f'echo verdict; sleep 60 & echo $! > "{self.pids}"'])
         self.assertEqual((run.exit_code, run.stdout), (0, b"verdict\n"))
         handle, wrapper = self.wrapper()
-        self.assertEqual(await asyncio.wait_for(wrapper.wait(), 8), 0)
+        # The close can reach the wrapper after it wrote the result but before it exited.
+        self.assertIn(await asyncio.wait_for(wrapper.wait(), 8), (0, 128 + signal.SIGTERM))
         await self.all_gone(self.recorded())
-        self.assertNotIn("terminal close", self.orca.verbs())
-        # Delivery still closes it; a terminal that already ended counts as closed.
+        self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
+        # Delivery closes it once more; a terminal that already ended counts as closed.
         self.assertEqual(await close_terminals([handle], self.repo), f"closed {handle}")
 
     async def test_closing_the_terminal_while_the_cli_runs_ends_the_cli_and_its_children(self):

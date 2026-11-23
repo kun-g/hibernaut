@@ -64,6 +64,7 @@ _WRAPPER_DEADLINE_MARGIN_SECONDS = 60
 LEASE_ROOT = Path(tempfile.gettempdir()) / "hibernaut-terminal-leases"
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
 _ORCA_ERRORS = (OSError, TimeoutError, ValueError, RuntimeError, KeyError)
+_STALE_HANDLE = "terminal_handle_stale"
 
 
 async def _orca(*args: str, cwd: Path) -> dict[str, Any]:
@@ -1052,6 +1053,31 @@ async def _close_quietly(handle: str, workdir: Path) -> bool:
     return True
 
 
+async def _close_cli_terminal(handle: str, workdir: Path) -> None:
+    # Orca keeps the tab of a command that ended and may resume the agent it recognised there in an interactive
+    # session, so the handle is closed even when its process is gone. What happens here never changes the run's result.
+    async def close() -> None:
+        try:
+            await _orca("terminal", "close", "--terminal", handle, cwd=workdir)
+        except Exception as exc:
+            ended = False
+            if _STALE_HANDLE in str(exc):
+                with contextlib.suppress(Exception):
+                    ended = not await _still_listed(handle, workdir)
+            if ended:
+                _log.info("Orca terminal %s was already closed", handle)
+            else:
+                _log.warning("Could not close Orca terminal %s: %s", handle, f"{type(exc).__name__} {exc}".strip())
+
+    closing = asyncio.ensure_future(close())
+    try:
+        await asyncio.shield(closing)
+    except asyncio.CancelledError:
+        # A cancellation that lands here must not leave the tab behind.
+        await closing
+        raise
+
+
 async def close_terminals(handles: Sequence[str], workdir: Path) -> str:
     workdir = Path(os.path.realpath(workdir))
     closed = [h for h in handles if await _close_quietly(h, workdir)]
@@ -1136,7 +1162,8 @@ class TerminalRun:
 
 class OrcaCommandTerminal:
     # Runs one non-interactive command in a visible Orca terminal of the worktree. The terminal shows the output as
-    # it comes and ends with the command; the result is read only from files the wrapper writes, never from the screen.
+    # it comes and is closed once the run is over, whatever its result; the result is read only from files the wrapper
+    # writes, never from the screen.
     def __init__(self, *, root: Path | None = None, poll_interval: float = 0.25, liveness_interval: float = 5.0) -> None:
         self._root = root or Path(tempfile.gettempdir()) / "hibernaut-cli-terminal"
         self._poll_interval = poll_interval
@@ -1173,7 +1200,6 @@ class OrcaCommandTerminal:
             json.dump(spec, stream)
         command = shlex.join(["exec", sys.executable, "-I", str(CLI_TERMINAL_SCRIPT), str(spec_path)])
         handle: str | None = None
-        finished = False
         try:
             try:
                 handle, _ = await _create_terminal(workdir, title, command)
@@ -1183,14 +1209,10 @@ class OrcaCommandTerminal:
                 slot.record(slot_label, {**(slot_extra or {}), "kind": "cli", "handle": handle, "dir": str(run_dir),
                                          "workdir": str(workdir), "deadline_at": time.time() + timeout_seconds,
                                          "timeout_seconds": timeout_seconds})
-            run = await self._wait(handle, run_dir, workdir, argv[0], timeout_seconds, is_interrupted, slot)
-            finished = True
-            return run
+            return await self._wait(handle, run_dir, workdir, argv[0], timeout_seconds, is_interrupted, slot)
         finally:
             if not detached(slot):
-                if handle and not finished:
-                    await _close_quietly(handle, workdir)
-                shutil.rmtree(run_dir, ignore_errors=True)
+                await self._end(handle, run_dir, workdir)
 
     async def pick_up(
         self, slot: TurnSlot, label: str, workdir: Path, is_interrupted: Callable[[], bool]
@@ -1212,20 +1234,23 @@ class OrcaCommandTerminal:
             return None
         if not (run_dir / "exit.json").exists() and not await _still_listed(handle, workdir):
             slot.note(f"Orca terminal {handle} ended without a result, so the review command ran again")
-            await _close_quietly(handle, workdir)
-            shutil.rmtree(run_dir, ignore_errors=True)
+            await self._end(handle, run_dir, workdir)
             return None
-        finished = False
         try:
-            run = await self._wait(handle, run_dir, workdir, "the review command", max(deadline_at - time.time(), 0.0),
-                                   is_interrupted, slot, timeout_label=timeout_seconds)
-            finished = True
-            return run
+            return await self._wait(handle, run_dir, workdir, "the review command",
+                                    max(deadline_at - time.time(), 0.0), is_interrupted, slot,
+                                    timeout_label=timeout_seconds)
         finally:
             if not slot.run.detached():
-                if not finished:
-                    await _close_quietly(handle, workdir)
-                shutil.rmtree(run_dir, ignore_errors=True)
+                await self._end(handle, run_dir, workdir)
+
+    async def _end(self, handle: str | None, run_dir: Path, workdir: Path) -> None:
+        # The directory goes last, whatever happens to the close: its removal stops a wrapper the close never reached.
+        try:
+            if handle:
+                await _close_cli_terminal(handle, workdir)
+        finally:
+            shutil.rmtree(run_dir, ignore_errors=True)
 
     async def _wait(
         self, handle: str, run_dir: Path, workdir: Path, what: str, timeout_seconds: float,

@@ -139,7 +139,8 @@ args = ["-p", "{prompt}", "--permission-mode", "plan"]
 # resume_args = ["-p", "{prompt}", "--resume", "{executor_session_id}"]
 timeout_seconds = 300.0
 terminal = "orca"               # 仅作评审者（SDE reviewer = "grok"）时生效：在任务 worktree 的 Orca 终端里跑同一条命令，人可实时旁观；
-#                               # 结果从包装脚本写的文件读，不读屏幕。项目 terminal_backend 不是 orca 或 orca 命令失败时退回子进程，
+#                               # 结果从包装脚本写的文件读，不读屏幕；读回后（失败、超时、中断同样）立即关闭终端，不等交付，
+#                               # 评审记录留终端句柄与 CLI 会话 ID。项目 terminal_backend 不是 orca 或 orca 命令失败时退回子进程，
 #                               # 评审结论首行注明 terminal=fallback。可选 none（默认，子进程）| orca。
 
 # 给 SDE 当 CLI 评审者用的 grok：{review_schema} 由评审替换为紧凑的结论 JSON Schema，grok 据此输出
@@ -215,7 +216,7 @@ ci_timeout_seconds = 1800.0     # 等 CI 的上限；超时则挂起，批准后
 ci_poll_seconds = 30.0
 merge_method = "squash"         # squash | merge | rebase
 max_handbacks = 2               # 合入主干出现版本号以外的冲突、或合入后检查失败时，交回同一 SDE 会话解决（只解了冲突的不再评审，另有改动的经增量评审，之后自动续交付）的次数；超过后挂起等人，人批准后重新计数；0 = 直接挂起
-close_terminal = true           # 交付有证据后（PR 头即已推送且检查通过的提交；授权合并时须已合并）自动关闭 SDE 终端与 CLI 评审者（terminal = "orca"）留下的评审终端；先记下 SHA、PR 与可恢复会话 ID，worktree 不动
+close_terminal = true           # 交付有证据后（PR 头即已推送且检查通过的提交；授权合并时须已合并）自动关闭 SDE 终端，并对 CLI 评审者（terminal = "orca"）每次评审后已关闭的终端再关一次兜底；先记下 SHA、PR 与可恢复会话 ID，worktree 不动
 delete_branch = true            # PR 合并后删除远端源分支（不强推；已不存在算成功），worktree 回收时一并删除本地分支；false 则都保留
 issue_link = "refs"             # 任务来自 GitHub Issue 时 PR 正文开头的一行：closes = `Closes #<n>`（合并进默认分支后关闭 Issue）；refs = `Refs #<n>`（只关联，Issue 保持打开）；none = 不写。跨仓库写 <owner>/<repo>#<n>
 # PR 合并后任务自动结案：会话关闭并按回收门禁回收 worktree，被门禁拒绝时只发一条说明原因的通知
