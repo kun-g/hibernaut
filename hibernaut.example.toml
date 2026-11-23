@@ -224,7 +224,7 @@ remote = "origin"
 version_file = "src/agent_runtime/__init__.py"   # 版本唯一来源；breaking→major，feature→minor，fix→patch，test_docs→不变
 version_pattern = '__version__\s*=\s*"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)"'
 title_template = "Hibernaut {version}: {title}"  # 版本未变时只用 title
-checks = [["lint-imports"], ["pytest", "-v"], ["pyright"]]   # 仓库门禁，按序在任务 worktree 运行，任一失败则不推送
+checks = [["lint-imports"], ["pytest", "-n", "auto", "--dist", "worksteal", "-v"], ["pyright"]]   # 仓库门禁，按序在任务 worktree 运行，任一失败则不推送
 check_timeout_seconds = 1800.0
 require_review = true           # 合并前要求独立评审 pass
 require_ci = true               # 合并前要求 PR 的 CI 全部通过（gh pr checks）

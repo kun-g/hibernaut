@@ -272,7 +272,7 @@ class PoolCase(unittest.IsolatedAsyncioTestCase):
         return daemon.handler.ingest(inbox_id=inbox_id, source="test", external_id=f"{text}-{self._seq}",
                                      payload={"text": text, **payload}, correlation_key=key)
 
-    async def until(self, check, timeout=5.0):
+    async def until(self, check, timeout=45.0):
         deadline = time.monotonic() + timeout
         while not check():
             if time.monotonic() > deadline:

@@ -26,8 +26,8 @@ REPO = "kun-g/hibernaut"
 TRIGGER_LABEL = "hibernaut"
 TASKBOARD_TOKEN = "test-taskboard-mcp-token"
 OPS_CHAT = "oc_ops_test"
-STARTUP_TIMEOUT = 20.0
-FLOW_TIMEOUT = 30.0
+STARTUP_TIMEOUT = 45.0
+FLOW_TIMEOUT = 45.0
 
 
 class TripleProcessEndToEndTests(unittest.TestCase):
@@ -258,9 +258,13 @@ consumer_id = "hibernaut"
         self._wait(lambda: task_id() is not None, "Taskboard to create the issue's task")
         tid = task_id()
         assert tid is not None
-        # The task is stored before its work.ready is published.
-        self._wait(lambda: any(e["metadata"]["task_id"] == tid for e in self._ready_events()), "the task's work.ready")
-        [ready] = [e for e in self._ready_events() if e["metadata"]["task_id"] == tid]
+
+        def ready_events() -> list[dict[str, Any]]:
+            return [e for e in self._ready_events() if e["metadata"]["task_id"] == tid]
+
+        # Taskboard stores the task before it publishes it.
+        self._wait(lambda: len(ready_events()) > 0, "work.ready for the task")
+        [ready] = ready_events()
         self._wait(lambda: self._delivery(ready["event_id"], "hibernaut") == "acked", "work.ready acked by Hibernaut")
         self._wait(lambda: self._status(tid) == "done", "the task to be done")
         self.assertEqual(self._task_actions(tid), ["claim", "complete"])

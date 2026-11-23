@@ -395,7 +395,7 @@ class TestLedgerConfigAndMCP(unittest.IsolatedAsyncioTestCase):
             return reply["result"]["structuredContent"]
 
         async def settle(event_id: str, status: str) -> None:
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 45
             while time.monotonic() < deadline:
                 if [e for e in daemon.inbox.list_events(inbox_id=INBOX, status=status) if e.event_id == event_id]:
                     return
