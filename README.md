@@ -89,7 +89,7 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 
 GitHub 入站只经 Switchboard。把 GitHub Webhook 指向 Switchboard 的 `/webhooks/github`，在 `switchboard.toml` 里设置 `[github] require_label` 和仓库路由，使路由目标匹配 Hibernaut 项目的 `inbox_id`，再启用同进程桥接或 Relay。未部署 Taskboard 时，按 `switchboard.example.toml` 的 `[routing.event_consumers]` 示例把 `work.opened`、`work.updated`、`work.closed` 路由到 Hibernaut。部署 Taskboard 时保持默认路由，按 [`taskboard.example.toml`](taskboard.example.toml) 写 `taskboard.toml`，设置 `SWITCHBOARD_RELAY_TOKEN`、`SWITCHBOARD_MCP_TOKEN`、`TASKBOARD_MCP_TOKEN` 后运行 `python -m taskboard.app --config taskboard.toml`；`[intake] auto_ready_sources`（默认 `["github"]`）来源的 Issue / PR（包括后贴触发标签的旧 Issue）直接进入 `ready`，由 Taskboard 发 `work.ready` 给 Hibernaut，Hibernaut 执行时把状态回写 Taskboard（这些内部同步不发评论）。人工待办与依赖异常通知没有可回复的来源时发往 `switchboard.toml` 的 `[outbound] notify_target`，未设置则发往 `approval_target`。Switchboard 与 Taskboard 共用一个域名时，`[http] base_path`（如 `/switchboard`）让 Switchboard 在带前缀和不带前缀的路径上都可访问。升级前使用本机 Issue 轮询或 daemon Webhook 的部署需要先切换入口。
 
-飞书事件订阅和卡片回调都指向 Switchboard 的 `/webhooks/feishu`。在 `switchboard.toml` 设置聊天路由和应用凭据环境变量名。要为无来源会话发审批卡，请配置 `[outbound]` 的 `approval_channel = "feishu"` 和 `approval_target`（接收卡片的聊天 ID）。
+飞书事件订阅和卡片回调都指向 Switchboard 的 `/webhooks/feishu`。在 `switchboard.toml` 设置聊天路由和应用凭据环境变量名。要为无来源会话发审批卡，请配置 `[outbound]` 的 `approval_channel = "feishu"` 和 `approval_target`（接收卡片的聊天 ID）。发往飞书的消息遇到限频（`230020`、`99991400`）会等待后自动重发，不早于飞书给出的恢复时间；次数用完才记 `failed`。
 
 旧 `hibernaut.toml` 仍可加载。以下键各自触发 `UserWarning` 并被忽略，可从对应配置段删除：
 

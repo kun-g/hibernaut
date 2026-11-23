@@ -6,6 +6,7 @@ from typing import Any, cast
 from urllib.parse import quote
 
 from switchboard.feishu_auth import TOKEN_REJECTED_CODES, FeishuAuthError, FeishuTokenSource
+from switchboard.feishu_rate_limit import is_rate_limited, reset_seconds
 from switchboard.http_client import HttpClient, HttpResponse
 from switchboard.ports import CredentialBrokerPort, OutboundMessage, SendResult
 
@@ -36,7 +37,9 @@ class FeishuOutboundAdapter:
         try:
             token = self._tokens.token() if self._tokens is not None else self._credentials.issue_ephemeral("feishu")
         except FeishuAuthError as exc:
-            return SendResult(ok=False, error=str(exc), retryable=exc.retryable)
+            return SendResult(
+                ok=False, error=str(exc), retryable=exc.retryable, retry_after_seconds=exc.retry_after_seconds
+            )
         if not token:
             return SendResult(ok=False, error="feishu credential unavailable", retryable=True)
         msg_type, content = self.render(msg)
@@ -84,8 +87,11 @@ def _feishu_result(response: HttpResponse) -> tuple[SendResult, object]:
         inner: Any = data.get("data")
         message_id: Any = cast(Mapping[str, Any], inner).get("message_id") if isinstance(inner, Mapping) else None
         return SendResult(ok=True, platform_msg_id=None if message_id is None else str(message_id)), 0
-    retryable = response.status == 429 or response.status >= 500
     code = data.get("code")
+    limited = is_rate_limited(response.status, code)
     return SendResult(
-        ok=False, error=f"feishu HTTP {response.status} code={code} msg={data.get('msg')}", retryable=retryable
+        ok=False,
+        error=f"feishu HTTP {response.status} code={code} msg={data.get('msg')}",
+        retryable=limited or response.status >= 500,
+        retry_after_seconds=reset_seconds(response) if limited else None,
     ), code

@@ -407,7 +407,8 @@ class ForwardTests(ForwardCase):
         [event] = self.queued(SDE)
         self.assertEqual(
             sorted(event.payload),
-            ["forwarded_by", "forwarded_from", "hop_count", "origin_key", "parent_session_id", "text"],
+            ["forwarded_by", "forwarded_from", "hop_count", "origin_key", "parent_event_id", "parent_session_id",
+             "text", "trace_id"],
         )
 
     async def test_closing_the_parent_closes_children_in_other_inboxes(self) -> None:

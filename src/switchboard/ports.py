@@ -88,6 +88,8 @@ class SendResult:
     platform_msg_id: str | None = None
     error: str | None = None
     retryable: bool = True
+    # The platform's own wait, counted from its response; the gateway never retries earlier than this.
+    retry_after_seconds: float | None = None
 
 
 class OutboundChannelAdapter(Protocol):
