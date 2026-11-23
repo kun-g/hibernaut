@@ -72,6 +72,28 @@ def _signals_held() -> Iterator[None]:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
 
 
+@contextmanager
+def _stop_deferred() -> Iterator[None]:
+    # Handlers rather than a blocked mask: the started process would inherit the mask.
+    caught: list[int] = []
+    previous = {sig: signal.signal(sig, lambda signum, _frame: caught.append(signum)) for sig in STOP_SIGNALS}
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        if caught:
+            raise Stopped(caught[0])
+
+
+def start_child(running: list[subprocess.Popen[bytes]], argv: list[str], **options: Any) -> subprocess.Popen[bytes]:
+    # A stop signal must not land between the process starting and its entry in `running`: the cleanup would miss it.
+    with _stop_deferred():
+        proc = subprocess.Popen(argv, **options)
+        running.append(proc)
+    return proc
+
+
 def end_group(proc: subprocess.Popen[bytes], grace: float | None = None) -> None:
     # Ends the process group `proc` leads (it was started in its own session or group) and reaps `proc`. Every
     # signal goes out while `proc` is unreaped; once it is reaped its pid is never signalled again.
@@ -133,14 +155,13 @@ def _run(spec_path: Path, running: list[subprocess.Popen[bytes]]) -> int:
     try:
         # A session of its own: the group can be ended as a whole, and a CLI that opens /dev/tty fails instead of
         # stopping in the background.
-        proc = subprocess.Popen(argv, cwd=spec["cwd"], env=_one_shot_env({**os.environ, **spec["env"]}),
-                                start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
+        proc = start_child(running, argv, cwd=spec["cwd"], env=_one_shot_env({**os.environ, **spec["env"]}),
+                           start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
     except OSError as exc:
         _write_atomic(exit_path, {"exit": None, "error": f"cannot start '{argv[0]}': {exc.strerror or exc}"})
         print(f"[hibernaut] cannot start {argv[0]}: {exc.strerror or exc}", file=sys.stderr, flush=True)
         return 1
-    running.append(proc)
     assert proc.stdout is not None and proc.stderr is not None
     threads = [
         threading.Thread(target=_tee, args=(proc.stdout, sys.stdout.buffer, spec["stdout"]), daemon=True),

@@ -157,6 +157,34 @@ class TestCLITerminalProcesses(Case):
         await self.all_gone(pids)
 
 
+# Runs a wrapper's main() with a SIGTERM that arrives once its Nth process is running but the call that starts it has
+# not returned yet, as a closing terminal can hit it.
+SIGNALLED_START = """
+import importlib, os, signal, subprocess, sys
+src, module, spec, pids, nth = sys.argv[1:]
+sys.path.insert(0, src)
+main = importlib.import_module(module).main
+real, started = subprocess.Popen, []
+def popen(*args, **kwargs):
+    proc = real(*args, **kwargs)
+    started.append(proc.pid)
+    if len(started) == int(nth):
+        with open(pids, "w") as out:
+            out.write(str(proc.pid))
+        os.kill(os.getpid(), signal.SIGTERM)
+    return proc
+subprocess.Popen = popen
+sys.exit(main(spec))
+"""
+
+
+def signalled_start(module: str, spec: Path, pids: Path, nth: int = 1) -> subprocess.Popen[bytes]:
+    src = Path(cli_terminal.__file__).resolve().parents[3]
+    return subprocess.Popen([sys.executable, "-c", SIGNALLED_START, str(src),
+                             f"agent_runtime.adapters.executor_cli.{module}", str(spec), str(pids), str(nth)],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 class TestCLITerminalScript(unittest.IsolatedAsyncioTestCase):
     # The wrapper on its own, without Hibernaut watching: its deadline and the signals of a closing terminal.
     def setUp(self):
@@ -197,6 +225,18 @@ class TestCLITerminalScript(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await until(lambda: proc.poll() is not None))
                 self.assertEqual(proc.returncode, 128 + sig)
                 self.assertTrue(await until(lambda: not any(alive(p) for p in pids)))
+
+    async def test_a_signal_while_the_cli_is_being_started_still_ends_it(self):
+        spec = {"title": "t", "cwd": str(self.root), "env": {}, "timeout_seconds": 30, "argv": ["/bin/sleep", "60"],
+                **{name: str(self.root / name) for name in ("stdout", "stderr", "exit.json")}}
+        (self.root / "spec.json").write_text(json.dumps(spec))
+        proc = signalled_start("cli_terminal", self.root / "spec.json", self.pids)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.assertTrue(await until(lambda: proc.poll() is not None, 30))
+        pid = int(self.pids.read_text())
+        self.addCleanup(lambda: alive(pid) and os.kill(pid, signal.SIGKILL))
+        self.assertEqual(proc.returncode, 128 + signal.SIGTERM)
+        self.assertTrue(await until(lambda: not alive(pid)))
 
 
 class TestCLIGroupSignals(unittest.TestCase):
@@ -281,6 +321,25 @@ class TestGateProcesses(Case):
         await self.orca("terminal", "close", "--terminal", handle, cwd=self.repo)
         self.assertEqual(gate.returncode, 128 + signal.SIGTERM)
         await self.all_gone(pids)
+
+    async def test_a_signal_while_the_probe_or_the_agent_is_being_started_still_ends_it(self):
+        init = json.dumps({"type": "system", "subtype": "init", "apiKeySource": "none", "model": "m"})
+        lease = self.root / "lease"
+        lease.touch()
+        spec = {"title": "t", "profile": {"name": "sde", "launcher": "fake", "launcher_command": "fake",
+                                          "billing": "subscription", "model": "m", "effort": "high",
+                                          "credential_proxy_url": None},
+                "unset": [], "set": {}, "probe": ["/bin/sh", "-c", f"echo '{init}'; exec sleep 60"], "probe_timeout": 30,
+                "exec": ["/bin/sleep", "60"], "status": str(self.root / "status.json"), "lease": str(lease)}
+        (self.root / "gate.json").write_text(json.dumps(spec))
+        for nth, name in ((1, "probe"), (2, "agent")):
+            with self.subTest(name):
+                self.pids.unlink(missing_ok=True)
+                gate = signalled_start("claude_gate", self.root / "gate.json", self.pids, nth)
+                self.addCleanup(lambda gate=gate: gate.poll() is None and gate.kill())
+                self.assertTrue(await until(lambda: gate.poll() is not None, 30))
+                self.assertEqual(gate.returncode, 128 + signal.SIGTERM)
+                await self.all_gone(self.recorded())
 
     async def test_a_lost_close_during_the_session_check_ends_the_probe(self):
         handle, gate = await self.start_gate(FAKE_PROBE_PIDFILE=str(self.pids))

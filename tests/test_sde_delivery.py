@@ -393,7 +393,8 @@ class TestProjectAdoption(unittest.TestCase):
         self.assertTrue(delivery.open_pr)
         self.assertFalse(delivery.auto_merge)
         self.assertEqual(delivery.version_file, "src/agent_runtime/__init__.py")
-        self.assertEqual(delivery.checks, (("lint-imports",), ("pytest", "-v"), ("pyright",)))
+        pytest_gate = ("pytest", "-n", "auto", "--dist", "worksteal", "-v")
+        self.assertEqual(delivery.checks, (("lint-imports",), pytest_gate, ("pyright",)))
         version = (REPO / delivery.version_file).read_text(encoding="utf-8")
         PRDelivery(delivery, Mock())._read_version(version, "check")  # the pattern matches the real file
 

@@ -166,6 +166,6 @@ schemas/v1/         # 执行账本的 AuditRecord / RunRecord JSON Schema（ADR-
 ```bash
 pip install -e ".[dev]"
 lint-imports   # 分层与反向依赖检查
-pytest -v      # 契约、并发、端到端测试（本地快检可用 pytest -n auto $(python scripts/select_tests.py)）
+pytest -n auto --dist worksteal -v   # 契约、并发、端到端测试全量（本地快检可用 pytest -n auto $(python scripts/select_tests.py)；串行 pytest -v 只用于排查并行相关的失败）
 pyright        # core/、engine/、switchboard/、ccpeer/、taskboard/、runner/、ledger/、dashboard/ 的 strict 类型检查
 ```

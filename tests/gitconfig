@@ -1,0 +1,10 @@
+# Global git config of the test suite (GIT_CONFIG_GLOBAL, set in tests/__init__.py): the developer's own, with
+# automatic maintenance off. A global config also reaches the git processes a local clone or push starts in the other
+# repository, which drop `-c` settings.
+[include]
+	path = ~/.config/git/config
+	path = ~/.gitconfig
+[maintenance]
+	auto = false
+[gc]
+	auto = 0
