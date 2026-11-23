@@ -112,11 +112,12 @@ class _ScopedCapabilities:
         tags: Sequence[str] = (),
         target_agent: str | None = None,
         return_to: str | None = None,
+        continues: str | None = None,
         approved_request_id: str | None = None,
     ) -> Event:
         return self._forwards.forward(
             target_inbox, text, title=title, tags=tags, target_agent=target_agent, return_to=return_to,
-            approved_request_id=approved_request_id,
+            continues=continues, approved_request_id=approved_request_id,
         )
 
 
@@ -1366,6 +1367,7 @@ class AgentWorker:
             routes=self._routes,
             events=lambda: batch + folded_events,
             approval=lambda request_id: self._approved(request_id, batch, active_session),
+            queued=lambda queued_in: [*self._inbox.fetch_pending(queued_in), *self._inbox.fetch_processing(queued_in)],
         )
         caps: RunCapabilities = _ScopedCapabilities(
             memory=self._memory,
@@ -1525,7 +1527,8 @@ class AgentWorker:
         handed_over = False
         if not carries_forwards(outcome):
             forwards.reset()
-        elif forwards.staged:
+        dropped = forwards.drop_refused()
+        if forwards.staged:
             if final_link is not None and not isinstance(outcome, Suspend):
                 handed_over = forwards.hand_over(final_link)
             sent = forwards.own_returns()
@@ -1567,6 +1570,14 @@ class AgentWorker:
             returned = True
             # Queued or held, this session no longer owes it.
             final_spec = replace(final_spec, return_to=None, delegation_id=None)
+        for event, reason in dropped:
+            title = f" ({event.payload['title']})" if event.payload.get("title") else ""
+            self._outbox.enqueue(
+                inbox_id=inbox_id,
+                content=f"[hibernaut] Did not forward work to {event.inbox_id}{title}: {reason}.",
+                metadata={**self._with_status(report_metadata, "refused"), "session_id": active_session.session_id,
+                          "kind": "forward_refused", "outcome_kind": "error"},
+            )
         # Before the result is written, so a crash in between repeats the Run and its deduplicated forwards.
         for event in forwards.staged:
             self._queue_event(event)

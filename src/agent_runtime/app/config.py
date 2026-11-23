@@ -118,6 +118,8 @@ class ProjectConfig:
     agents: tuple[AgentConfig, ...] = ()
     # Inboxes of this project running at once; None leaves only runtime.max_concurrency.
     max_concurrency: int | None = None
+    # What the project is, for a Steward outside it that may send work here.
+    description: str = ""
 
     def route(self, inbox_id: str) -> InboxRoute:
         bound = next((b.binding for b in self.inbox_bindings if b.rule.matches(inbox_id)), None)
@@ -1185,11 +1187,14 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
                                                 declared=agents.keys()),
             agents=tuple(agents.values()),
             max_concurrency=_max_concurrency(f"projects.{name}", item),
+            description=_optional_text(f"projects.{name}", item, "description"),
         )
     validate_project_rules(projects.values())
     validate_project_bindings(projects.values())
     runtime = dataclasses.replace(runtime, inbox_bindings=parse_workdir_bindings(
         rt_raw.get("inbox_bindings"), declared=agents, resolve=lambda path: _resolve_path(path, base_dir),
+        stewards={name: role.workdir for name, role in roles.items() if role.role == STEWARD_ROLE},
+        main_inboxes={project.inbox_id: project.name for project in projects.values()},
     ))
     validate_workdir_bindings(runtime.inbox_bindings, projects.values(),
                               {name: role.workdir for name, role in roles.items() if role.workdir})
