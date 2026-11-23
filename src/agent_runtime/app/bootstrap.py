@@ -46,6 +46,7 @@ from runner.config import NamespacePolicy, ProjectCheckout, RunnerConfig
 from runner.daemon import RunnerDaemon
 from runner.protocol import RunnerPort
 from runner.registry import WorkspaceAffinityStore
+from runner.transport.auth import read_relay_token
 from runner.transport.in_process import InProcessRunnerClient
 from runner.transport.relay_hub import RunnerRelayHub
 
@@ -158,6 +159,7 @@ class RunnerHandle:
             executor_calls_tools=True,
             authorize_tools=True,
             node_wait_seconds=self._link.node_wait_seconds,
+            readonly=self._link.readonly_only,
         )
 
     def apply(self, config: HibernautConfig) -> None:
@@ -220,6 +222,8 @@ class RelayRunnerHandle(RunnerHandle):
         link = config.runner
         # Executor subprocesses inherit os.environ; moving the token out keeps it away from agents.
         token = environ.pop(link.token_env, "")
+        if link.token_file:
+            token = read_relay_token(Path(link.token_file))
         if not token:
             raise ValueError(f'runner.mode = "relay" needs {link.token_env} in the environment')
         affinity_db = Path(link.affinity_db_path) if link.affinity_db_path else _runner_dir(config, "") / "affinity.db"

@@ -59,5 +59,6 @@
 - **Steward（项目管家）**：`role = "steward"` 的 Agent，项目主 Inbox 的前台：读事件后自己答复、转投给别的 Agent，或汇总回投的结果。在项目主检出（或配置的 `workdir`）里只读运行，每轮在 Orca 终端里一次性执行，不建 worktree，不能编辑文件或执行命令，没有内置工具，读文件也经逐次过门禁的 MCP 工具；可读写所在 Inbox 的 Memory、只读查询本项目的会话与事件。能路由到哪些 Inbox 和 Agent 由 Runtime 每次唤醒时现拼的路由清单（routing manifest）给出。
 - **Runner Relay**：Hibernaut 进程内的 Runner 反向 WebSocket 端点（`RunnerRelayHub`），Runner 主动连入，凭共享令牌鉴权后接单。`[runner]` 的 `relay` 模式与试点路由各开各的。与 Switchboard 的 relay 无关。
 - **Runner 试点路由**：`[runner_pilot]` 配置的一条默认关闭的路由：只把一个任务级 Inbox 交给一台单槽位的独立 Runner，执行器固定为 `runner-protocol-check`（无工具的协议文件校验）。关闭时该 Inbox 按原路由执行。
+- **远端 Agent 节点**：经 `[runner]` 的 `relay` 模式连入的单槽位、单项目、只读 Runner（`python -m runner.agent_service`），只带一个 CLI 执行器，只执行显式指名该 agent 的事件。与只带协议校验程序的试点节点是两种服务，配置互不通用。
 - **候选提交（`candidate_commit`）**：试点任务载荷里要核验的 40 位完整提交号。与 SDE 交付中的候选分支无关。
 - **汇总摘要（manifest digest）**：试点核验的五份 Runner 协议文件按路径排序的 `<sha256>  <路径>` 清单（`shasum -a 256` 格式）的 SHA-256，用 git 与 `shasum` 即可独立复算。

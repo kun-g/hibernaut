@@ -387,16 +387,20 @@ class RunnerLinkConfig:
     # Added to the permission policy; a tool in neither list, nor in the built-in ones, asks a person.
     allow_tools: frozenset[str] = frozenset()
     block_tools: frozenset[str] = frozenset()
+    # Every Run of these executors is read-only, whatever its events ask for.
+    readonly_only: bool = False
     # in_process
     runner_id: str = "local"
     max_concurrent: int | None = None
     worktree_backend: WorktreeBackend = "git"
     state_dir: str = ""
     logs_dir: str = ""
-    # relay: where this process listens for nodes, and the environment variable holding their shared token.
+    # relay: where this process listens for nodes, and the environment variable (or the owner-only file) holding their
+    # shared token.
     listen_host: str = "127.0.0.1"
     listen_port: int = 8790
     token_env: str = "HIBERNAUT_RUNNER_TOKEN"
+    token_file: str = ""
     affinity_db_path: str = ""
 
 
@@ -665,6 +669,8 @@ def _validate_runner_pilot(config: HibernautConfig) -> None:
         raise ValueError("runner_pilot.port is channels.port")
     if config.runner.enabled and config.runner.mode == "relay" and pilot.port == config.runner.listen_port:
         raise ValueError("runner_pilot.port is runner.listen_port; each relay needs its own port")
+    if config.runner.enabled and config.runner.mode == "relay" and pilot.token_file == config.runner.token_file:
+        raise ValueError("runner_pilot.token_file is runner.token_file; each relay needs its own token")
     if config.memory_hub.http.enabled and pilot.port == config.memory_hub.http.listen_port:
         raise ValueError("runner_pilot.port is memory_hub.http.listen_port")
 
@@ -706,6 +712,11 @@ def parse_runner_link(
     enabled = item.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("runner.enabled must be true or false")
+    readonly_only = item.get("readonly_only", False)
+    if not isinstance(readonly_only, bool):
+        raise ValueError("runner.readonly_only must be true or false")
+    if "token_env" in item and "token_file" in item:
+        raise ValueError("runner.token_env and runner.token_file cannot both be set")
     mode = next((m for m in _RUNNER_MODES if m == item.get("mode", defaults.mode)), None)
     if mode is None:
         raise ValueError('runner.mode must be "in_process" or "relay"')
@@ -764,6 +775,7 @@ def parse_runner_link(
         node_wait_seconds=seconds("node_wait_seconds", defaults.node_wait_seconds, zero=True),
         allow_tools=frozenset(names("allow_tools")),
         block_tools=frozenset(names("block_tools")),
+        readonly_only=readonly_only,
         runner_id=text("runner_id", defaults.runner_id),
         max_concurrent=slots,
         worktree_backend=backend,
@@ -772,6 +784,7 @@ def parse_runner_link(
         listen_host=text("listen_host", defaults.listen_host),
         listen_port=port,
         token_env=text("token_env", defaults.token_env),
+        token_file=path("token_file"),
         affinity_db_path=path("affinity_db_path"),
     )
 
