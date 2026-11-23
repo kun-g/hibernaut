@@ -258,7 +258,13 @@ consumer_id = "hibernaut"
         self._wait(lambda: task_id() is not None, "Taskboard to create the issue's task")
         tid = task_id()
         assert tid is not None
-        [ready] = [e for e in self._ready_events() if e["metadata"]["task_id"] == tid]
+
+        def ready_events() -> list[dict[str, Any]]:
+            return [e for e in self._ready_events() if e["metadata"]["task_id"] == tid]
+
+        # Taskboard stores the task before it publishes work.ready to Switchboard.
+        self._wait(lambda: bool(ready_events()), "work.ready to reach Switchboard")
+        [ready] = ready_events()
         self._wait(lambda: self._delivery(ready["event_id"], "hibernaut") == "acked", "work.ready acked by Hibernaut")
         self._wait(lambda: self._status(tid) == "done", "the task to be done")
         self.assertEqual(self._task_actions(tid), ["claim", "complete"])

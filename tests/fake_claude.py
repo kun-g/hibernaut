@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Test double for the Claude Code CLI in stream-json mode; never contacts a model.
+import fcntl
 import json
 import os
 import re
@@ -60,9 +61,13 @@ def next_step(name):
     steps = json.loads(Path(plan_path).read_text(encoding="utf-8")).get(name) or []
     if not steps:
         return None
-    counter = Path(f"{plan_path}.{name}.n")
-    n = int(counter.read_text()) if counter.exists() else 0
-    counter.write_text(str(n + 1))
+    with open(f"{plan_path}.{name}.n", "a+", encoding="utf-8") as counter:
+        # Sessions of two projects may take a step at the same moment.
+        fcntl.flock(counter, fcntl.LOCK_EX)
+        counter.seek(0)
+        n = int(counter.read() or 0)
+        counter.truncate(0)
+        counter.write(str(n + 1))
     return steps[min(n, len(steps) - 1)]
 
 
