@@ -12,7 +12,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 按 Inbox 并发 | 每个 `inbox_id` 一条串行队列，不同 Inbox 并行；同一个 Issue、Drive 文件或飞书话题的事件接着同一会话和 worktree 做 |
 | 多执行器 | claude / cursor-agent / grok / dsh 等 CLI 和角色执行器；按事件、会话、项目、全局四级选择，会话粘在首次选定的执行器上 |
 | SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `executor_id = "sde"`（Drive 任务 frontmatter 写 `executor_id: sde`），项目也可设为默认执行器；GitHub Issue 以 `# 标题` + 正文为需求、标题为 PR 标题 |
-| 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok，模板写 `terminal = "orca"` 可在 Orca 终端里旁观评审）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested` |
+| 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok，模板写 `terminal = "orca"` 可在 Orca 终端里旁观评审）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested`；SDE 内置评审第 1 轮通审，第 2 轮起只做增量复核：只有上一轮没修好的项和之后改动引入的新问题能打回，其余由程序降为跟进，交付时列在 PR 正文「跟进」小节和完成消息里 |
 | PR 交付 | SDE 完成后由 Hibernaut 合入主干、按改动类型定版本号、跑检查、推分支、开 PR，可选在评审通过且 CI 绿后自动合并；合入主干冲突（版本号以外）或合入后检查失败时交回同一开发会话解决，评审增量后自动续交付，超过次数上限才挂起等人；合并后删除源分支并结案；与任务来源无关 |
 | 可见终端 | 运行在 Orca 终端里打开，人可以旁观、回答提问，后续事件回到同一对话；项目设 `handoff = "peer"` 时任务、返工与结果经 ccpeer 消息往来，结果落在 launchd 常驻接收端的收件箱，hb 重启不丢 |
 | 工作区管理 | 按任务自动建 `hb-*` worktree、复用，证据齐全（PR 已合并、无未提交改动等）后才回收；交付合并 PR 后自动关闭会话并回收 worktree 和本地分支；当时被排队事件或在线会话挡住的，由后台清扫（启动时一轮，之后默认每 5 分钟，`[runtime] worktree_sweep_interval_seconds`）在其结束后回收；目录已被人手或 Orca 删掉的记录，在没有排队事件、未结束的 Run 等占用时清除，并关闭引用它的会话、发一条告警 |

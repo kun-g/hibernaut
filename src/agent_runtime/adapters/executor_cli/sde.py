@@ -45,6 +45,7 @@ from agent_runtime.adapters.executor_cli.project_guidance import (
     repo_root,
     resolve_commit,
 )
+from agent_runtime.adapters.executor_cli.review_scope import merge_notes
 from agent_runtime.adapters.executor_cli.reviewer import (
     CODE_REVIEWER_ROLE,
     CoderReviewerExecutor,
@@ -52,6 +53,7 @@ from agent_runtime.adapters.executor_cli.reviewer import (
     Reviewer,
     ReviewRequest,
     format_blocking,
+    review_scope,
     review_title,
     snapshot_diff,
     worktree_fingerprint,
@@ -217,6 +219,10 @@ class _State:
     issue: str = ""
     # What happened when a Run was resumed after a restart and could not simply continue (a turn sent again).
     resume_log: list[str] = field(default_factory=_no_history)
+    # Notes of every review round, downgraded blocking items included; delivered as follow-ups.
+    review_notes: list[str] = field(default_factory=_no_history)
+    # A person added requirements since the last review, so the next one covers the whole change again.
+    new_requirements: bool = False
 
     def fields(self) -> dict[str, Any]:
         return {f: getattr(self, f) for f in self.__slots__}
@@ -520,6 +526,7 @@ class SDEExecutor:
         text = "\n\n".join(state.followups)
         if text:
             state.requirements = f"{state.requirements}\n\n## Follow-up from a person\n{text}"
+            state.new_requirements = True
         state.followups = []
         return text
 
@@ -759,15 +766,21 @@ class SDEExecutor:
                 return self._pending(session_id, native, state, f"review launch {decision.action}: {decision.reason}")
             try:
                 snapshot = await asyncio.to_thread(worktree_fingerprint, workdir)
-                previous = ""
+                previous, scope = "", None
                 if (state.blocking or state.recheck) and state.reviewed_snapshot:
+                    if not state.new_requirements:
+                        # Unchanged code can still miss a requirement added since; only then may it block again.
+                        scope = await asyncio.to_thread(
+                            review_scope, workdir, state.reviewed_snapshot, snapshot, previous=state.blocking,
+                            notes=state.review_notes,
+                        )
                     delta = await asyncio.to_thread(snapshot_diff, workdir, state.reviewed_snapshot, snapshot)
                     if state.blocking:
                         previous = (
                             f"## Previous review round\n{state.last_review}\n\n"
                             f"## Changes since the previous review\n```diff\n{delta}\n```"
                         )
-                    else:
+                    elif scope is not None:
                         previous = _recheck_section(state.recheck, state.last_review, delta)
                 pin, selection = await asyncio.to_thread(self._guidance_inputs, state)
                 subject = state.work_key or workdir.name
@@ -777,6 +790,7 @@ class SDEExecutor:
                     ReviewRequest(workdir=workdir, requirements=state.requirements,
                                   test_evidence=state.test_evidence, base_ref=state.base_ref,
                                   pin=pin, selection=selection, previous_round=previous,
+                                  scope=scope,
                                   label=f"review of {subject} round {len(state.history) + 1}",
                                   inbox_id=state.inbox_id),
                     caps,
@@ -784,17 +798,23 @@ class SDEExecutor:
                 )
             except (ReviewAborted, ClaudeCodeError, ValueError) as exc:
                 return self._pending(session_id, native, state, f"the review could not complete: {exc}")
+            if scope is not None:
+                # Whoever reviewed, the program decides what may block in a re-review.
+                review = await asyncio.to_thread(scope.narrow, review)
             blocking: list[dict[str, str]] = review["blocking"]
             state.rounds += 1
+            counts = [f"{n} {what}" for n, what in
+                      ((len(blocking), "blocking"), (review.get("downgraded", 0), "downgraded")) if n]
             state.history.append(
-                f"round {len(state.history) + 1} {review['verdict']}"
-                + (f" ({len(blocking)} blocking)" if blocking else "")
+                f"round {len(state.history) + 1} {review['verdict']}" + (f" ({', '.join(counts)})" if counts else "")
             )
+            state.review_notes = merge_notes(state.review_notes, review.get("notes", []))
             state.review_terminals += [str(h) for h in review.get("cli_terminals", ())]
             state.last_review = reviewer.format_review(review)
             state.reviewed_snapshot = snapshot
             state.blocking = blocking
             state.recheck = ""
+            state.new_requirements = False
             if review["verdict"] == "pass":
                 return await self._finish(session_id, native, state, caps, review="pass", progress=progress)
             if state.rounds >= self._options.max_review_rounds:
@@ -825,6 +845,7 @@ class SDEExecutor:
             f"Checked: no commit and a clean worktree since {check.base[:12]}; nothing to review or deliver.",
             f"Summary: {state.summary or '(none)'}",
             f"Test evidence:\n{state.test_evidence or '(none)'}",
+            *_review_followups(state),
         ]
         if state.followups:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
@@ -932,6 +953,7 @@ class SDEExecutor:
             review=review,
             review_detail="; ".join([self._review_status(state), *state.history]),
             issue=state.issue,
+            followups=tuple(state.review_notes),
         )
         # A stop ends the delivery at its next checkpoint; a resumed Run delivers again from the stored record.
         record = await asyncio.to_thread(
@@ -1033,6 +1055,7 @@ class SDEExecutor:
             lines.append(f"Review history: {'; '.join(state.history)}")
         if state.last_review:
             lines.append(f"Last review:\n{state.last_review}")
+        lines += _review_followups(state)
         if state.followups:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
         outcome = self._delivery.outcome(delivery) if self._delivery is not None and delivery is not None else None
@@ -1054,6 +1077,7 @@ class SDEExecutor:
             lines.append(f"Test evidence so far:\n{state.test_evidence}")
         if state.history:
             lines.append(f"Review history: {'; '.join(state.history)}")
+        lines += _review_followups(state)
         if state.followups:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
         return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native, status="stopped")
@@ -1065,6 +1089,10 @@ class SDEExecutor:
 
 def _stays() -> bool:
     return False
+
+
+def _review_followups(state: _State) -> list[str]:
+    return ["跟进：\n" + "\n".join(f"- {' '.join(n.split())}" for n in state.review_notes)] if state.review_notes else []
 
 
 def _validate_report(raw: object) -> dict[str, Any]:

@@ -41,6 +41,8 @@ TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRI
 _SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 _MAX_MAIN_MOVES = 3
 _TAIL = 4000
+# GitHub rejects a PR body over 65536 characters; the Outbox message always has the whole list.
+_MAX_FOLLOWUPS = 15_000
 # No CI result for this long while the base has moved past the PR: GitHub may never run CI for it.
 _EMPTY_CHECKS_GRACE = 300.0
 CIResult = Literal["passed", "failed", "stale"]
@@ -266,6 +268,8 @@ class DeliveryRequest:
     review_detail: str = ""
     # "owner/repo#n" of the GitHub Issue the task came from (source_issue); "" for any other source.
     issue: str = ""
+    # Review notes that did not block, listed in the PR body.
+    followups: tuple[str, ...] = ()
 
 
 def _strs() -> list[str]:
@@ -395,6 +399,20 @@ def remote_env(base: Mapping[str, str]) -> dict[str, str]:
     env = {k: v for k, v in base.items() if k not in TOKEN_ENV}
     env.update({"GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"})
     return env
+
+
+def _followup_list(notes: Sequence[str]) -> str:
+    # One line each. A zero-width space keeps a quoted decorator or number from pinging a person or closing an issue.
+    lines: list[str] = []
+    size = 0
+    for i, note in enumerate(notes):
+        line = "- " + re.sub(r"([@#])(?=\w)", "\\1\u200b", " ".join(note.split()))
+        size += len(line) + 1
+        if size > _MAX_FOLLOWUPS:
+            lines.append(f"- 另有 {len(notes) - i} 条，见 Hibernaut 完成消息")
+            break
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _tail(text: str, limit: int = _TAIL) -> str:
@@ -821,6 +839,7 @@ class PRDelivery:
             f"## Version\n{version}",
             f"## Checks (run by Hibernaut on {rec.head_sha[:12]})\n{checks}",
             f"## Review\n{review}",
+            *([f"## 跟进\n{_followup_list(req.followups)}"] if req.followups else []),
             f"## Test evidence (from the developer)\n```text\n{_tail(req.test_evidence, 20000)}\n```",
             f"Delivered by Hibernaut for task `{req.work_key}`.",
         ])

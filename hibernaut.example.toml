@@ -97,7 +97,7 @@ reviewer = "code-reviewer"      # review = true 时必填有效值：role = "cod
 # reviewer = "grok-reviewer"    # 用 [executors.grok-reviewer] 模板非交互评审：prompt 末尾要求只输出一个 JSON 结论，格式错重试一次；模板写 terminal = "orca" 时在 Orca 终端里可旁观。
 #                               # 只读保证较弱：CLI 的工具不受限制，只靠评审前后比对 worktree 指纹，改动了就作废结论并挂起为 review pending。
 #                               # 省略 reviewer 且没有名为 code-reviewer 的执行器时，回退用旧名 coder-reviewer 的评审角色执行器。
-max_review_rounds = 3           # 超过轮数仍未通过则保持待处理（Suspend），批准再修一轮，拒绝则标注未评审交付
+max_review_rounds = 3           # 第 2 轮起只做增量复核（上一轮没修好的项、之后改动引入的新问题），其余降为跟进；超过轮数仍未通过则保持待处理（Suspend），批准再修一轮，拒绝则标注未评审交付
 interactive = true              # 开发对话在交互终端里续接（存活终端或 --resume）；缺后端则挂起并说明原因，批准重试；false 走非交互
 # 可选：同上，省略时用内置 "builtin:sde"（测试先行）。各角色只读自己这一节的 skills，SDE 内置评审用评审者那一节的。
 # 项目自己的流程不写在这里：放在项目仓库根目录，AGENTS.md 写简短通用约束，guidance.toml 登记各规范文档的路径、适用活动、标签和匹配的文件路径。

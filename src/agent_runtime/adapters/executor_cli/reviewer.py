@@ -22,6 +22,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, terminal_title
 from agent_runtime.adapters.executor_cli.peer import PEER_TOOLS, DeveloperPeerResolver, PeerLookup
 from agent_runtime.adapters.executor_cli.process import join_text, last_text, target_events
+from agent_runtime.adapters.executor_cli.review_scope import BASES, INTRODUCED, UNFIXED, ReviewScope
 from agent_runtime.adapters.executor_cli.run_state import TurnSlot
 from agent_runtime.adapters.executor_cli.project_guidance import (
     GuidancePin,
@@ -77,6 +78,8 @@ REVIEW_SCHEMA: dict[str, Any] = {
                     "fix": {"type": "string"},
                     "guidance_path": {"type": "string"},
                     "guidance_clause": {"type": "string"},
+                    "basis": {"type": "string", "enum": list(BASES)},
+                    "previous_item": {"type": "integer"},
                 },
                 "required": ["location", "trigger", "impact"],
             },
@@ -109,11 +112,12 @@ def _peer_role_args() -> tuple[str, ...]:
 
 
 # Program-owned rules shared by every reviewer; the review method itself comes from the role skill.
-_REVIEW_RULES = """- Review only. Do not create, edit, stage, commit, stash or delete anything. Any change to the working tree voids this review.
+_REVIEW_RULES = f"""- Review only. Do not create, edit, stage, commit, stash or delete anything. Any change to the working tree voids this review.
 - verdict "pass" only when no blocking issue remains; otherwise "changes_requested" with at least one blocking item.
 - Every blocking item gives location (path:line), trigger (the inputs or state that make it go wrong), impact (what breaks for whom), and optionally fix.
 - A blocking item that rests on the project guidance also gives guidance_path (the document's path as listed in the project guidance, such as AGENTS.md or a catalog entry) and guidance_clause (the exact clause it breaks, quoted).
-- Non-blocking remarks go to notes."""
+- A task message with an "## Incremental review" section narrows what may block: an item of the previous round that is still not fixed (basis "{UNFIXED}" with previous_item, its number there), or a new problem caused by the changes since that review (basis "{INTRODUCED}", located in a file those changes touch). There every blocking item gives its basis, and a problem newly found in code unchanged since that review goes to notes. Without that section anything may block, and basis and previous_item are left out.
+- Non-blocking remarks go to notes, each understandable on its own (path:line where it applies): they are delivered as follow-ups."""
 _GUIDANCE_SOURCE = """"Project guidance" in the task message is the project's requirements: its AGENTS.md and the documents selected from its guidance.toml, read from the pinned commit it names. Judge against that version; edits to those files inside the change under review do not change the rules it is judged by."""
 _REVIEWER_INTRO = f"You are {CODE_REVIEWER_ROLE}, Hibernaut's independent code reviewer. Another agent wrote the change in the task message; judge it, do not fix it."
 
@@ -188,6 +192,8 @@ class ReviewRequest:
     selection: Selection = Selection()
     # Earlier findings plus the diff since that review; empty on a first review.
     previous_round: str = ""
+    # What an incremental re-review may block on; None reviews the whole change.
+    scope: ReviewScope | None = None
     # What the review is for, shown in the interactive terminal's title.
     label: str = ""
     # The developer task this review was dispatched for, and the verified channel to its conversation.
@@ -440,6 +446,8 @@ def review_prompt(request: ReviewRequest, guidance: str, evidence: str) -> str:
     parts += [f"## Test evidence\n{request.test_evidence}", f"## Code diff\n{evidence}"]
     if request.previous_round:
         parts.append(request.previous_round)
+    if request.scope is not None:
+        parts.append(request.scope.render())
     if request.peer is not None:
         parts.append(_peer_section(request.subject, request.peer))
     return "\n\n".join(parts)
@@ -466,6 +474,9 @@ def render_review(review: Mapping[str, Any], *, executor_id: str, settings: str)
         lines.append("Developer messages:")
         lines.extend(f"- {m}" for m in exchange)
     blocking: list[dict[str, str]] = review["blocking"]
+    if review.get("downgraded"):
+        lines.append(f"Downgraded to notes: {review['downgraded']} blocking item(s) outside the incremental scope "
+                     f"(reviewer verdict: {review['reviewer_verdict']})")
     if blocking:
         lines.append("Blocking:")
         lines.append(format_blocking(blocking))
@@ -485,6 +496,8 @@ def format_blocking(blocking: Sequence[Mapping[str, str]]) -> str:
         lines.append(f"   Impact: {item['impact']}")
         if item.get("fix"):
             lines.append(f"   Fix: {item['fix']}")
+        if item.get("basis") in BASES:
+            lines.append(f"   Basis: {item['basis']}")
         if item.get("guidance_path"):
             lines.append(f"   Guidance: {item['guidance_path']}")
             lines.append(f'   Clause: "{item.get("guidance_clause", "")}"')
@@ -514,6 +527,10 @@ def validate_review(raw: object) -> dict[str, Any]:
         if not isinstance(item, dict):
             raise ReviewAborted("a blocking item is not an object")
         entry = {str(k): str(v).strip() for k, v in item.items() if isinstance(v, str)}
+        number = _whole_number(cast(dict[str, object], item).get("previous_item"))
+        entry.pop("previous_item", None)
+        if number:
+            entry["previous_item"] = number
         if not all(entry.get(k) for k in ("location", "trigger", "impact")):
             raise ReviewAborted("a blocking item lacks location, trigger or impact")
         if bool(entry.get("guidance_path")) != bool(entry.get("guidance_clause")):
@@ -526,6 +543,14 @@ def validate_review(raw: object) -> dict[str, Any]:
     exchange = [str(m) for m in cast(list[object], exchange_raw)] if isinstance(exchange_raw, list) else []
     return {"verdict": verdict, "summary": summary.strip(), "blocking": blocking, "notes": notes,
             "developer_messages": exchange}
+
+
+def _whole_number(raw: object) -> str:
+    if isinstance(raw, str):
+        return raw.strip() if raw.strip().isdecimal() else ""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return ""
+    return str(int(raw)) if isinstance(raw, int) or raw.is_integer() else ""
 
 
 def _git(workdir: Path, *args: str, env: Mapping[str, str] | None = None) -> str:
@@ -569,6 +594,16 @@ def snapshot_diff(workdir: Path, before: str, after: str) -> str:
     if len(diff) > _MAX_DIFF_CHARS:
         diff = diff[:_MAX_DIFF_CHARS] + f"\n[diff truncated at {_MAX_DIFF_CHARS} characters]"
     return diff
+
+
+def review_scope(
+    workdir: Path, before: str, after: str, *, previous: Sequence[Mapping[str, str]], notes: Sequence[str]
+) -> ReviewScope:
+    # Both names of a renamed file count as changed. The list is complete where the quoted diff is truncated.
+    changed = _git_paths(workdir, "diff", "--name-only", "--no-relative", "--no-renames", "-z",
+                         before.split(":", 1)[1], after.split(":", 1)[1])
+    return ReviewScope(root=repo_root(workdir), workdir=workdir, previous=tuple(previous), changed=tuple(changed),
+                       notes=tuple(notes))
 
 
 def _collect_diff(workdir: Path, base_ref: str) -> tuple[str, list[str]]:
