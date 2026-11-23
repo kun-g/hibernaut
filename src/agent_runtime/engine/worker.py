@@ -884,7 +884,13 @@ class AgentWorker:
                     executor.executor_id,
                     exc,
                     len(all_failed_ids),
-                    self._report_metadata(batch + folded_events, batch_correlation_key, executor.executor_id, run_id),
+                    self._report_metadata(
+                        batch + folded_events,
+                        batch_correlation_key,
+                        executor.executor_id,
+                        run_id,
+                        _task_link(batch + folded_events, active_session),
+                    ),
                 )
             if claimed_link is not None:
                 # Otherwise the task would stay in_progress on Taskboard with nothing working on it.
@@ -1358,7 +1364,6 @@ class AgentWorker:
                 route = self._route_failure(executor_id, telemetry=telemetry)
                 error_kind = route.error_kind if route is not None else None
                 error_summary = outcome.messages[0] if outcome.messages else None
-            link = _task_link(events, session)
             ledger.record_run(
                 RunLedgerEntry(
                     run_id=run_id,
@@ -1372,7 +1377,7 @@ class AgentWorker:
                     outcome_kind=end_kind,
                     emit_status=emit_status,
                     correlation_key=self._extract_correlation_key(events, session),
-                    trace_id=link.trace_id if link is not None else None,
+                    trace_id=_run_trace_id(events, _task_link(events, session)),
                     work_key=session.work_key,
                     parent_session_id=session.parent_session_id,
                     replay_of_run_id=_replay_of_run_id(events),

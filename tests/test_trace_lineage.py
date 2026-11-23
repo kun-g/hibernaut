@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from agent_runtime.adapters.ledger_bridge import RunLedger
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteInboxAdapter
 from agent_runtime.app.main import build_daemon
 from agent_runtime.core.models import (
@@ -22,8 +23,8 @@ from agent_runtime.core.models import (
     resolve_trace_id,
     resolve_trigger_event,
 )
-from agent_runtime.core.ports import InboxPort, RunCapabilities
-from agent_runtime.engine.worker import AgentWorker, RunReport
+from agent_runtime.core.ports import InboxPort, RunCapabilities, RunLedgerPort
+from agent_runtime.engine.worker import AgentWorker, ExecutorFailed, RunReport
 from tests.fakes import (
     InMemoryInbox,
     InMemoryLock,
@@ -47,13 +48,16 @@ def _event(event_id: str, payload: dict[str, Any] | None = None, **kwargs: Any) 
 class _ScriptedExecutor:
     executor_id = "claude"
 
-    def __init__(self, *outcomes: RunOutcome) -> None:
+    def __init__(self, *outcomes: RunOutcome | Exception) -> None:
         self._outcomes = list(outcomes)
 
     async def execute(
         self, events: Sequence[Event], session: SessionRef | None, caps: RunCapabilities
     ) -> RunOutcome:
-        return self._outcomes.pop(0)
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 
 class TestTraceResolution(unittest.TestCase):
@@ -84,7 +88,13 @@ class TestTraceResolution(unittest.TestCase):
 
 
 class TestRunTrace(unittest.IsolatedAsyncioTestCase):
-    def _worker(self, inbox: InboxPort, outbox: InMemoryOutbox, *outcomes: RunOutcome) -> AgentWorker:
+    def _worker(
+        self,
+        inbox: InboxPort,
+        outbox: InMemoryOutbox,
+        *outcomes: RunOutcome | Exception,
+        run_ledger: RunLedgerPort | None = None,
+    ) -> AgentWorker:
         return AgentWorker(
             worker_id="w1",
             inbox=inbox,
@@ -95,6 +105,7 @@ class TestRunTrace(unittest.IsolatedAsyncioTestCase):
             lock=InMemoryLock(),
             sessions=InMemorySessionStore(),
             executor=_ScriptedExecutor(*outcomes),
+            run_ledger=run_ledger,
         )
 
     async def _run(
@@ -161,6 +172,39 @@ class TestRunTrace(unittest.IsolatedAsyncioTestCase):
     async def test_close_session_report_carries_the_trace(self) -> None:
         reports, _ = await self._run(events=[_event("e", {"action": "close_session", "_trace_id": "t"})])
         self.assertEqual(reports[0].trace_id, "t")
+
+    async def test_ledger_run_and_outbox_carry_the_same_trace(self) -> None:
+        for event, trace in ((_event("evt_root"), "evt_root"), (_event("evt_in", {"_trace_id": "trc_ext_01"}), "trc_ext_01")):
+            with self.subTest(trace=trace), tempfile.TemporaryDirectory() as tmp:
+                ledger = RunLedger(Path(tmp) / "ledger.db")
+                try:
+                    inbox, outbox = InMemoryInbox(), InMemoryOutbox()
+                    inbox.append(event)
+                    worker = self._worker(inbox, outbox, Emit(messages=("hi",)), run_ledger=ledger.recorder)
+                    await worker.process_inbox(INBOX)
+                    (message,) = outbox.fetch_pending()
+                    self._assert_trace(message, trace)
+                    self.assertEqual(
+                        [r.run_id for r in ledger.store.list_runs(trace_id=trace)], [message.metadata["run_id"]]
+                    )
+                finally:
+                    ledger.close()
+
+    async def test_failed_run_alert_and_record_carry_the_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = RunLedger(Path(tmp) / "ledger.db", retry_delays=())
+            try:
+                inbox, outbox = InMemoryInbox(), InMemoryOutbox()
+                inbox.append(_event("evt_in", {"_trace_id": "trc_ext_01"}))
+                worker = self._worker(inbox, outbox, ValueError("boom"), run_ledger=ledger.recorder)
+                with self.assertRaises(ExecutorFailed):
+                    await worker.process_inbox(INBOX)
+                (alert,) = outbox.fetch_pending()
+                self.assertEqual(alert.metadata["kind"], "run_failed")
+                self._assert_trace(alert, "trc_ext_01")
+                self.assertEqual(len(ledger.store.list_runs(trace_id="trc_ext_01")), 1)
+            finally:
+                ledger.close()
 
     async def test_stored_event_payload_is_byte_identical_after_the_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
