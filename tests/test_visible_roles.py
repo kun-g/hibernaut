@@ -330,6 +330,33 @@ class TestVisibleSDE(VisibleCase):
         # The placeholder key is set by the gate, never typed into the terminal.
         self.assertNotIn(PROXY_PLACEHOLDER_KEY, self.orca.created()[0]["command"])
 
+    async def test_configured_gateway_and_model_reach_the_interactive_session(self):
+        self.set_plan(sde=[dev(FIXED)])
+        env = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:3425", "ANTHROPIC_AUTH_TOKEN": "magpie"}
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-daemon", "ANTHROPIC_BASE_URL": "http://daemon-gw"}):
+            outcome = await self.sde(review=False, model="codex/gpt-6.2-astra", env=env).execute(
+                [event(self.payload())], None, self.caps
+            )
+        assert isinstance(outcome, Emit), outcome
+        (call,) = self.calls("sde", "interactive")
+        self.assertEqual((call["base_url"], call["auth_token"]), ("http://127.0.0.1:3425", "magpie"))
+        self.assertEqual(call["paid_env"], ["ANTHROPIC_AUTH_TOKEN"])
+        self.assertEqual(call["argv"][call["argv"].index("--model") + 1], "codex/gpt-6.2-astra")
+        self.assertNotIn("magpie", self.orca.created()[0]["command"])
+
+    async def test_the_gate_accepts_a_credential_source_written_in_the_config(self):
+        for where in ("executor", "launcher"):
+            with self.subTest(where):
+                self.log.unlink(missing_ok=True)
+                self.set_plan(sde=[dev(FIXED)])
+                configured = {"ANTHROPIC_API_KEY": "configured"}
+                overrides = {"env": configured} if where == "executor" else {
+                    "launcher": ClaudeCodeLauncher(name="fake", command=fake_command(self.root), env=configured)}
+                outcome = await self.sde(review=False, **overrides).execute([event(self.payload())], None, self.caps)
+                assert isinstance(outcome, Emit), outcome
+                (call,) = self.calls("sde", "interactive")
+                self.assertEqual(call["api_key"], "configured")
+
     async def test_timeout_closes_the_terminal_and_keeps_the_conversation_resumable(self):
         self.set_plan(sde=[{"hang": True}])
         outcome = await self.sde(review=False, timeout=0.8).execute([event(self.payload())], None, self.caps)

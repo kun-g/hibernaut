@@ -4,7 +4,8 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TypeVar
 
-from agent_runtime.core.models import Event
+from agent_runtime.core.models import Event, SessionRef
+from agent_runtime.engine.forwarding import carried_spec
 
 T = TypeVar("T")
 
@@ -63,6 +64,15 @@ def is_approval(event: Event) -> bool:
 def target_events(events: Sequence[Event]) -> list[Event]:
     # An approval reply resumes the batch's Run and only supplies the target when it runs alone.
     return [e for e in events if not is_approval(e)] or list(events)
+
+
+def relayed_work_key(events: Sequence[Event], session: SessionRef | None) -> str | None:
+    # Work passed on inside one inbox goes on in the worktree of the agent that passed it, and so does whatever
+    # follows in the same session.
+    relayed = carried_spec(events[0]) if events else None
+    if relayed is not None and relayed.work_key:
+        return relayed.work_key
+    return session.forward.work_key if session is not None and session.forward is not None else None
 
 
 def last_text(events: Sequence[Event], key: str) -> str | None:

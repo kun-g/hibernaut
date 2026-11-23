@@ -65,8 +65,9 @@ STATIC_DEPS: dict[str, tuple[str, ...]] = {
 
 RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("src/agent_runtime/adapters/executor_cli/skills/**", ("src/agent_runtime/adapters/executor_cli/role_skills.py",)),
+    ("src/dashboard/static/**", ("src/dashboard/server.py",)),
     ("hibernaut.example.toml", ("tests/test_bootstrap_loop.py", "tests/test_sde_delivery.py")),
-    ("switchboard.example.toml", ("tests/test_switchboard_core.py",)),
+    ("switchboard.example.toml", ("tests/test_switchboard_core.py", "tests/test_switchboard_check.py")),
     ("taskboard.example.toml", ("tests/taskboard/test_m7_service.py",)),
     ("deploy/gdrive-proxy/**", ("tests/test_gdrive_credential_proxy.py",)),
     ("deploy/switchboard/**", ("tests/test_switchboard_deploy.py",)),
@@ -85,6 +86,7 @@ RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "tests/test_taskboard_hibernaut_loop.py",
         ),
     ),
+    ("schemas/runner/**", ("tests/test_runner_stage1.py",)),
     ("schemas/v1/**", ("tests/test_ledger_all.py",)),
     ("docs/dispatch/**", ("tests/test_sde_delivery.py",)),
     ("docs/process/versioning.md", ("tests/test_sde_delivery.py",)),

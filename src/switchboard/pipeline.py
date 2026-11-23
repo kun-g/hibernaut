@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import sys
 import threading
-from collections.abc import Callable, Collection, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -200,7 +200,6 @@ class DeliveryWorker:
         self._clock = clock
         self._idle_poll_seconds = idle_poll_seconds
         self._max_parallel = max(1, max_parallel)
-        self._pool: ThreadPoolExecutor | None = None
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -217,15 +216,22 @@ class DeliveryWorker:
         self._thread = threading.Thread(target=self._loop, name="switchboard-delivery", daemon=True)
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    # From here on nothing more is claimed; deliveries in flight still record their outcome.
+    def request_stop(self) -> None:
         self._stop.set()
         self._wake.set()
+
+    def join(self, timeout: float) -> bool:
         if self._thread is not None:
             self._thread.join(timeout)
+            if self._thread.is_alive():
+                return False
             self._thread = None
-        if self._pool is not None:
-            self._pool.shutdown(wait=False, cancel_futures=True)
-            self._pool = None
+        return True
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        self.request_stop()
+        return self.join(timeout)
 
     # Called when a relay consumer (re)connects: its offline-deferred rows become due now.
     def reset_offline_pending(self, consumer_id: str) -> int:
@@ -251,19 +257,43 @@ class DeliveryWorker:
             due = self._store.due_deliveries(self._clock())
             if not due:
                 break
-            # Each due item heads a distinct (consumer_id, scope) queue, so running them
-            # concurrently keeps per-scope order.
-            if self._max_parallel == 1 or len(due) == 1:
-                for item in due:
-                    self._deliver(item)
-            else:
-                if self._pool is None:
-                    self._pool = ThreadPoolExecutor(
-                        self._max_parallel, thread_name_prefix="switchboard-deliver"
-                    )
-                list(self._pool.map(self._deliver, due))
-            delivered += len(due)
+            delivered += self._deliver_all(due)
+            if self._stop.is_set():
+                break
         return delivered
+
+    # Each due item heads a distinct (consumer_id, scope) queue, so running them concurrently keeps per-scope
+    # order. Plain daemon threads: the interpreter joins ThreadPoolExecutor workers at exit, so one stuck
+    # delivery would keep the process alive past the shutdown timeout.
+    def _deliver_all(self, due: Sequence[DueDelivery]) -> int:
+        todo = deque(due)
+        errors: list[Exception] = []
+        done: list[None] = []
+
+        def work() -> None:
+            while not self._stop.is_set():
+                try:
+                    item = todo.popleft()
+                except IndexError:
+                    return
+                try:
+                    self._deliver(item)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                done.append(None)
+
+        threads = [
+            threading.Thread(target=work, name=f"switchboard-deliver-{index}", daemon=True)
+            for index in range(1, min(self._max_parallel, len(due)))
+        ]
+        for thread in threads:
+            thread.start()
+        work()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+        return len(done)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -271,6 +301,9 @@ class DeliveryWorker:
                 self.run_once()
             except Exception as exc:  # noqa: BLE001
                 print(f"[switchboard] delivery loop error: {exc!r}", file=sys.stderr)
+            # A forced shutdown has closed the store by now.
+            if self._stop.is_set():
+                return
             self._wake.wait(self._sleep_seconds())
             self._wake.clear()
 

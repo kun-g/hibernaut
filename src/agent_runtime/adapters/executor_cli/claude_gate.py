@@ -73,12 +73,14 @@ def _main(spec: dict[str, Any], running: list[subprocess.Popen[bytes]]) -> int:
     env = {k: v for k, v in os.environ.items() if k not in spec["unset"]}
     env.update(spec["set"])
     p = spec["profile"]
+    # A daemon started before this file was updated writes specs without the env fields.
     profile = ClaudeCodeProfile(
         name=p["name"],
-        launcher=ClaudeCodeLauncher(name=p["launcher"], command=p["launcher_command"]),
+        launcher=ClaudeCodeLauncher(name=p["launcher"], command=p["launcher_command"], env=p.get("launcher_env", {})),
         billing=p["billing"],
         model=p["model"],
         effort=p["effort"],
+        env=p.get("env", {}),
         credential_proxy_url=p["credential_proxy_url"],
     )
     try:

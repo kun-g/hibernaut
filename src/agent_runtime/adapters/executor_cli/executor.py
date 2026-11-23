@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Literal
 
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner
-from agent_runtime.adapters.executor_cli.process import ProcessTimeout, last_text, supervise, target_events
+from agent_runtime.adapters.executor_cli.process import (
+    ProcessTimeout,
+    last_text,
+    relayed_work_key,
+    supervise,
+    target_events,
+)
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager, WorkspaceIsolationError
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.core.models import (
@@ -41,6 +47,8 @@ class CLITemplate:
     orca_agent: str | None = None
     # Only CLIReviewer reads it: "orca" runs the review in a visible Orca terminal of the worktree.
     terminal: Literal["none", "orca"] = "none"
+    # Read by the worker pool: inboxes running this executor at once, across all projects; None leaves it unlimited.
+    max_concurrency: int | None = None
 
 
 CLI_TERMINALS: tuple[Literal["none", "orca"], ...] = ("none", "orca")
@@ -120,7 +128,8 @@ class LocalCLIExecutor:
         targets = target_events(events)
         explicit_workdir = self._extract_explicit_workdir(targets)
         work_key = (
-            events[0].correlation_key
+            relayed_work_key(targets, session)
+            or events[0].correlation_key
             or (session.correlation_key if session is not None else None)
             or f"task:{inbox_id}:{events[0].event_id}"
         )

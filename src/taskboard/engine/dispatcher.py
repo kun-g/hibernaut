@@ -58,6 +58,7 @@ class UnlockDispatcher:
         *,
         trace_id: str | None = None,
         hop_count: int = 0,
+        replay: bool = False,
     ) -> TaskItem | None:
         if task.status != "ready":
             return None
@@ -66,8 +67,11 @@ class UnlockDispatcher:
 
         self._guard_hops(hop_count, task_id=task.task_id)
         if task.claimed_ready_at is not None and task.claimed_ready_at == task.ready_at:
-            # Replay: this ready episode already owns dispatch_seq, so the same external_id is
-            # republished and Switchboard dedupes it.
+            # This ready episode is already claimed. Only the redelivery of the event that made the
+            # claim republishes it (same external_id, deduped by Switchboard), finishing a publish
+            # that failed; anyone else reaching it concurrently leaves it to its claimer.
+            if not replay:
+                return None
             claimed = task
         else:
             claimed = self._store.try_claim_dispatch(task.task_id, expected_version=task.version)
@@ -113,6 +117,7 @@ class UnlockDispatcher:
         *,
         trace_id: str | None = None,
         hop_count: int = 0,
+        replay: bool = False,
     ) -> list[TaskItem]:
         candidates = self._store.list_unblocked_downstream(completed_task_id)
         promoted: list[TaskItem] = []
@@ -141,7 +146,9 @@ class UnlockDispatcher:
         dispatched: list[TaskItem] = []
         effective_trace = trace_id or new_trace_id()
         for item in promoted:
-            sent = self.dispatch_ready_task(item, trace_id=effective_trace, hop_count=hop_count)
+            sent = self.dispatch_ready_task(
+                item, trace_id=effective_trace, hop_count=hop_count, replay=replay
+            )
             dispatched.append(sent if sent is not None else item)
         return dispatched
 

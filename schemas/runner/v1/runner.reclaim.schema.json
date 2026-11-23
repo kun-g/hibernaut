@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hibernaut.local/schemas/runner/v1/runner.reclaim.schema.json",
+  "title": "RunnerReclaim",
+  "type": "object",
+  "oneOf": [
+    {
+      "title": "ReclaimRequest",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "namespace", "project_key", "owner_scope", "work_key"],
+      "properties": {
+        "schema_version": { "const": "runner.v1" },
+        "namespace": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,15}$" },
+        "project_key": { "type": "string", "minLength": 1 },
+        "owner_scope": { "type": "string", "minLength": 1 },
+        "work_key": { "type": "string", "minLength": 1 },
+        "merged_head_sha": { "type": ["string", "null"] }
+      }
+    },
+    {
+      "title": "ReclaimResult",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "reclaimed", "status", "reason", "blockers"],
+      "properties": {
+        "schema_version": { "const": "runner.v1" },
+        "reclaimed": { "type": "boolean" },
+        "status": { "enum": ["reclaimed", "blocked", "not_found", "error"] },
+        "reason": { "type": "string" },
+        "blockers": { "type": "array", "items": { "type": "string" } },
+        "branch_kept": { "type": ["string", "null"] }
+      }
+    }
+  ]
+}
