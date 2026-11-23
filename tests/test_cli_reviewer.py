@@ -30,7 +30,8 @@ from agent_runtime.core.models import Emit, Event, PermissionDecision
 from tests.async_deadline import expire_when_ready
 from tests.fakes import InMemoryPermission
 from tests.test_coder_reviewer import CHANGES_REQUESTED, fake_command, make_repo
-from tests.test_pr_delivery import DeliveryCase
+from tests.test_pr_delivery import DeliveryCase, rendered_body
+from tests.review_flow_support import DONE, REPORT, ReviewFlowCase
 from tests.test_visible_roles import FakeOrcaTerminals
 
 FAKE_CLI = Path(__file__).with_name("fake_cli_reviewer.py")
@@ -393,58 +394,81 @@ class TestSDEWithCLIReviewer(DeliveryCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.cli.calls()), 1)
         self.assertEqual(Path(self.cli.calls()[0]["cwd"]).resolve(), self.wt.resolve())
 
+    def git_bare(self, *args):
+        import subprocess
+        return subprocess.run(["git", *args], cwd=self.bare, check=True, capture_output=True, text=True).stdout.strip()
+
+
+class TestCLIReviewerRounds(ReviewFlowCase):
+    terminal = False
+
+    async def reviewed_rounds(self, reviews, changes):
+        template = CLITemplate(name="grok", command="grok", args=("-p",), terminal="orca" if self.terminal else "none")
+        terminal = Mock(spec=OrcaCommandTerminal) if self.terminal else None
+        cli = CLIReviewer(template=template, terminal=terminal)
+        outputs = [f"```json\n{json.dumps(review)}\n```" for review in reviews]
+        self.prompts = []
+        if terminal is not None:
+            async def reply(**command):
+                self.prompts.append(command["argv"][2])
+                index = len(self.prompts) - 1
+                return orca_module.TerminalRun(f"term_{index}", outputs[index].encode(), b"", 0)
+            terminal.run.side_effect = reply
+        else:
+            async def stdout(prompt, cwd, caps):
+                self.prompts.append(prompt)
+                return outputs[len(self.prompts) - 1]
+            self.enterContext(patch.object(cli, "_run_subprocess", new=stdout))
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.cli_reviewer.review_inputs", return_value=("diff", "")))
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.cli_reviewer.worktree_fingerprint", return_value="head:tree"))
+        self.executor._reviewer = cli
+        self.executor._options = SDEOptions(review=True, reviewer="grok", max_review_rounds=4)
+        self.delivery.config.close_terminal = False
+        snaps = [str(i) for i in range(len(reviews))]
+        diffs = {(a, b): (f"+++ b/{name}\n+x = 2", [name]) for a, b, name in zip(snaps[:-1], snaps[1:], changes, strict=True)}
+        reports = [REPORT] * (len(reviews) - 1) + [{**REPORT, "summary": "zero divisor rejected"}]
+        outcome = await self.run_flow(snapshots=snaps, diffs=diffs, reviews=reviews, reports=reports, deliveries=[DONE])
+        self.assertIsInstance(outcome, Emit)
+        self.assertEqual(len(self.prompts), len(reviews))
+        return outcome.messages[0]
+
     async def test_cli_changes_requested_sends_the_blocking_items_back_for_a_fix(self):
-        self.set_dev(({"calc.py": "x = 1\n"}, "first try"), ({"calc.py": "x = 2\n"}, "zero divisor rejected"))
-        self.cli.set(f"```json\n{json.dumps(CHANGES_REQUESTED)}\n```", json.dumps(PASS))
-        self.caps.permissions = InMemoryPermission({MERGE_TOOL: PermissionDecision("block", "not in this test")})
-        outcome = await self.executor(self.delivery()).execute([self.event()], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
-        self.assertIn("review=pass after 2 round", outcome.messages[0])
-        self.assertIn("zero divisor rejected", outcome.messages[0])
-        first_dev, fix_dev = self.dev_calls()
+        text = await self.reviewed_rounds([CHANGES_REQUESTED, PASS], ["calc.py"])
+        self.assertIn("review=pass after 2 round", text)
+        self.assertIn("zero divisor rejected", text)
+        first, fix = self.develop.await_args_list
         for part in ("calc.py:2", "divide(1, 0)", "ZeroDivisionError crashes the caller", "reject zero divisors"):
-            self.assertIn(part, fix_dev["prompt"])
-        first_review, rereview = self.cli.calls()
-        rereview_prompt = rereview["argv"][1]
-        self.assertIn("## Previous review round\n[grok] verdict=changes_requested (cli=", rereview_prompt)
-        self.assertIn("## Changes since the previous review", rereview_prompt)
-        self.assertIn("+x = 2", rereview_prompt)
+            self.assertIn(part, fix.args[3])
+        self.assertIn("## Previous review round\n[grok] verdict=changes_requested (cli=", self.prompts[1])
+        self.assertIn("## Changes since the previous review", self.prompts[1])
+        self.assertIn("+x = 2", self.prompts[1])
 
     async def test_a_cli_review_in_round_two_is_held_to_the_same_scope(self):
-        old = {"location": "old.py:1", "trigger": "y is read", "impact": "wrong value"}
+        late = {"location": "old.py:1", "trigger": "y is read", "impact": "wrong value", "basis": "introduced_since_previous"}
         unfixed = {**CHANGES_REQUESTED["blocking"][0], "basis": "unfixed_previous", "previous_item": 1}
-        late = {**old, "basis": "introduced_since_previous"}
-        broke = {"location": "calc.py:1", "trigger": "import", "impact": "x is gone",
-                 "basis": "introduced_since_previous"}
-        self.set_dev(({"calc.py": "x = 1\n", "old.py": "y = 1\n"}, "try 1"), ({"calc.py": "x = 2\n"}, "try 2"),
-                     ({"calc.py": "x = 3\n"}, "try 3"), ({"other.txt": "z\n"}, "try 4"))
+        broke = {"location": "calc.py:1", "trigger": "import", "impact": "x is gone", "basis": "introduced_since_previous"}
         rounds = [CHANGES_REQUESTED, {**CHANGES_REQUESTED, "blocking": [unfixed, late], "notes": []},
                   {**CHANGES_REQUESTED, "blocking": [broke, late], "notes": []},
                   {**CHANGES_REQUESTED, "blocking": [late], "notes": []}]
-        self.cli.set(*(f"```json\n{json.dumps(r)}\n```" for r in rounds))
-        self.caps.permissions = InMemoryPermission({MERGE_TOOL: PermissionDecision("block", "not in this test")})
-        executor = self.executor(self.delivery())
-        executor._options = SDEOptions(review=True, reviewer="grok", max_review_rounds=4)  # pyright: ignore
-        outcome = await executor.execute([self.event()], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
-        text = outcome.messages[0]
+        text = await self.reviewed_rounds(rounds, ["calc.py", "calc.py", "other.txt"])
         for part in ("review=pass after 4 round", "round 2 changes_requested (1 blocking, 1 downgraded)",
                      "round 3 changes_requested (1 blocking, 1 downgraded)", "round 4 pass (1 downgraded)", "已降级：",
                      "[grok] verdict=pass (cli="):
             self.assertIn(part, text)
-        self.assertIn("ZeroDivisionError crashes the caller", self.dev_calls()[2]["prompt"])
-        self.assertIn("x is gone", self.dev_calls()[3]["prompt"])
-        self.assertNotIn("old.py:1", "".join(c["prompt"] for c in self.dev_calls()))
-        self.assertIn("## Incremental review", self.cli.calls()[1]["argv"][1])
-        state = json.loads(self.state_file.read_text())
-        followups = state["prs"][0]["body"].split("## 跟进\n")[1].split("\n\n## ")[0]
+        prompts = [c.args[3] for c in self.develop.await_args_list]
+        self.assertIn("ZeroDivisionError crashes the caller", prompts[2])
+        self.assertIn("x is gone", prompts[3])
+        self.assertNotIn("old.py:1", "".join(prompts))
+        self.assertIn("## Incremental review", self.prompts[1])
+        request = self.delivery.deliver.call_args.args[0]
+        followups = rendered_body(followups=request.followups).split("## 跟进\n")[1].split("\n\n## ")[0]
         self.assertEqual(followups.count("old.py:1"), 1)
         self.assertIn("name the helper more clearly", followups)
         self.assertEqual(text.split("跟进：\n")[1].count("old.py:1"), 1)
 
-    def git_bare(self, *args):
-        import subprocess
-        return subprocess.run(["git", *args], cwd=self.bare, check=True, capture_output=True, text=True).stdout.strip()
+
+class TestCLIReviewerTerminalRounds(TestCLIReviewerRounds):
+    terminal = True
 
 
 _RUNNER = object()

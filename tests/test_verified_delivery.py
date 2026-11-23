@@ -350,13 +350,11 @@ class ReclaimCase(DeliveryCase):
         return git(self.wt, "rev-parse", "HEAD")
 
     def squash_merge(self):
-        merger = self.clone("merger", None)
-        git(merger, "merge", "--squash", "origin/hb/task-9")
-        git(merger, "commit", "-qm", "work (#3)")
-        git(merger, "push", "-q", "origin", "main")
-        git(merger, "push", "-q", "origin", "--delete", "hb/task-9")
-        git(self.wt, "fetch", "-q", "--prune", "origin")
-        return git(merger, "rev-parse", "HEAD")
+        # This fixture has no upstream changes: a squash has the task's tree and the old main as its only parent.
+        git(self.primary, "merge-base", "--is-ancestor", "origin/main", "hb/task-9")
+        merge = git(self.primary, "commit-tree", "hb/task-9^{tree}", "-p", "origin/main", "-m", "work (#3)")
+        git(self.primary, "push", "-q", "--atomic", "origin", f"{merge}:refs/heads/main", ":refs/heads/hb/task-9")
+        return merge
 
     def merged_pr(self, head, merge):
         self.gh["merged"] = CommandResult(0, json.dumps(
