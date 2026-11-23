@@ -10,6 +10,8 @@ services:
       dockerfile: deploy/switchboard/Dockerfile
     image: switchboard:local
     restart: unless-stopped
+    # Longer than shutdown_timeout_seconds plus the forced close; Docker's default of 10s would SIGKILL the drain.
+    stop_grace_period: 20s
     env_file: [".env"]
     volumes:
       - ./switchboard.toml:/etc/switchboard/switchboard.toml:ro

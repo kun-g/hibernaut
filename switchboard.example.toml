@@ -5,6 +5,12 @@
 # SWITCHBOARD_FEISHU_APP_SECRET, which Switchboard exchanges and refreshes itself) from the environment, plus
 # SWITCHBOARD_RELAY_WEBHOOK_SECRET (the token relay agents must present) when [relay] is enabled.
 
+# Validate this file and the environment without side effects: python -m switchboard.app --config <file> --check
+
+# On SIGTERM / SIGINT: seconds to wait for requests, deliveries and sends in flight (positive, default 10). Must stay
+# above the first [table]; give the supervisor (docker stop, systemd, launchd) a few seconds more before SIGKILL.
+shutdown_timeout_seconds = 10.0
+
 [http]
 host = "127.0.0.1"
 port = 8790

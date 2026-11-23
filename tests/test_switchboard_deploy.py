@@ -21,6 +21,8 @@ class DockerConfigTemplateTests(unittest.TestCase):
         self.assertIs(config.relay.enabled, True)
         self.assertEqual(config.relay.transport, "hybrid")
         self.assertEqual(config.relay.path, "/ws/relay")
+        # Supervisors need a grace period longer than this (DockerKitTests).
+        self.assertEqual(config.shutdown_timeout_seconds, 10.0)
         # The relay must share the [http] port, the only one Caddy forwards to.
         self.assertIsNone(config.relay.listen_port)
         # A public repo must not let anyone start a Run by opening an issue.
@@ -56,6 +58,14 @@ class DockerKitTests(unittest.TestCase):
         self.assertIn('"80:80"', blocks["caddy"])
         self.assertIn('"443:443"', blocks["caddy"])
         self.assertIn("condition: service_healthy", blocks["caddy"])
+
+    def test_every_compose_file_gives_the_drain_more_time_than_its_limit(self) -> None:
+        limit = load_config(DEPLOY / "switchboard.docker.toml").shutdown_timeout_seconds
+        for name in ("docker-compose.yml", "README.md"):
+            with self.subTest(name):
+                grace = re.search(r"(?m)^ +stop_grace_period: (\d+)s$", (DEPLOY / name).read_text(encoding="utf-8"))
+                assert grace is not None
+                self.assertGreaterEqual(int(grace.group(1)), limit + 5)
 
     def test_env_example_lists_names_without_values(self) -> None:
         lines = [
