@@ -49,6 +49,8 @@ class RunnerConfig:
     state_dir: Path
     logs_dir: Path
     labels: dict[str, str] = field(default_factory=_empty_labels)
+    # Refuse every run that asks for a writable workspace.
+    readonly_only: bool = False
 
     def __post_init__(self) -> None:
         if not self.runner_id:
@@ -86,6 +88,9 @@ def parse_runner_config(raw: Mapping[str, Any], *, base_dir: Path) -> RunnerConf
     logs_dir = _resolve_path(str(runner_sec.get("logs_dir", "logs/runs")), base_dir)
     labels_raw = cast(Mapping[str, Any], runner_sec.get("labels", {}))
     labels = {str(k): str(v) for k, v in labels_raw.items()}
+    readonly_only: Any = runner_sec.get("readonly_only", False)
+    if not isinstance(readonly_only, bool):
+        raise ValueError("runner.readonly_only must be true or false")
 
     ns_section = cast(Mapping[str, Any], raw.get("namespaces", {}))
     namespaces: dict[str, NamespacePolicy] = {}
@@ -127,6 +132,7 @@ def parse_runner_config(raw: Mapping[str, Any], *, base_dir: Path) -> RunnerConf
         state_dir=state_dir,
         logs_dir=logs_dir,
         labels=labels,
+        readonly_only=readonly_only,
     )
 
 

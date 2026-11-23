@@ -47,6 +47,7 @@ from agent_runtime.app.projects import (
 )
 from agent_runtime.core.models import InboxRoute, NewEventPolicy
 from runner.cli_drivers import TemplateCLIDriver, ToolHookStyle
+from runner.protocol_check import PROTOCOL_CHECK_EXECUTOR_ID
 
 _log = logging.getLogger(__name__)
 
@@ -399,6 +400,19 @@ _RUNNER_KEYS = frozenset(f.name for f in dataclasses.fields(RunnerLinkConfig))
 
 
 @dataclass(frozen=True, slots=True)
+class RunnerPilotConfig:
+    # One task inbox checked by one standalone Runner (docs/runner.md §8); off unless a deployment turns it on.
+    enabled: bool = False
+    inbox_id: str = ""
+    runner_id: str = ""
+    project_key: str = ""
+    # The Relay listens on 127.0.0.1 only; the address is not configurable.
+    port: int = 8791
+    token_file: str = ""
+    timeout_seconds: float = 120.0
+
+
+@dataclass(frozen=True, slots=True)
 class HibernautConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
@@ -415,6 +429,7 @@ class HibernautConfig:
     switchboard: SwitchboardLinkConfig = field(default_factory=SwitchboardLinkConfig)
     peer: PeerHandoffConfig = field(default_factory=PeerHandoffConfig)
     runner: RunnerLinkConfig = field(default_factory=RunnerLinkConfig)
+    runner_pilot: RunnerPilotConfig = field(default_factory=RunnerPilotConfig)
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
 
@@ -534,6 +549,68 @@ def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> Switchb
         mcp_url=mcp_url,
         ca_file=ca_file,
     )
+
+
+_PILOT_KEYS = frozenset({"enabled", "inbox_id", "runner_id", "project_key", "port", "token_file", "timeout_seconds"})
+# <project>:<task>: a user's or a project's main inbox would put ordinary work on the pilot route.
+_TASK_INBOX_RE = re.compile(r"(?!user:|proj:)[^\s:]+:[^\s:]+")
+
+
+def parse_runner_pilot(raw: Any, *, base_dir: Path | None = None) -> RunnerPilotConfig:
+    defaults = RunnerPilotConfig()
+    if raw is None:
+        return defaults
+    if not isinstance(raw, dict):
+        raise ValueError("[runner_pilot] must be a table")
+    section = cast(dict[str, Any], raw)
+    unknown = sorted(set(section) - _PILOT_KEYS)
+    if unknown:
+        raise ValueError(f"[runner_pilot] has unknown keys: {', '.join(unknown)}")
+    enabled = section.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("runner_pilot.enabled must be true or false")
+    texts: dict[str, str] = {}
+    for key in ("inbox_id", "runner_id", "project_key", "token_file"):
+        value = section.get(key, "")
+        if not isinstance(value, str) or value != value.strip() or (enabled and not value):
+            raise ValueError(f"runner_pilot.{key} must be a non-empty string when the route is enabled")
+        texts[key] = value
+    port = section.get("port", defaults.port)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("runner_pilot.port must be a port number")
+    timeout = section.get("timeout_seconds", defaults.timeout_seconds)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 600:
+        raise ValueError("runner_pilot.timeout_seconds must be a number above 0 and at most 600")
+    if enabled and _TASK_INBOX_RE.fullmatch(texts["inbox_id"]) is None:
+        raise ValueError('runner_pilot.inbox_id must be one task inbox ("<project>:<task>", not "proj:" or "user:")')
+    return RunnerPilotConfig(
+        enabled=enabled,
+        inbox_id=texts["inbox_id"],
+        runner_id=texts["runner_id"],
+        project_key=texts["project_key"],
+        port=port,
+        token_file=_resolve_path(texts["token_file"], base_dir) if texts["token_file"] else "",
+        timeout_seconds=float(timeout),
+    )
+
+
+def _validate_runner_pilot(config: HibernautConfig) -> None:
+    pilot = config.runner_pilot
+    if not pilot.enabled:
+        return
+    if pilot.inbox_id == config.gdrive.default_inbox_id:
+        raise ValueError("runner_pilot.inbox_id is gdrive.default_inbox_id; use a task inbox of its own")
+    for project in config.projects.values():
+        if project.inbox_id == pilot.inbox_id:
+            raise ValueError(
+                f"runner_pilot.inbox_id is the primary inbox of projects.{project.name}; use a task inbox of its own"
+            )
+    if config.runtime.default_agent not in config.agents:
+        raise ValueError("runner_pilot.enabled needs runtime.default_agent to be a declared agent (no run starts without it)")
+    if pilot.port == config.channels.port:
+        raise ValueError("runner_pilot.port is channels.port")
+    if config.runner.enabled and config.runner.mode == "relay" and pilot.port == config.runner.listen_port:
+        raise ValueError("runner_pilot.port is runner.listen_port; each relay needs its own port")
 
 
 def tool_hook_style(agent: AgentConfig, template: CLITemplate) -> ToolHookStyle | None:
@@ -758,6 +835,10 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
     # Launchers come only from this trusted deployment file; events cannot name a command.
     launchers = parse_launchers(raw.get("launchers", {}))
 
+    for table in ("executors", "agents"):
+        if PROTOCOL_CHECK_EXECUTOR_ID in raw.get(table, {}):
+            raise ValueError(f"{table}.{PROTOCOL_CHECK_EXECUTOR_ID}: the name is reserved for [runner_pilot]")
+
     executors: dict[str, CLITemplate] = {}
     roles: dict[str, RoleConfig] = {}
     # Pure drivers: no role and no command, so nothing to run until an agent picks them.
@@ -963,7 +1044,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         default_inbox_id=str(gd_raw.get("default_inbox_id", "default")).strip() or "default",
     )
 
-    return HibernautConfig(
+    config = HibernautConfig(
         runtime=runtime,
         channels=channels,
         executors=executors,
@@ -977,5 +1058,8 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         switchboard=parse_switchboard_link(raw.get("switchboard"), base_dir=base_dir),
         peer=parse_peer(raw.get("peer"), base_dir=base_dir),
         runner=parse_runner_link(raw.get("runner"), agents=agents, templates=executors, base_dir=base_dir),
+        runner_pilot=parse_runner_pilot(raw.get("runner_pilot"), base_dir=base_dir),
         config_dir=str(base_dir) if base_dir is not None else "",
     )
+    _validate_runner_pilot(config)
+    return config

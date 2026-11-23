@@ -21,6 +21,7 @@ class AutoModePermissionAdapter:
             "orca.agent.launch",
             "code_reviewer.launch",
             "sde.launch",
+            "runner.protocol_check.launch",
             "steward.launch",
             # The worker limits forwards by project, whitelist and hop count whatever this says; move it to the defer
             # list to also ask a person every time.

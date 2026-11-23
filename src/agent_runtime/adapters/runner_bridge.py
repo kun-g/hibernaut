@@ -30,6 +30,7 @@ from runner.protocol import (
     ToolDecision,
 )
 from runner.registry import NoEligibleRunnerError, NodeAffinityOfflineError
+from runner.transport.relay_hub import RunnerConnectionLostError
 
 _CHECKPOINT_KIND = "runner_tool_defer"
 _PROMPT_ARGS_CHARS = 4000
@@ -212,7 +213,7 @@ class RunnerExecutorBridge:
                 "event_ids": [ev.event_id for ev in events],
             },
         )
-
+        req = self._prepare_request(req, events, session)
         stop = asyncio.Event()
         run_task = asyncio.create_task(self._submit(req, policy.authorize if gated else None, stop))
         interrupted = False
@@ -229,10 +230,10 @@ class RunnerExecutorBridge:
             # Run on the same work_key would start a second CLI in the same worktree.
             stop.set()
             await _uncancellable(self._stop_run(run_task, run_id))
-            if not run_task.cancelled() and run_task.exception() is None:
-                # The runner's own result says which node ran (and stopped) the Run; the worker records it.
-                result = run_task.result()
-                raise RunCancelled(result.error_summary or "interrupted", telemetry=_run_telemetry(result)) from None
+            telemetry = _stopped_telemetry(run_task)
+            if telemetry is not None:
+                # It says which node ran (and stopped) the Run; the worker records it.
+                raise RunCancelled(telemetry.stderr or "interrupted", telemetry=telemetry) from None
             raise
         result = run_task.result()
         # A Run stopped for new events goes back to its inbox and asks again; only one stopped by the defer suspends.
@@ -259,8 +260,14 @@ class RunnerExecutorBridge:
                 session_checkpoint=deferred.dump(),
                 session_id=session.session_id,
                 executor_session_id=result.executor_session_id or session.executor_session_id,
-                telemetry=_run_telemetry(result),
+                telemetry=run_telemetry(result),
             )
+        return self._translate(result, session, events)
+
+    def _prepare_request(self, req: RunRequest, events: Sequence[Event], session: SessionRef) -> RunRequest:
+        return req
+
+    def _translate(self, result: RunResult, session: SessionRef, events: Sequence[Event]) -> RunOutcome:
         return translate_run_result(result, session_id=session.session_id)
 
     async def _submit(self, req: RunRequest, authorizer: ToolAuthorizer | None, stop: asyncio.Event) -> RunResult:
@@ -348,7 +355,21 @@ def _approval_prompt(request_id: str, state: _DeferState) -> str:
     return f"需要人工确认（{request_id}）：准备执行 {state.tool_name} {shown}{reason}"
 
 
-def _run_telemetry(result: RunResult) -> RunTelemetry:
+def _stopped_telemetry(run_task: asyncio.Task[RunResult]) -> RunTelemetry | None:
+    if run_task.cancelled():
+        return None
+    exc = run_task.exception()
+    if exc is None:
+        return run_telemetry(run_task.result())
+    return lost_run_telemetry(exc) if isinstance(exc, RunnerConnectionLostError) else None
+
+
+def lost_run_telemetry(exc: RunnerConnectionLostError) -> RunTelemetry:
+    # The node reaps its runs when the connection goes; its result and log reference did not arrive.
+    return RunTelemetry(stderr=str(exc), error_kind="network", runner_id=exc.runner_id)
+
+
+def run_telemetry(result: RunResult) -> RunTelemetry:
     # The worker's run ledger logs, prices and classifies a Run from its telemetry, as it does for LocalCLIExecutor.
     return RunTelemetry(
         stdout=result.stdout_excerpt,
@@ -356,16 +377,26 @@ def _run_telemetry(result: RunResult) -> RunTelemetry:
         exit_code=result.exit_code,
         error_kind=result.error_kind,
         runner_id=result.runner_id,
+        runner_log=_runner_log(result),
     )
 
 
+def _runner_log(result: RunResult) -> str | None:
+    ref = result.log_ref
+    if ref is None:
+        return None
+    # The path below the node's logs_dir (<day>/<run>.log); where that directory is stays on the node.
+    tail = "/".join(ref.path.replace("\\", "/").split("/")[-2:])
+    return f"runner://{ref.runner_id}/{tail} run_id={result.run_id} sha256={ref.sha256} bytes={ref.bytes}"
+
+
 def translate_run_result(result: RunResult, *, session_id: str) -> RunOutcome:
-    return replace(_translate_status(result, session_id=session_id), telemetry=_run_telemetry(result))
+    return replace(_translate_status(result, session_id=session_id), telemetry=run_telemetry(result))
 
 
 def _translate_status(result: RunResult, *, session_id: str) -> RunOutcome:
     if result.status == "interrupted":
-        raise RunCancelled(result.error_summary or "interrupted", telemetry=_run_telemetry(result))
+        raise RunCancelled(result.error_summary or "interrupted", telemetry=run_telemetry(result))
 
     if result.status == "refused":
         return Emit(

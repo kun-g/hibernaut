@@ -38,7 +38,22 @@ class TestSelectTests(unittest.TestCase):
     def test_runner_schema_change_selects_schema_consuming_test(self) -> None:
         res = select_tests(["schemas/runner/v1/runner.run_request.schema.json"])
         self.assertFalse(res.full_suite)
-        self.assertEqual(res.tests, ("tests/test_runner_stage1.py", "tests/test_runner_tool_gate.py"))
+        self.assertEqual(
+            res.tests,
+            (
+                "tests/test_runner_pilot.py",
+                "tests/test_runner_service.py",
+                "tests/test_runner_stage1.py",
+                "tests/test_runner_tool_gate.py",
+            ),
+        )
+
+    def test_runner_service_program_and_deploy_example_select_the_tests_that_start_it(self) -> None:
+        # The check program is run as a script; no test imports everything that starts it.
+        program = select_tests(["src/runner/protocol_check.py"])
+        self.assertIn("tests/test_runner_service.py", program.tests)
+        self.assertIn("tests/test_runner_pilot.py", program.tests)
+        self.assertEqual(select_tests(["deploy/runner/runner.example.toml"]).tests, ("tests/test_runner_service.py",))
 
     def test_taskboard_service_entry_and_example_config_select_service_tests(self) -> None:
         entry = select_tests(["src/taskboard/app/__main__.py"])
