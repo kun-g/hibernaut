@@ -13,6 +13,7 @@ from typing import Any, cast
 from agent_runtime.adapters.executor_cli.executor import CLITemplate, render_cli_args
 from agent_runtime.adapters.executor_cli.orca import (
     OrcaCommandTerminal,
+    TerminalRun,
     TerminalRunFailed,
     TerminalStartFailed,
     TerminalUnavailable,
@@ -28,6 +29,7 @@ from agent_runtime.adapters.executor_cli.reviewer import (
     ReviewRequest,
     plain_review_contract,
     render_review,
+    render_terminals,
     review_inputs,
     review_prompt,
     validate_review,
@@ -38,6 +40,8 @@ from agent_runtime.core.ports import RunCapabilities
 
 _FENCE = re.compile(r"```[ \t]*(?:json)?[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
 _MAX_STDERR_CHARS = 500
+_SESSION_KEYS = ("session_id", "sessionId")
+_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _FIRST_TURN = "review"
 _RETRY_TURN = "review-retry"
 _COMPACT_SCHEMA = json.dumps(REVIEW_SCHEMA, separators=(",", ":"))
@@ -48,11 +52,22 @@ def _no_handles() -> list[str]:
     return []
 
 
+def _no_sessions() -> dict[str, str]:
+    return {}
+
+
 @dataclass(slots=True)
 class _Where:
     # Where one review's runs went: Orca terminals, or a subprocess after Orca was unavailable (fallback says why).
     handles: list[str] = field(default_factory=_no_handles)
+    # The CLI's own session ID by terminal handle, for the runs that printed one.
+    sessions: dict[str, str] = field(default_factory=_no_sessions)
     fallback: str = ""
+
+    def add(self, run: TerminalRun) -> None:
+        self.handles.append(run.handle)
+        if session := _cli_session(run.stdout):
+            self.sessions[run.handle] = session
 
 
 class CLIReviewer:
@@ -84,10 +99,21 @@ class CLIReviewer:
         self, request: ReviewRequest, caps: RunCapabilities, slot: TurnSlot | None = None
     ) -> dict[str, Any]:
         # A slot applies only to runs in an Orca terminal; a subprocess run is waited for when the process stops.
+        where = self._where()
+        try:
+            return await self._review(request, caps, slot, where)
+        except ReviewAborted as exc:
+            # The terminals are closed by now; a review without a verdict still says which ones it ran in.
+            if where is None or not where.handles:
+                raise
+            raise ReviewAborted(f"{exc} (Orca terminal: {render_terminals(where.handles, where.sessions)})") from exc
+
+    async def _review(
+        self, request: ReviewRequest, caps: RunCapabilities, slot: TurnSlot | None, where: _Where | None
+    ) -> dict[str, Any]:
         evidence, guidance = await review_inputs(request)
         prompt = f"{review_prompt(request, guidance, evidence)}\n\n{plain_review_contract()}"
         subject = request.label or request.workdir.name
-        where = self._where()
         saved = (slot.peek(_RETRY_TURN) or slot.peek(_FIRST_TURN)) if slot is not None else None
         recorded = saved.get("before") if saved is not None else None
         before = recorded if isinstance(recorded, str) else await asyncio.to_thread(worktree_fingerprint, request.workdir)
@@ -132,7 +158,7 @@ class CLIReviewer:
             raise ReviewAborted(f"{t.name}: {exc}") from exc
         if run is None:
             return None
-        where.handles.append(run.handle)
+        where.add(run)
         if run.exit_code is None:
             raise ReviewAborted(f"{t.name}: {run.error or f'no exit code from Orca terminal {run.handle}'}")
         return self._stdout(run.exit_code, run.stdout, run.stderr)
@@ -151,7 +177,7 @@ class CLIReviewer:
         if where is None:
             return {}
         return {"cli_terminal": "fallback" if where.fallback else "orca", "cli_terminal_fallback": where.fallback,
-                "cli_terminals": list(where.handles)}
+                "cli_terminals": list(where.handles), "cli_sessions": dict(where.sessions)}
 
     async def _unchanged(self, workdir: Path, before: str) -> None:
         after = await asyncio.to_thread(worktree_fingerprint, workdir)
@@ -196,7 +222,7 @@ class CLIReviewer:
             raise ReviewAborted(f"{t.name}: '{t.command}' {exc}") from exc
         except TerminalRunFailed as exc:
             raise ReviewAborted(f"{t.name}: {exc}") from exc
-        where.handles.append(run.handle)
+        where.add(run)
         if run.exit_code is None:
             raise ReviewAborted(f"{t.name}: {run.error or f'no exit code from Orca terminal {run.handle}'}")
         return self._stdout(run.exit_code, run.stdout, run.stderr)
@@ -233,11 +259,29 @@ class CLIReviewer:
         if not mode:
             return render_review(review, executor_id=self._template.name, settings=settings)
         lines = render_review(review, executor_id=self._template.name, settings=f"{settings} terminal={mode}").split("\n")
+        if review.get("cli_terminals"):
+            terminals = render_terminals(review["cli_terminals"], review.get("cli_sessions", {}))
+            lines.insert(1, f"Orca terminal: {terminals}")
         if mode == "fallback":
             lines.insert(1, f"Terminal fallback: {review.get('cli_terminal_fallback')}; ran as a subprocess")
-        elif review.get("cli_terminals"):
-            lines.insert(1, f"Orca terminal: {', '.join(review['cli_terminals'])}")
         return "\n".join(lines)
+
+
+def _cli_session(stdout: bytes) -> str:
+    # From the JSON envelope some CLIs print (cursor-agent and claude session_id, grok sessionId); "" when there is none.
+    try:
+        found: object = json.loads(stdout)
+    except ValueError:
+        return ""
+    if not isinstance(found, dict):
+        return ""
+    envelope = cast(dict[str, Any], found)
+    for key in _SESSION_KEYS:
+        value = envelope.get(key)
+        # The text is the CLI's and lands in messages people read: only something shaped like an ID is kept.
+        if isinstance(value, str) and _SESSION_ID.fullmatch(value):
+            return value
+    return ""
 
 
 def extract_verdict(stdout: str) -> object:

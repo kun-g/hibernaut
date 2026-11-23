@@ -14,7 +14,7 @@ from agent_runtime.adapters.storage_sqlite.stores import (
     SQLiteSessionStoreAdapter,
 )
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
-from agent_runtime.core.models import CLOSE_SOURCE, MCP_APPROVAL_SOURCE, Event, new_id
+from agent_runtime.core.models import CLOSE_SOURCE, MCP_APPROVAL_SOURCE, Event, explicit_trace_id, new_id
 from agent_runtime.core.ports import LockPort, OutboxPort
 from agent_runtime.engine.closing import close_session
 from agent_runtime.engine.handler import EventHandler
@@ -431,6 +431,8 @@ class MCPServerAdapter:
                         "last_error": diag.last_error if diag else None,
                         "correlation_key": e.correlation_key,
                         "session_id": e.session_id,
+                        "trace_id": explicit_trace_id(e),
+                        "parent_event_id": parent if isinstance(parent := e.payload.get("parent_event_id"), str) else None,
                         "created_at": e.occurred_at,
                     }
                     for e in events
