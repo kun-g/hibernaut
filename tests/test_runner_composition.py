@@ -359,6 +359,7 @@ def test_reload_keeps_the_runner_and_gives_it_the_new_settings(tmp_path: Path, m
             write(changed)
             await until(lambda: "Reloaded" in stderr.getvalue())
             assert built[1].runner is first and first.started
+            assert built[1].pool.limiter is built[0].pool.limiter
             post(built[1], "e1", {"body": plan(("Bash", CLEANUP))})
             await until(lambda: (tmp_path / "second.log").exists() and "ran" in (tmp_path / "second.log").read_text())
             # The runner itself is process-wide.
