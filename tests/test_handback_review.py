@@ -4,9 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_runtime.adapters.executor_cli.base_merge import only_conflicts_resolved, without_base
+from agent_runtime.adapters.executor_cli.base_merge import without_base
 from agent_runtime.adapters.executor_cli.reviewer import ReviewAborted, worktree_fingerprint
-from agent_runtime.adapters.executor_cli.sde import _State
+from agent_runtime.adapters.executor_cli.sde import _State, _review_delta
 from agent_runtime.core.models import Emit, Suspend
 from tests.test_coder_reviewer import git as run_git
 from tests.test_incremental_review import FIRST, FIX, block, verdict
@@ -62,15 +62,31 @@ class TestConflictResolution(unittest.TestCase):
         self.commit(files, "merge main")
         current = worktree_fingerprint(self.repo)
         since = without_base(self.repo, self.reviewed, current, "main")
-        return only_conflicts_resolved(self.repo, since, current), since, current
+        return since, current
 
-    def test_resolutions_made_of_both_sides_are_only_resolutions(self):
+    def assert_delta(self, before, after):
+        # Test the exact patch given to the reviewer, including unchanged files named in a conflict.
+        path = self.repo / "f.py"
+        def tree(text):
+            path.write_text(text)
+            run_git(self.repo, "add", "f.py")
+            return out(self.repo, "write-tree")
+
+        old, new = tree(before), tree(after)
+        delta, scope = _review_delta(self.repo, old, f":{new}", ("f.py",))
+        self.assertEqual(scope, ["f.py"])
+        if before == after:
+            self.assertEqual(delta, "")
+        else:
+            subprocess.run(["git", "apply", "-R", "--whitespace=nowarn"], cwd=self.repo, input=delta, text=True, check=True)
+            self.assertEqual(path.read_text(), before)
+
+    def test_resolutions_from_either_side_are_in_scope(self):
         for name, text in {"combined": self.MERGED, "ours": self.OURS, "theirs": self.THEIRS}.items():
             with self.subTest(name):
-                self.reset_branches()
-                self.assertTrue(self.resolve({"f.py": text})[0])
+                self.assert_delta(self.OURS, text)
 
-    def test_any_other_change_is_not(self):
+    def test_changes_outside_conflict_blocks_are_shown(self):
         cases = {
             "outside the conflict blocks": {"f.py": self.MERGED.replace("d = 1", "d = 2")},
             "before the first block": {"f.py": "z = 1\n" + self.MERGED},
@@ -85,17 +101,17 @@ class TestConflictResolution(unittest.TestCase):
         for name, files in cases.items():
             with self.subTest(name):
                 self.reset_branches()
-                self.assertFalse(self.resolve(files)[0])
+                _, current = self.resolve(files)
+                delta, paths = _review_delta(self.repo, self.reviewed.split(":")[1], current, ("f.py",))
+                self.assertEqual(set(paths), {"main_only.py", "f.py", *files})
+                self.assertIn("+++ b/f.py", delta)
 
     def block(self, base, ours, theirs, resolved):
         # One conflict block in the middle of a file.
         def text(lines):
             return "".join(f"{ln}\n" for ln in ["top = 1", "", *lines, "", "end = 1"])
 
-        self.reset_branches()
-        self.commit({"f.py": text(base)}, "base file")
-        run_git(self.repo, "branch", "-f", "main", "task")
-        return self.resolve({"f.py": text(resolved)}, ours={"f.py": text(ours)}, theirs={"f.py": text(theirs)})[0]
+        self.assert_delta(text(ours), text(resolved))
 
     def test_a_block_may_combine_what_the_sides_have(self):
         for name, args in {
@@ -108,7 +124,7 @@ class TestConflictResolution(unittest.TestCase):
             "documents": (["说明一。"], ["说明一。补充甲。"], ["说明一。补充乙。"], ["说明一。补充甲。补充乙。"]),
         }.items():
             with self.subTest(name):
-                self.assertTrue(self.block(*args))
+                self.block(*args)
 
     def test_a_block_that_the_sides_do_not_explain_is_reviewed(self):
         two = ([], ["notify(a)"], ["notify(b)"])
@@ -130,16 +146,16 @@ class TestConflictResolution(unittest.TestCase):
             "quotes": ([], ["notify(a)"], ["notify(b)"], ['notify("a")', "notify(b)"]),
         }.items():
             with self.subTest(name):
-                self.assertFalse(self.block(*args))
+                self.block(*args)
 
     TEXT = (["T = \"\"\"", "head", "old", "\"\"\""], ["T = \"\"\"", "head", "ours", "\"\"\""],
             ["T = \"\"\"", "head", "theirs", "\"\"\""])
 
-    def test_a_string_taken_from_one_side_as_it_is_needs_no_review(self):
+    def test_strings_taken_from_either_side_are_in_scope(self):
         _, ours, theirs = self.TEXT
         for name, resolved in {"ours": ours, "theirs": theirs}.items():
             with self.subTest(name):
-                self.assertTrue(self.block(*self.TEXT, resolved))
+                self.block(*self.TEXT, resolved)
 
     def test_blank_lines_and_trailing_spaces_are_part_of_a_string(self):
         base, ours, theirs = self.TEXT
@@ -149,27 +165,27 @@ class TestConflictResolution(unittest.TestCase):
             "spaces on a blank line": ["T = \"\"\"", "head", "ours", "  ", "\"\"\""],
         }.items():
             with self.subTest(name):
-                self.assertFalse(self.block(base, ours, theirs, resolved))
+                self.block(base, ours, theirs, resolved)
         sides = ["T = \"\"\"", "ours", "\"\"\""], ["U = \"\"\"", "theirs", "\"\"\""]
         both = [*sides[0], *sides[1]]
-        self.assertTrue(self.block([], *sides, both))
+        self.block([], *sides, both)
         for name, resolved in {
             "a blank line in both combined": [both[0], "", *both[1:]],
             "a trailing space in both combined": [both[0], "ours ", *both[2:]],
         }.items():
             with self.subTest(name):
-                self.assertFalse(self.block([], *sides, resolved))
+                self.block([], *sides, resolved)
 
     def test_a_blank_line_is_not_made_of_another_line_that_was_dropped(self):
-        self.assertFalse(self.block([], ["f(a)", "f(b)"], ["g(a)", "g(b)"], ["f(a)", "", "f(b)", "g(b)"]))
+        self.block([], ["f(a)", "f(b)"], ["g(a)", "g(b)"], ["f(a)", "", "f(b)", "g(b)"])
 
     def test_blank_lines_of_both_sides_may_be_combined(self):
-        self.assertTrue(self.block([], ["f()", "", "f()"], ["g()", "", "g()"], ["f()", "", "f()", "g()", "", "g()"]))
+        self.block([], ["f()", "", "f()"], ["g()", "", "g()"], ["f()", "", "f()", "g()", "", "g()"])
 
-    def test_each_block_is_explained_by_its_own_sides(self):
+    def test_a_change_taken_from_another_block_is_shown(self):
         # new(y) belongs to the second block; using it in the first one is another change.
         swapped = self.MERGED.replace("new(x)", "new(y)")
-        self.assertFalse(self.resolve({"f.py": swapped})[0])
+        self.assert_delta(self.OURS, swapped)
 
     def test_conflicts_without_blocks_are_not_judged(self):
         # main deleted a file the task changed: restoring the task's copy changes nothing, removing it is a decision.
@@ -187,8 +203,9 @@ class TestConflictResolution(unittest.TestCase):
                     (self.repo / rel).unlink()
                 self.commit({}, "merge main")
                 current = worktree_fingerprint(self.repo)
-                since = without_base(self.repo, reviewed, current, "main")
-                self.assertEqual(only_conflicts_resolved(self.repo, since, current), expected)
+                delta, paths = _review_delta(self.repo, reviewed.split(":")[1], current, ("keep.py",))
+                self.assertEqual(paths, ["keep.py"])
+                self.assertEqual(delta == "", expected)
 
     def test_nothing_merged_is_not_a_resolution(self):
         self.commit({"f.py": self.OURS})
@@ -196,11 +213,10 @@ class TestConflictResolution(unittest.TestCase):
         self.commit({"f.py": self.MERGED})
         current = worktree_fingerprint(self.repo)
         since = without_base(self.repo, reviewed, current, "main")
-        self.assertEqual((since.tree, since.merged), (reviewed.split(":")[1], ""))
-        self.assertFalse(only_conflicts_resolved(self.repo, since, current))
+        self.assertEqual(since.tree, reviewed.split(":")[1])
 
     def test_the_base_branchs_own_changes_are_left_out(self):
-        _, since, current = self.resolve({"f.py": self.MERGED, "keep.py": "k = 2\n"})
+        since, current = self.resolve({"f.py": self.MERGED, "keep.py": "k = 2\n"})
         names = out(self.repo, "diff", "--name-only", since.tree, current.split(":")[1]).split()
         self.assertEqual(names, ["f.py", "keep.py"])
 
@@ -243,31 +259,30 @@ class TestHandBackReview(SDEDeliveryCase):
         prompt = self.calls("reviewer")[call]["prompt"]
         return prompt.split("## Changes since the p")[1].split("\n## Incremental review")[0], prompt
 
-    async def test_a_passed_change_with_only_conflicts_resolved_is_delivered_without_another_review(self):
+    async def test_a_plain_conflict_resolution_is_reviewed_before_delivery(self):
         self.conflict()
-        outcome = await self.run_task([self.merge_step({"calc.py": TASK_CALC})], [PASS])
+        outcome = await self.run_task([self.merge_step({"calc.py": TASK_CALC})], [PASS, PASS])
         assert isinstance(outcome, Emit), outcome
-        self.assertEqual((len(self.calls("sde")), len(self.calls("reviewer"))), (2, 1))
-        text = outcome.messages[0]
-        for part in ("review=pass after 1 round", "Delivery: pr_open - PR created",
-                     "Delivery hand-back 1 of 2: merging origin/main conflicts in calc.py",
-                     "conflicts resolved only, not reviewed again"):
-            self.assertIn(part, text)
-        # The repository checks ran on the resolved head, and the PR says why it was not reviewed again.
+        self.assertEqual((len(self.calls("sde")), len(self.calls("reviewer"))), (2, 2))
+        delta, prompt = self.delta()
+        self.assertIn("+++ b/main_only.py", delta)
+        self.assertNotIn("+++ b/calc.py", delta)  # kept the reviewed side
+        self.assertIn("calc.py", prompt.split("## Incremental review\n")[1])
+        self.assertIn("round 2 pass", outcome.messages[0])
         self.assertEqual(self.check_log.read_text(), "ran\n")
-        self.assertIn("conflicts resolved only, not reviewed again", self.gh_state()["prs"][0]["body"])
+        self.assertIn("round 2 pass", self.gh_state()["prs"][0]["body"])
         self.assertEqual(out(self.bare, "show", "hb/task-1:calc.py"), TASK_CALC.strip())
 
     async def test_failing_checks_after_a_plain_resolution_go_back_and_that_fix_is_reviewed_alone(self):
         self.conflict()
         check = ("/bin/sh", "-c", "test -f ok.txt || { echo 'needs ok.txt'; exit 1; }")
         outcome = await self.run_task([self.merge_step({"calc.py": TASK_CALC}), dev({"ok.txt": "ok\n"}, commit="fix")],
-                                      [PASS, PASS], checks=(check,))
+                                      [PASS, PASS, PASS], checks=(check,))
         assert isinstance(outcome, Emit), outcome
-        self.assertEqual((len(self.calls("sde")), len(self.calls("reviewer"))), (3, 2))
+        self.assertEqual((len(self.calls("sde")), len(self.calls("reviewer"))), (3, 3))
         self.assertIn("Delivery hand-back 2 of 2: repository checks failed", outcome.messages[0])
         self.assertIn("round 2 pass", outcome.messages[0])
-        delta, prompt = self.delta()
+        delta, prompt = self.delta(2)
         self.assertIn("+++ b/ok.txt", delta)
         # Neither main, nor the accepted resolution, nor Hibernaut's own version commit.
         for absent in ("main_only.py", "calc.py", VERSION_FILE):
@@ -280,7 +295,7 @@ class TestHandBackReview(SDEDeliveryCase):
         # The first attempt merges and versions, fails its checks, and main conflicts again before the fix is done.
         self.set_plan(sde=[dev({"calc.py": TASK_CALC}), self.merge_step({"calc.py": TASK_CALC}),
                            dev({"ok.txt": "ok\n"}, commit="fix"), self.merge_step({"calc.py": TASK_CALC})],
-                      reviewer=[PASS, PASS])
+                      reviewer=[PASS] * 4)
         delivery = self.delivery(checks=(check,), max_handbacks=3)
         executor = self.executor(delivery=delivery)
         moved = []
@@ -295,26 +310,21 @@ class TestHandBackReview(SDEDeliveryCase):
         delivery.deliver = deliver  # type: ignore[method-assign]
         outcome = await executor.execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Emit), outcome
-        self.assertEqual((len(self.calls("sde")), len(self.calls("reviewer"))), (4, 2))
+        self.assertEqual((len(self.calls("sde")), len(self.calls("reviewer"))), (4, 4))
         self.assertIn("hand-back 3 of 3: merging origin/main conflicts", outcome.messages[0])
 
-    async def test_anything_beyond_the_resolution_is_reviewed_without_mains_changes(self):
+    async def test_reviewer_can_block_a_problem_in_the_merged_result(self):
         self.conflict()
         late = block("main_only.py:2", trigger="from_main()", impact="wrong", basis="introduced_since_previous")
-        outcome = await self.run_task([self.merge_step({"calc.py": TASK_CALC, "extra.py": "n = 1\n"})],
-                                      [PASS, verdict(late)])
+        outcome = await self.run_task([self.merge_step({"calc.py": TASK_CALC, "extra.py": "n = 1\n"}),
+                                       dev({"main_only.py": "m = 2\n"})], [PASS, verdict(late), PASS])
         assert isinstance(outcome, Emit), outcome
-        self.assertEqual(len(self.calls("reviewer")), 2)
+        self.assertEqual(len(self.calls("reviewer")), 3)
         delta, prompt = self.delta()
-        self.assertIn("+++ b/extra.py", delta)
-        self.assertIn("return b", delta)  # main's side of the conflict, as the block the developer resolved
-        self.assertNotIn("main_only.py", delta)
-        scope = prompt.split("## Incremental review\n")[1]
-        self.assertIn("- calc.py\n- extra.py", scope)
-        self.assertNotIn("main_only.py", scope)
-        self.assertNotIn("main_only.py", prompt.split("## Code diff")[1])
-        # A finding in code main brought in cannot send the task back.
-        self.assertIn("round 2 pass (1 downgraded)", outcome.messages[0])
+        for name in ("extra.py", "main_only.py"):
+            self.assertIn(f"+++ b/{name}", delta)
+        self.assertIn("- calc.py\n- extra.py\n- main_only.py", prompt)
+        self.assertIn("main_only.py:2", self.calls("sde")[2]["prompt"])
 
     async def test_new_logic_in_the_conflict_itself_is_reviewed(self):
         self.conflict()
@@ -342,14 +352,14 @@ class TestHandBackReview(SDEDeliveryCase):
         question = {"output": {"status": "needs_input", "summary": "s", "test_evidence": "", "question": "which?",
                                "change_kind": "fix", "change_rationale": "r"}}
         self.set_plan(sde=[dev({"calc.py": TASK_CALC}), question, self.merge_step({"calc.py": TASK_CALC})],
-                      reviewer=[PASS])
+                      reviewer=[PASS, PASS])
         executor = self.executor(delivery=self.delivery())
         outcome = await executor.execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Suspend), outcome
         answer = event({"approval_request_id": outcome.request_id, "approved": True, "comment": "keep ours"})
         done = await executor.execute([answer], self.resume(outcome), self.caps)
         assert isinstance(done, Emit), done
-        self.assertEqual(len(self.calls("reviewer")), 1)
+        self.assertEqual(len(self.calls("reviewer")), 2)
 
     async def test_commits_nobody_reviewed_before_the_hand_back_are_reviewed(self):
         # Something was committed between the passed review and the delivery: it is not Hibernaut's, so it is shown.

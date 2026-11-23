@@ -231,7 +231,7 @@ require_ci = true               # 合并前要求 PR 的 CI 全部通过（gh pr
 ci_timeout_seconds = 1800.0     # 等 CI 的上限；超时则挂起，批准后再查
 ci_poll_seconds = 30.0
 merge_method = "squash"         # squash | merge | rebase
-max_handbacks = 2               # 合入主干出现版本号以外的冲突、或合入后检查失败时，交回同一 SDE 会话解决（只解了冲突的不再评审，另有改动的经增量评审，之后自动续交付）的次数；超过后挂起等人，人批准后重新计数；0 = 直接挂起
+max_handbacks = 2               # 合入主干出现版本号以外的冲突、或合入后检查失败时，交回同一 SDE 会话解决（手工解冲突后一律复审两次快照间的变更，检查失败后的修复按增量复审，之后自动续交付）的次数；超过后挂起等人，人批准后重新计数；0 = 直接挂起
 close_terminal = true           # 交付有证据后（PR 头即已推送且检查通过的提交；授权合并时须已合并）自动关闭 SDE 终端，并对 CLI 评审者（terminal = "orca"）每次评审后已关闭的终端再关一次兜底；先记下 SHA、PR 与可恢复会话 ID，worktree 不动
 delete_branch = true            # PR 合并后删除远端源分支（不强推；已不存在算成功），worktree 回收时一并删除本地分支；false 则都保留
 issue_link = "refs"             # 任务来自 GitHub Issue 时 PR 正文开头的一行：closes = `Closes #<n>`（合并进默认分支后关闭 Issue）；refs = `Refs #<n>`（只关联，Issue 保持打开）；none = 不写。跨仓库写 <owner>/<repo>#<n>

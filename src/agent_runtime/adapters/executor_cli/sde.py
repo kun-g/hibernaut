@@ -22,7 +22,6 @@ from agent_runtime.adapters.executor_cli.base_merge import (
     SinceReview,
     changed_paths,
     newest_base,
-    only_conflicts_resolved,
     regular_file,
     with_upstream,
     without_base,
@@ -548,8 +547,6 @@ class SDEExecutor:
         text = "\n\n".join(state.followups)
         if text:
             state.requirements = f"{state.requirements}\n\n## Follow-up from a person\n{text}"
-            if state.handback:
-                state.handback["new_requirements"] = True
         state.followups = []
         return text
 
@@ -781,29 +778,27 @@ class SDEExecutor:
                 return await self._finish(session_id, native, state, caps, review="off", progress=progress)
             workdir = Path(state.workdir)
             since: SinceReview | None = None
-            resolved = False
+            conflict = bool(state.recheck and state.handback.get("kind") == "conflict")
             try:
                 snapshot = await asyncio.to_thread(worktree_fingerprint, workdir)
                 if (state.blocking or state.recheck) and state.reviewed_snapshot:
-                    since = await asyncio.to_thread(self._since_review, state, workdir, snapshot)
-                    if state.recheck and state.handback.get("kind") == "conflict":
-                        resolved = not state.handback.get("new_requirements") and await asyncio.to_thread(
-                            only_conflicts_resolved, workdir, since, snapshot)
+                    if conflict:
+                        since = SinceReview(state.reviewed_snapshot.split(":", 1)[1])
+                    else:
+                        since = await asyncio.to_thread(self._since_review, state, workdir, snapshot)
             except (ReviewAborted, ValueError) as exc:
                 return self._pending(session_id, native, state, f"the review could not complete: {exc}")
-            if resolved:
-                return await self._resolved(session_id, native, state, caps, snapshot, progress)
             decision = reviewer.check_launch(caps, workdir)
             if decision.action != "allow":
                 return self._pending(session_id, native, state, f"review launch {decision.action}: {decision.reason}")
             try:
                 previous, scope, base_ref = "", None, state.base_ref
                 if since is not None:
-                    # Everything the re-review is shown as changed is the task's own, the base's commits left out.
-                    changed = await asyncio.to_thread(changed_paths, workdir, since.tree, snapshot.split(":", 1)[1])
+                    delta, changed = await asyncio.to_thread(
+                        _review_delta, workdir, since.tree, snapshot, _strs(state.handback.get("files")) if conflict else ()
+                    )
                     scope = await asyncio.to_thread(review_scope, workdir, changed, previous=state.blocking,
                                                     notes=state.review_notes)
-                    delta = await asyncio.to_thread(snapshot_diff, workdir, f":{since.tree}", snapshot)
                     base_ref = await asyncio.to_thread(_evidence_base, workdir, base_ref, since.base)
                     if state.blocking:
                         previous = (
@@ -811,7 +806,7 @@ class SDEExecutor:
                             f"## Changes since the previous review\n```diff\n{delta}\n```"
                         )
                     else:
-                        previous = _recheck_section(state.recheck, state.last_review, delta)
+                        previous = _recheck_section(state.recheck, state.last_review, delta, conflict=conflict)
                 pin, selection = await asyncio.to_thread(self._guidance_inputs, state)
                 subject = state.work_key or workdir.name
                 if progress is not None:
@@ -879,16 +874,6 @@ class SDEExecutor:
         if configured and configured not in refs:
             return newest_base(workdir, snapshot, [configured]) or newest_base(workdir, snapshot, refs)
         return newest_base(workdir, snapshot, refs)
-
-    async def _resolved(
-        self, session_id: str, native: str | None, state: _State, caps: RunCapabilities, snapshot: str,
-        progress: _Progress | None,
-    ) -> RunOutcome:
-        # The passed review still covers the change; the delivery step runs the checks on the merged head.
-        state.history.append(f"hand-back {state.handbacks}: conflicts resolved only, not reviewed again")
-        state.rounds = int(state.handback.get("rounds", 0))
-        state.reviewed_snapshot, state.recheck, state.handback = snapshot, "", {}
-        return await self._finish(session_id, native, state, caps, review="pass", progress=progress)
 
     def _delivered_snapshot(self, state: _State, base_sha: str) -> str:
         # The delivery step's own commits (the base merge, the version) need no review: when nothing else happened
@@ -1073,12 +1058,15 @@ class SDEExecutor:
         what = _handback_summary(handback)
         state.handback_log.append(f"Delivery hand-back {state.handbacks} of {limit}: {what}; "
                                   "handed back to the developer")
-        rounds, state.rounds = state.rounds, 0
+        state.rounds = 0
         if state.review_status == "pass":
             state.recheck = what
             base_sha = str(handback.get("base_sha", ""))
-            state.reviewed_snapshot = await asyncio.to_thread(self._delivered_snapshot, state, base_sha)
-            state.handback = {"kind": handback.get("kind"), "base_sha": base_sha, "rounds": rounds}
+            state.handback = {"kind": handback.get("kind"), "base_sha": base_sha}
+            if handback.get("kind") == "conflict":
+                state.handback["files"] = list(_strs(handback.get("files")))
+            else:
+                state.reviewed_snapshot = await asyncio.to_thread(self._delivered_snapshot, state, base_sha)
         return await self._run(session_id, native, state, caps, _handback_prompt(handback), progress=progress)
 
     async def _exit_terminal(self, session_id: str, native: str | None, state: _State, record: DeliveryRecord) -> str:
@@ -1189,6 +1177,12 @@ def _stays() -> bool:
 
 def _next_round(state: _State) -> int:
     return 1 + sum(h.startswith("round ") for h in state.history)
+
+
+def _review_delta(workdir: Path, before_tree: str, snapshot: str, conflicts: tuple[str, ...]) -> tuple[str, list[str]]:
+    paths = changed_paths(workdir, before_tree, snapshot.split(":", 1)[1])
+    # Keeping our side can discard a base change without changing the reviewed tree.
+    return snapshot_diff(workdir, f":{before_tree}", snapshot), sorted(set(paths).union(conflicts))
 
 
 def _evidence_base(workdir: Path, base_ref: str, base: str) -> str:
@@ -1315,13 +1309,17 @@ def _handback_prompt(handback: Mapping[str, Any]) -> str:
     )
 
 
-def _recheck_section(why: str, last_review: str, delta: str) -> str:
+def _recheck_section(why: str, last_review: str, delta: str, *, conflict: bool) -> str:
+    instruction = (
+        "Review the changes between the passed snapshot and the resolved snapshot, including changes brought in "
+        "by the base. Compare the merge with both parents to check conflict resolutions, even where the "
+        "developer kept the reviewed side."
+        if conflict else "Review the developer's fix since the passed review. Base changes are left out."
+    )
     return (
         f"## Previous review round (passed)\n{last_review}\n\n"
         f"## Why this is reviewed again\nThe delivery step handed the passed work back to the developer: {why}. "
-        "Review only the developer's changes since the passed review below (how merge conflicts were resolved, and "
-        "any fix); the rest was reviewed already. What the base branch brought in is left out: it was reviewed there. "
-        "A resolved conflict shows as the change from git's conflict block to the resolution.\n\n"
+        f"{instruction}\n\n"
         f"## Changes since the passed review\n```diff\n{delta}\n```"
     )
 
