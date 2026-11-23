@@ -7,7 +7,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Generic, Protocol, TypeVar, cast
 
-from agent_runtime.adapters.memory_fs import check_inbox_id
+from agent_runtime.adapters.executor_cli.process import last_text, names_path
+from agent_runtime.adapters.memory_fs import check_inbox_id, directory_key
 from agent_runtime.app.inbox_patterns import UncomparablePattern, common_match
 from agent_runtime.core.models import Event, InboxBinding, InboxMatchRule, InboxRoute
 from agent_runtime.core.ports import SessionStorePort
@@ -290,19 +291,10 @@ class _CheckedOut(Protocol):
     def inbox_rules(self) -> tuple[InboxRule, ...]: ...
 
 
-def _directory_key(path: Path) -> object:
-    # The same directory under another spelling, link or letter case is the same one.
-    try:
-        found = path.stat()
-    except OSError:
-        return path
-    return found.st_dev, found.st_ino
-
-
 def validate_workdir_bindings(bindings: Sequence[WorkdirBinding], projects: Iterable[_CheckedOut]) -> None:
     listed = list(projects)
     writers: dict[object, WorkdirBinding] = {}
-    checkouts = {_directory_key(Path(p.checkout).expanduser().resolve()): p for p in listed}
+    checkouts = {directory_key(Path(p.checkout).expanduser()): p for p in listed}
     for bound in bindings:
         where = f"runtime.inbox_bindings pattern {bound.binding.inbox!r}"
         for proj in listed:
@@ -315,12 +307,12 @@ def validate_workdir_bindings(bindings: Sequence[WorkdirBinding], projects: Iter
             raise ValueError(f"{where} may match more than one inbox, which would share a writable workdir; name one "
                              "inbox or set checkout_access = \"readonly\"")
         workdir = Path(bound.workdir).resolve()
-        other = writers.setdefault(_directory_key(workdir), bound)
+        other = writers.setdefault(directory_key(workdir), bound)
         if other is not bound:
             raise ValueError(f"{where} and {other.binding.inbox!r} have the same writable workdir {bound.workdir}; "
                              "give each its own or set checkout_access = \"readonly\"")
         for directory in (workdir, *workdir.parents):
-            project = checkouts.get(_directory_key(directory))
+            project = checkouts.get(directory_key(directory))
             if project is not None:
                 raise ValueError(f"{where}: writable workdir {bound.workdir} is in the checkout of projects.{project.name}")
 
@@ -592,14 +584,25 @@ class UnmatchedProjectHold:
         return session is not None and session.status == "suspended"
 
 
+class InboxRefused(Exception):
+    # No worker can be made for this inbox. Its events stay pending; nothing retries them until the inbox is woken.
+    def __init__(self, inbox_id: str, reason: object) -> None:
+        super().__init__(f"inbox {inbox_id!r} cannot be served: {reason}")
+
+
 class MissingWorkdirHold(UnmatchedProjectHold):
-    # The same for an inbox bound to a workdir that is not there: it is never created, and no event is lost to it.
+    # The same for an inbox bound to a workdir that is not there, which is never created. Every event waits, since the
+    # executor would refuse it and end it; only one that asks for another directory is refused whatever happens.
     def __init__(self, sessions: SessionStorePort, workdir: str) -> None:
         super().__init__(sessions)
         self._workdir = workdir
 
     def __call__(self, event: Event) -> str | None:
         return None if Path(self._workdir).is_dir() else super().__call__(event)
+
+    def _runs_without_project(self, event: Event) -> bool:
+        asked = last_text([event], "explicit_workdir")
+        return asked is not None and not names_path(asked, Path(self._workdir))
 
     def _reason(self, event: Event) -> str:
         return (

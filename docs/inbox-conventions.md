@@ -40,8 +40,8 @@ workdir = "/abs/path/to/ops-workdir"
 checkout_access = "readwrite"   # readonly | readwrite，默认 readwrite
 ```
 
-- `workdir` 必填；`~` 与相对路径（以配置文件所在目录为准）都可以。目录不会自动创建，不存在时事件保持 `pending`。
-- 可写的 `workdir` 只给一个 Inbox 用：`pattern` 须是单个精确 ID，两条绑定不能指向同一个可写目录，也不能落在某个项目的检出里。`checkout_access = "readonly"` 可以共享目录、可以用正则。
+- `workdir` 必填；`~` 与相对路径（以配置文件所在目录为准）都可以。目录不会自动创建，不存在时事件保持 `pending`（含 `review_of`、审批回复、关闭请求、挂起会话的后续和指向该目录的 `explicit_workdir`）；只有 `explicit_workdir` 指向别的目录的事件照样在本轮拒绝。
+- 可写的 `workdir` 只给一个 Inbox 用：`pattern` 须是单个精确 ID，两条绑定不能指向同一个可写目录（已存在的按 inode 比较；尚不存在的部分不分大小写比较，区分大小写的卷上也一样），也不能落在某个项目的检出里。`checkout_access = "readonly"` 可以共享目录、可以用正则。
 - `readonly` 对 CLI agent 是声明：运行时据此放行共享，并在提示里写明不改文件，但不拦 CLI 的写操作。真正只读由该 CLI 自己的参数保证（如 `--permission-mode plan`）。
 - 只能用不带 `role` 的 CLI agent。`sde`、`code-reviewer`、`steward` 依赖项目检出，加载时拒绝。
 - 一条绑定自成一个转投范围：可以在本 Inbox 内换 agent 接力，不能与项目或别的绑定互投。
@@ -54,6 +54,7 @@ checkout_access = "readwrite"   # readonly | readwrite，默认 readwrite
 | Agent 在 Inbox 绑定的 `agents` 白名单里 | 明确拒绝，不换别的 agent |
 | 非项目 Inbox 有显式 `workdir`，且不与项目 Inbox 重叠、不共享可写目录 | 配置拒绝加载；热加载保留旧配置 |
 | `inbox_id` 匹配某个项目或某条 `[[runtime.inbox_bindings]]` | 事件保持 `pending`，记 `WARNING` |
+| `inbox_id` 能作 Memory 分区名（不含 `/`、`\`、`..`，且目录建得出来） | 事件保持 `pending`，每次唤醒记一条 `WARNING`，不占 Worker |
 | 事件里的 `explicit_workdir` 不能把有绑定的非项目 Inbox 换到别的目录 | 本轮拒绝 |
 | 一件外部事件最多主动转投 3 次（`MAX_FORWARD_HOPS = 3`）；回投是对转投的答复，不计数 | 转投被拒，当前 agent 就地答复 |
 | 不能转投给同一 `(inbox_id, agent_id)` | 拒绝 |

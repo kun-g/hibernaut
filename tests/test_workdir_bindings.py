@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from agent_runtime.app.config import load_config, parse_config
 from agent_runtime.app.main import build_daemon_from_config, serve_configured
+from agent_runtime.core.models import SessionRef
 from tests.test_project_inbox_rules import _DispatchCase, project_table
 
 HOLD_LOGGER = "agent_runtime.app.projects"
@@ -83,6 +84,23 @@ class TestConfig(unittest.TestCase):
     def test_a_workdir_that_does_not_exist_yet_is_compared_too(self):
         missing = str(self.root / "later")
         self.refused("same writable workdir", self.binding(workdir=missing), self.binding("user:main", workdir=missing))
+
+    def test_a_missing_workdir_in_another_spelling_is_the_same_one(self):
+        # Once created, both name one directory on a volume that ignores letter case (APFS by default).
+        link = self.root / "link"
+        link.symlink_to(self.ops)
+        for one, other in ((self.ops / "Hb", self.ops / "hb"), (self.ops / "a" / "Hb", self.ops / "A" / "hB"),
+                           (self.ops / "hb", link / "HB"), (self.ops / "caf\u00e9", self.ops / "cafe\u0301")):
+            with self.subTest(one=str(one), other=str(other)):
+                self.refused("same writable workdir", self.binding(workdir=str(one)),
+                             self.binding("user:main", workdir=str(other)))
+        self.parse(self.binding(workdir=str(self.ops / "Hb")),
+                   self.binding("user:main", workdir=str(self.ops / "hb2")))
+        self.assertEqual(list(self.ops.iterdir()), [])
+
+    def test_a_missing_workdir_in_a_missing_checkout_is_found_in_another_spelling(self):
+        self.refused("checkout of projects.p", self.binding(workdir=str(self.root / "Later" / "sub")),
+                     project={"checkout": str(self.root / "later")})
 
     def test_readonly_bindings_may_share_a_workdir(self):
         cfg = self.parse(self.binding(checkout_access="readonly"),
@@ -211,6 +229,73 @@ class TestDispatch(_DispatchCase):
         await self.dispatch(path, [])
         self.assertEqual(self.statuses(OPS), [("done", 1)])
         self.assertEqual([r["cwd"] for r in self.cli_runs()], [str(gone)])
+
+    async def test_events_that_name_a_target_wait_for_a_missing_workdir_too(self):
+        gone = self.root / "gone"
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        path = self.write_config(self.project + binding_table(OPS, gone))
+        waiting = [
+            ({"text": "same", "explicit_workdir": str(gone)}, "task:1"),
+            ({"text": "spelled", "explicit_workdir": f"{elsewhere}/../gone"}, "task:2"),
+            ({"text": "review", "review_of": "task:1"}, "task:3"),
+            ({"text": "answer"}, "task:4"),
+            ({"text": "approved", "approval_request_id": "req-1", "decision": "approve"}, "task:4"),
+            ({"text": "close", "action": "close_session"}, "task:4"),
+        ]
+        daemon = build_daemon_from_config(load_config(path))
+        daemon.sessions.save(SessionRef(
+            session_id="s1", inbox_id=OPS, correlation_key="task:4", executor_id="cli", status="suspended",
+            pending_request_id="req-1",
+        ))
+        daemon.close()
+        with self.assertLogs(HOLD_LOGGER, level="WARNING") as logs:
+            await self.dispatch(path, [
+                (OPS, {"text": "moved", "explicit_workdir": str(elsewhere)}, "task:0"),
+                *((OPS, payload, key) for payload, key in waiting),
+            ])
+        self.assertEqual(self.statuses(OPS), [("done", 1)] + [("pending", 0)] * len(waiting))
+        self.assertEqual(len(logs.records), len(waiting))
+        [refusal] = [c for (c,) in self.rows("SELECT content FROM outbox")]
+        self.assertIn("is not this inbox's workdir", refusal)
+        self.assertEqual(self.cli_runs(), [])
+        self.assertFalse(gone.exists())
+
+        gone.mkdir()
+        await self.dispatch(path, [])
+        self.assertNotIn("pending", [status for status, _ in self.statuses(OPS)])
+        runs = self.cli_runs()
+        self.assertEqual({r["cwd"] for r in runs}, {str(gone)})
+        self.assertLessEqual({"same", "spelled", "review"}, {r["text"] for r in runs})
+        self.assertEqual(self.rows("SELECT status FROM sessions WHERE session_id = 's1'"), [("closed",)])
+
+    async def test_a_directory_name_no_path_can_have_is_refused(self):
+        for workdir in (self.ops, self.root / "gone"):
+            with self.subTest(exists=workdir.is_dir()):
+                path = self.write_config(self.project + binding_table(OPS, workdir))
+                await asyncio.wait_for(self.dispatch(
+                    path, [(OPS, {"text": "odd", "explicit_workdir": "a\0b"}, None)]), timeout=20)
+                self.assertEqual(self.statuses(OPS)[-1], ("done", 1))
+                self.assertIn("is not this inbox's workdir", self.rows("SELECT content FROM outbox ORDER BY seq")[-1][0])
+
+    async def test_an_inbox_with_an_unusable_id_waits_and_takes_no_worker(self):
+        path = self.write_config(self.project.replace('"proj:p"', '["proj:p", "proj:p:.+"]')
+                                 + binding_table("sys:ops(:.+)?", self.ops, checkout_access='"readonly"'))
+        bad = ["sys:ops:a/b", "sys:ops:a\\b", "sys:ops:..", "sys:ops:" + "x" * 300, "proj:p:a/b", "none/none"]
+        with self.assertLogs("agent_runtime.app.main", level="WARNING") as logs:
+            # More of them than there are workers, then inboxes that must still run.
+            daemon = await asyncio.wait_for(self.dispatch(path, [
+                *((inbox_id, {"text": "bad"}, "task:1") for inbox_id in bad),
+                ("sys:ops:good", {"text": "good"}, "task:1"),
+            ]), timeout=20)
+        for inbox_id in bad:
+            with self.subTest(inbox_id=inbox_id[:20]):
+                self.assertEqual(self.statuses(inbox_id), [("pending", 0)])
+                self.assertEqual(len([r for r in logs.records if repr(inbox_id) in r.getMessage()]), 1)
+        self.assertEqual({r.levelname for r in logs.records}, {"WARNING"})
+        self.assertEqual([r["text"] for r in self.cli_runs()], ["good"])
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM worker_leases"), [(0,)])
+        self.assertIsNotNone(daemon)
 
     async def test_a_reload_takes_a_complete_binding_only(self):
         with socket.socket() as sock:

@@ -104,6 +104,7 @@ from agent_runtime.app.config import (
 from agent_runtime.app.projects import (
     AmbiguousProjectMatch,
     ProjectRouter,
+    InboxRefused,
     MissingWorkdirHold,
     UnmatchedProjectHold,
     build_routing_manifest,
@@ -262,6 +263,13 @@ class AsyncWorkerPool:
         for worker in self._active.values():
             worker.detach()
 
+    def _make_worker(self, inbox_id: str, worker_id: str) -> AgentWorker:
+        # Anyone who can post an event chooses its inbox_id: one that has no memory directory must not end the loop.
+        try:
+            return self._worker_factory(inbox_id, worker_id)
+        except (ValueError, OSError) as exc:
+            raise InboxRefused(inbox_id, exc) from exc
+
     async def _worker_loop(self, worker_idx: int, stop_event: asyncio.Event) -> None:
         worker_id = f"{self._pool_id}-worker-{worker_idx}"
         while self._handoff is None and (not stop_event.is_set() or self._queue):
@@ -275,7 +283,7 @@ class AsyncWorkerPool:
             settled = False
             try:
                 # Inside the try: a factory that refuses the inbox (AmbiguousProjectMatch) leaves its events pending.
-                worker = self._worker_factory(inbox_id, worker_id)
+                worker = self._make_worker(inbox_id, worker_id)
                 self._active[inbox_id] = worker
                 batch_reports = await worker.process_inbox(inbox_id)
                 settled = True
@@ -288,6 +296,8 @@ class AsyncWorkerPool:
                             "Post-run callback failed for inbox %s",
                             inbox_id,
                         )
+            except InboxRefused as exc:
+                logging.getLogger(__name__).warning("%s; its events stay pending", exc)
             except ExecutorFailed as exc:
                 settled = exc.batch_settled
                 logging.getLogger(__name__).exception(
@@ -1160,7 +1170,9 @@ def build_daemon_from_config(
         )
 
         def _cli_worker_factory(inbox_id: str, worker_id: str) -> AgentWorker:
-            # Raises AmbiguousProjectMatch before any lease, executor or workspace exists for the inbox.
+            # Both raise (InboxRefused by way of the pool, AmbiguousProjectMatch) before any lease, executor or
+            # workspace exists for the inbox.
+            check_inbox_id(inbox_id)
             project = router.resolve(inbox_id)
             bound = config.runtime.workdir_binding(inbox_id) if project is None else None
             if project is not None:

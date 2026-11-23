@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 from typing import TypeVar
 
 from agent_runtime.core.models import Event, SessionRef
@@ -81,6 +82,13 @@ def last_text(events: Sequence[Event], key: str) -> str | None:
         if isinstance(val, str) and val.strip():
             return val.strip()
     return None
+
+
+def names_path(text: str, path: Path) -> bool:
+    try:
+        return Path(text).resolve() == path.resolve()
+    except (ValueError, OSError, RuntimeError):  # no path at all (a NUL in it), or a loop of links
+        return False
 
 
 def join_text(events: Sequence[Event], keys: Sequence[str]) -> str:

@@ -13,6 +13,7 @@ from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner
 from agent_runtime.adapters.executor_cli.process import (
     ProcessTimeout,
     last_text,
+    names_path,
     relayed_work_key,
     supervise,
     target_events,
@@ -224,7 +225,7 @@ class LocalCLIExecutor:
 
     def _bound_refusal(self, explicit_workdir: str | None) -> str | None:
         assert self._bound_workdir is not None
-        if explicit_workdir is not None and Path(explicit_workdir).resolve() != self._bound_workdir:
+        if explicit_workdir is not None and not names_path(explicit_workdir, self._bound_workdir):
             return f"explicit_workdir {explicit_workdir} is not this inbox's workdir {self._bound_workdir}"
         return None if self._bound_workdir.is_dir() else f"workdir {self._bound_workdir} is not a directory"
 
