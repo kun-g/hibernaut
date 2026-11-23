@@ -138,6 +138,13 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
             except urllib.error.HTTPError as err:
                 return int(err.code), json.loads(err.read().decode("utf-8"))
 
+        async def _reported(kind: type[Suspend] | type[Emit]) -> None:
+            # An HTTP thread's wake may reach the loop after its response: until then the pool still counts as idle.
+            async with asyncio.timeout(10.0):
+                while not any(isinstance(r.outcome, kind) for r in daemon.pool.reports):
+                    await asyncio.sleep(0.01)
+            await daemon.pool.wait_until_idle(timeout_seconds=3.0)
+
         try:
             # 1. Trigger a Suspend on proj:ops via generic /events route
             status, _ = await asyncio.to_thread(
@@ -157,7 +164,7 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
                 ).encode("utf-8"),
             )
             self.assertEqual(status, 202)
-            await daemon.pool.wait_until_idle(timeout_seconds=3.0)
+            await _reported(Suspend)
 
             suspend_reports = [r for r in daemon.pool.reports if isinstance(r.outcome, Suspend)]
             self.assertEqual(len(suspend_reports), 1)
@@ -170,7 +177,7 @@ class TestWebhooksEndToEnd(unittest.IsolatedAsyncioTestCase):
             }).encode("utf-8")
             status, _ = await asyncio.to_thread(_post, "/events", approval)
             self.assertEqual(status, 202)
-            await daemon.pool.wait_until_idle(timeout_seconds=3.0)
+            await _reported(Emit)
             await daemon.dispatcher.dispatch_once()
 
             emit_reports = [r for r in daemon.pool.reports if isinstance(r.outcome, Emit)]

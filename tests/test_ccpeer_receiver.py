@@ -50,7 +50,8 @@ class ReceiverProcessTests(unittest.TestCase):
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 self.fail(f"receiver exited {proc.returncode}: {proc.communicate()}")
-            if any(s.pid == proc.pid for s in discover([self.cfg])):
+            # The session entry is written before the receiver's own record.
+            if any(s.pid == proc.pid for s in discover([self.cfg])) and receiver_info(name, self.state) is not None:
                 return
             time.sleep(0.05)
         self.fail("receiver never registered")

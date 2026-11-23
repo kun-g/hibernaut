@@ -188,9 +188,8 @@ class DriveChainTests(ForwardCase):
                 await self.step(SDE)
                 self.assertNotIn("MARK-55", self.outside())
                 self.assertEqual(self.folder(), "dir-progress")
-                # Back to the steward, or held: out of hops after the child got its own result back.
-                self.assertEqual((len(self.returned()), len(self.sent("approval_request"))),
-                                 (1, 0) if source == "message" else (0, 1))
+                # Back to the steward: the result the child got back used no hop.
+                self.assertEqual((len(self.returned()), len(self.sent("approval_request"))), (1, 0))
                 # A later failure the child answers for itself is written.
                 self.ingest(SDE, key="gdrive:f1", text="again")
                 await self.step(SDE)

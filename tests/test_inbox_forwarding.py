@@ -298,7 +298,7 @@ class ForwardTests(ForwardCase):
         self.assertEqual(
             {k: event.payload[k] for k in ("text", "status", "hop_count", "forwarded_from", "forwarded_by",
                                           "parent_session_id")},
-            {"text": "part one done", "status": "done", "hop_count": 2, "forwarded_from": SDE, "forwarded_by": "sde",
+            {"text": "part one done", "status": "done", "hop_count": 1, "forwarded_from": SDE, "forwarded_by": "sde",
              "parent_session_id": steward.session_id},
         )
         self.answer("steward", "all done")
@@ -548,6 +548,61 @@ class AntiLoopTests(ForwardCase):
                 await self.run_inbox(inbox)
         self.assertEqual(len(self.agents["sde"].runs) + len(self.agents["writer"].runs), MAX_FORWARD_HOPS + 1)
         self.assertEqual(len(self.sent()), 1)
+
+    async def test_returns_use_no_hops_so_a_four_step_chain_comes_back_whole(self) -> None:
+        # steward -> sde -> back -> review -> back, each leg asked for by the steward itself.
+        self.ingest(reply_channel="feishu", reply_target="oc_1")
+        self.forward("steward", SDE, "implement", return_to=MAIN)
+        await self.run_inbox()
+        self.answer("sde", "implemented")
+        await self.run_inbox(SDE)
+        self.forward("steward", DOCS, "review", return_to=MAIN)
+        await self.run_inbox()
+        self.answer("writer", "reviewed")
+        await self.run_inbox(DOCS)
+        self.answer("steward", "all done")
+        await self.run_inbox()
+        self.assertEqual([(e.payload["text"], e.payload["status"], e.payload["hop_count"]) for e in self.returned()],
+                         [("implemented", "done", 1), ("reviewed", "done", 2)])
+        self.assertEqual(self.sent("approval_request"), [])
+        [answer] = self.sent()
+        self.assertEqual((answer.content, answer.metadata["reply_target"]), ("all done", "oc_1"))
+
+    async def test_a_round_trip_at_the_last_hop_still_comes_back(self) -> None:
+        self.ingest(SDE, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=MAIN, hop_count=MAX_FORWARD_HOPS)
+        self.answer("sde", "done")
+        await self.run_inbox(SDE)
+        self.assertEqual([(e.payload["text"], e.payload["hop_count"]) for e in self.returned()],
+                         [("done", MAX_FORWARD_HOPS)])
+        self.assertEqual(self.sent("approval_request"), [])
+
+    async def test_an_agent_that_sends_out_every_result_again_stops_at_the_limit(self) -> None:
+        refused: list[str] = []
+
+        def again(_e: Sequence[Event], _s: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
+            try:
+                caps.forward_to_inbox(SDE, "once more", return_to=MAIN)
+            except ForwardRefused as exc:
+                refused.append(str(exc))
+                return Emit(messages=("giving up",))
+            return Silent()
+
+        self.agents["steward"].script = again
+        self.answer("sde", "not yet")
+        self.ingest()
+        for _ in range(MAX_FORWARD_HOPS + 3):
+            await self.run_inbox()
+            await self.run_inbox(SDE)
+        self.assertEqual((len(self.agents["sde"].runs), len(self.returned())), (MAX_FORWARD_HOPS, MAX_FORWARD_HOPS))
+        self.assertEqual(len(refused), 1)
+        self.assertIn("hop", refused[0])
+        self.assertEqual([m.content for m in self.sent()], ["giving up"])
+
+    async def test_results_nobody_waits_for_start_no_new_allowance(self) -> None:
+        # The parent session is gone: whoever takes the result goes on from the hops it came with.
+        self.ingest(source=RETURN_SOURCE, key="late", text="late", status="done", hop_count=MAX_FORWARD_HOPS,
+                    delegation_id="d", forwarded_from=SDE)
+        self.assertIn("hop", str(await self.refusal(SDE, "again")))
 
     async def test_hops_survive_a_suspend(self) -> None:
         self.ingest(source=FORWARD_SOURCE, forwarded_from=SDE, hop_count=MAX_FORWARD_HOPS)
@@ -1352,11 +1407,9 @@ class DelegationTests(ForwardCase):
         assert first is not None and second is not None
         self.assertEqual(first.session_id, second.session_id)
         self.assertEqual(self.sent(), [])
-        # Out of hops by now: the result waits for a person instead of ending up outside.
-        [card] = self.sent("approval_request")
-        holder = self.sessions.get(card.metadata["session_id"])
-        assert holder is not None and holder.forward is not None and holder.forward.held is not None
-        self.assertEqual((holder.forward.return_to, holder.forward.held.payload["text"]), (MAIN, "reworked"))
+        # The last hop was used for the rework; its result still goes back.
+        self.assertEqual(self.sent("approval_request"), [])
+        self.assertEqual([e.payload["text"] for e in self.returned()], ["reworked"])
 
     async def test_replaying_a_settled_piece_does_not_settle_the_one_the_session_owes_now(self) -> None:
         self.forward("steward", SDE, "one", return_to=MAIN)
@@ -1917,7 +1970,7 @@ class DelegationTests(ForwardCase):
         assert first is not None and second is not None
         self.assertEqual(first.session_id, second.session_id)
         [back] = self.returned()
-        self.assertEqual((back.payload["text"], back.payload["hop_count"]), ("did two", 2))
+        self.assertEqual((back.payload["text"], back.payload["hop_count"]), ("did two", 1))
 
     async def test_a_session_that_waits_for_one_chain_does_not_take_a_piece_of_another(self) -> None:
         # It has answered the first piece, but a part it sent out for it is still away, with that chain's hops.
@@ -1941,7 +1994,7 @@ class DelegationTests(ForwardCase):
         self.ingest(SDE, key=None, approval_request_id="req1", approved=True, event_type="approval.decided")
         await self.run_inbox(SDE)
         self.assertEqual([(e.payload["text"], e.payload["hop_count"]) for e in self.returned()],
-                         [("did one", 2), ("did two", 2)])
+                         [("did one", 1), ("did two", 1)])
 
     async def test_a_refused_follow_up_leaves_the_piece_owed(self) -> None:
         def split(_e: Sequence[Event], _s: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
@@ -2162,7 +2215,7 @@ class HeldReturnTests(ForwardCase):
         self.assertTrue(decided.pending_elsewhere)
         [event] = self.queued(MAIN)
         self.assertEqual((event.source, event.session_id, event.payload["text"], event.payload["status"],
-                          event.payload["hop_count"]), (RETURN_SOURCE, steward, "result", "done", 2))
+                          event.payload["hop_count"]), (RETURN_SOURCE, steward, "result", "done", 1))
         self.assertEqual((len(self.agents["sde"].runs), self.sent()), (1, []))
         closed = self.sessions.get(waiting.session_id)
         assert closed is not None
@@ -2408,7 +2461,7 @@ class HeldReturnTests(ForwardCase):
                     [forwarded] = self.queued(SDE)
                     self.inbox.mark_done([forwarded.event_id])
                     self.ingest(SDE, key="late", source=FORWARD_SOURCE,
-                                **{**forwarded.payload, "hop_count": MAX_FORWARD_HOPS})
+                                **{**forwarded.payload, "hop_count": MAX_FORWARD_HOPS + 1})
                     self.gate(action)
                     _report, card = await self.held("MARK late")
                     self.assertIn("limit", card.content)
@@ -2427,7 +2480,8 @@ class HeldReturnTests(ForwardCase):
         for approved, action in ((True, "complete"), (False, "release")):
             with self.subTest(approved=approved):
                 self.setUp()
-                self.ingest(SDE, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=MAIN, hop_count=MAX_FORWARD_HOPS)
+                self.ingest(SDE, source=FORWARD_SOURCE, forwarded_from=MAIN, return_to=MAIN,
+                            hop_count=MAX_FORWARD_HOPS + 1)
                 self.ingest(SDE, event_type="work.ready", task_id="t1", hop_count=1)
                 _report, card = await self.held()
                 await self.decide(card, approved)
