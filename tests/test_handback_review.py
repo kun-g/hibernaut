@@ -3,11 +3,16 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 
-from agent_runtime.adapters.executor_cli.base_merge import without_base
+from agent_runtime.adapters.delivery.pr_delivery import DeliveryRecord
+from agent_runtime.adapters.executor_cli import sde
+from agent_runtime.adapters.executor_cli.base_merge import SinceReview, without_base
+from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.reviewer import ReviewAborted, worktree_fingerprint
 from agent_runtime.adapters.executor_cli.sde import _State, _review_delta
 from agent_runtime.core.models import Emit, Suspend
+from tests.fakes import InMemoryPermission
 from tests.test_coder_reviewer import git as run_git
 from tests.test_incremental_review import FIRST, FIX, block, verdict
 from tests.test_pr_delivery import VERSION_FILE
@@ -98,11 +103,17 @@ class TestConflictResolution(unittest.TestCase):
             "a new operator inside a block": {"f.py": self.MERGED.replace("new(x)", "-new(x)")},
             "conflict markers left in": {},
         }
+        # All nine resolutions start from the same merge, including the case that leaves its markers in place.
+        self.resolve({})
+        reviewed_tree = self.reviewed.split(":")[1]
         for name, files in cases.items():
             with self.subTest(name):
-                self.reset_branches()
-                _, current = self.resolve(files)
-                delta, paths = _review_delta(self.repo, self.reviewed.split(":")[1], current, ("f.py",))
+                run_git(self.repo, "reset", "--hard", "HEAD")
+                for path, content in files.items():
+                    (self.repo / path).write_text(content)
+                run_git(self.repo, "add", "-A")
+                tree = out(self.repo, "write-tree")
+                delta, paths = _review_delta(self.repo, reviewed_tree, f":{tree}", ("f.py",))
                 self.assertEqual(set(paths), {"main_only.py", "f.py", *files})
                 self.assertIn("+++ b/f.py", delta)
 
@@ -244,6 +255,57 @@ class TestConflictResolution(unittest.TestCase):
             without_base(self.repo, f"{'0' * 40}:{'0' * 40}", worktree_fingerprint(self.repo), "main")
 
 
+class TestRepeatedHandBack(unittest.IsolatedAsyncioTestCase):
+    async def test_a_second_conflict_is_judged_against_the_last_passed_snapshot(self):
+        conflict = {"kind": "conflict", "base": "origin/main", "files": ["calc.py"]}
+        delivery = Mock()
+        delivery.config.max_handbacks = 3
+        delivery.deliver.side_effect = [
+            DeliveryRecord(problem="merge conflict", handback=conflict),
+            DeliveryRecord(problem="check failed", handback={"kind": "checks", "failed": "needs ok.txt"}),
+            DeliveryRecord(problem="merge conflict", handback=conflict),
+            DeliveryRecord(state="pr_open"),
+        ]
+        reviewer = Mock()
+        reviewer.check_launch.return_value.action = "allow"
+        reviewer.review = AsyncMock(return_value=PASS)
+        reviewer.format_review.return_value = "pass"
+        executor = sde.SDEExecutor(profile=ClaudeCodeProfile(name="sde"), options=sde.SDEOptions(review=True),
+                                   reviewer=reviewer, worktree_manager=Mock(), inbox_checkout_map={}, tasks=Mock(),
+                                   delivery=delivery)
+        report = {**dev({})["output"], "code_change": True}
+        state = _State(stage="develop", workdir="/test/repo", base_ref="main", requirements="divide")
+        patches = [
+            ("--- a/calc.py\n+++ b/calc.py\n@@ -1 +1 @@\n-return a\n+return b\n", ["calc.py"]),
+            ("--- /dev/null\n+++ b/ok.txt\n@@ -0,0 +1 @@\n+ok\n", ["ok.txt"]),
+            ("--- a/calc.py\n+++ b/calc.py\n@@ -1 +1 @@\n-return b\n+return b + b\n", ["calc.py"]),
+        ]
+        with (
+            patch.object(executor, "_develop", new_callable=AsyncMock, return_value=(report, "native")) as develop,
+            patch.object(executor, "_unfinished", return_value=("", None)),
+            patch.object(executor, "_guidance_inputs", return_value=(None, None)),
+            patch.object(executor, "_delivered_snapshot", return_value="v:versioned"),
+            patch.object(executor, "_since_review", return_value=SinceReview("versioned")),
+            patch.object(sde, "worktree_fingerprint", side_effect=["a:first", "b:resolved", "c:fixed", "d:last"]),
+            patch.object(sde, "_review_delta", side_effect=patches) as delta,
+            patch.object(sde, "review_scope", return_value=Mock(narrow=dict)),
+            patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected subprocess")),
+        ):
+            outcome = await executor._run("session", None, state, Mock(permissions=InMemoryPermission()), "divide")
+        self.assertIsInstance(outcome, Emit)
+        self.assertEqual((develop.await_count, reviewer.review.await_count, delivery.deliver.call_count), (4, 4, 4))
+        self.assertEqual([call.args[1:] for call in delta.call_args_list], [
+            ("first", "b:resolved", ("calc.py",)),
+            ("versioned", "c:fixed", ()),
+            ("fixed", "d:last", ("calc.py",)),
+        ])
+        first, *rechecks = [call.args[0] for call in reviewer.review.await_args_list]
+        self.assertEqual(first.previous_round, "")
+        for request, (expected_diff, _) in zip(rechecks, patches, strict=True):
+            self.assertIn(f"```diff\n{expected_diff}\n```", request.previous_round)
+        self.assertIn("hand-back 3 of 3: merging origin/main conflicts", outcome.messages[0])
+
+
 class TestHandBackReview(SDEDeliveryCase):
     def merge_step(self, files, **kwargs):
         return {**dev(files, commit="merge origin/main", **kwargs), "run": MERGE_MAIN}
@@ -288,30 +350,6 @@ class TestHandBackReview(SDEDeliveryCase):
         for absent in ("main_only.py", "calc.py", VERSION_FILE):
             self.assertNotIn(absent, delta)
         self.assertIn("Files changed since the previous review:\n- ok.txt\n", prompt + "\n")
-
-    async def test_a_second_conflict_is_judged_against_the_first_resolution(self):
-        self.conflict()
-        check = ("/bin/sh", "-c", "test -f ok.txt || exit 1")
-        # The first attempt merges and versions, fails its checks, and main conflicts again before the fix is done.
-        self.set_plan(sde=[dev({"calc.py": TASK_CALC}), self.merge_step({"calc.py": TASK_CALC}),
-                           dev({"ok.txt": "ok\n"}, commit="fix"), self.merge_step({"calc.py": TASK_CALC})],
-                      reviewer=[PASS] * 4)
-        delivery = self.delivery(checks=(check,), max_handbacks=3)
-        executor = self.executor(delivery=delivery)
-        moved = []
-        original = delivery.deliver
-
-        def deliver(request, **kwargs):
-            if (Path(request.workdir) / "ok.txt").exists() and not moved:
-                moved.append(True)
-                self.push_main({"calc.py": "def divide(a, b):\n    return b + b\n"}, message="again")
-            return original(request, **kwargs)
-
-        delivery.deliver = deliver  # type: ignore[method-assign]
-        outcome = await executor.execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
-        self.assertEqual((len(self.calls("sde")), len(self.calls("reviewer"))), (4, 4))
-        self.assertIn("hand-back 3 of 3: merging origin/main conflicts", outcome.messages[0])
 
     async def test_reviewer_can_block_a_problem_in_the_merged_result(self):
         self.conflict()
@@ -506,6 +544,8 @@ class TestHandBackReview(SDEDeliveryCase):
         self.assertEqual(len(self.calls("reviewer")), 2)
         self.assertNotIn("not reviewed again", declined.messages[0])
 
+
+class TestHandBackCheckpoint(unittest.TestCase):
     def test_a_checkpoint_from_before_the_hand_back_record_still_loads(self):
         fields = _State(stage="review_pending", workdir="/w", base_ref="", requirements="r").fields()
         del fields["handback"]

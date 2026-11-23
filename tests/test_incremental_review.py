@@ -3,14 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_runtime.adapters.delivery import DeliveryRequest
 from agent_runtime.adapters.delivery.pr_delivery import _followup_list
 from agent_runtime.adapters.executor_cli.review_scope import ReviewScope, merge_notes
 from agent_runtime.adapters.executor_cli.reviewer import REVIEW_SCHEMA, plain_review_contract, validate_review
 from agent_runtime.adapters.executor_cli.sde import _State
 from agent_runtime.core.models import Emit, Suspend
-from tests.test_coder_reviewer import git
-from tests.test_pr_delivery import DeliveryCase
+from tests.test_pr_delivery import rendered_body
 from tests.test_sde_delivery import MAIN_CALC, MERGE_MAIN, PASS, RESOLVED, TASK_CALC, SDEDeliveryCase, dev, event
 
 BUGGY = {"calc.py": "def divide(a, b):\n    return a / b\n", "old.py": "def total(xs):\n    return sum(xs)\n"}
@@ -354,6 +352,8 @@ class TestRoleReviewRounds(SDEDeliveryCase):
         self.assertNotIn("跟进", outcome.messages[0])
         self.assertNotIn("## 跟进", self.gh_state()["prs"][0]["body"])
 
+
+class TestReviewCheckpoint(unittest.TestCase):
     def test_a_checkpoint_from_before_notes_were_kept_still_loads(self):
         fields = _State(stage="review_pending", workdir="/w", base_ref="", requirements="r").fields()
         del fields["review_notes"]
@@ -362,21 +362,9 @@ class TestRoleReviewRounds(SDEDeliveryCase):
         self.assertEqual(state.review_notes, [])
 
 
-class TestFollowUpSection(DeliveryCase):
+class TestFollowUpSection(unittest.TestCase):
     def body(self, *followups, summary="s", evidence="e"):
-        key = f"task-{getattr(self, 'n', 1)}"
-        wt = self.clone(key, f"hb/{key}")
-        (wt / "calc.py").write_text("x = 1\n")
-        git(wt, "commit", "-qam", "work")
-        request = DeliveryRequest(
-            work_key=f"task:{key[5:]}", workdir=wt, title="t", summary=summary, test_evidence=evidence, change_kind="fix",
-            rationale="r", review="pass", followups=followups)
-        self.delivery().deliver(request, permissions=self.allow())
-        return self.gh_state()["prs"][-1]["body"]
-
-    def allow(self):
-        from tests.fakes import InMemoryPermission
-        return InMemoryPermission()
+        return rendered_body(followups=followups, summary=summary, evidence=evidence)
 
     def test_notes_are_one_line_each_and_ping_or_close_nothing(self):
         section = self.body("first\nline", "use @property; fixes #12").split("## 跟进\n")[1].split("\n\n## ")[0]
@@ -391,11 +379,9 @@ class TestFollowUpSection(DeliveryCase):
 
     def test_the_room_left_by_the_rest_of_the_body_is_used_to_the_last_character(self):
         overhead = len(self.body("x")) - 1
-        self.gh_reset()
         exact = "n" * (65_536 - overhead)
         body = self.body(exact)
         self.assertEqual((len(body), self.section(body)), (65_536, f"- {exact}"))
-        self.gh_reset()
         over = self.body(exact + "n")
         self.assertLessEqual(len(over), 65_536)
         self.assertGreater(len(over), 65_000)
@@ -415,9 +401,7 @@ class TestFollowUpSection(DeliveryCase):
         # The rest of the body, heading included, leaves 10 characters: fewer than the notice itself takes.
         for name, evidence in (("long evidence", "e" * 20_000), ("short evidence", "e")):
             with self.subTest(name):
-                self.gh_reset()
                 fixed = len(self.body("x", evidence=evidence)) - 2  # without the one-character summary and note
-                self.gh_reset()
                 summary = "s" * (65_526 - fixed)
                 body = self.body("n" * 5_000, summary=summary, evidence=evidence)
                 self.assertLessEqual(len(body), 65_536)
@@ -434,10 +418,6 @@ class TestFollowUpSection(DeliveryCase):
         self.assertEqual(_followup_list(["n" * 100], -5), "")
         for room in range(0, 110):
             self.assertLessEqual(len(_followup_list(["n" * 60, "m" * 60], room)), room)
-
-    def gh_reset(self):
-        # Another PR body in the same test: a fresh task branch and clone.
-        self.n = getattr(self, "n", 1) + 1
 
 
 if __name__ == "__main__":

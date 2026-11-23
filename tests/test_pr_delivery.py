@@ -9,11 +9,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from agent_runtime.adapters.delivery import (
     MERGE_TOOL,
     OPEN_PR_TOOL,
     DeliveryConfig,
+    DeliveryRecord,
     DeliveryRequest,
     PRDelivery,
     bump_version,
@@ -263,6 +265,36 @@ class DeliveryCase(unittest.TestCase):
         return out
 
 
+def rendered_body(*, issue="", repo="", link="refs", followups=(), summary="s", evidence="e"):
+    config = DeliveryConfig(repo=repo, issue_link=link, version_file=VERSION_FILE)
+    request = DeliveryRequest(work_key="task:1", workdir=Path("repo"), title="t", summary=summary,
+                              test_evidence=evidence, change_kind="fix", rationale="r", review="pass",
+                              followups=followups, issue=issue)
+    record = DeliveryRecord(state="pr_open", head_sha="a" * 40, base_sha="b" * 40, version="0.4.1",
+                            base_version="0.4.0", bump="patch", checks=[{"command": "pytest", "exit_code": 0}])
+    return PRDelivery(config, Mock(spec_set=SQLiteDeliveryStore), env={})._body(request, record)
+
+
+class TestPullRequestBody(unittest.TestCase):
+    def test_pr_body_opens_with_the_source_issue_line_for_each_issue_link(self):
+        cases = {
+            ("closes", "o/r#7"): "Closes #7\n\n## Summary",
+            ("refs", "o/r#7"): "Refs #7\n\n## Summary",
+            ("closes", "other/lib#12"): "Closes other/lib#12\n\n## Summary",
+            ("refs", "Other/Lib#12"): "Refs Other/Lib#12\n\n## Summary",
+            ("closes", "O/R#3"): "Closes #3\n\n## Summary",
+            ("none", "o/r#7"): "## Summary",
+            ("closes", ""): "## Summary",
+        }
+        for (link, issue), start in cases.items():
+            with self.subTest(link=link, issue=issue):
+                body = rendered_body(issue=issue, repo="o/r", link=link)
+                self.assertTrue(body.startswith(start), body[:80])
+
+    def test_without_a_configured_repo_the_issue_is_written_in_full(self):
+        self.assertTrue(rendered_body(issue="o/r#7", link="closes").startswith("Closes o/r#7\n\n## Summary"))
+
+
 class TestOpenPullRequest(DeliveryCase):
     def test_merges_latest_main_sets_version_runs_checks_pushes_and_creates_the_pr(self):
         wt = self.task("task-a", {"calc.py": "def divide(a, b):\n    return a / b\n"})
@@ -302,32 +334,6 @@ class TestOpenPullRequest(DeliveryCase):
         self.assertEqual(self.gh_state()["prs"][0]["edits"], 1)
         self.assertEqual(self.check_log.read_text(), "ran\n")
         self.assertEqual(second.attempts, 2)
-
-    def test_pr_body_opens_with_the_source_issue_line_for_each_issue_link(self):
-        cases = {
-            ("closes", "o/r#7"): "Closes #7\n\n## Summary",
-            ("refs", "o/r#7"): "Refs #7\n\n## Summary",
-            ("closes", "other/lib#12"): "Closes other/lib#12\n\n## Summary",
-            ("refs", "Other/Lib#12"): "Refs Other/Lib#12\n\n## Summary",
-            ("closes", "O/R#3"): "Closes #3\n\n## Summary",
-            ("none", "o/r#7"): "## Summary",
-            ("closes", ""): "## Summary",
-        }
-        for (link, issue), start in cases.items():
-            with self.subTest(link=link, issue=issue):
-                name = f"task-{link}-{issue.replace('/', '-').replace('#', '-') or 'plain'}".lower()
-                wt = self.task(name, {"calc.py": "x = 1\n"})
-                rec = self.delivery(issue_link=link).deliver(self.request(wt, issue=issue),
-                                                             permissions=InMemoryPermission())
-                self.assertEqual(rec.problem, "")
-                pr = next(p for p in self.gh_state()["prs"] if p["head"] == f"hb/{name}")
-                self.assertTrue(pr["body"].startswith(start), pr["body"][:80])
-
-    def test_without_a_configured_repo_the_issue_is_written_in_full(self):
-        wt = self.task("task-a", {"calc.py": "x = 1\n"})
-        self.delivery(repo="", issue_link="closes").deliver(self.request(wt, issue="o/r#7"),
-                                                            permissions=InMemoryPermission())
-        self.assertTrue(self.gh_state()["prs"][0]["body"].startswith("Closes o/r#7\n\n## Summary"))
 
     def test_a_reused_pr_keeps_the_issue_line_when_its_body_is_updated(self):
         wt = self.task("task-a", {"calc.py": "x = 1\n"})
