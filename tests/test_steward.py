@@ -1341,23 +1341,11 @@ agents = ["sde"]
 """
 
 
-class DaemonTests(unittest.IsolatedAsyncioTestCase):
+class DaemonCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        origin = make_base_repo(self.root)
         self.repo = self.root / "checkout"
-        git(self.root, "clone", "-q", str(origin), str(self.repo))
-        git(self.repo, "config", "user.email", "t@example.invalid")
-        git(self.repo, "config", "user.name", "t")
-        self.log = self.root / "calls.jsonl"
-        self.plan = self.root / "plan.json"
-        self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan)}))
-        self.orca = FakeOrcaTerminals(self.root)
-        self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
         self.channel = RecordingChannel()
-
-    async def asyncTearDown(self) -> None:
-        await self.orca.close_all()
 
     def raw(self) -> dict[str, Any]:
         return tomllib.loads(CONFIG.format(root=self.root, repo=self.repo, command=fake_command(self.root)))
@@ -1375,6 +1363,23 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         stop.set()
         await pool
         return daemon
+
+
+class DaemonTests(DaemonCase):
+    def setUp(self) -> None:
+        super().setUp()
+        origin = make_base_repo(self.root)
+        git(self.root, "clone", "-q", str(origin), str(self.repo))
+        git(self.repo, "config", "user.email", "t@example.invalid")
+        git(self.repo, "config", "user.name", "t")
+        self.log = self.root / "calls.jsonl"
+        self.plan = self.root / "plan.json"
+        self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan)}))
+        self.orca = FakeOrcaTerminals(self.root)
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
+
+    async def asyncTearDown(self) -> None:
+        await self.orca.close_all()
 
     def launches(self) -> list[dict[str, Any]]:
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
@@ -1443,14 +1448,36 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((forwarded.payload["trace_id"], forwarded.payload["parent_event_id"]),
                          ("trace-1", asked.event_id))
 
+
+class DaemonReturnTests(DaemonCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo.mkdir()
+        self.steps = iter(())
+        self.roles = []
+        self.answers = []
+
+        async def steward(executor, native, prompt, caps, tools):
+            self.roles.append("steward")
+            step = next(self.steps)
+            for call in step.get("calls", []):
+                self.answers.append(await tools.call(call["tool"], call["arguments"]))
+            return {"session_id": "test-steward", "structured_output": step.get("output", {"action": "silent"})}
+
+        async def developer(executor, events, session, caps, run):
+            self.roles.append("sde")
+            return Emit(messages=("implemented",))
+
+        self.enterContext(patch.object(StewardExecutor, "_converse", new=steward))
+        self.enterContext(patch.object(SDEExecutor, "_execute", new=developer))
+
     async def test_a_deferred_return_waits_for_its_own_approval(self) -> None:
-        self.set_plan(
+        self.steps = iter(
             [
                 {"calls": [{"tool": "forward_to_inbox", "arguments": {
                     "target_inbox": SDE, "text": "do it", "return_to": MAIN}}]},
                 {"output": {"action": "reply", "message": "all done"}},
             ],
-            [{"write": {"calc.py": "x = 1\n"}}],
         )
         check = AutoModePermissionAdapter.check
 
@@ -1474,15 +1501,14 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             await daemon.pool.wait_until_idle(60)
             stop.set()
             await pool
-        self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde", "steward"])
+        self.assertEqual(self.roles, ["steward", "sde", "steward"])
         answers = [(m.inbox_id, m.content) for m in daemon.outbox.fetch_pending(limit=50) if m.metadata["kind"] == "emit"]
         self.assertEqual(answers, [(MAIN, "all done")])
 
     async def test_a_withheld_result_ends_the_stewards_wait(self) -> None:
-        self.set_plan(
+        self.steps = iter(
             [{"calls": [{"tool": "forward_to_inbox", "arguments": {
                 "target_inbox": SDE, "text": "do it", "return_to": MAIN}}]}],
-            [{"write": {"calc.py": "x = 1\n"}}],
         )
         check = AutoModePermissionAdapter.check
 
@@ -1505,7 +1531,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             await daemon.pool.wait_until_idle(60)
             stop.set()
             await pool
-        self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde"])
+        self.assertEqual(self.roles, ["steward", "sde"])
         sent = {m.metadata["kind"]: m for m in daemon.outbox.fetch_pending(limit=50)}
         self.assertEqual(sorted(sent), ["approval_request", "return_withheld"])
         notice = sent["return_withheld"]
@@ -1516,9 +1542,8 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(steward.forward.pending_returns, ())
 
     async def test_direct_forward_answers_from_the_child(self) -> None:
-        self.set_plan(
+        self.steps = iter(
             [{"calls": [{"tool": "forward_to_inbox", "arguments": {"target_inbox": SDE, "text": "do it"}}]}],
-            [{"write": {"calc.py": "x = 1\n"}}],
         )
         daemon = await self.run_daemon((MAIN, "feishu:1", {"text": "x", "reply_channel": "feishu"}))
         messages = [m for m in daemon.outbox.fetch_pending(limit=50) if m.metadata["kind"] == "emit"]
@@ -1527,18 +1552,17 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_targets_the_config_does_not_cover_are_refused(self) -> None:
         targets = ["proj:x:docs", "proj:y", "proj:x:sde:a/b", "proj:x:sde:.."]
-        self.set_plan([{"calls": [
+        self.steps = iter([{"calls": [
             {"tool": "forward_to_inbox", "arguments": {"target_inbox": t, "text": "x"}} for t in targets
         ] + [{"tool": "forward_to_inbox", "arguments": {"target_inbox": SDE, "text": "x", "target_agent": "steward"}}]}])
         daemon = await self.run_daemon((MAIN, "feishu:1", {"text": "x"}))
-        answers = [a for c in map(json.loads, self.log.read_text().splitlines()) for a in c.get("answers", [])]
-        self.assertEqual([failed for failed, _ in answers], [True] * 5)
+        self.assertEqual([failed for _, failed in self.answers], [True] * 5)
         self.assertEqual(len(daemon.inbox.list_events()), 1)
 
     async def test_agent_outside_the_whitelist_is_refused_end_to_end(self) -> None:
         daemon = await self.run_daemon((MAIN, "feishu:1", {"text": "x", "agent_id": "sde"}))
         self.assertEqual([e.status for e in daemon.inbox.list_events()], ["failed"])
-        self.assertFalse(self.log.exists())
+        self.assertEqual(self.roles, [])
         self.assertEqual([m.metadata["kind"] for m in daemon.outbox.fetch_pending(limit=5)], ["agent_refused"])
 
 
