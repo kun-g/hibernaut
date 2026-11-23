@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -186,6 +188,82 @@ def test_concurrent_dual_upstream_done_unlocks_at_most_once(tmp_path: Path) -> N
         assert final_down.dispatch_seq == 1
         assert pub.work_ready == [(down.task_id, 1)]
     finally:
+        store.close()
+
+
+class _HeldFirstPublish(_RecordingPublisher):
+    # Holds the first work.ready inside publish, after its claim committed, until released.
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed = False
+        self.in_publish = threading.Event()
+        self.release = threading.Event()
+
+    def publish_work_ready(self, task: TaskItem, *, trace_id: str, hop_count: int) -> None:
+        if self.armed and not self.in_publish.is_set():
+            self.in_publish.set()
+            assert self.release.wait(timeout=5)
+        super().publish_work_ready(task, trace_id=trace_id, hop_count=hop_count)
+
+
+class _HoldAfterCommit:
+    # Pauses one task's transition after its terminal write commits, before its fan-out runs.
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+        self.committed = threading.Event()
+        self.resume = threading.Event()
+
+    def emit(
+        self,
+        event_name: str,
+        *,
+        task_id: str | None = None,
+        detail: Mapping[str, Any] | None = None,
+    ) -> None:
+        del detail
+        if event_name == "task_transitioned" and task_id == self.task_id:
+            self.committed.set()
+            assert self.resume.wait(timeout=5)
+
+
+def test_dual_upstream_done_race_does_not_republish_the_claim(tmp_path: Path) -> None:
+    # The interleaving the barrier test hits by chance: both completions commit, then the first
+    # fan-out claims the downstream and is still publishing when the second fan-out reaches it.
+    store = SQLiteTaskStore(tmp_path / "taskboard.db")
+    pub = _HeldFirstPublish()
+    svc = IngestionService(store, publisher=pub)
+    try:
+        up1 = svc.tb_create_task("proj:hibernaut", "Up 1", initial_status="ready")
+        up2 = svc.tb_create_task("proj:hibernaut", "Up 2", initial_status="ready")
+        down = svc.tb_create_task("proj:hibernaut", "Downstream")
+        svc.tb_manage_dependency("add", up1.task_id, down.task_id)
+        svc.tb_manage_dependency("add", up2.task_id, down.task_id)
+        svc.tb_transition_task(up1.task_id, "in_progress")
+        svc.tb_transition_task(up2.task_id, "in_progress")
+        pub.work_ready.clear()
+        pub.armed = True
+        hold = _HoldAfterCommit(up2.task_id)
+        svc = IngestionService(store, publisher=pub, audit=hold)
+
+        second = threading.Thread(target=svc.tb_transition_task, args=(up2.task_id, "done"))
+        second.start()
+        assert hold.committed.wait(timeout=5)
+        first = threading.Thread(target=svc.tb_transition_task, args=(up1.task_id, "done"))
+        first.start()
+        assert pub.in_publish.wait(timeout=5)
+        claimed = store.get_task(down.task_id)
+        assert claimed is not None and claimed.dispatch_seq == 1
+
+        hold.resume.set()
+        second.join(timeout=5)
+        pub.release.set()
+        first.join(timeout=5)
+
+        assert pub.work_ready == [(down.task_id, 1)]
+        final_down = store.get_task(down.task_id)
+        assert final_down is not None and final_down.dispatch_seq == 1
+    finally:
+        pub.release.set()
         store.close()
 
 
