@@ -122,6 +122,8 @@ def translate_run_result(result: RunResult, *, session_id: str) -> RunOutcome:
         stdout=result.stdout_excerpt,
         stderr=result.error_summary or "",
         exit_code=result.exit_code,
+        error_kind=result.error_kind,
+        runner_id=result.runner_id,
     )
     return replace(_translate_status(result, session_id=session_id), telemetry=telemetry)
 

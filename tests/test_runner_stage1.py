@@ -452,13 +452,14 @@ def test_bridge_outcomes_carry_run_telemetry_for_the_ledger(
 ) -> None:
     result = RunResult(
         run_id="run_t",
-        runner_id="local",
+        runner_id="vps-1",
         status=status,  # type: ignore[arg-type]
         executor_id="claude",
         started_at="2026-01-01T00:00:00Z",
         ended_at="2026-01-01T00:00:01Z",
         duration_ms=1000,
         exit_code=0 if status == "succeeded" else 2,
+        error_kind=None if status == "succeeded" else "rate_limit",
         error_summary=None if status == "succeeded" else "boom on stderr",
         stdout_excerpt="tokens: 12",
         structured_output=structured,
@@ -469,6 +470,8 @@ def test_bridge_outcomes_carry_run_telemetry_for_the_ledger(
         stdout="tokens: 12",
         stderr="" if status == "succeeded" else "boom on stderr",
         exit_code=0 if status == "succeeded" else 2,
+        error_kind=None if status == "succeeded" else "rate_limit",
+        runner_id="vps-1",
     )
 
 

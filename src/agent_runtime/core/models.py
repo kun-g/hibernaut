@@ -135,6 +135,11 @@ class RunTelemetry:
     stdout: str = ""
     stderr: str = ""
     exit_code: int | None = None
+    # Set by executors that already classify their failures (the runner's error_kind); the ledger takes it as given
+    # instead of guessing from stderr and the exit code.
+    error_kind: str | None = None
+    # The execution node that ran the process; None means this process (the ledger records "local").
+    runner_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
