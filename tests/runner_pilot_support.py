@@ -45,7 +45,7 @@ def commit(repo: Path, message: str) -> str:
 def recomputed_manifest(repo: Path, commit_id: str) -> str:
     # Independent of runner.protocol_check: git objects and SHA-256 only.
     lines = ""
-    for path in sorted(git("ls-tree", "-r", "--name-only", commit_id, "schemas/runner/v1/", cwd=repo).splitlines()):
+    for path in sorted(PROTOCOL_FILES):
         blob = subprocess.run(
             ["git", "cat-file", "blob", f"{commit_id}:{path}"], cwd=repo, check=True, capture_output=True
         ).stdout

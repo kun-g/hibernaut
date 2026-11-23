@@ -57,4 +57,4 @@
 - **Runner Relay**：Hibernaut 进程内的 Runner 反向 WebSocket 端点（`RunnerRelayHub`），Runner 主动连入，凭共享令牌鉴权后接单。`[runner]` 的 `relay` 模式与试点路由各开各的。与 Switchboard 的 relay 无关。
 - **Runner 试点路由**：`[runner_pilot]` 配置的一条默认关闭的路由：只把一个任务级 Inbox 交给一台单槽位的独立 Runner，执行器固定为 `runner-protocol-check`（无工具的协议文件校验）。关闭时该 Inbox 按原路由执行。
 - **候选提交（`candidate_commit`）**：试点任务载荷里要核验的 40 位完整提交号。与 SDE 交付中的候选分支无关。
-- **汇总摘要（manifest digest）**：五份 Runner 协议文件按路径排序的 `<sha256>  <路径>` 清单（`shasum -a 256` 格式）的 SHA-256，用 git 与 `shasum` 即可独立复算。
+- **汇总摘要（manifest digest）**：试点核验的五份 Runner 协议文件按路径排序的 `<sha256>  <路径>` 清单（`shasum -a 256` 格式）的 SHA-256，用 git 与 `shasum` 即可独立复算。

@@ -120,7 +120,7 @@ def _schema_problem(path: str, data: bytes) -> str | None:
 
 def _blobs(commit: str) -> dict[str, tuple[str, str]]:
     found: dict[str, tuple[str, str]] = {}
-    for entry in _git("ls-tree", "-rz", "--full-tree", commit, "--", f"{PROTOCOL_DIR}/").split(b"\0"):
+    for entry in _git("ls-tree", "-rz", "--full-tree", commit, "--", *PROTOCOL_FILES).split(b"\0"):
         if entry:
             meta, _, path = entry.partition(b"\t")
             mode, _, oid = meta.decode("ascii").split(" ")
@@ -138,7 +138,6 @@ def check_commit(commit: str) -> dict[str, Any]:
 
     blobs = _blobs(commit)
     problems = [f"{path} is missing" for path in PROTOCOL_FILES if path not in blobs]
-    problems += [f"{path} is not one of the {len(PROTOCOL_FILES)} protocol files" for path in sorted(blobs) if path not in PROTOCOL_FILES]
     files: list[dict[str, Any]] = []
     for path in PROTOCOL_FILES:
         if path not in blobs:

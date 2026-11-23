@@ -87,10 +87,6 @@ def _missing(repo: Path) -> None:
     (repo / PROTOCOL_FILES[1]).unlink()
 
 
-def _extra(repo: Path) -> None:
-    (repo / "schemas/runner/v1/sixth.schema.json").write_text("{}", encoding="utf-8")
-
-
 def _symlink(repo: Path) -> None:
     (repo / PROTOCOL_FILES[2]).unlink()
     (repo / PROTOCOL_FILES[2]).symlink_to("runner.interrupt.schema.json")
@@ -112,7 +108,6 @@ def _wrong_id(repo: Path) -> None:
     ("change", "problem"),
     [
         (_missing, "runner.interrupt.schema.json is missing"),
-        (_extra, "sixth.schema.json is not one of the 5 protocol files"),
         (_symlink, "runner.reclaim.schema.json has mode 120000"),
         (_not_json, "runner.run_request.schema.json is not valid JSON"),
         (_duplicate_key, "duplicate key"),
@@ -127,6 +122,17 @@ def test_a_commit_whose_protocol_files_differ_fails_without_a_report(tmp_path: P
     proc = _check(repo, CheckRequest(bad).to_json())
     assert (proc.returncode, proc.stdout) == (1, "") and problem in proc.stderr
     assert _check(repo, CheckRequest(good).to_json()).returncode == 0
+
+
+def test_other_files_in_the_protocol_directory_are_not_part_of_the_check(tmp_path: Path) -> None:
+    # The protocol grows (runner.tool_authorize.schema.json): the five files stay checkable, with the same digest.
+    repo = tmp_path / "repo"
+    before = report_of(_check(repo, CheckRequest(protocol_repo(repo)).to_json()).stdout)
+    (repo / "schemas/runner/v1/sixth.schema.json").write_text("not a schema", encoding="utf-8")
+    proc = _check(repo, CheckRequest(commit(repo, "one more")).to_json())
+    assert proc.returncode == 0, proc.stderr
+    after = report_of(proc.stdout)
+    assert (after["files"], after["manifest_sha256"]) == (before["files"], before["manifest_sha256"])
 
 
 def test_only_the_request_format_and_a_commit_of_this_repository_are_accepted(tmp_path: Path) -> None:
