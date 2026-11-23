@@ -1,0 +1,2915 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Runner 执行面架构 · 双向透视与决策蓝图</title>
+  <style>
+    :root {
+      --bg-canvas: #FAF9F6;
+      --bg-card: #FFFFFF;
+      --bg-subtle: #F3F1EB;
+      --bg-elevated: #EAE7DE;
+      --bg-code: #F6F5F0;
+
+      --text-primary: #18181B;
+      --text-muted: #52525B;
+      --text-faint: #71717A;
+
+      --border: #E4E1D8;
+      --border-strong: #27272A;
+
+      --accent: #D95D24;
+      --accent-hover: #BF4E1A;
+      --accent-soft: rgba(217, 93, 36, 0.10);
+      --accent-border: rgba(217, 93, 36, 0.42);
+
+      --teal: #0F766E;
+      --teal-soft: rgba(15, 118, 110, 0.10);
+      --teal-border: rgba(15, 118, 110, 0.38);
+
+      --indigo: #4F46E5;
+      --indigo-soft: rgba(79, 70, 229, 0.10);
+      --indigo-border: rgba(79, 70, 229, 0.36);
+
+      --amber: #B45309;
+      --amber-soft: rgba(180, 83, 9, 0.10);
+      --amber-border: rgba(180, 83, 9, 0.34);
+
+      --rose: #BE123C;
+      --rose-soft: rgba(190, 18, 60, 0.09);
+      --rose-border: rgba(190, 18, 60, 0.35);
+
+      --zone-fill: #F4F2EC;
+      --svg-edge-idle: #A1A1AA;
+      --shadow-xs: 0 1px 2px rgba(24, 24, 27, 0.04);
+      --shadow-sm: 0 4px 16px rgba(24, 24, 27, 0.06);
+
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, monospace;
+
+      --r-sm: 6px;
+      --r-md: 10px;
+      --r-lg: 14px;
+    }
+
+    [data-theme="dark"] {
+      --bg-canvas: #141413;
+      --bg-card: #1E1D1B;
+      --bg-subtle: #282623;
+      --bg-elevated: #32302C;
+      --bg-code: #181715;
+
+      --text-primary: #F4F3EE;
+      --text-muted: #A1A1AA;
+      --text-faint: #71717A;
+
+      --border: #2E2D2A;
+      --border-strong: #E4E4E7;
+
+      --accent: #F07B42;
+      --accent-hover: #FF945E;
+      --accent-soft: rgba(240, 123, 66, 0.14);
+      --accent-border: rgba(240, 123, 66, 0.45);
+
+      --teal: #2DD4BF;
+      --teal-soft: rgba(45, 212, 191, 0.13);
+      --teal-border: rgba(45, 212, 191, 0.38);
+
+      --indigo: #818CF8;
+      --indigo-soft: rgba(129, 140, 248, 0.14);
+      --indigo-border: rgba(129, 140, 248, 0.38);
+
+      --amber: #F59E0B;
+      --amber-soft: rgba(245, 158, 11, 0.14);
+      --amber-border: rgba(245, 158, 11, 0.36);
+
+      --rose: #FB7185;
+      --rose-soft: rgba(251, 113, 133, 0.13);
+      --rose-border: rgba(251, 113, 133, 0.38);
+
+      --zone-fill: #23221F;
+      --svg-edge-idle: #52525B;
+      --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.25);
+      --shadow-sm: 0 4px 16px rgba(0, 0, 0, 0.35);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: var(--font-sans);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    code.ic {
+      font-family: var(--font-mono);
+      font-size: 0.87em;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border);
+      padding: 1px 5px;
+      border-radius: 5px;
+      color: var(--text-primary);
+    }
+
+    /* Sticky Header */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      background: color-mix(in srgb, var(--bg-canvas) 90%, transparent);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border);
+    }
+    .topbar-inner {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 11px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: var(--text-primary);
+    }
+    .brand-mark {
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      display: grid;
+      place-items: center;
+      font-family: var(--font-mono);
+      font-weight: 800;
+      font-size: 12px;
+      letter-spacing: -0.02em;
+    }
+    .brand-title { display: block; font-size: 14.5px; font-weight: 700; letter-spacing: -0.01em; }
+    .brand-sub { display: block; font-size: 11.5px; color: var(--text-muted); }
+
+    .nav-links { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+    .nav-links a {
+      text-decoration: none;
+      color: var(--text-muted);
+      font-size: 13px;
+      font-weight: 500;
+      transition: color 0.15s;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .nav-links a:hover { color: var(--accent); }
+    .nav-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      display: inline-block;
+    }
+
+    .theme-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      border-radius: 999px;
+      padding: 5px 12px;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .theme-btn:hover { border-color: var(--accent-border); }
+
+    /* Layout */
+    main { max-width: 1320px; margin: 0 auto; padding: 24px 20px 80px; }
+    .sec { margin-bottom: 52px; scroll-margin-top: 76px; }
+    .sec-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .sec-kicker {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--accent);
+      margin-bottom: 4px;
+    }
+    .sec-title { margin: 0 0 6px; font-size: 21px; font-weight: 750; letter-spacing: -0.02em; }
+    .sec-desc { margin: 0; font-size: 13.6px; color: var(--text-muted); max-width: 820px; }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-muted);
+    }
+    .badge-accent { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent); }
+    .badge-teal { background: var(--teal-soft); border-color: var(--teal-border); color: var(--teal); }
+    .badge-indigo { background: var(--indigo-soft); border-color: var(--indigo-border); color: var(--indigo); }
+    .badge-amber { background: var(--amber-soft); border-color: var(--amber-border); color: var(--amber); }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--r-lg);
+      box-shadow: var(--shadow-xs);
+    }
+
+    /* Section 00: Interactive Decision & Diagram Workshop */
+    .workshop-shell { padding: 18px 20px; }
+    .q-strip {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 12px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .q-tab {
+      flex: 0 0 auto;
+      border: 1.5px solid var(--border);
+      background: var(--bg-subtle);
+      color: var(--text-primary);
+      border-radius: 10px;
+      padding: 8px 13px;
+      text-align: left;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      font-family: var(--font-sans);
+      min-width: 170px;
+    }
+    .q-tab:hover { border-color: var(--accent-border); }
+    .q-tab.active {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent);
+    }
+    .q-tab-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      font-weight: 700;
+      color: var(--text-faint);
+    }
+    .q-tab.active .q-tab-top { color: var(--accent); }
+    .q-status {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+    }
+    .q-status.now { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .q-status.done { background: var(--teal-soft); border-color: var(--teal-border); color: var(--teal); }
+    .q-tab-title { font-size: 13px; font-weight: 700; margin-top: 3px; }
+
+    .ws-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .ws-title { margin: 0 0 4px; font-size: 17px; font-weight: 750; }
+    .ws-sub { margin: 0; font-size: 13px; color: var(--text-muted); }
+
+    .fork-pills {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .fork-pill {
+      border: 1px solid var(--border);
+      background: var(--bg-subtle);
+      color: var(--text-primary);
+      border-radius: 999px;
+      padding: 5px 12px;
+      font-size: 12.2px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .fork-pill.active {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .fork-pill .dec-mark {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-faint);
+    }
+    .fork-pill .dec-mark.picked {
+      background: var(--teal-soft);
+      border-color: var(--teal-border);
+      color: var(--teal);
+    }
+
+    .diagram-stage {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 14px;
+      overflow-x: auto;
+    }
+    .diagram-stage svg {
+      width: 100%;
+      min-width: 680px;
+      height: auto;
+      display: block;
+    }
+    .diagram-caption {
+      font-size: 12.2px;
+      color: var(--text-muted);
+      margin-top: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .option-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .option-grid.cols-3 {
+      grid-template-columns: repeat(3, 1fr);
+    }
+    .option-grid.cols-1 {
+      grid-template-columns: 1fr;
+    }
+    @media (max-width: 900px) { .option-grid.cols-3 { grid-template-columns: 1fr; } }
+    @media (max-width: 780px) { .option-grid { grid-template-columns: 1fr; } }
+
+    .opt-card {
+      border: 1.5px solid var(--border);
+      background: var(--bg-card);
+      border-radius: 11px;
+      padding: 13px 15px;
+      transition: all 0.15s ease;
+    }
+    .opt-card.recommended { border-color: var(--teal-border); }
+    .opt-card.selected {
+      border-color: var(--accent);
+      background: color-mix(in srgb, var(--accent-soft) 55%, var(--bg-card));
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 16%, transparent);
+    }
+    .opt-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .opt-title { font-size: 14px; font-weight: 750; }
+    .opt-list { margin: 6px 0 10px; padding-left: 17px; font-size: 12.6px; color: var(--text-muted); }
+    .opt-list li { margin-bottom: 4px; }
+    .opt-list strong { color: var(--text-primary); }
+
+    .pick-btn {
+      border: 1px solid var(--border);
+      background: var(--bg-subtle);
+      color: var(--text-primary);
+      border-radius: 7px;
+      padding: 5px 11px;
+      font-size: 12px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    .pick-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .pick-btn.picked {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    .decision-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding-top: 12px;
+      border-top: 1px dashed var(--border);
+      font-size: 12.5px;
+      color: var(--text-muted);
+    }
+    .copy-btn {
+      border: 1px solid var(--accent-border);
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-radius: 8px;
+      padding: 6px 13px;
+      font-size: 12.5px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    .copy-btn:hover { background: var(--accent); color: #fff; }
+
+    /* Section 01: X-Ray Explorer */
+    .xray-grid {
+      display: grid;
+      grid-template-columns: minmax(380px, 1.08fr) minmax(380px, 1fr);
+      gap: 18px;
+      align-items: start;
+    }
+    @media (max-width: 980px) { .xray-grid { grid-template-columns: 1fr; } }
+
+    .xray-map { padding: 18px; }
+    .xray-map-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .xray-map-title { font-size: 13.5px; font-weight: 700; display: flex; align-items: center; gap: 7px; }
+    .xray-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block; }
+    .dep-legend { display: flex; gap: 12px; font-size: 11.5px; color: var(--text-muted); flex-wrap: wrap; }
+    .dep-legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+
+    .zone {
+      background: var(--zone-fill);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 13px;
+      margin-bottom: 11px;
+    }
+    .zone:last-child { margin-bottom: 0; }
+    .zone.ambient { border-style: dashed; border-color: var(--teal-border); background: color-mix(in srgb, var(--teal-soft) 55%, var(--bg-card)); }
+    .zone-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 9px;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .zone-label { font-family: var(--font-mono); font-size: 11px; font-weight: 700; color: var(--text-muted); letter-spacing: 0.04em; }
+    .zone-rule { font-size: 11px; color: var(--text-faint); }
+
+    .chip-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .chip-grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    @media (max-width: 560px) { .chip-grid-2 { grid-template-columns: 1fr; } }
+
+    .chip {
+      border: 1.5px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+      border-radius: 10px;
+      padding: 9px 11px;
+      text-align: left;
+      cursor: pointer;
+      transition: all 0.16s ease;
+      font-family: var(--font-sans);
+      flex: 1;
+      min-width: 145px;
+    }
+    .chip:hover { border-color: var(--accent-border); transform: translateY(-1px); }
+    .chip-kicker { font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; color: var(--text-faint); }
+    .chip-name { font-size: 13px; font-weight: 700; margin-top: 2px; }
+    .chip-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; line-height: 1.35; }
+
+    .chip.active {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent);
+    }
+    .chip.active .chip-kicker { color: var(--accent); }
+    .chip.is-upstream { border-color: var(--teal); background: var(--teal-soft); }
+    .chip.is-upstream .chip-kicker { color: var(--teal); }
+    .chip.is-downstream { border-color: var(--indigo); background: var(--indigo-soft); }
+    .chip.is-downstream .chip-kicker { color: var(--indigo); }
+    .chip.is-dim { opacity: 0.42; }
+
+    /* Inspector Panel */
+    .inspector { padding: 18px 20px; position: sticky; top: 72px; }
+    @media (max-width: 980px) { .inspector { position: static; } }
+    .insp-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 12px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .insp-kicker { font-family: var(--font-mono); font-size: 11px; font-weight: 700; color: var(--accent); }
+    .insp-title { font-size: 18px; font-weight: 750; margin: 3px 0 4px; }
+    .insp-purpose { font-size: 13px; color: var(--text-muted); margin: 0; }
+
+    .tabs {
+      display: flex;
+      gap: 6px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 14px;
+      overflow-x: auto;
+    }
+    .tab-btn {
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      font-family: var(--font-sans);
+      font-size: 12.8px;
+      font-weight: 600;
+      padding: 8px 12px;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      white-space: nowrap;
+    }
+    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+    .kv-block {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 11px 13px;
+      margin-bottom: 11px;
+      font-size: 12.8px;
+    }
+    .kv-label { font-family: var(--font-mono); font-size: 11px; font-weight: 700; color: var(--text-faint); margin-bottom: 5px; }
+    .rel-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .rel-chip {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-weight: 600;
+      padding: 3px 9px;
+      border-radius: 999px;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-primary);
+    }
+    .rel-chip.up { background: var(--teal-soft); border-color: var(--teal-border); color: var(--teal); }
+    .rel-chip.down { background: var(--indigo-soft); border-color: var(--indigo-border); color: var(--indigo); }
+
+    .bullet-list { margin: 6px 0 0; padding-left: 18px; font-size: 12.8px; }
+    .bullet-list li { margin-bottom: 5px; }
+
+    pre.code-box {
+      margin: 0;
+      padding: 13px 14px;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-family: var(--font-mono);
+      font-size: 11.6px;
+      line-height: 1.55;
+      overflow-x: auto;
+      color: var(--text-primary);
+      user-select: text;
+    }
+    .code-meta {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-faint);
+      margin-bottom: 6px;
+    }
+
+    /* Scenario Strip & Horizontal Trace Rail */
+    .sc-strip {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 6px;
+      margin-bottom: 10px;
+    }
+    .sc-pill {
+      flex: 0 0 auto;
+      border: 1px solid var(--border);
+      background: var(--bg-subtle);
+      color: var(--text-primary);
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .sc-pill.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+
+    .trace-rail {
+      display: flex;
+      gap: 10px;
+      overflow-x: auto;
+      padding: 4px 2px 10px;
+    }
+    .trace-card {
+      flex: 0 0 238px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 11px;
+      background: var(--bg-subtle);
+    }
+    .trace-card.hit { border-color: var(--accent); background: var(--accent-soft); }
+    .trace-step { font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; color: var(--accent); }
+    .trace-title { font-size: 12.8px; font-weight: 700; margin: 2px 0 6px; }
+    .trace-desc { font-size: 11.8px; color: var(--text-muted); margin: 0 0 8px; }
+    .trace-item {
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      border-radius: 7px;
+      padding: 6px 8px;
+      margin-bottom: 5px;
+      font-size: 11.3px;
+      cursor: pointer;
+    }
+    .trace-item:last-child { margin-bottom: 0; }
+    .trace-item-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; font-family: var(--font-mono); font-weight: 600; }
+    .trace-item-body { display: none; margin-top: 5px; padding-top: 5px; border-top: 1px dashed var(--border); font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); user-select: text; }
+    .trace-item.open .trace-item-body { display: block; }
+    .tag-mini { font-size: 10px; padding: 1px 5px; border-radius: 4px; background: var(--bg-subtle); color: var(--text-muted); }
+
+    /* Section 02: Scenarios Table */
+    .tbl-wrap { overflow-x: auto; }
+    table.ed-tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.ed-tbl th, table.ed-tbl td {
+      text-align: left;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    table.ed-tbl th { font-size: 12px; color: var(--text-muted); background: var(--bg-subtle); font-weight: 700; }
+    table.ed-tbl tr:last-child td { border-bottom: none; }
+    .jump-btn {
+      border: 1px solid var(--accent-border);
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-radius: 7px;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .jump-btn:hover { background: var(--accent); color: #fff; }
+
+    /* Section 03: ER Diagram */
+    .er-pills { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+    .er-pill {
+      border: 1px solid var(--border);
+      background: var(--bg-subtle);
+      color: var(--text-primary);
+      border-radius: 999px;
+      padding: 5px 12px;
+      font-family: var(--font-mono);
+      font-size: 11.8px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .er-pill.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+    .er-note {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 11px 14px;
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-top: 12px;
+    }
+    .er-note strong { color: var(--text-primary); }
+
+    /* Section 04: Repo & Guardrails */
+    .repo-grid { display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px; }
+    @media (max-width: 880px) { .repo-grid { grid-template-columns: 1fr; } }
+    .split-card {
+      border: 1px solid var(--border);
+      background: var(--bg-subtle);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 10px;
+    }
+    .split-card:last-child { margin-bottom: 0; }
+    .split-k { font-family: var(--font-mono); font-size: 11px; font-weight: 700; color: var(--accent); }
+    .split-t { font-size: 13.5px; font-weight: 700; margin: 2px 0 4px; }
+    .split-d { font-size: 12.5px; color: var(--text-muted); margin: 0; }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: var(--border-strong);
+      color: var(--bg-canvas);
+      padding: 9px 15px;
+      border-radius: 9px;
+      font-size: 12.8px;
+      font-weight: 600;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(8px);
+      transition: all 0.2s ease;
+      z-index: 60;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a href="#sec-workshop" class="brand">
+        <span class="brand-mark">RUN</span>
+        <span>
+          <span class="brand-title">Runner 执行面架构 · 双向透视与决策蓝图</span>
+          <span class="brand-sub">RunnerPort × 多节点亲和调度 × Worktree 三道保险 × 多 CLI 驱动</span>
+        </span>
+      </a>
+      <nav class="nav-links" aria-label="快捷导航">
+        <a href="#sec-workshop"><span class="nav-dot"></span>问题讨论区</a>
+        <a href="#sec-xray">01 透视台</a>
+        <a href="#sec-scenarios">02 运行场景</a>
+        <a href="#sec-er">03 契约关联图</a>
+        <a href="#sec-repo">04 目录与门禁</a>
+      </nav>
+      <button type="button" id="theme-toggle" class="theme-btn">
+        <span id="theme-icon">☾</span>
+        <span id="theme-label">深色</span>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <!-- SECTION 00: INTERACTIVE DECISION & DIAGRAM WORKSHOP -->
+    <section id="sec-workshop" class="sec">
+      <div class="sec-head">
+        <div>
+          <div class="sec-kicker">Workshop · 定位边界与 5 大核心问题图解台</div>
+          <h2 class="sec-title">问题讨论区：先钉死定位与边界，再按图逐项拍板</h2>
+          <p class="sec-desc"><strong>Q0–Q4 共 15 项架构决策已全部锁定定稿（v1.0）</strong>。下方保留全部图解与决策账本供随时复盘，已同步生成 Google Drive 独立设计文档。</p>
+        </div>
+        <span class="badge badge-teal" id="decision-progress">v1.0 全部 15 / 15 项已定稿</span>
+      </div>
+
+      <div class="card workshop-shell">
+        <div class="q-strip" id="q-strip"></div>
+        <div id="workshop-body"></div>
+      </div>
+    </section>
+
+    <!-- SECTION 01: INTERACTIVE X-RAY EXPLORER -->
+    <section id="sec-xray" class="sec">
+      <div class="sec-head">
+        <div>
+          <div class="sec-kicker">Section 01 · Runner Bidirectional X-Ray Explorer</div>
+          <h2 class="sec-title">Runner 双向依赖透视台：点击任意组件查看上下游、契约与演练轨迹</h2>
+          <p class="sec-desc">不硬套 4 层整洁架构，采用「薄契约（<code class="ic">RunnerPort</code>）+ 宿主调度 + Worktree/CLI 驱动」，同时服务 Hibernaut（<code class="ic">hb-*</code>）与 Workshop（<code class="ic">ws-*</code>）。</p>
+        </div>
+        <span class="badge badge-teal">青色上游 · 靛蓝下游 · ADR-0001</span>
+      </div>
+
+      <div class="xray-grid">
+        <div class="card xray-map">
+          <div class="xray-map-head">
+            <div class="xray-map-title"><span class="xray-dot"></span>Runner 内部与边界拓扑（点击卡片透视）</div>
+            <div class="dep-legend">
+              <span><i class="sw" style="background:var(--accent)"></i>当前选中</span>
+              <span><i class="sw" style="background:var(--teal)"></i>上游调用方</span>
+              <span><i class="sw" style="background:var(--indigo)"></i>下游依赖</span>
+            </div>
+          </div>
+
+          <div class="zone">
+            <div class="zone-head">
+              <span class="zone-label">CALLERS · 上游控制面（零 Git / 零子进程依赖）</span>
+              <span class="zone-rule">只传逻辑键，不碰磁盘路径</span>
+            </div>
+            <div class="chip-grid-2">
+              <button type="button" class="chip" data-id="hb_control">
+                <div class="chip-kicker">CALLER 01 · hb-*</div>
+                <div class="chip-name">Hibernaut 控制面</div>
+                <div class="chip-sub">Session 4 态 · 单活锁 · 粘滞路由</div>
+              </button>
+              <button type="button" class="chip" data-id="ws_control">
+                <div class="chip-kicker">CALLER 02 · ws-*</div>
+                <div class="chip-name">Workshop / 车间</div>
+                <div class="chip-sub">Append-only 事实表 · 插件编排</div>
+              </button>
+            </div>
+          </div>
+
+          <div class="zone">
+            <div class="zone-head">
+              <span class="zone-label">CONTRACT &amp; TRANSPORT · 协议与双模传输（ADR-0001）</span>
+              <span class="zone-rule">JSON Schema 2020-12 · 同进程 / 反向 WS</span>
+            </div>
+            <div class="chip-grid-2">
+              <button type="button" class="chip" data-id="runner_port">
+                <div class="chip-kicker">CONTRACT · 4 方法</div>
+                <div class="chip-name">RunnerPort 契约</div>
+                <div class="chip-sub">capabilities · run · interrupt · reclaim</div>
+              </button>
+              <button type="button" class="chip" data-id="transport">
+                <div class="chip-kicker">TRANSPORT · 双模</div>
+                <div class="chip-name">InProcess / Relay WS</div>
+                <div class="chip-sub">本机直调 ↔ 反向 wss:// + conn_epoch</div>
+              </button>
+            </div>
+          </div>
+
+          <div class="zone">
+            <div class="zone-head">
+              <span class="zone-label">RUNNER HOST · 执行节点宿主（Mac 本机 / 远端 VPS）</span>
+              <span class="zone-rule">无会话状态机 · 管槽位与子进程</span>
+            </div>
+            <div class="chip-grid-2">
+              <button type="button" class="chip" data-id="runner_daemon">
+                <div class="chip-kicker">HOST · 调度与槽位</div>
+                <div class="chip-name">RunnerDaemon</div>
+                <div class="chip-sub">run_id 幂等去重 · 并发槽位 · 心跳上报</div>
+              </button>
+              <button type="button" class="chip" data-id="supervisor">
+                <div class="chip-kicker">HOST · 防挂死</div>
+                <div class="chip-name">ProcessSupervisor</div>
+                <div class="chip-sub">SIGTERM→SIGKILL · 看门狗 · 日志落盘</div>
+              </button>
+            </div>
+          </div>
+
+          <div class="zone">
+            <div class="zone-head">
+              <span class="zone-label">DRIVERS · 可插拔执行驱动（磁盘隔离 + 多 CLI）</span>
+              <span class="zone-rule">前缀严格隔离 · 兼容 magpie</span>
+            </div>
+            <div class="chip-grid-2">
+              <button type="button" class="chip" data-id="worktree_drv">
+                <div class="chip-kicker">DRIVER 01 · 工作区</div>
+                <div class="chip-name">Worktree 驱动</div>
+                <div class="chip-sub">Orca / Git · creating 占位 · 三关回收</div>
+              </button>
+              <button type="button" class="chip" data-id="cli_drv">
+                <div class="chip-kicker">DRIVER 02 · 多 CLI</div>
+                <div class="chip-name">CLI 驱动层</div>
+                <div class="chip-sub">claude / grok / cursor / dsh · resume</div>
+              </button>
+            </div>
+          </div>
+
+          <div class="zone ambient">
+            <div class="zone-head">
+              <span class="zone-label">SECURITY &amp; AMBIENT · 零长期密钥与旁路观测</span>
+              <span class="zone-rule">短期凭据租约 · 故障不阻断主链路</span>
+            </div>
+            <div class="chip-grid-2">
+              <button type="button" class="chip" data-id="broker">
+                <div class="chip-kicker">SECURITY · 凭据代理</div>
+                <div class="chip-name">Credential Broker</div>
+                <div class="chip-sub">短期 Lease Token · 剥离环境长效密钥</div>
+              </button>
+              <button type="button" class="chip" data-id="ledger">
+                <div class="chip-kicker">AMBIENT · 只追加账本</div>
+                <div class="chip-name">Observability / Ledger</div>
+                <div class="chip-sub">runs + logs/runs/&lt;run_id&gt;.log + 耗时</div>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right: 4-Tab Inspector -->
+        <div class="card inspector">
+          <div class="insp-top">
+            <div>
+              <div class="insp-kicker" id="insp-kicker"></div>
+              <h3 class="insp-title" id="insp-title"></h3>
+              <p class="insp-purpose" id="insp-purpose"></p>
+            </div>
+            <span class="badge" id="insp-style"></span>
+          </div>
+
+          <div class="tabs" role="tablist">
+            <button type="button" class="tab-btn active" data-tab="arch">架构透视</button>
+            <button type="button" class="tab-btn" data-tab="code">代码与契约</button>
+            <button type="button" class="tab-btn" data-tab="change">演进与边界</button>
+            <button type="button" class="tab-btn" data-tab="scenarios">关联场景</button>
+          </div>
+
+          <div id="insp-body"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 02: CORE SCENARIOS LIST -->
+    <section id="sec-scenarios" class="sec">
+      <div class="sec-head">
+        <div>
+          <div class="sec-kicker">Section 02 · Runner Runtime Scenarios</div>
+          <h2 class="sec-title">核心运行场景清单</h2>
+          <p class="sec-desc">点击右侧按钮直接在 Section 01 透视台演练每一步的契约帧、磁盘状态与异常兜底。</p>
+        </div>
+      </div>
+      <div class="card tbl-wrap">
+        <table class="ed-tbl">
+          <thead>
+            <tr>
+              <th>编号</th>
+              <th>场景名称</th>
+              <th>涉及组件</th>
+              <th>核心验证点</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="scenarios-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- SECTION 03: INTERACTIVE ER / CONTRACT KEY DIAGRAM -->
+    <section id="sec-er" class="sec">
+      <div class="sec-head">
+        <div>
+          <div class="sec-kicker">Section 03 · Contract &amp; State ER Diagram</div>
+          <h2 class="sec-title">交互式 ER / 契约关联图（按逻辑键高亮）</h2>
+          <p class="sec-desc">控制面与 Runner 之间零共享数据库、零物理外键，仅靠 4 个逻辑键把跨节点调度、工作区亲和性、幂等中断与外置日志串成闭环。</p>
+        </div>
+      </div>
+      <div class="card" style="padding:18px 20px;">
+        <div class="er-pills" id="er-pills">
+          <button type="button" class="er-pill active" data-er="all">全部关联</button>
+          <button type="button" class="er-pill" data-er="run_id">run_id · 幂等执行与中断</button>
+          <button type="button" class="er-pill" data-er="runner_id">runner_id · 节点与亲和路由</button>
+          <button type="button" class="er-pill" data-er="work_key">namespace + work_key · 磁盘隔离与回收</button>
+          <button type="button" class="er-pill" data-er="exec_sid">executor_session_id · 原生续接</button>
+        </div>
+        <div style="overflow-x:auto;">
+          <svg id="er-svg" viewBox="0 0 960 405" role="img" aria-label="Runner 契约与状态关联图"></svg>
+        </div>
+        <div class="er-note" id="er-note"></div>
+      </div>
+    </section>
+
+    <!-- SECTION 04: DIRECTORY STRUCTURE & GUARDRAILS -->
+    <section id="sec-repo" class="sec">
+      <div class="sec-head">
+        <div>
+          <div class="sec-kicker">Section 04 · Package Layout &amp; Architecture Guardrails</div>
+          <h2 class="sec-title">Runner 目录结构与防腐化门禁规则</h2>
+          <p class="sec-desc">过渡期落在单仓独立包 <code class="ic">src/runner/</code>，通过 <code class="ic">.importlinter</code> 与 JSON Schema 双向契约测试锁死边界。</p>
+        </div>
+      </div>
+      <div class="repo-grid">
+        <div class="card" style="padding:16px 18px;">
+          <div class="code-meta">src/runner/ 目标目录结构（薄契约 + 双模传输 + 可插拔驱动）</div>
+          <pre class="code-box">hibernaut/
+├── schemas/v1/
+│   ├── runner.capabilities.schema.json    # 节点能力与槽位快照
+│   ├── runner.run_request.schema.json     # RunRequest (ADR-0001)
+│   ├── runner.run_result.schema.json      # RunResult + ErrorKind + log_ref
+│   ├── runner.interrupt.schema.json       # InterruptRequest / Result
+│   └── runner.reclaim.schema.json         # ReclaimRequest / Result
+├── src/runner/
+│   ├── protocol.py                        # RunnerPort Protocol + dataclass
+│   ├── transport/
+│   │   ├── in_process.py                  # Stage 1: 本机内存直调
+│   │   ├── relay_hub.py                   # Stage 2: 控制面 WS Hub + conn_epoch
+│   │   └── relay_client.py                # Stage 2: Runner 主动外连 Agent
+│   ├── daemon.py                          # run_id 幂等表 · 并发槽位 · 心跳
+│   ├── supervisor.py                      # 子进程 supervise / terminate / 日志落盘
+│   ├── worktree/
+│   │   ├── base.py                        # WorktreeDriver 抽象 + 三关核验框架
+│   │   ├── orca_driver.py                 # OrcaWorktreeDriver (hb-* / ws-*)
+│   │   └── git_driver.py                  # 纯 git worktree 兜底驱动
+│   └── cli_drivers/
+│       ├── base.py                        # CLIDriver + StreamPipe 扩展口
+│       ├── claude.py                      # claude (-p / stream-json / --resume)
+│       ├── grok.py                        # grok CLI 封装
+│       ├── cursor_agent.py                # cursor-agent 封装
+│       └── dsh.py                         # dsh 封装 + magpie 环境变量透传
+└── tests/
+    └── test_runner_contract.py            # Producer / Consumer JSON Schema 双向校验</pre>
+        </div>
+        <div class="card" style="padding:16px 18px;">
+          <div class="code-meta">4 条硬门禁（CI 强制拦截架构漂移）</div>
+          <div class="split-card">
+            <div class="split-k">GATE 01 · 零业务反向依赖</div>
+            <div class="split-t"><code class="ic">.importlinter</code> 禁止 <code class="ic">runner</code> 导入 <code class="ic">agent_runtime</code> 或 <code class="ic">workshop</code></div>
+            <p class="split-d">Runner 只能依赖标准库、JSON Schema 协议与自身驱动；反向导入直接阻断 PR 合入。</p>
+          </div>
+          <div class="split-card">
+            <div class="split-k">GATE 02 · ADR-0001 双向契约测试</div>
+            <div class="split-t">Producer 真实产出与 Consumer 夹具同过 Draft 2020-12 校验</div>
+            <p class="split-d">v1 只允许新增可选字段，禁止删字段或改类型；破坏性变更强制升 <code class="ic">schemas/v2/</code>。</p>
+          </div>
+          <div class="split-card">
+            <div class="split-k">GATE 03 · 命名空间前缀隔离红线</div>
+            <div class="split-t"><code class="ic">hb-*</code> 与 <code class="ic">ws-*</code> 物理目录、分支与回收权严格隔离</div>
+            <p class="split-d">回收与写校验必须同时核验 <code class="ic">namespace</code> + <code class="ic">owner_scope</code> + 本地登记表，绝不跨项目误删。</p>
+          </div>
+          <div class="split-card">
+            <div class="split-k">GATE 04 · 进程内零长期明文密钥</div>
+            <div class="split-t">子进程环境统一剥离长效 Token，仅放行 Broker 短期 Lease</div>
+            <p class="split-d">沿用现有 <code class="ic">child_env()</code> 剥离机制，上 VPS 前所有 GitHub/API 凭据强制走外置 Broker 代理。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    /* ============================================================
+       SECTION 00: INTERACTIVE QUESTION & DIAGRAM WORKSHOP DATA
+       ============================================================ */
+    const QUESTIONS = [
+      {
+        id: 'q0',
+        code: 'Q0',
+        title: 'Runner 定位与边界划分',
+        statusText: '已锁定',
+        statusKind: 'done',
+        summary: '先在 3 种工程定位中拍板 Runner 的核心形态（0A），再敲定代码拆分线（0B）与三关 PR 检查归属（0C）。',
+        forks: [
+          {
+            id: 'q0_positioning',
+            label: '分叉 0A · 三种定位与四条边界',
+            short: '0A 定位',
+            caption: 'Runner = 执行宿主（管机器、worktree、槽位、子进程、日志）；Executor = 内部托管的具体 CLI（claude / grok / cursor-agent / dsh）。',
+            svg: `
+              <svg viewBox="0 0 860 300" role="img" aria-label="Runner 定位与四条边界全景图">
+                <defs>
+                  <marker id="arr-q0t" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--teal)"/>
+                  </marker>
+                  <marker id="arr-q0i" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--indigo)"/>
+                  </marker>
+                </defs>
+
+                <!-- Left: Callers & Orchestration -->
+                <rect x="12" y="14" width="232" height="128" rx="10" fill="var(--teal-soft)" stroke="var(--teal-border)" stroke-width="1.4"/>
+                <text x="26" y="36" font-size="11.5" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">边界 1 · 控制面 (HB / Workshop)</text>
+                <text x="26" y="58" font-size="11" fill="var(--text-primary)">• Session 4 态与单活租约锁</text>
+                <text x="26" y="78" font-size="11" fill="var(--text-primary)">• 多节点路由 &amp; work_key 亲和</text>
+                <text x="26" y="98" font-size="11" fill="var(--text-primary)">• 业务终态翻译 (Silent/Emit/Suspend)</text>
+                <text x="26" y="122" font-size="10.2" font-family="var(--font-mono)" fill="var(--rose)">✕ 严禁碰本地路径 / 起子进程</text>
+
+                <rect x="12" y="156" width="232" height="128" rx="10" fill="var(--bg-card)" stroke="var(--border)" stroke-width="1.4"/>
+                <text x="26" y="178" font-size="11.5" font-weight="700" font-family="var(--font-mono)" fill="var(--amber)">边界 2 · 角色编排 (SDE / Reviewer)</text>
+                <text x="26" y="200" font-size="11" fill="var(--text-primary)">• 开发 → 评审 → 返工多轮状态机</text>
+                <text x="26" y="220" font-size="11" fill="var(--text-primary)">• Suspend 审批检查点与续接</text>
+                <text x="26" y="240" font-size="11" fill="var(--text-primary)">• guidance.toml 选读 &amp; PRDelivery</text>
+                <text x="26" y="264" font-size="10.2" font-family="var(--font-mono)" fill="var(--text-muted)">每轮向 Runner 发一次原子 run()</text>
+
+                <!-- Center: Runner Execution Host -->
+                <rect x="288" y="14" width="284" height="270" rx="12" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="2"/>
+                <text x="430" y="39" text-anchor="middle" font-size="12.5" font-weight="800" font-family="var(--font-mono)" fill="var(--accent)">RUNNER · 通用代码执行宿主</text>
+                <text x="430" y="57" text-anchor="middle" font-size="10.8" fill="var(--text-muted)">无业务语义 · 独占本机磁盘与子进程</text>
+
+                <rect x="304" y="72" width="252" height="106" rx="8" fill="var(--bg-card)" stroke="var(--teal-border)"/>
+                <text x="316" y="92" font-size="11" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">✓ IN-SCOPE（必须做）</text>
+                <text x="316" y="111" font-size="10.8" fill="var(--text-primary)">1. hb-* / ws-* 工作区隔离与三关回收</text>
+                <text x="316" y="129" font-size="10.8" fill="var(--text-primary)">2. claude/grok/cursor/dsh 托管与续接</text>
+                <text x="316" y="147" font-size="10.8" fill="var(--text-primary)">3. 进程组防挂死、interrupt 与日志落盘</text>
+                <text x="316" y="165" font-size="10.8" fill="var(--text-primary)">4. capabilities() 能力自报与槽位守门</text>
+
+                <rect x="304" y="188" width="252" height="82" rx="8" fill="var(--rose-soft)" stroke="var(--rose-border)"/>
+                <text x="316" y="208" font-size="11" font-weight="700" font-family="var(--font-mono)" fill="var(--rose)">✕ NON-GOALS（坚决不做）</text>
+                <text x="316" y="227" font-size="10.8" fill="var(--text-primary)">• 不管多节点选机 · 不做 DAG / 重试策略</text>
+                <text x="316" y="245" font-size="10.8" fill="var(--text-primary)">• 不持 Session 锁 · 不发飞书/GitHub 出站</text>
+                <text x="316" y="261" font-size="10.8" fill="var(--text-primary)">• 进程与磁盘零长期明文密钥</text>
+
+                <!-- Right: Broker & Ledger -->
+                <rect x="616" y="14" width="232" height="128" rx="10" fill="var(--indigo-soft)" stroke="var(--indigo-border)" stroke-width="1.4"/>
+                <text x="630" y="36" font-size="11.5" font-weight="700" font-family="var(--font-mono)" fill="var(--indigo)">边界 3 · Credential Broker</text>
+                <text x="630" y="58" font-size="11" fill="var(--text-primary)">• 集中保管长期 GitHub/API 密钥</text>
+                <text x="630" y="78" font-size="11" fill="var(--text-primary)">• 签发短期 Lease Token / 代理 URL</text>
+                <text x="630" y="98" font-size="11" fill="var(--text-primary)">• Runner 起子进程前剥离环境长密钥</text>
+                <text x="630" y="122" font-size="10.2" font-family="var(--font-mono)" fill="var(--indigo)">上 VPS 前必须完全收口</text>
+
+                <rect x="616" y="156" width="232" height="128" rx="10" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-dasharray="4 3" stroke-width="1.4"/>
+                <text x="630" y="178" font-size="11.5" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">边界 4 · Observability / Ledger</text>
+                <text x="630" y="200" font-size="11" fill="var(--text-primary)">• 旁路接收 run_id / 耗时 / ErrorKind</text>
+                <text x="630" y="220" font-size="11" fill="var(--text-primary)">• 外置完整日志 logs/runs/&lt;id&gt;.log</text>
+                <text x="630" y="240" font-size="11" fill="var(--text-primary)">• 跨项目复盘、统计与换执行器重放</text>
+                <text x="630" y="264" font-size="10.2" font-family="var(--font-mono)" fill="var(--teal)">旁路弱耦合：故障绝不阻断执行</text>
+
+                <!-- Connectors -->
+                <line x1="244" y1="78" x2="286" y2="78" stroke="var(--teal)" stroke-width="1.8" marker-end="url(#arr-q0t)"/>
+                <line x1="244" y1="220" x2="286" y2="220" stroke="var(--teal)" stroke-width="1.8" marker-end="url(#arr-q0t)"/>
+                <line x1="572" y1="78" x2="614" y2="78" stroke="var(--indigo)" stroke-width="1.8" marker-end="url(#arr-q0i)"/>
+                <line x1="572" y1="220" x2="614" y2="220" stroke="var(--teal)" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#arr-q0t)"/>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '定位 A：薄执行宿主（当前全景图）',
+                points: [
+                  '<strong>核心形态</strong>：管机器、持久化 <code class="ic">hb-*</code>/<code class="ic">ws-*</code> worktree、槽位、子进程与日志；零业务状态机。',
+                  '<strong>收益</strong>：HB 与 Workshop 无缝共用，<code class="ic">Suspend</code> 审批零槽位占用，节点重启不丢业务进度。',
+                  '<strong>代价</strong>：控制面需多发几次原子 <code class="ic">run()</code> 串联多轮流程。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '定位 B：自治任务执行节点',
+                points: [
+                  '<strong>核心形态</strong>：接一个完整任务，在 Runner 内跑完“开发→评审→返工→开 PR”全闭环。',
+                  '<strong>收益</strong>：跨网往返次数少，现有 <code class="ic">sde.py</code> 几乎不用拆分。',
+                  '<strong>代价</strong>：Runner 变成“小 HB”，需自管检查点与审批挂起，Workshop 很难复用。'
+                ]
+              },
+              {
+                key: 'C',
+                badge: '不推荐',
+                title: '定位 C：阅后即焚沙箱（类 CI Runner）',
+                points: [
+                  '<strong>核心形态</strong>：每次 <code class="ic">run()</code> 临时 clone/起容器，跑完即毁，不维护持久化 worktree。',
+                  '<strong>收益</strong>：彻底无状态，天然无 <code class="ic">work_key</code> 亲和调度问题。',
+                  '<strong>代价</strong>：丢本地增量构建缓存、无法承接 Orca 可见终端与多轮本地续接。'
+                ]
+              }
+            ]
+          },
+          {
+            id: 'q0_cli_split',
+            label: '切口 0B · 现有 executor_cli/ 拆分线',
+            short: '0B 代码拆分',
+            caption: '当前 src/agent_runtime/adapters/executor_cli/ 混放了底层执行原语与上层 SDE 业务编排，拆出 Runner 时从哪里下刀？',
+            svg: `
+              <svg viewBox="0 0 860 250" role="img" aria-label="切口 0B 现有 executor_cli 拆分图">
+                <rect x="10" y="10" width="840" height="230" rx="11" fill="var(--bg-card)" stroke="var(--border)"/>
+                <text x="24" y="34" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--accent)">推荐切线（方案 A）：原子原语下沉 Runner，多轮业务编排留 HB 控制面</text>
+
+                <!-- Left: Existing mixed folder -->
+                <rect x="24" y="52" width="214" height="172" rx="9" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="38" y="74" font-size="11.5" font-weight="700" font-family="var(--font-mono)" fill="var(--text-primary)">现状 executor_cli/</text>
+                <text x="38" y="98" font-size="10.8" font-family="var(--font-mono)" fill="var(--teal)">• worktree.py / process.py</text>
+                <text x="38" y="118" font-size="10.8" font-family="var(--font-mono)" fill="var(--teal)">• claude_code.py / orca.py</text>
+                <text x="38" y="138" font-size="10.8" font-family="var(--font-mono)" fill="var(--teal)">• executor.py (CLI 模板)</text>
+                <text x="38" y="164" font-size="10.8" font-family="var(--font-mono)" fill="var(--indigo)">• sde.py (多轮评审循环)</text>
+                <text x="38" y="184" font-size="10.8" font-family="var(--font-mono)" fill="var(--indigo)">• reviewer.py / guidance.py</text>
+                <text x="38" y="204" font-size="10.8" font-family="var(--font-mono)" fill="var(--indigo)">• delivery/pr_delivery.py</text>
+
+                <!-- Arrows -->
+                <path d="M 238 112 L 310 92" fill="none" stroke="var(--teal)" stroke-width="1.8"/>
+                <path d="M 238 178 L 310 186" fill="none" stroke="var(--indigo)" stroke-width="1.8"/>
+
+                <!-- Top right: Runner -->
+                <rect x="314" y="52" width="522" height="80" rx="9" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="330" y="74" font-size="12" font-weight="700" fill="var(--teal)">下沉至 Runner（纯执行原语 · HB 与 Workshop 共用）</text>
+                <text x="330" y="96" font-size="11" fill="var(--text-primary)">worktree 隔离回收 · process 防挂死 · claude/grok/cursor/dsh 启动器 · orca 终端 · 只读指纹校验</text>
+                <text x="330" y="116" font-size="10.5" font-family="var(--font-mono)" fill="var(--text-muted)">特点：零业务状态机，单次原子 run() 即可被任何项目复用</text>
+
+                <!-- Bottom right: HB Control -->
+                <rect x="314" y="144" width="522" height="80" rx="9" fill="var(--indigo-soft)" stroke="var(--indigo-border)"/>
+                <text x="330" y="166" font-size="12" font-weight="700" fill="var(--indigo)">留在 HB 控制面（多轮角色编排与交付状态机）</text>
+                <text x="330" y="188" font-size="11" fill="var(--text-primary)">SDE 开发→评审→返工回路 · Suspend 检查点 · guidance.toml 规范挑选 · PRDelivery 发布合入</text>
+                <text x="330" y="208" font-size="10.5" font-family="var(--font-mono)" fill="var(--text-muted)">特点：等待人工审批时立刻释放 Runner 槽位，重启不丢多轮进度</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：原子原语进 Runner，多轮编排留 HB',
+                points: [
+                  '<strong>彻底守住无状态边界</strong>：Runner 不含 <code class="ic">sde.py</code> 评审循环与 <code class="ic">deliveries</code> 状态表。',
+                  '<strong>跨项目无包袱</strong>：Workshop 复用 Runner 时无需背负 Hibernaut 专属的 SDE/PR 流程。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '方案 B：整包迁移 executor_cli/ 进 Runner',
+                points: [
+                  '<strong>短期改代码最少</strong>：原样把 SDE/Reviewer 打包进 Runner。',
+                  '<strong>长期债重</strong>：Runner 变成“小 HB”，跨节点容灾与 Workshop 复用均受阻。'
+                ]
+              }
+            ]
+          },
+          {
+            id: 'q0_reclaim_gh',
+            label: '切口 0C · 三关回收「无开着 PR」检查归属',
+            short: '0C 三关 PR 核验',
+            caption: '三关安全回收需核验“无开着 PR / 已 squash 合并”。为了守住 Runner 零 GitHub 长期密钥，这一关放哪儿查？',
+            svg: `
+              <svg viewBox="0 0 860 250" role="img" aria-label="切口 0C 三关回收 PR 检查归属对比图">
+                <rect x="10" y="10" width="840" height="106" rx="10" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="33" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐 · 零 GitHub 凭据边界最干净）：远端 PR 由控制面验，Runner 只验本地 Git</text>
+
+                <rect x="24" y="48" width="256" height="54" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="38" y="70" font-size="11.5" font-weight="700" fill="var(--text-primary)">控制面 (HB / Broker)</text>
+                <text x="38" y="89" font-size="10.5" fill="var(--text-muted)">关 0：ref=0 + 查远端无开着 PR</text>
+
+                <line x1="280" y1="75" x2="346" y2="75" stroke="var(--teal)" stroke-width="1.8"/>
+                <text x="313" y="66" text-anchor="middle" font-size="9.5" font-family="var(--font-mono)" fill="var(--teal)">reclaim()</text>
+
+                <rect x="350" y="48" width="280" height="54" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="364" y="70" font-size="11.5" font-weight="700" fill="var(--teal)">Runner（纯本地 Git 核验）</text>
+                <text x="364" y="89" font-size="10.5" fill="var(--text-primary)">关 1：树干净 · 关 2：HEAD 已推/已合</text>
+
+                <rect x="644" y="48" width="192" height="54" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="656" y="70" font-size="11" font-weight="700" fill="var(--teal)">收益：Runner 零 gh 依赖</text>
+                <text x="656" y="89" font-size="10.2" fill="var(--text-muted)">VPS Runner 无需任何 GitHub 凭据</text>
+
+                <rect x="10" y="130" width="840" height="106" rx="10" fill="var(--bg-card)" stroke="var(--border)"/>
+                <text x="24" y="153" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--amber)">方案 B（沿用现状）：三关全部留在 Runner 本地，由 Runner 调只读 gh 代理</text>
+
+                <rect x="24" y="168" width="490" height="54" rx="8" fill="var(--amber-soft)" stroke="var(--amber-border)"/>
+                <text x="38" y="190" font-size="11.5" font-weight="700" fill="var(--text-primary)">Runner 独占全部三关（PR + 树干净 + HEAD 已推）</text>
+                <text x="38" y="209" font-size="10.5" fill="var(--text-muted)">优点：单次原子自保，防止任何调用方漏查 PR；缺点：每台 Runner 须通只读 GitHub 代理</text>
+
+                <rect x="530" y="168" width="306" height="54" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="544" y="190" font-size="11" font-weight="700" fill="var(--text-primary)">兜底折中提示：</text>
+                <text x="544" y="209" font-size="10.2" fill="var(--text-muted)">方案 A 中控制面可将 merged_head_sha 传入供本地比对</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：远端 PR 控制面验，本地 Git Runner 验',
+                points: [
+                  '<strong>彻底切断 Runner 对 GitHub API 的依赖</strong>：执行机无需配置 <code class="ic">gh</code> 认证或 GitHub Broker 路由。',
+                  '<strong>squash 合并同样安全</strong>：控制面查到已合并 PR 后将 <code class="ic">merged_head_sha</code> 随请求传给 Runner 比对本地 <code class="ic">HEAD</code>。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '方案 B：三关全留 Runner 内（走只读 gh 代理）',
+                points: [
+                  '<strong>防御纵深更强</strong>：哪怕上游调用方（HB 或 Workshop）忘了查 PR，Runner 也会拒绝删除。',
+                  '<strong>运维代价</strong>：每台远端 VPS Runner 都必须维护只读 <code class="ic">gh</code> / Broker 连通性。'
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        id: 'q1',
+        code: 'Q1',
+        title: 'RunnerPort 协议与传输抽象',
+        statusText: '已锁定',
+        statusKind: 'done',
+        summary: '锁定 RunnerPort 的 4 个操作（capabilities / run / interrupt / reclaim_workspace）与 3 个核心架构分叉。',
+        forks: [
+          {
+            id: 'q1_outcome',
+            label: '分叉 1A · 终态语义归属',
+            short: '1A 终态',
+            caption: '核心问题：Runner 应该返回“通用执行事实”，还是直接返回 Hibernaut 专属的 Silent / Emit / Suspend？',
+            svg: `
+              <svg viewBox="0 0 860 270" role="img" aria-label="分叉 1A 终态语义归属对比图">
+                <defs>
+                  <marker id="arr-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--teal)"/>
+                  </marker>
+                  <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--rose)"/>
+                  </marker>
+                </defs>
+
+                <!-- Plan A -->
+                <rect x="10" y="10" width="840" height="118" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="32" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐）· Runner 只回报执行事实，控制面各自翻译业务终态</text>
+
+                <rect x="24" y="48" width="170" height="62" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="109" y="72" text-anchor="middle" font-size="12" font-weight="700" fill="var(--text-primary)">Runner 执行节点</text>
+                <text x="109" y="92" text-anchor="middle" font-size="10.5" font-family="var(--font-mono)" fill="var(--text-muted)">零 HB / 车间业务耦合</text>
+
+                <line x1="194" y1="79" x2="258" y2="79" stroke="var(--teal)" stroke-width="1.8" marker-end="url(#arr-a)"/>
+                <text x="226" y="71" text-anchor="middle" font-size="10" font-family="var(--font-mono)" fill="var(--teal)">RunResult</text>
+
+                <rect x="262" y="46" width="248" height="66" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="386" y="67" text-anchor="middle" font-size="11.5" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">status: succeeded | failed</text>
+                <text x="386" y="84" text-anchor="middle" font-size="10.8" font-family="var(--font-mono)" fill="var(--text-primary)">interrupted | timed_out | refused</text>
+                <text x="386" y="101" text-anchor="middle" font-size="10" font-family="var(--font-mono)" fill="var(--text-muted)">+ structured_output + log_ref</text>
+
+                <path d="M 510 66 L 574 56" fill="none" stroke="var(--teal)" stroke-width="1.6" marker-end="url(#arr-a)"/>
+                <path d="M 510 92 L 574 100" fill="none" stroke="var(--teal)" stroke-width="1.6" marker-end="url(#arr-a)"/>
+
+                <rect x="578" y="38" width="256" height="36" rx="7" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="590" y="60" font-size="11.2" font-family="var(--font-mono)" fill="var(--text-primary)">HB 适配层 → Silent | Emit | Suspend</text>
+
+                <rect x="578" y="82" width="256" height="36" rx="7" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="590" y="104" font-size="11.2" font-family="var(--font-mono)" fill="var(--text-primary)">Workshop 适配层 → 车间事实表终态</text>
+
+                <!-- Plan B -->
+                <rect x="10" y="144" width="840" height="114" rx="11" fill="var(--bg-card)" stroke="var(--border)" stroke-width="1.2"/>
+                <text x="24" y="166" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--rose)">方案 B · Runner 直接返回 HB 的 RunOutcome (Silent / Emit / Suspend)</text>
+
+                <rect x="24" y="182" width="210" height="60" rx="8" fill="var(--rose-soft)" stroke="var(--rose-border)"/>
+                <text x="129" y="205" text-anchor="middle" font-size="12" font-weight="700" fill="var(--text-primary)">Runner 被迫理解 HB 语义</text>
+                <text x="129" y="225" text-anchor="middle" font-size="10.5" font-family="var(--font-mono)" fill="var(--rose)">依赖 Session / Approval 概念</text>
+
+                <line x1="234" y1="212" x2="310" y2="212" stroke="var(--rose)" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#arr-b)"/>
+
+                <rect x="314" y="182" width="520" height="60" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="330" y="205" font-size="11.5" font-weight="600" fill="var(--text-primary)">代价：Workshop 接入 Runner 时必须反向翻译 Suspend/Emit，跨项目复用变重</text>
+                <text x="330" y="226" font-size="11" fill="var(--text-muted)">且 HB 调整 RunOutcome 字段时会强迫 Runner 协议同步升级。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：Runner 只返回执行事实态',
+                points: [
+                  '<strong>协议纯净</strong>：<code class="ic">status</code> 仅表达进程执行事实（succeeded / failed / interrupted / timed_out / refused）。',
+                  '<strong>跨项目零适配痛点</strong>：HB 转成 <code class="ic">Silent | Emit | Suspend</code>，Workshop 转成车间状态，互不污染。',
+                  '<strong>结构化承载</strong>：CLI 产出的 JSON 放在 <code class="ic">structured_output</code>，业务解释权留在控制面。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '方案 B：Runner 直接返回 RunOutcome',
+                points: [
+                  '<strong>短期省一层映射</strong>：HB 侧无需写 <code class="ic">RunResult → RunOutcome</code> 的薄翻译函数。',
+                  '<strong>耦合风险</strong>：把 Hibernaut 的审批挂起语义泄漏进通用执行层，Workshop 复用别扭。'
+                ]
+              }
+            ]
+          },
+          {
+            id: 'q1_transport',
+            label: '分叉 1B · 本地/远程传输选型',
+            short: '1B 传输',
+            caption: '核心问题：公网控制面如何同时调度“家里私网的 Mac（无公网 IP）”与“多台远端 VPS”，且支持 30 分钟长任务与秒级中断？',
+            svg: `
+              <svg viewBox="0 0 860 286" role="img" aria-label="分叉 1B 传输架构对比图">
+                <defs>
+                  <marker id="arr-t" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--teal)"/>
+                  </marker>
+                  <marker id="arr-i" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--indigo)"/>
+                  </marker>
+                  <marker id="arr-r" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--rose)"/>
+                  </marker>
+                </defs>
+
+                <!-- Plan A: Reverse WS -->
+                <rect x="10" y="10" width="840" height="148" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="32" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐）· Stage 1 同进程直调 + Stage 2 反向 WebSocket（复用 Switchboard relay_protocol + conn_epoch）</text>
+
+                <rect x="24" y="48" width="215" height="94" rx="9" fill="var(--accent-soft)" stroke="var(--accent-border)"/>
+                <text x="131" y="72" text-anchor="middle" font-size="12.5" font-weight="700" fill="var(--text-primary)">公网控制面 (HB / Hub)</text>
+                <text x="131" y="92" text-anchor="middle" font-size="10.8" font-family="var(--font-mono)" fill="var(--accent)">wss://hub/ws/runner</text>
+                <text x="131" y="112" text-anchor="middle" font-size="10.2" fill="var(--text-muted)">下发 run.submit / interrupt</text>
+                <text x="131" y="128" text-anchor="middle" font-size="10.2" fill="var(--text-muted)">接收 run.completed / heartbeat</text>
+
+                <!-- Bidirectional Arrows -->
+                <line x1="244" y1="74" x2="430" y2="74" stroke="var(--indigo)" stroke-width="1.8" marker-end="url(#arr-i)"/>
+                <text x="337" y="66" text-anchor="middle" font-size="10" font-family="var(--font-mono)" fill="var(--indigo)">run.submit / interrupt / reclaim</text>
+                <line x1="430" y1="92" x2="244" y2="92" stroke="var(--teal)" stroke-width="1.8" marker-end="url(#arr-t)"/>
+                <text x="337" y="107" text-anchor="middle" font-size="10" font-family="var(--font-mono)" fill="var(--teal)">主动外连 wss:// · ACK · completed · 心跳</text>
+
+                <line x1="244" y1="126" x2="430" y2="126" stroke="var(--teal)" stroke-width="1.5" stroke-dasharray="4 3" marker-start="url(#arr-t)" marker-end="url(#arr-i)"/>
+
+                <!-- Mac Runner -->
+                <rect x="436" y="46" width="194" height="46" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="533" y="66" text-anchor="middle" font-size="11.8" font-weight="700" fill="var(--text-primary)">Mac 本机 Runner (NAT 后)</text>
+                <text x="533" y="83" text-anchor="middle" font-size="10" font-family="var(--font-mono)" fill="var(--teal)">无需公网IP · 合盖重连不脑裂</text>
+
+                <!-- VPS Runner -->
+                <rect x="436" y="100" width="194" height="44" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="533" y="119" text-anchor="middle" font-size="11.8" font-weight="700" fill="var(--text-primary)">VPS-01 / VPS-02 Runner</text>
+                <text x="533" y="135" text-anchor="middle" font-size="10" font-family="var(--font-mono)" fill="var(--text-muted)">同一套协议 · 未来直扩 stream-json</text>
+
+                <!-- Highlight Box -->
+                <rect x="644" y="46" width="192" height="98" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="656" y="66" font-size="11" font-weight="700" font-family="var(--font-mono)" fill="var(--accent)">为什么不卡死超时？</text>
+                <text x="656" y="85" font-size="10.8" fill="var(--text-muted)">1. submit 立即回 accepted</text>
+                <text x="656" y="103" font-size="10.8" fill="var(--text-muted)">2. 跑 20 分钟后推 completed</text>
+                <text x="656" y="121" font-size="10.8" fill="var(--text-muted)">3. 断线重连可 run.query 补拉</text>
+                <text x="656" y="137" font-size="10.8" fill="var(--text-muted)">4. 纯 stdlib RFC 6455 零依赖</text>
+
+                <!-- Plan B: Direct HTTP -->
+                <rect x="10" y="170" width="840" height="104" rx="11" fill="var(--bg-card)" stroke="var(--border)" stroke-width="1.2"/>
+                <text x="24" y="192" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--rose)">方案 B · 控制面直连 HTTP REST（POST /runs + 轮询/回调）</text>
+
+                <rect x="24" y="206" width="175" height="54" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="111" y="230" text-anchor="middle" font-size="11.5" font-weight="700" fill="var(--text-primary)">公网控制面 (HB)</text>
+                <text x="111" y="247" text-anchor="middle" font-size="10" font-family="var(--font-mono)" fill="var(--text-muted)">主动 POST Runner</text>
+
+                <line x1="199" y1="233" x2="296" y2="233" stroke="var(--rose)" stroke-width="1.8" marker-end="url(#arr-r)"/>
+                <rect x="300" y="206" width="140" height="54" rx="8" fill="var(--rose-soft)" stroke="var(--rose-border)"/>
+                <text x="370" y="229" text-anchor="middle" font-size="11.5" font-weight="700" fill="var(--rose)">NAT / 防火墙拦截</text>
+                <text x="370" y="247" text-anchor="middle" font-size="10" fill="var(--text-muted)">Mac 必须另配 FRP/TS</text>
+
+                <rect x="462" y="206" width="374" height="54" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="476" y="227" font-size="11.2" font-weight="600" fill="var(--text-primary)">额外成本：长任务仍需建回调或轮询，未来做 stream-json 又要加 WS</text>
+                <text x="476" y="246" font-size="10.8" fill="var(--text-muted)">等价于维护“HTTP + 轮询 + 隧道”三套机制，不如一步统一反向 WS。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：同进程直调 + 反向 WebSocket',
+                points: [
+                  '<strong>现成代码复用</strong>：直接复用 Switchboard Phase 2 已验证的纯 stdlib RFC 6455 与 <code class="ic">conn_epoch</code> 防脑裂机制。',
+                  '<strong>一套拓扑通吃</strong>：私网 Mac 与公网 VPS 均主动外连 Hub，零内网穿透配置。',
+                  '<strong>面向未来</strong>：Q4 扩展 <code class="ic">stream-json</code> 双向管道只需加帧类型，不推翻传输层。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '方案 B：并行保留 HTTP REST 传输',
+                points: [
+                  '<strong>调试直观</strong>：纯内网/Tailscale VPS 可直接 <code class="ic">curl</code> 触发。',
+                  '<strong>维护翻倍</strong>：仍需解决私网 Mac 穿透、长任务轮询与双通道鉴权一致性。'
+                ]
+              }
+            ]
+          },
+          {
+            id: 'q1_sde',
+            label: '分叉 1C · SDE 编排（已随 0B 锁定 A）',
+            short: '1C 薄/厚Runner',
+            caption: '核心问题：现有 sde.py 里的“开发 → 评审 → 返工 → PRDelivery”多轮循环，应该留在 HB 控制面，还是塞进 Runner 内部？',
+            svg: `
+              <svg viewBox="0 0 860 286" role="img" aria-label="分叉 1C 薄Runner与厚Runner对比图">
+                <defs>
+                  <marker id="arr-s1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--teal)"/>
+                  </marker>
+                  <marker id="arr-s2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--amber)"/>
+                  </marker>
+                </defs>
+
+                <!-- Plan A: Thin Runner -->
+                <rect x="10" y="10" width="840" height="142" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="32" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐 · 薄 Runner）· HB 管多轮状态机与 Suspend，Runner 只管单次原子 CLI 执行</text>
+
+                <rect x="24" y="48" width="230" height="88" rx="9" fill="var(--accent-soft)" stroke="var(--accent-border)"/>
+                <text x="139" y="70" text-anchor="middle" font-size="12" font-weight="700" fill="var(--text-primary)">HB 编排层 (状态机 + 检查点)</text>
+                <text x="139" y="90" text-anchor="middle" font-size="10.5" fill="var(--text-muted)">Round 1: 调 run(sde)</text>
+                <text x="139" y="107" text-anchor="middle" font-size="10.5" fill="var(--text-muted)">Round 2: 调 run(reviewer, readonly)</text>
+                <text x="139" y="124" text-anchor="middle" font-size="10.5" font-family="var(--font-mono)" fill="var(--accent)">Suspend 时立即释放 Runner 槽位</text>
+
+                <line x1="254" y1="74" x2="334" y2="74" stroke="var(--teal)" stroke-width="1.7" marker-end="url(#arr-s1)"/>
+                <text x="294" y="66" text-anchor="middle" font-size="9.8" font-family="var(--font-mono)" fill="var(--teal)">原子 run()</text>
+                <line x1="254" y1="110" x2="334" y2="110" stroke="var(--teal)" stroke-width="1.7" marker-end="url(#arr-s1)"/>
+                <text x="294" y="102" text-anchor="middle" font-size="9.8" font-family="var(--font-mono)" fill="var(--teal)">原子 run()</text>
+
+                <rect x="338" y="48" width="225" height="40" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="450" y="72" text-anchor="middle" font-size="11.2" font-weight="700" fill="var(--text-primary)">Runner 原子执行 #1 (claude 写代码)</text>
+
+                <rect x="338" y="96" width="225" height="40" rx="8" fill="var(--indigo-soft)" stroke="var(--indigo-border)"/>
+                <text x="450" y="120" text-anchor="middle" font-size="11.2" font-weight="700" fill="var(--text-primary)">Runner 原子执行 #2 (grok 只读评审)</text>
+
+                <rect x="580" y="48" width="256" height="88" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="594" y="70" font-size="11.2" font-weight="700" fill="var(--teal)">核心收益：</text>
+                <text x="594" y="90" font-size="10.8" fill="var(--text-muted)">• 挂起等人审批时零槽位占用</text>
+                <text x="594" y="108" font-size="10.8" fill="var(--text-muted)">• 节点重启不丢多轮进度（状态在 HB）</text>
+                <text x="594" y="126" font-size="10.8" fill="var(--text-muted)">• Workshop 无需背负 SDE 评审代码</text>
+
+                <!-- Plan B: Thick Runner -->
+                <rect x="10" y="166" width="840" height="108" rx="11" fill="var(--bg-card)" stroke="var(--border)" stroke-width="1.2"/>
+                <text x="24" y="188" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--amber)">方案 B（厚 Runner）· 把整个 SDE + 评审 + 交付循环打包成 Runner 内部复合执行器</text>
+
+                <rect x="24" y="204" width="160" height="56" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="104" y="229" text-anchor="middle" font-size="11.5" font-weight="700" fill="var(--text-primary)">HB 控制面</text>
+                <text x="104" y="247" text-anchor="middle" font-size="10" font-family="var(--font-mono)" fill="var(--text-muted)">只发 1 次大 run()</text>
+
+                <line x1="184" y1="232" x2="246" y2="232" stroke="var(--amber)" stroke-width="1.7" marker-end="url(#arr-s2)"/>
+
+                <rect x="250" y="202" width="586" height="60" rx="8" fill="var(--amber-soft)" stroke="var(--amber-border)"/>
+                <text x="266" y="224" font-size="11.5" font-weight="700" fill="var(--text-primary)">Runner 内部自治：开发 → 评审 → 返工 → PRDelivery（黑盒长循环）</text>
+                <text x="266" y="245" font-size="10.8" fill="var(--text-muted)">代价：Runner 被迫持有检查点与审批状态机，违反“Runner 无逻辑会话状态”边界；崩掉难恢复。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：薄 Runner（原子单轮执行）',
+                points: [
+                  '<strong>严格遵守已锁定边界</strong>：Runner 零会话状态机，SDE 评审/交付状态机留在 HB 编排层。',
+                  '<strong>槽位利用率最高</strong>：进入 <code class="ic">Suspend</code> 等待人工审批时立即释放 Runner 槽位。',
+                  '<strong>容灾与复用最佳</strong>：每轮结束即落盘 HB 检查点，Workshop 也可干净复用原子 <code class="ic">run()</code>。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '方案 B：厚 Runner（复合角色留在执行面）',
+                points: [
+                  '<strong>迁移改造成本低</strong>：现有 <code class="ic">sde.py</code> 几乎原样搬进 Runner。',
+                  '<strong>破坏边界</strong>：Runner 需自行持久化 <code class="ic">deliveries</code> / 审批断点，与“无状态执行节点”冲突。'
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        id: 'q2',
+        code: 'Q2',
+        title: '多节点注册、心跳与亲和性',
+        statusText: '已锁定',
+        statusKind: 'done',
+        summary: 'Mac 本机与多台 VPS 同时在线时，敲定 work_key 亲和漂移规则（2A）、并发槽位防超卖机制（2B）与亲和表持久化/握手对账（2C）。',
+        forks: [
+          {
+            id: 'q2_affinity',
+            label: '分叉 2A · work_key 亲和性与节点离线',
+            short: '2A 亲和策略',
+            caption: 'Mac 建了 hb-issue-42 后合盖离线，此时来了新事件：是全部硬等待，还是允许只读任务漂移到在线 VPS？',
+            svg: `
+              <svg viewBox="0 0 860 272" role="img" aria-label="分叉 2A work_key 亲和性与离线策略图解">
+                <defs>
+                  <marker id="arr-q2t" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--teal)"/>
+                  </marker>
+                  <marker id="arr-q2a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--accent)"/>
+                  </marker>
+                </defs>
+
+                <!-- Top: Route Flow -->
+                <rect x="10" y="10" width="840" height="144" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="33" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐）· 写任务严格硬亲和，纯远端只读任务允许漂移</text>
+
+                <rect x="24" y="48" width="210" height="90" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="38" y="70" font-size="11.5" font-weight="700" fill="var(--text-primary)">新事件命中 hb-issue-42</text>
+                <text x="38" y="90" font-size="10.5" font-family="var(--font-mono)" fill="var(--accent)">亲和表 → mac-m4 (离线)</text>
+                <text x="38" y="110" font-size="10.5" fill="var(--text-muted)">心跳超 40s 已标 offline</text>
+                <text x="38" y="128" font-size="10.5" fill="var(--text-muted)">不计失败、不消耗重试</text>
+
+                <line x1="234" y1="74" x2="314" y2="74" stroke="var(--accent)" stroke-width="1.7" marker-end="url(#arr-q2a)"/>
+                <text x="274" y="66" text-anchor="middle" font-size="9.5" font-family="var(--font-mono)" fill="var(--accent)">readonly=false</text>
+
+                <line x1="234" y1="116" x2="314" y2="116" stroke="var(--teal)" stroke-width="1.7" marker-end="url(#arr-q2t)"/>
+                <text x="274" y="108" text-anchor="middle" font-size="9.5" font-family="var(--font-mono)" fill="var(--teal)">readonly+远端</text>
+
+                <rect x="318" y="50" width="516" height="40" rx="8" fill="var(--accent-soft)" stroke="var(--accent-border)"/>
+                <text x="332" y="74" font-size="11.2" font-weight="600" fill="var(--text-primary)">硬亲和等待：保持 pending，Mac 开盖重连后零延迟补推续跑（绝不双机建目录）</text>
+
+                <rect x="318" y="98" width="516" height="40" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="332" y="122" font-size="11.2" font-weight="600" fill="var(--teal)">可漂移：不依赖本地未提交改动的只读分析/远端 PR 审查，可路由至在线 VPS-01</text>
+
+                <!-- Bottom: Plan B -->
+                <rect x="10" y="168" width="840" height="92" rx="11" fill="var(--bg-card)" stroke="var(--border)"/>
+                <text x="24" y="191" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--indigo)">方案 B（极简绝对安全）· 无论读写，已绑定 work_key 一律硬亲和原节点</text>
+                <rect x="24" y="204" width="810" height="44" rx="8" fill="var(--indigo-soft)" stroke="var(--indigo-border)"/>
+                <text x="38" y="224" font-size="11.2" font-weight="600" fill="var(--text-primary)">规则唯一：凡亲和表有记录即锁定原节点，离线一律 pending 等重连；绝不会因评审想看本地未提交 diff 而读错现场</text>
+                <text x="38" y="241" font-size="10.5" fill="var(--text-muted)">缺点：Mac 合盖期间，针对同一 work_key 的只读评审也必须等待开盖。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：写任务硬亲和，纯远端只读可漂移',
+                points: [
+                  '<strong>防双机分叉</strong>：写任务绝不跨机重开 worktree；仅在显式标记 <code class="ic">readonly=true</code> 且不需本地未提交现场时才允许漂移。',
+                  '<strong>利用率更高</strong>：Mac 合盖时，基于远端分支的只读任务仍可由 VPS 承接。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '方案 B：全量硬亲和（读写一律回原节点）',
+                points: [
+                  '<strong>心智与实现最简单</strong>：路由层无需区分“依赖本地未提交现场的只读”和“纯远端只读”，零读错现场风险。',
+                  '<strong>完全贴合现有评审模型</strong>：现有 <code class="ic">reviewer.py</code> 默认直接读本地 worktree 未提交改动。'
+                ]
+              }
+            ]
+          },
+          {
+            id: 'q2_slots',
+            label: '分叉 2B · 并发槽位与防超卖机制',
+            short: '2B 槽位防超卖',
+            caption: '心跳每 20s 一次，若 1 秒内并发派发 3 个任务给 max_concurrent=2 的节点，如何防止超卖与“僵尸槽位”？',
+            svg: `
+              <svg viewBox="0 0 860 250" role="img" aria-label="分叉 2B 并发槽位与防超卖图解">
+                <rect x="10" y="10" width="840" height="114" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="33" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐）· 控制面预扣 + Runner 本地信号量终裁 + 20s 心跳校准</text>
+
+                <rect x="24" y="48" width="246" height="62" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="38" y="70" font-size="11.5" font-weight="700" fill="var(--text-primary)">1. 控制面内存预扣 (reserved)</text>
+                <text x="38" y="90" font-size="10.5" fill="var(--text-muted)">发 run.submit 前先扣 1 槽，防瞬间洪峰</text>
+
+                <rect x="294" y="48" width="268" height="62" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="308" y="70" font-size="11.5" font-weight="700" fill="var(--teal)">2. Runner Semaphore 最终裁决</text>
+                <text x="308" y="90" font-size="10.5" fill="var(--text-primary)">真满载直接回 slots_full，控制面换节点</text>
+
+                <rect x="586" y="48" width="248" height="62" rx="8" fill="var(--indigo-soft)" stroke="var(--indigo-border)"/>
+                <text x="600" y="70" font-size="11.5" font-weight="700" fill="var(--indigo)">3. 每 20s 心跳真值校准</text>
+                <text x="600" y="90" font-size="10.5" fill="var(--text-muted)">以 Runner 上报 active_runs 覆盖纠偏</text>
+
+                <rect x="10" y="138" width="840" height="98" rx="11" fill="var(--bg-card)" stroke="var(--border)"/>
+                <text x="24" y="161" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--amber)">方案 B · 控制面不做预扣，纯靠 Runner 拒绝后轮询下一个节点</text>
+                <rect x="24" y="174" width="810" height="48" rx="8" fill="var(--amber-soft)" stroke="var(--amber-border)"/>
+                <text x="38" y="194" font-size="11.2" font-weight="600" fill="var(--text-primary)">实现更薄：控制面只读上次心跳快照；缺点：同一毫秒突发多任务会全部打到同一台空闲节点再被拒绝重派</text>
+                <text x="38" y="212" font-size="10.5" fill="var(--text-muted)">在个人 2–3 台节点、低并发场景下也能跑通，只是缺少瞬时防惊群保护。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：控制面预扣 + Runner 终裁 + 心跳校准',
+                points: [
+                  '<strong>三层闭环零漂移</strong>：预扣挡并发惊群，Runner <code class="ic">Semaphore</code> 保底不超载，心跳真值自动修复偶发丢包导致的账面漂移。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '方案 B：纯 Runner 裁决（无控制面预扣）',
+                points: [
+                  '<strong>代码最省</strong>：控制面不维护 <code class="ic">reserved</code> 计数，遇 <code class="ic">slots_full</code> 直接切下一个候选节点重试。'
+                ]
+              }
+            ]
+          },
+          {
+            id: 'q2_registry',
+            label: '分叉 2C · 亲和表持久化与握手对账',
+            short: '2C 亲和持久化',
+            caption: '如果 Mac 合盖离线期间公网控制面重启了，控制面怎么知道 hb-issue-42 其实早已建在 Mac 上、绝不能派给在线 VPS？',
+            svg: `
+              <svg viewBox="0 0 860 250" role="img" aria-label="分叉 2C 亲和表持久化与握手对账图解">
+                <rect x="10" y="10" width="840" height="118" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="33" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐）· 在线态纯内存 + 亲和表落控制面 SQLite + 握手上报 work_keys 自动对账</text>
+
+                <rect x="24" y="48" width="256" height="66" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="38" y="69" font-size="11.5" font-weight="700" fill="var(--text-primary)">NodeRegistry（纯内存）</text>
+                <text x="38" y="88" font-size="10.5" fill="var(--text-muted)">存 WS 连接、conn_epoch、实时槽位</text>
+                <text x="38" y="104" font-size="10.2" font-family="var(--font-mono)" fill="var(--text-faint)">重启清空，Runner 几秒内自动重连</text>
+
+                <rect x="298" y="48" width="268" height="66" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="312" y="69" font-size="11.5" font-weight="700" fill="var(--teal)">workspace_affinity（SQLite）</text>
+                <text x="312" y="88" font-size="10.5" font-family="var(--font-mono)" fill="var(--text-primary)">(ns, project, owner, work_key) → runner_id</text>
+                <text x="312" y="104" font-size="10.2" fill="var(--text-muted)">Mac 离线期间控制面重启也不丢绑定</text>
+
+                <rect x="584" y="48" width="250" height="66" rx="8" fill="var(--indigo-soft)" stroke="var(--indigo-border)"/>
+                <text x="598" y="69" font-size="11.5" font-weight="700" fill="var(--indigo)">hello 握手清单对账</text>
+                <text x="598" y="88" font-size="10.5" fill="var(--text-primary)">Runner 上报现存 ready work_keys</text>
+                <text x="598" y="104" font-size="10.2" fill="var(--text-muted)">自动清理手工删目录留下的脏映射</text>
+
+                <rect x="10" y="142" width="840" height="94" rx="11" fill="var(--bg-card)" stroke="var(--border)"/>
+                <text x="24" y="165" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--rose)">方案 B · 不落库，完全靠 Runner 握手动态重建内存亲和表</text>
+                <rect x="24" y="178" width="810" height="44" rx="8" fill="var(--rose-soft)" stroke="var(--rose-border)"/>
+                <text x="38" y="198" font-size="11.2" font-weight="600" fill="var(--rose)">致命漏洞：Mac 离线时若控制面重启，内存无 Mac 记录 → 新事件会被错派给在线 VPS，产生双机同名分叉目录！</text>
+                <text x="38" y="215" font-size="10.5" fill="var(--text-muted)">因此亲和映射属于持久化状态，必须落控制面 SQLite，不能仅放内存。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：在线态纯内存 + 亲和表落 SQLite + 握手对账',
+                points: [
+                  '<strong>彻底防双机脑裂</strong>：即便 Mac 离线期间控制面重启，SQLite 仍记住 <code class="ic">work_key → mac-m4</code>，绝不错派给 VPS。',
+                  '<strong>自愈脏记录</strong>：Runner 重连 <code class="ic">hello</code> 附带本机现存 <code class="ic">work_keys</code>，手工删目录或回收后自动对齐。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '不推荐',
+                title: '方案 B：仅内存动态重建（不落 SQLite）',
+                points: [
+                  '<strong>存在重启盲区</strong>：离线节点的已有目录在控制面重启后不可见，容易触发跨机重复建目录。'
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        id: 'q3',
+        code: 'Q3',
+        title: 'Worktree 驱动与三道保险抽离',
+        statusText: '已锁定',
+        statusKind: 'done',
+        summary: '将现有 OrcaWorktreeManager 抽离为通用 WorktreeDriver，锁定元数据库形态（3A）、命名规则归属（3B）与 Orca/Git 后端边界（3C）。',
+        forks: [
+          {
+            id: 'q3_storage',
+            label: '分叉 3A · 元数据存储形态（单库 vs 分库）',
+            short: '3A 元数据存储',
+            caption: '同一台 Runner 同时承接 hb-* 与 ws-* 工作区时，本地 workspaces 登记表是单 SQLite 按 namespace 分区，还是物理分库？',
+            svg: `
+              <svg viewBox="0 0 860 250" role="img" aria-label="分叉 3A Worktree 元数据存储对比图">
+                <rect x="10" y="10" width="840" height="118" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="33" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐）· 单库 runner_workspaces.db + (namespace, project_key, owner_scope, work_key) 复合主键</text>
+
+                <rect x="24" y="48" width="330" height="66" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="38" y="70" font-size="11.5" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">workspaces (单表 · WAL 模式)</text>
+                <text x="38" y="89" font-size="10.5" font-family="var(--font-mono)" fill="var(--text-primary)">PK (namespace, project_key, owner_scope, work_key)</text>
+                <text x="38" y="105" font-size="10.2" fill="var(--text-muted)">列：dir_name · branch · status · updated_at</text>
+
+                <rect x="372" y="48" width="224" height="66" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="386" y="70" font-size="11.5" font-weight="700" fill="var(--text-primary)">全局对账一次完成</text>
+                <text x="386" y="89" font-size="10.5" fill="var(--text-muted)">与 git worktree list --porcelain</text>
+                <text x="386" y="105" font-size="10.5" fill="var(--text-muted)">单事务核对孤儿 creating/reclaiming</text>
+
+                <rect x="614" y="48" width="220" height="66" rx="8" fill="var(--indigo-soft)" stroke="var(--indigo-border)"/>
+                <text x="628" y="70" font-size="11.5" font-weight="700" fill="var(--indigo)">查询强校验 namespace</text>
+                <text x="628" y="89" font-size="10.5" fill="var(--text-primary)">所有读写/回收 SQL 必带</text>
+                <text x="628" y="105" font-size="10.5" font-family="var(--font-mono)" fill="var(--indigo)">WHERE namespace = ?</text>
+
+                <rect x="10" y="142" width="840" height="94" rx="11" fill="var(--bg-card)" stroke="var(--border)"/>
+                <text x="24" y="165" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--amber)">方案 B · 按 namespace 拆独立库（hb_workspaces.db / ws_workspaces.db）</text>
+                <rect x="24" y="178" width="810" height="44" rx="8" fill="var(--amber-soft)" stroke="var(--amber-border)"/>
+                <text x="38" y="198" font-size="11.2" font-weight="600" fill="var(--text-primary)">文件级物理隔离，但同机扫描孤儿目录、防止目录名碰撞或盘点整机容量时必须跨多库聚合</text>
+                <text x="38" y="215" font-size="10.5" fill="var(--text-muted)">且每新增一个接入项目都要初始化一套新的 SQLite 连接与迁移脚本。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：单库 + namespace 复合主键',
+                points: [
+                  '<strong>对账简单无死角</strong>：崩溃恢复时单表直接对照 <code class="ic">git worktree list</code> 清理孤儿 <code class="ic">creating</code> 占位。',
+                  '<strong>零跨项目越权</strong>：所有查询与 CAS 回收强制绑定 <code class="ic">namespace + owner_scope</code>，且磁盘目录前缀双检。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '方案 B：按 namespace 物理分库',
+                points: [
+                  '<strong>物理文件完全独立</strong>：备份或重置单个项目的元数据互不影响，但全机目录对账变重。'
+                ]
+              }
+            ]
+          },
+          {
+            id: 'q3_naming',
+            label: '分叉 3B · 目录与分支命名规则归属',
+            short: '3B 命名策略',
+            caption: 'Hibernaut 用可读名（hb-issue-42 / hb/issue-42），Workshop 用短哈希（ws-<sha256[:16]>），命名逻辑放在哪一侧？',
+            svg: `
+              <svg viewBox="0 0 860 250" role="img" aria-label="分叉 3B Worktree 命名策略图解">
+                <rect x="10" y="10" width="840" height="118" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="33" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐）· Runner 锁死强前缀 (&lt;ns&gt;- / &lt;ns&gt;/)，后半段接受安全 name_hint 并自动防重名</text>
+
+                <rect x="24" y="48" width="242" height="66" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="38" y="69" font-size="11.5" font-weight="700" fill="var(--text-primary)">控制面传可选 name_hint</text>
+                <text x="38" y="88" font-size="10.5" font-family="var(--font-mono)" fill="var(--teal)">HB: hint="issue-42"</text>
+                <text x="38" y="105" font-size="10.5" font-family="var(--font-mono)" fill="var(--indigo)">WS: hint="a1b2c3d4e5f67890"</text>
+
+                <rect x="284" y="48" width="276" height="66" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="298" y="69" font-size="11.5" font-weight="700" fill="var(--teal)">Runner 强制拼前缀 + 清洗</text>
+                <text x="298" y="88" font-size="10.5" font-family="var(--font-mono)" fill="var(--text-primary)">仅允 [a-z0-9_-]，拒绝 ../ 越界</text>
+                <text x="298" y="105" font-size="10.5" fill="var(--text-muted)">撞名（含未挂载本地分支）自动顺延 -2</text>
+
+                <rect x="578" y="48" width="256" height="66" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="592" y="69" font-size="11.5" font-weight="700" fill="var(--text-primary)">最终物理产出</text>
+                <text x="592" y="88" font-size="10.5" font-family="var(--font-mono)" fill="var(--teal)">hb-issue-42 · 分支 hb/issue-42</text>
+                <text x="592" y="105" font-size="10.5" font-family="var(--font-mono)" fill="var(--indigo)">ws-a1b2c3d4... · 分支 ws/a1b2...</text>
+
+                <rect x="10" y="142" width="840" height="94" rx="11" fill="var(--bg-card)" stroke="var(--border)"/>
+                <text x="24" y="165" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--amber)">方案 B · 所有业务命名规则硬编码在 Runner 内部</text>
+                <rect x="24" y="178" width="810" height="44" rx="8" fill="var(--amber-soft)" stroke="var(--amber-border)"/>
+                <text x="38" y="198" font-size="11.2" font-weight="600" fill="var(--text-primary)">Runner 必须解析 GitHub Issue/PR 正则与 Workshop 哈希算法，违反“Runner 无业务语义”边界</text>
+                <text x="38" y="215" font-size="10.5" fill="var(--text-muted)">每接入一个新项目（如知识库流水线）都要改 Runner 代码发版。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：Runner 锁死前缀 + 调用方传安全 name_hint',
+                points: [
+                  '<strong>兼顾可读性与解耦</strong>：HB 保留极简 <code class="ic">hb-issue-42</code>，Workshop 保留 <code class="ic">ws-&lt;hash16&gt;</code>，Runner 不解析任何业务 ID 格式。',
+                  '<strong>安全兜底</strong>：前缀由 <code class="ic">namespace</code> 强控不可伪造；缺省 <code class="ic">name_hint</code> 时 Runner 自动回退 <code class="ic">&lt;ns&gt;-task-&lt;seq&gt;</code>。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '方案 B：命名规则全部内置在 Runner',
+                points: [
+                  '<strong>请求字段少 1 个</strong>：但会把 GitHub/Workshop 业务命名约定反向耦合进 Runner。'
+                ]
+              }
+            ]
+          },
+          {
+            id: 'q3_backend',
+            label: '分叉 3C · Orca 与纯 Git 后端降级边界',
+            short: '3C 后端边界',
+            caption: 'Mac 有 Orca（含可见终端），Linux VPS 只有纯 git worktree：二者如何共用三道保险，交互需求缺后端时如何处理？',
+            svg: `
+              <svg viewBox="0 0 860 250" role="img" aria-label="分叉 3C Orca 与纯 Git 后端边界图解">
+                <rect x="10" y="10" width="840" height="118" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="33" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐）· 共享三道保险基类 + 显式能力声明，交互任务绝不静默降级 headless</text>
+
+                <rect x="24" y="48" width="256" height="66" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="38" y="69" font-size="11.5" font-weight="700" fill="var(--text-primary)">WorktreeManager（通用底座）</text>
+                <text x="38" y="88" font-size="10.5" fill="var(--text-muted)">统一管 creating 占位 / 写隔离锁</text>
+                <text x="38" y="105" font-size="10.5" fill="var(--text-muted)">统一管 CAS 认领 + 本地 Git 回收核验</text>
+
+                <rect x="298" y="48" width="256" height="66" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="312" y="69" font-size="11.5" font-weight="700" fill="var(--teal)">双后端仅差异 2 个原语</text>
+                <text x="312" y="88" font-size="10.5" font-family="var(--font-mono)" fill="var(--text-primary)">OrcaBackend: orca worktree create/rm</text>
+                <text x="312" y="105" font-size="10.5" font-family="var(--font-mono)" fill="var(--text-primary)">GitBackend: git worktree add/remove</text>
+
+                <rect x="572" y="48" width="262" height="66" rx="8" fill="var(--rose-soft)" stroke="var(--rose-border)"/>
+                <text x="586" y="69" font-size="11.5" font-weight="700" fill="var(--rose)">防静默降级红线</text>
+                <text x="586" y="88" font-size="10.5" fill="var(--text-primary)">interactive=true 只派给 orca 节点</text>
+                <text x="586" y="105" font-size="10.5" fill="var(--text-muted)">缺后端或 orca 失败直接 refused，不偷跑后台</text>
+
+                <rect x="10" y="142" width="840" height="94" rx="11" fill="var(--bg-card)" stroke="var(--border)"/>
+                <text x="24" y="165" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--amber)">方案 B · Orca 不可用时自动静默回退纯 git + headless 后台跑</text>
+                <rect x="24" y="178" width="810" height="44" rx="8" fill="var(--amber-soft)" stroke="var(--amber-border)"/>
+                <text x="38" y="198" font-size="11.2" font-weight="600" fill="var(--text-primary)">违反现有 architecture.md 铁律：需要人工随时接入的交互会话会被悄无声息扔进后台，且易残留 Orca 不认识的目录</text>
+                <text x="38" y="215" font-size="10.5" fill="var(--text-muted)">仅显式声明 interactive=false 的后台任务才允许走纯 git 后端。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：共享三道保险 + 显式声明后端，严禁静默降级',
+                points: [
+                  '<strong>复用度最高</strong>：<code class="ic">Orca</code> 与 <code class="ic">Git</code> 仅实现极薄的 <code class="ic">create()</code> / <code class="ic">remove()</code>，其余对账与安全回收 100% 共享。',
+                  '<strong>守住交互红线</strong>：<code class="ic">interactive=true</code> 必须匹配 <code class="ic">interactive_surface="orca"</code>，不可用直接报 <code class="ic">refused</code>。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '不推荐',
+                title: '方案 B：Orca 异常时自动静默降级纯 Git / headless',
+                points: [
+                  '<strong>隐患大</strong>：用户以为有可见终端可随时接管，实际已被静默降级成后台无头进程。'
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        id: 'q4',
+        code: 'Q4',
+        title: '多 CLI 驱动与防挂死/流式口',
+        statusText: '已锁定',
+        statusKind: 'done',
+        summary: '统一封装 claude / grok / cursor-agent / dsh，敲定防挂死看门狗策略（4A）、原生续接防错传（4B）与 stream-json 双向演进边界（4C）。',
+        forks: [
+          {
+            id: 'q4_watchdog',
+            label: '分叉 4A · 防挂死看门狗策略',
+            short: '4A 防挂死',
+            caption: 'CLI 子进程既可能总耗时过长，也可能网络卡死无任何输出：是上“硬超时 + 可选静默看门狗”双保险，还是只留硬超时？',
+            svg: `
+              <svg viewBox="0 0 860 250" role="img" aria-label="分叉 4A 防挂死看门狗对比图">
+                <rect x="10" y="10" width="840" height="118" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="33" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐）· ProcessSupervisor 双保险：总硬超时 + 按驱动可配的静默看门狗 (idle_timeout)</text>
+
+                <rect x="24" y="48" width="248" height="66" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="38" y="69" font-size="11.5" font-weight="700" fill="var(--text-primary)">1. 总硬超时 (timeout_seconds)</text>
+                <text x="38" y="88" font-size="10.5" fill="var(--text-muted)">兜底上限（如 1800s），防无限循环</text>
+                <text x="38" y="105" font-size="10.2" font-family="var(--font-mono)" fill="var(--text-faint)">所有驱动强制生效</text>
+
+                <rect x="290" y="48" width="276" height="66" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="304" y="69" font-size="11.5" font-weight="700" fill="var(--teal)">2. 静默看门狗 (idle_timeout_s)</text>
+                <text x="304" y="88" font-size="10.5" fill="var(--text-primary)">流式驱动(claude)默认 300s 无输出即判假死</text>
+                <text x="304" y="105" font-size="10.2" fill="var(--text-muted)">长编译/无中间输出驱动可设 null 防误杀</text>
+
+                <rect x="584" y="48" width="250" height="66" rx="8" fill="var(--rose-soft)" stroke="var(--rose-border)"/>
+                <text x="598" y="69" font-size="11.5" font-weight="700" fill="var(--rose)">3. 独立进程组整树回收</text>
+                <text x="598" y="88" font-size="10.5" font-family="var(--font-mono)" fill="var(--text-primary)">killpg SIGTERM → 2s → SIGKILL</text>
+                <text x="598" y="105" font-size="10.2" fill="var(--text-muted)">回 timed_out + 保留完整 .log 排障</text>
+
+                <rect x="10" y="142" width="840" height="94" rx="11" fill="var(--bg-card)" stroke="var(--border)"/>
+                <text x="24" y="165" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--amber)">方案 B · 仅保留总硬超时（无静默输出看门狗）</text>
+                <rect x="24" y="178" width="810" height="44" rx="8" fill="var(--amber-soft)" stroke="var(--amber-border)"/>
+                <text x="38" y="198" font-size="11.2" font-weight="600" fill="var(--text-primary)">零误杀风险，但 CLI 遇到上游连接半开假死时必须干等满 30 分钟才会释放并发槽位</text>
+                <text x="38" y="215" font-size="10.5" fill="var(--text-muted)">对槽位紧缺的 Mac 本机节点影响明显。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：总硬超时 + 按驱动可配的静默看门狗',
+                points: [
+                  '<strong>兼顾防挂死与零误杀</strong>：<code class="ic">claude</code> 等流式输出驱动默认开启 <code class="ic">idle_timeout=300s</code>；无中间输出的驱动可配置为 <code class="ic">null</code> 关闭。',
+                  '<strong>进程组杀树 + 实时落盘</strong>：边读边写 <code class="ic">logs/runs/&lt;run_id&gt;.log</code>，内存仅留尾部摘要防 OOM。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '方案 B：仅保留单轮总硬超时',
+                points: [
+                  '<strong>逻辑极简</strong>：不关心输出间隔，但假死任务会霸占槽位直到硬超时。'
+                ]
+              }
+            ]
+          },
+          {
+            id: 'q4_resume',
+            label: '分叉 4B · 原生续接与切执行器防护',
+            short: '4B 原生续接',
+            caption: '不同 CLI 的原生续接参数各异（claude 用 --resume，部分 CLI 不支持），如何避免跨执行器错传 executor_session_id？',
+            svg: `
+              <svg viewBox="0 0 860 250" role="img" aria-label="分叉 4B 原生会话续接防护图解">
+                <rect x="10" y="10" width="840" height="118" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="33" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐）· 驱动显式声明 supports_resume + 命名空间前缀校验，切执行器自动降级新开</text>
+
+                <rect x="24" y="48" width="246" height="66" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="38" y="69" font-size="11.5" font-weight="700" fill="var(--text-primary)">回传带驱动前缀的会话键</text>
+                <text x="38" y="88" font-size="10.5" font-family="var(--font-mono)" fill="var(--teal)">"claude:550e8400-..."</text>
+                <text x="38" y="105" font-size="10.2" fill="var(--text-muted)">控制面原样透传，无需解析内部格式</text>
+
+                <rect x="288" y="48" width="278" height="66" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="302" y="69" font-size="11.5" font-weight="700" fill="var(--teal)">驱动启动前双检防呆</text>
+                <text x="302" y="88" font-size="10.5" fill="var(--text-primary)">1. 驱动 supports_resume == true</text>
+                <text x="302" y="105" font-size="10.5" fill="var(--text-primary)">2. 前缀匹配当前 driver_id → 走 resume_args</text>
+
+                <rect x="584" y="48" width="250" height="66" rx="8" fill="var(--indigo-soft)" stroke="var(--indigo-border)"/>
+                <text x="598" y="69" font-size="11.5" font-weight="700" fill="var(--indigo)">不匹配则静默退回全新 args</text>
+                <text x="598" y="88" font-size="10.5" fill="var(--text-primary)">如 claude → grok 切换或重放</text>
+                <text x="598" y="105" font-size="10.2" fill="var(--text-muted)">绝不把 claude UUID 错喂给 grok</text>
+
+                <rect x="10" y="142" width="840" height="94" rx="11" fill="var(--bg-card)" stroke="var(--border)"/>
+                <text x="24" y="165" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--amber)">方案 B · Runner 盲传裸 executor_session_id，全靠各调用方自己防呆</text>
+                <rect x="24" y="178" width="810" height="44" rx="8" fill="var(--amber-soft)" stroke="var(--amber-border)"/>
+                <text x="38" y="198" font-size="11.2" font-weight="600" fill="var(--text-primary)">HB 虽有粘滞检查，但 Workshop 或新调用方一旦漏判就会把不兼容的原生 ID 喂给 CLI 直接报错</text>
+                <text x="38" y="215" font-size="10.5" fill="var(--text-muted)">在 Runner 驱动侧用 driver 前缀自检，成本仅 3 行代码，所有调用方同时受益。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：driver 前缀自检 + 不匹配自动新开',
+                points: [
+                  '<strong>全调用方自动防呆</strong>：回传 <code class="ic">&lt;driver&gt;:&lt;native_id&gt;</code>，驱动剥离前缀后注入 <code class="ic">resume_args</code>；跨执行器切换自动新开。',
+                  '<strong>兼容 yetone/magpie</strong>：环境变量与网关配置仍由各驱动的 <code class="ic">launcher</code> 模板按需透传。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '备选',
+                title: '方案 B：裸传 native_id，由控制面保证一致性',
+                points: [
+                  '<strong>与旧库零格式转换</strong>：但每个接入 Runner 的新项目都要重复实现跨执行器防错传逻辑。'
+                ]
+              }
+            ]
+          },
+          {
+            id: 'q4_stream',
+            label: '分叉 4C · stream-json 双向管道演进边界',
+            short: '4C 流式扩展口',
+            caption: '现在是单轮请求-响应，未来想利用 Claude Code stream-json 做实时进度回显或中途追问：当下做到哪一层最合理？',
+            svg: `
+              <svg viewBox="0 0 860 250" role="img" aria-label="分叉 4C stream-json 双向管道演进图解">
+                <rect x="10" y="10" width="840" height="118" rx="11" fill="var(--bg-card)" stroke="var(--teal-border)" stroke-width="1.5"/>
+                <text x="24" y="33" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">方案 A（推荐）· 当下内部流式解析 + 预留 StreamPipe 口，对外保持简洁 run()，Phase 2 无痛扩 WS 帧</text>
+
+                <rect x="24" y="48" width="268" height="66" rx="8" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="38" y="69" font-size="11.5" font-weight="700" fill="var(--teal)">Phase 1（当下落地）</text>
+                <text x="38" y="88" font-size="10.5" fill="var(--text-primary)">claude 驱动内部逐行读 stream-json</text>
+                <text x="38" y="105" font-size="10.2" fill="var(--text-muted)">init 验计费/模型 + 落盘 .log → 回 RunResult</text>
+
+                <rect x="310" y="48" width="256" height="66" rx="8" fill="var(--bg-subtle)" stroke="var(--border)"/>
+                <text x="324" y="69" font-size="11.5" font-weight="700" fill="var(--text-primary)">预留内部扩展口 (StreamPipe)</text>
+                <text x="324" y="88" font-size="10.5" font-family="var(--font-mono)" fill="var(--indigo)">on_event(evt) · send_stdin(msg)</text>
+                <text x="324" y="105" font-size="10.2" fill="var(--text-muted)">默认 NoopSink，零额外网络复杂度</text>
+
+                <rect x="584" y="48" width="250" height="66" rx="8" fill="var(--indigo-soft)" stroke="var(--indigo-border)"/>
+                <text x="598" y="69" font-size="11.5" font-weight="700" fill="var(--indigo)">Phase 2（未来增量开启）</text>
+                <text x="598" y="88" font-size="10.5" font-family="var(--font-mono)" fill="var(--text-primary)">同条 WS 新增 run.chunk / run.stdin</text>
+                <text x="598" y="105" font-size="10.2" fill="var(--text-muted)">支持实时进度与中途追问，不破 v1 契约</text>
+
+                <rect x="10" y="142" width="840" height="94" rx="11" fill="var(--bg-card)" stroke="var(--border)"/>
+                <text x="24" y="165" font-size="12" font-weight="700" font-family="var(--font-mono)" fill="var(--rose)">方案 B · Phase 1 直接把 RunnerPort.run() 设计成全双工流式 RPC</text>
+                <rect x="24" y="178" width="810" height="44" rx="8" fill="var(--rose-soft)" stroke="var(--rose-border)"/>
+                <text x="38" y="198" font-size="11.2" font-weight="600" fill="var(--rose)">过度设计：现在 HB / Workshop 根本不消费逐 token 增量帧，却要提前背负流控、断线续传与背压代码</text>
+                <text x="38" y="215" font-size="10.5" fill="var(--text-muted)">保持协议薄、内部留接口，是演进成本最低的工程解。</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '推荐',
+                title: '方案 A：当下单轮 RunResult + 内部留 StreamPipe，Phase 2 扩 WS 帧',
+                points: [
+                  '<strong>拒绝过度设计</strong>：Phase 1 保持 <code class="ic">RunnerPort.run()</code> 简洁好测；<code class="ic">claude</code> 驱动内部已逐行读 <code class="ic">stream-json</code> 做 <code class="ic">init</code> 核验。',
+                  '<strong>平滑升级路径</strong>：未来在反向 WS 加 <code class="ic">run.chunk</code> / <code class="ic">run.stdin</code> 帧即可接通双向管道。'
+                ]
+              },
+              {
+                key: 'B',
+                badge: '不推荐',
+                title: '方案 B：Phase 1 一步到位做全双工流式 RunnerPort',
+                points: [
+                  '<strong>前期复杂度陡增</strong>：引入背压、帧序号重放与异步生成器状态管理，拖慢 MVP 落地。'
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        id: 'q5',
+        code: 'Q5',
+        title: 'v1.0 定稿总账与双轨产物',
+        statusText: '已定稿',
+        statusKind: 'done',
+        summary: 'Q0–Q4 全部 15 项工程决策已收敛，双轨产物（Google Drive 设计文档 + runner_blueprint.html）已同步定稿，暂不动代码。',
+        forks: [
+          {
+            id: 'q5_plan',
+            label: 'v1.0 架构决策总账（15 / 15 锁定）',
+            short: '已定稿',
+            caption: '所有架构边界与协议决策已闭环，后续可随时按阶段（Stage 1 本机直调 → Stage 2 反向 WS 多节点）平滑落地。',
+            svg: `
+              <svg viewBox="0 0 860 198" role="img" aria-label="v1.0 全量架构决策总账图">
+                <rect x="10" y="10" width="160" height="178" rx="10" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="22" y="34" font-size="11" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">Q0 · 定位与边界 ✓</text>
+                <text x="22" y="58" font-size="10.8" fill="var(--text-primary)">• 0A: 薄执行宿主</text>
+                <text x="22" y="80" font-size="10.8" fill="var(--text-primary)">• 0B: 原子原语下沉</text>
+                <text x="22" y="102" font-size="10.8" fill="var(--text-primary)">  多轮编排留 HB</text>
+                <text x="22" y="126" font-size="10.8" fill="var(--text-primary)">• 0C: 远端 PR 控制</text>
+                <text x="22" y="146" font-size="10.8" fill="var(--text-primary)">  面验，本地 Git 验</text>
+
+                <rect x="180" y="10" width="160" height="178" rx="10" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="192" y="34" font-size="11" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">Q1 · 协议与传输 ✓</text>
+                <text x="192" y="58" font-size="10.8" fill="var(--text-primary)">• 1A: 仅回执行事实</text>
+                <text x="192" y="80" font-size="10.8" fill="var(--text-primary)">• 1B: 同进程直调 +</text>
+                <text x="192" y="102" font-size="10.8" fill="var(--text-primary)">  反向 WS+epoch</text>
+                <text x="192" y="126" font-size="10.8" fill="var(--text-primary)">• 1C: 薄 Runner</text>
+                <text x="192" y="146" font-size="10.8" fill="var(--text-primary)">  ADR-0001 Schema</text>
+
+                <rect x="350" y="10" width="160" height="178" rx="10" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="362" y="34" font-size="11" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">Q2 · 多节点调度 ✓</text>
+                <text x="362" y="58" font-size="10.8" fill="var(--text-primary)">• 2A: 写硬亲和，纯</text>
+                <text x="362" y="80" font-size="10.8" fill="var(--text-primary)">  远端只读可漂移</text>
+                <text x="362" y="102" font-size="10.8" fill="var(--text-primary)">• 2B: 预扣+终裁+</text>
+                <text x="362" y="124" font-size="10.8" fill="var(--text-primary)">  20s 心跳校准</text>
+                <text x="362" y="146" font-size="10.8" fill="var(--text-primary)">• 2C: 亲和落 SQLite</text>
+
+                <rect x="520" y="10" width="160" height="178" rx="10" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="532" y="34" font-size="11" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">Q3 · Worktree ✓</text>
+                <text x="532" y="58" font-size="10.8" fill="var(--text-primary)">• 3A: 单库复合主键</text>
+                <text x="532" y="80" font-size="10.8" fill="var(--text-primary)">• 3B: 配置+鉴权锁</text>
+                <text x="532" y="102" font-size="10.8" fill="var(--text-primary)">  强前缀+name_hint</text>
+                <text x="532" y="126" font-size="10.8" fill="var(--text-primary)">• 3C: 共享三道保险</text>
+                <text x="532" y="146" font-size="10.8" fill="var(--text-primary)">  禁交互静默降级</text>
+
+                <rect x="690" y="10" width="160" height="178" rx="10" fill="var(--teal-soft)" stroke="var(--teal-border)"/>
+                <text x="702" y="34" font-size="11" font-weight="700" font-family="var(--font-mono)" fill="var(--teal)">Q4 · CLI 与流式 ✓</text>
+                <text x="702" y="58" font-size="10.8" fill="var(--text-primary)">• 4A: 硬超时 + 可配</text>
+                <text x="702" y="80" font-size="10.8" fill="var(--text-primary)">  静默看门狗</text>
+                <text x="702" y="102" font-size="10.8" fill="var(--text-primary)">• 4B: driver 前缀</text>
+                <text x="702" y="124" font-size="10.8" fill="var(--text-primary)">  自检防错传续接</text>
+                <text x="702" y="146" font-size="10.8" fill="var(--text-primary)">• 4C: 留 StreamPipe</text>
+              </svg>
+            `,
+            options: [
+              {
+                key: 'A',
+                badge: '已定稿',
+                title: 'v1.0 双轨产物已同步：Google Doc 正式设计书 + Canvas 交互蓝图',
+                points: [
+                  '<strong>Google Drive 设计文档</strong>：《Always-on Agent · Runner 执行面架构设计方案》已落盘「Always-on Agent 架构设计」目录。',
+                  '<strong>Canvas 交互蓝图</strong>：<code class="ic">runner_blueprint.html</code> 已同步全量 15 项锁定决策与契约关联。'
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ];
+
+    /* ============================================================
+       SECTION 01: X-RAY MODULES DATA
+       ============================================================ */
+    const MODULES = {
+      hb_control: {
+        kicker: 'CALLER 01 · Hibernaut 控制面',
+        title: 'Hibernaut 控制面',
+        style: '完整 L0–L3',
+        purpose: '常驻控制面：管 worker_leases 单活锁、Session 4 态、4 级执行器粘滞路由与 Memory 组装，零 Git / 零子进程依赖。',
+        upstream: [],
+        downstream: ['runner_port', 'broker', 'ledger'],
+        rules: [
+          '不接触本地磁盘路径：只传 namespace="hb"、project_key、owner_scope(inbox_id)、work_key 与 executor_id。',
+          '通过薄适配层将 Runner 返回的 RunResult 翻译回 L0 RunOutcome (Silent | Emit | Suspend)。',
+          '确认 count_active_by_work_key(work_key) == 0 后才调用 RunnerPort.reclaim_workspace()。'
+        ],
+        codeMeta: 'src/agent_runtime/adapters/runner_bridge.py · 控制面薄适配层',
+        code: `class RunnerExecutorBridge(ExecutorPort):
+    async def execute(self, events, session, caps) -> RunOutcome:
+        req = RunRequest(
+            run_id=new_id("run"),
+            namespace="hb",
+            project_key=self.project_key,
+            owner_scope=session.inbox_id,
+            work_key=session.work_key,
+            executor_id=self.executor_id,
+            executor_session_id=session.executor_session_id,
+            readonly=False,
+            prompt=self.build_prompt(events, caps.memory),
+            timeout_seconds=1800.0,
+        )
+        result = await self.runner.run(req)
+        return translate_to_outcome(result)`,
+        changes: [
+          { when: '从单机演进到多台 VPS 节点', action: 'HB 控制面业务零重写，只需在 bootstrap 将 InProcessRunnerClient 替换为 RelayRunnerClient。' }
+        ]
+      },
+      ws_control: {
+        kicker: 'CALLER 02 · Workshop / 车间',
+        title: 'Workshop / 车间',
+        style: '插件解耦编排',
+        purpose: '独立 Python 编排项目：通过同一套 RunnerPort 复用 Worktree 三道保险与多 CLI 执行能力，前缀严格锁定 ws-*。',
+        upstream: [],
+        downstream: ['runner_port', 'ledger'],
+        rules: [
+          '所有请求强制声明 namespace="ws"，与 Hibernaut 的 hb-* 目录与分支物理隔离。',
+          '车间自行解释 RunResult 并写入其 Append-only 事实表，不引入任何 Hibernaut 领域依赖。'
+        ],
+        codeMeta: 'workshop 侧调用示例 · 与 HB 共用 RunnerPort',
+        code: `req = RunRequest(
+    run_id=new_id("run"),
+    namespace="ws",               # 强制 ws-* 前缀隔离
+    project_key="workshop",
+    owner_scope="ws:pipeline-a",
+    work_key=item_hash_16,
+    executor_id="claude",
+    readonly=False,
+    prompt=rendered_prompt,
+    timeout_seconds=900.0,
+)
+res = await runner_port.run(req)`,
+        changes: [
+          { when: '车间与 HB 同时共用一台 Mac 或 VPS Runner', action: '达成生态蓝图 Signal 02（多消费者复用），可将 src/runner/ 独立拆仓。' }
+        ]
+      },
+      runner_port: {
+        kicker: 'CONTRACT · ADR-0001 JSON Schema 2020-12',
+        title: 'RunnerPort 契约',
+        style: '薄契约 Protocol',
+        purpose: '控制面与执行面之间唯一允许跨越的 4 方法边界：capabilities / run / interrupt / reclaim_workspace。',
+        upstream: ['hb_control', 'ws_control'],
+        downstream: ['transport', 'runner_daemon'],
+        rules: [
+          '遵循 ADR-0001：JSON Schema Draft 2020-12 为单一事实源，v1 只增可选字段，严禁破坏性变更。',
+          'run() 必须携带调用方生成的全局唯一 run_id 作为幂等键，网络重试绝不重复拉起子进程。',
+          'interrupt() 替代进程内 caps.is_interrupted() 闭包，支持跨网秒级安全中止。'
+        ],
+        codeMeta: 'src/runner/protocol.py · RunnerPort 4 方法',
+        code: `class RunnerPort(Protocol):
+    async def capabilities(self) -> RunnerCapabilities: ...
+    async def run(self, req: RunRequest) -> RunResult: ...
+    async def interrupt(self, req: InterruptRequest) -> InterruptResult: ...
+    async def reclaim_workspace(self, req: ReclaimRequest) -> ReclaimResult: ...`,
+        changes: [
+          { when: '未来引入 stream-json 双向交互流', action: '在 RunnerPort 上增量新增可选 stream_run() 方法，不破坏现有 run() 契约。' }
+        ]
+      },
+      transport: {
+        kicker: 'TRANSPORT · 双模平滑切换',
+        title: 'InProcess / Relay WS 传输层',
+        style: '纯 stdlib 传输',
+        purpose: '屏蔽本机与跨网络差异：Stage 1 内存直调；Stage 2 复用 Switchboard 反向 WebSocket（wss://）+ conn_epoch 防脑裂。',
+        upstream: ['runner_port'],
+        downstream: ['runner_daemon'],
+        rules: [
+          'Runner 主动外连公网 Hub，天然穿透私网 Mac（无公网 IP）并支持合盖休眠后指数退避重连。',
+          'run() 走异步帧：run.submit → run.accepted → run.completed，断线重连后支持 run.query(run_id) 兜底补拉。',
+          '同一 runner_id 新连接递增 conn_epoch，旧连接以 Close 4009 踢出并丢弃陈旧帧。'
+        ],
+        codeMeta: 'src/runner/transport/relay_protocol.py · 帧类型',
+        code: `# 反向 WebSocket JSON 文本帧（复用 RFC 6455 手写实现）
+# Runner -> Hub: hello | capabilities | run.accepted | run.completed | pong
+# Hub -> Runner: welcome(conn_epoch) | run.submit | run.interrupt | run.query | reclaim | ping`,
+        changes: [
+          { when: '从本机单进程切到公网控制面 + 多节点 Runner', action: '只切换配置中的 transport 模式，上层控制面与下层驱动零改动。' }
+        ]
+      },
+      runner_daemon: {
+        kicker: 'HOST · 执行节点宿主',
+        title: 'RunnerDaemon & 槽位池',
+        style: '薄调度内核',
+        purpose: '运行在每台执行机上的宿主进程：维护 run_id 幂等表、并发槽位信号量、定时心跳上报与工作区编排。',
+        upstream: ['runner_port', 'transport'],
+        downstream: ['supervisor', 'worktree_drv', 'cli_drv', 'broker', 'ledger'],
+        rules: [
+          '零逻辑会话状态机、零租约锁：只响应控制面指令，完成后落盘结果并回传。',
+          '同 run_id 重复投递直接返回已有运行态或缓存终态，保证 At-Least-Once 下不重复执行。',
+          '槽位耗尽时拒绝超额派发（status="refused"），由控制面重选其他空闲节点或排队。'
+        ],
+        codeMeta: 'src/runner/daemon.py · 执行主循环',
+        code: `async def handle_run(self, req: RunRequest) -> RunResult:
+    if existing := self.runs.get(req.run_id):
+        return await existing.wait_result()         # 幂等防重
+    async with self.slot_semaphore:                 # 并发槽位上限
+        workdir = self.worktrees.resolve(req)       # 解析/建 hb-* 或 ws-*
+        env = self.broker.build_child_env(req)      # 剥离长效密钥
+        return await self.supervisor.execute(req, workdir, env)`,
+        changes: [
+          { when: '单机同时跑多任务需要控制内存/CPU 峰值', action: '仅调整节点配置 max_concurrent，心跳自动向控制面广播最新槽位。' }
+        ]
+      },
+      supervisor: {
+        kicker: 'HOST · 进程看门狗与日志流',
+        title: 'ProcessSupervisor',
+        style: '进程监管器',
+        purpose: '统一监管所有 CLI 子进程：进程组隔离、优雅中止（SIGTERM→SIGKILL）、硬超时/静默看门狗与实时日志落盘。',
+        upstream: ['runner_daemon'],
+        downstream: ['cli_drv', 'ledger'],
+        rules: [
+          '子进程启用独立进程组（start_new_session=True），中断时整树回收，杜绝孤儿孙进程。',
+          'stdout / stderr 边读边落盘 logs/runs/YYYY-MM-DD/<run_id>.log，内存只截断保留 excerpt 防 OOM。',
+          '中断后不写半成品交付，统一返回 status="interrupted" 与已落盘 log_ref。'
+        ],
+        codeMeta: 'src/runner/supervisor.py · 继承自 process.py',
+        code: `async def supervise(proc, *, timeout_s: float, idle_timeout_s: float | None,
+                    cancel_event: asyncio.Event, log_file: Path):
+    # 4A 已锁：总硬超时 + 按驱动可配静默看门狗（流式默认 300s，无中间输出可设 None）
+    # 触发取消或超时 -> os.killpg(pgid, SIGTERM) -> grace 2s -> SIGKILL`,
+        changes: [
+          { when: '发现某 CLI 频繁假死无输出', action: '在 Supervisor 启用按驱动可配的 idle_timeout 看门狗即可全局生效。' }
+        ]
+      },
+      worktree_drv: {
+        kicker: 'DRIVER 01 · 磁盘工作区与三道保险',
+        title: 'Worktree 驱动（Orca / Git）',
+        style: '可插拔驱动',
+        purpose: '抽象现有 OrcaWorktreeManager：按 namespace 前缀隔离（hb-* / ws-*）、creating 意图占位、写归属校验与三关安全回收。',
+        upstream: ['runner_daemon'],
+        downstream: [],
+        rules: [
+          '保险 1（意图占位）：建目录前先在本地 SQLite 写入 creating 占位，崩溃重入先与 git worktree list 对账。',
+          '保险 2（强前缀与写隔离 · 3B 已锁）：prefix 由 runner.toml 白名单 + 鉴权身份钉死，调用方仅传安全 name_hint，越界写直接 refused。',
+          '保险 3（安全回收 · 0C 已锁）：控制面先验 ref=0 与无开着 PR（可传 merged_head_sha）；Runner CAS 认领后只验本地树干净 + HEAD 已推/已合，零 gh 凭据依赖。'
+        ],
+        codeMeta: 'src/runner/worktree/base.py · 通用工作区驱动',
+        code: `class WorktreeDriver(Protocol):
+    def resolve(self, namespace: str, project_key: str, owner_scope: str,
+                work_key: str, *, readonly: bool) -> ResolvedWorktree: ...
+    def reclaim(self, namespace: str, project_key: str, owner_scope: str,
+                work_key: str, *, merged_head_sha: str | None = None) -> ReclaimResult: ...`,
+        changes: [
+          { when: 'Linux 无桌面 VPS 部署 Runner', action: '配置 worktree_backend="git" 自动切换纯 GitWorktreeDriver，保留同一套三关保险。' }
+        ]
+      },
+      cli_drv: {
+        kicker: 'DRIVER 02 · 多 CLI 执行器抽象',
+        title: 'CLI 驱动层',
+        style: '模板 + 驱动插件',
+        purpose: '统一封装 claude / grok / cursor-agent / dsh 的非交互参数、resume_args 原生续接、结构化输出解析与 yetone/magpie 透传。',
+        upstream: ['runner_daemon', 'supervisor'],
+        downstream: [],
+        rules: [
+          '4B 已锁：回传 <driver>:<native_id>；驱动校验 supports_resume 与前缀匹配才走 resume_args，不匹配自动降级新开。',
+          '统一输出提取器：支持纯 JSON、```json 围栏块、stream-json init 校验（计费来源与模型全名核验）。',
+          '预留 StreamPipe 双向接口，为后续 Claude Code stream-json 交互流做无痛升级。'
+        ],
+        codeMeta: 'src/runner/cli_drivers/base.py · 统一驱动契约',
+        code: `class CLIDriver(Protocol):
+    driver_id: str
+    def build_command(self, req: RunRequest, workdir: Path) -> CommandSpec: ...
+    def parse_output(self, stdout: str, stderr: str, exit_code: int) -> ParsedCLIOutput: ...`,
+        changes: [
+          { when: '接入新 CLI（如 codex / aider）', action: '只需在 cli_drivers/ 新增 1 个驱动文件并声明能力，控制面与传输层零改动。' }
+        ]
+      },
+      broker: {
+        kicker: 'SECURITY · 零长期明文密钥',
+        title: 'Credential Broker',
+        style: '外置安全代理',
+        purpose: 'Runner 与子进程内严禁持有长期明文密钥；敏感 API/GitHub 访问通过短期 Lease Token 或外置代理注入。',
+        upstream: ['hb_control', 'runner_daemon'],
+        downstream: [],
+        rules: [
+          '启动子进程前统一剥离 GH_TOKEN、GITHUB_TOKEN、ANTHROPIC_API_KEY 等环境变量。',
+          'api 计费模式把 ANTHROPIC_BASE_URL 指向外置 Broker 代理端点，只给占位 key。',
+          '上公网/多台 VPS Runner 前必须完全切到 Broker 短期凭据。'
+        ],
+        codeMeta: 'CredentialLease 短期租约结构',
+        code: `{
+  "broker_url": "https://broker.internal/proxy/anthropic",
+  "lease_token": "ephemeral_short_lived_token",
+  "expires_at": "2026-11-22T12:30:00Z"
+}`,
+        changes: [
+          { when: '新增 VPS 节点或轮换平台 Token', action: '只在 Broker 侧集中轮换，所有 Runner 节点零配置同步成本。' }
+        ]
+      },
+      ledger: {
+        kicker: 'AMBIENT · 全链路旁路可观测',
+        title: 'Observability / Ledger',
+        style: '只追加账本',
+        purpose: '异步记录每次 Run 的 run_id、runner_id、耗时、ErrorKind 与外置 log_ref；旁路弱耦合，故障不阻断执行主链路。',
+        upstream: ['hb_control', 'ws_control', 'runner_daemon', 'supervisor'],
+        downstream: [],
+        rules: [
+          '只追加不覆写：同一任务重试 3 次保留全部 3 条 RunRecord 与各自 .log。',
+          'ErrorKind 标准化（rate_limit / network / timeout / tool_error / config_error 等），支撑控制面分流重试。'
+        ],
+        codeMeta: 'logs/runs/YYYY-MM-DD/<run_id>.log + RunRecord',
+        code: `RunRecord(
+    run_id="run_01j...", runner_id="mac-m4-local",
+    namespace="hb", work_key="github:kun-g/hibernaut#42",
+    executor_id="claude", status="succeeded",
+    duration_ms=41200, log_ref="logs/runs/2026-11-22/run_01j....log"
+)`,
+        changes: [
+          { when: '多节点日志需要统一检索复盘', action: 'Runner 结束后旁路上传 .log 摘要/归档至 Ledger，控制面经 MCP get_run_log 统一查。' }
+        ]
+      }
+    };
+
+    /* ============================================================
+       SECTION 02: SCENARIOS DATA
+       ============================================================ */
+    const SCENARIOS = [
+      {
+        id: 'remote_run',
+        code: '01',
+        name: '跨网派发执行闭环（HB 控制面 → 反向 WS → Mac Runner）',
+        mods: ['hb_control', 'runner_port', 'transport', 'runner_daemon', 'worktree_drv', 'cli_drv', 'ledger'],
+        verify: '提交即 ACK + 异步回传终态 + 轻信封 log_ref，全程不阻塞 HTTP',
+        steps: [
+          {
+            step: 'STEP 00', title: '控制面组装 RunRequest', mod: 'hb_control',
+            desc: 'HB 抢占 inbox 锁，拼好 Prompt 与短期 Broker Lease，生成唯一 run_id。',
+            items: [{ kind: '契约', title: 'RunRequest (hb, claude)', body: 'run_id="run_01k9a", namespace="hb"\nwork_key="github:kun-g/hibernaut#42"\nreadonly=false, timeout_seconds=1800' }]
+          },
+          {
+            step: 'STEP 01', title: '反向 WS 下发并立即 ACK', mod: 'transport',
+            desc: 'Hub 沿已建立的 wss:// 长连接发 run.submit；Runner 校验槽位并写入幂等表后秒回 run.accepted。',
+            items: [{ kind: '帧', title: 'run.submit → run.accepted', body: 'conn_epoch=7, runner_id="mac-m4-local"\nslots: available 2 → 1' }]
+          },
+          {
+            step: 'STEP 02', title: 'Worktree 意图占位 + CLI 启动', mod: 'worktree_drv',
+            desc: 'WorktreeDriver 先写 creating 占位再建 hb-issue-42，Supervisor 剥离密钥后拉起 claude。',
+            items: [{ kind: '磁盘', title: 'workspaces[hb-issue-42]=ready', body: 'branch="hb/issue-42"\nlog="logs/runs/2026-11-22/run_01k9a.log"' }]
+          },
+          {
+            step: 'STEP 03', title: '异步回传 RunResult', mod: 'runner_daemon',
+            desc: '执行结束释放槽位，推回 run.completed（含 executor_session_id 与 log_ref），Ledger 旁路记账。',
+            items: [{ kind: '结果', title: 'RunResult (succeeded, 41.2s)', body: 'status="succeeded", exit_code=0\nexecutor_session_id="ses_claude_9f2"\nHB 翻译为 Emit 写 Outbox' }]
+          }
+        ]
+      },
+      {
+        id: 'interrupt',
+        code: '02',
+        name: '高优新事件触发跨网 interrupt 安全中断',
+        mods: ['hb_control', 'runner_port', 'transport', 'supervisor'],
+        verify: '跨网秒级杀进程树、绝不写半成品、幂等释放槽位',
+        steps: [
+          {
+            step: 'STEP 00', title: '新事件触发 interrupt 策略', mod: 'hb_control',
+            desc: '用户在飞书发纠偏指令，HB 按 NewEventPolicy=interrupt 调用 RunnerPort.interrupt()。',
+            items: [{ kind: '契约', title: 'InterruptRequest', body: 'run_id="run_01k9a"\nreason="new_event", grace_seconds=2.0' }]
+          },
+          {
+            step: 'STEP 01', title: 'Supervisor 杀进程组', mod: 'supervisor',
+            desc: '向子进程组发送 SIGTERM，等待 2 秒宽限期未退则 SIGKILL，保留已落盘日志。',
+            items: [{ kind: '响应', title: 'InterruptResult (cancelling)', body: 'accepted=true, state="cancelling"\n无孤儿孙进程残留' }]
+          },
+          {
+            step: 'STEP 02', title: '回传 interrupted 终态', mod: 'runner_daemon',
+            desc: 'run() 返回 status="interrupted"，HB 不写 Outbox，原批次退回 pending 与新事件合并重启。',
+            items: [{ kind: '结果', title: 'RunResult (interrupted)', body: 'status="interrupted"\nlog_ref 完整保留用于排障' }]
+          }
+        ]
+      },
+      {
+        id: 'reclaim',
+        code: '03',
+        name: 'hb-* 与 ws-* 同机共存 + 三关安全回收',
+        mods: ['hb_control', 'ws_control', 'worktree_drv', 'runner_daemon'],
+        verify: '前缀严格隔离；未推送/开着 PR 绝不误删目录',
+        steps: [
+          {
+            step: 'STEP 00', title: '同机隔离双命名空间', mod: 'ws_control',
+            desc: 'HB 与 Workshop 同时在 mac-m4 上工作，各自占用 hb-issue-42 与 ws-a1b2c3d4。',
+            items: [{ kind: '隔离', title: 'namespace 强隔离', body: 'hb 请求无法访问 ws-* 目录\n越界直接返回 status="refused"' }]
+          },
+          {
+            step: 'STEP 01', title: 'HB 引用归零触发回收', mod: 'hb_control',
+            desc: 'Issue #42 会话关闭且 ref=0，HB 经 Broker 核验远端无开着 PR（并取 merged_head_sha）后发 ReclaimRequest。',
+            items: [{ kind: '契约', title: 'reclaim_workspace(hb, #42)', body: 'namespace="hb", owner_scope="proj:hibernaut"\nwork_key="github:kun-g/hibernaut#42"' }]
+          },
+          {
+            step: 'STEP 02', title: 'CAS 认领 + 三关核验', mod: 'worktree_drv',
+            desc: 'Runner 零 gh 依赖，纯本地核验工作树干净 + HEAD 已推送或匹配 merged_head_sha，通过才删目录并保留分支。',
+            items: [{ kind: '结果', title: 'ReclaimResult (reclaimed)', body: 'reclaimed=true, blockers=[]\nbranch_kept="hb/issue-42"' }]
+          }
+        ]
+      },
+      {
+        id: 'reconnect',
+        code: '04',
+        name: 'Mac 合盖离线 → 重连 conn_epoch 防脑裂与终态补拉',
+        mods: ['transport', 'runner_daemon', 'hb_control'],
+        verify: '离线不消耗死信重试；重连后旧连接被 4009 踢出并补拉结果',
+        steps: [
+          {
+            step: 'STEP 00', title: 'Mac 合盖心跳超时摘除', mod: 'transport',
+            desc: '连续 2 次心跳（40s）无入站帧，Hub 将 mac-m4 标为 offline，关联 work_key 保持 pending。',
+            items: [{ kind: '状态', title: 'node=offline (不计失败)', body: '已绑定 mac-m4 的 work_key 绝不漂移到 VPS\n不消耗重试额度' }]
+          },
+          {
+            step: 'STEP 01', title: '开盖重连递增 conn_epoch', mod: 'transport',
+            desc: 'Runner 重连握手，Hub 分配 conn_epoch=8，旧半开连接以 Close 4009 清理。',
+            items: [{ kind: '帧', title: 'hello → welcome(epoch=8)', body: '任何携带 epoch=7 的延迟帧直接丢弃' }]
+          },
+          {
+            step: 'STEP 02', title: 'run.query 补拉在途终态', mod: 'runner_daemon',
+            desc: 'Hub 对断线前未收到终态的 run_id 发起 run.query，直接拿回已落盘的 RunResult 避免重跑。',
+            items: [{ kind: '幂等', title: 'run.query("run_01k9a")', body: '返回缓存终态 succeeded，无缝闭环' }]
+          }
+        ]
+      }
+    ];
+
+    /* ============================================================
+       WORKSHOP STATE & RENDERING
+       ============================================================ */
+    let activeQId = 'q5';
+    let activeForkIdx = 0;
+    const DECISIONS = {
+      q0_positioning: 'A',
+      q0_cli_split: 'A',
+      q0_reclaim_gh: 'A',
+      q1_outcome: 'A',
+      q1_transport: 'A',
+      q1_sde: 'A',
+      q2_affinity: 'A',
+      q2_slots: 'A',
+      q2_registry: 'A',
+      q3_storage: 'A',
+      q3_naming: 'A',
+      q3_backend: 'A',
+      q4_watchdog: 'A',
+      q4_resume: 'A',
+      q4_stream: 'A'
+    };
+
+    function showToast(msg) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.classList.add('show');
+      clearTimeout(window.__toastTimer);
+      window.__toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+    }
+
+    function updateProgressBadge() {
+      const badge = document.getElementById('decision-progress');
+      if (activeQId === 'q5') {
+        const allForks = QUESTIONS.slice(0, 5).flatMap(q => q.forks);
+        const totalDone = allForks.filter(f => DECISIONS[f.id]).length;
+        badge.textContent = `v1.0 全部 ${totalDone} / ${allForks.length} 项已定稿`;
+        badge.className = 'badge badge-teal';
+        return;
+      }
+      const curQ = QUESTIONS.find(x => x.id === activeQId) || QUESTIONS[0];
+      const forks = curQ.forks.filter(f => f.options.length > 1);
+      const target = forks.length ? forks : curQ.forks;
+      const done = target.filter(f => DECISIONS[f.id]).length;
+      badge.textContent = `${curQ.code} 已选定 ${done} / ${target.length} 项`;
+      badge.className = done === target.length ? 'badge badge-teal' : 'badge badge-accent';
+    }
+
+    function renderWorkshop() {
+      const qStrip = document.getElementById('q-strip');
+      qStrip.innerHTML = QUESTIONS.map(q => {
+        const isAct = q.id === activeQId;
+        const pickable = q.forks.filter(f => f.options.length > 1); const allPicked = ['q0', 'q1', 'q2', 'q3', 'q4'].includes(q.id) && pickable.length > 0 && pickable.every(f => DECISIONS[f.id]);
+        const stCls = allPicked ? 'done' : (q.statusKind === 'now' ? 'now' : '');
+        const stTxt = allPicked ? '已选定' : q.statusText;
+        return `
+          <button type="button" class="q-tab ${isAct ? 'active' : ''}" data-qid="${q.id}">
+            <div class="q-tab-top">
+              <span>${q.code}</span>
+              <span class="q-status ${stCls}">${stTxt}</span>
+            </div>
+            <div class="q-tab-title">${q.title}</div>
+          </button>
+        `;
+      }).join('');
+
+      qStrip.querySelectorAll('.q-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+          activeQId = btn.dataset.qid;
+          activeForkIdx = 0;
+          renderWorkshop();
+        });
+      });
+
+      const q = QUESTIONS.find(x => x.id === activeQId);
+      const fork = q.forks[activeForkIdx] || q.forks[0];
+      const picked = DECISIONS[fork.id] || null;
+
+      const pillsHtml = q.forks.length > 1
+        ? `<div class="fork-pills">${q.forks.map((f, idx) => {
+            const d = DECISIONS[f.id];
+            return `
+              <button type="button" class="fork-pill ${idx === activeForkIdx ? 'active' : ''}" data-fidx="${idx}">
+                <span>${f.label}</span>
+                <span class="dec-mark ${d ? 'picked' : ''}">${d ? '已选 ' + d : '待选'}</span>
+              </button>
+            `;
+          }).join('')}</div>`
+        : '';
+
+      const isMulti = fork.options.length > 1;
+      const gridCls = fork.options.length === 3 ? 'cols-3' : (fork.options.length === 1 ? 'cols-1' : '');
+      const optsHtml = fork.options.map(opt => {
+        const isSel = picked === opt.key;
+        const isRec = opt.badge === '推荐';
+        const isNo = opt.badge === '不推荐';
+        const badgeCls = isRec ? 'badge-teal' : (isNo ? 'badge-amber' : '');
+        const btnHtml = isMulti
+          ? `<button type="button" class="pick-btn ${isSel ? 'picked' : ''}" data-fork="${fork.id}" data-key="${opt.key}">${isSel ? '✓ 已选定方案 ' + opt.key : '倾向方案 ' + opt.key}</button>`
+          : '';
+        return `
+          <div class="opt-card ${isRec ? 'recommended' : ''} ${isSel ? 'selected' : ''}">
+            <div class="opt-head">
+              <div class="opt-title">${opt.title}</div>
+              <span class="badge ${badgeCls}">${opt.badge}</span>
+            </div>
+            <ul class="opt-list">${opt.points.map(p => `<li>${p}</li>`).join('')}</ul>
+            ${btnHtml}
+          </div>
+        `;
+      }).join('');
+
+      const curSummaryForks = q.forks.filter(f => f.options.length > 1);
+      const summaryList = curSummaryForks.length ? curSummaryForks : q.forks;
+      const curSummaryText = summaryList.map(f => {
+        const val = DECISIONS[f.id] ? `方案 ${DECISIONS[f.id]}` : '待定';
+        return `${f.short}=${val}`;
+      }).join(' · ');
+
+      document.getElementById('workshop-body').innerHTML = `
+        <div class="ws-head">
+          <div>
+            <h3 class="ws-title">${q.code} · ${q.title}</h3>
+            <p class="ws-sub">${q.summary}</p>
+          </div>
+        </div>
+        ${pillsHtml}
+        <div class="diagram-stage">
+          ${fork.svg}
+          <div class="diagram-caption">
+            <span><strong>图解要点：</strong>${fork.caption}</span>
+          </div>
+        </div>
+        <div class="option-grid ${gridCls}">${optsHtml}</div>
+        <div class="decision-bar">
+          <div><strong>${q.code} 当前选择：</strong><code class="ic">${curSummaryText}</code></div>
+          <button type="button" class="copy-btn" id="copy-decisions-btn">复制决策摘要发回对话</button>
+        </div>
+      `;
+
+      document.querySelectorAll('.fork-pill').forEach(p => {
+        p.addEventListener('click', () => {
+          activeForkIdx = Number(p.dataset.fidx);
+          renderWorkshop();
+        });
+      });
+
+      document.querySelectorAll('.pick-btn').forEach(b => {
+        b.addEventListener('click', () => {
+          const fid = b.dataset.fork;
+          const k = b.dataset.key;
+          DECISIONS[fid] = (DECISIONS[fid] === k) ? null : k;
+          updateProgressBadge();
+          renderWorkshop();
+        });
+      });
+
+      document.getElementById('copy-decisions-btn').addEventListener('click', () => {
+        const lines = [`Runner ${q.code}（${q.title}）拍板结果：`];
+        q.forks.forEach(f => {
+          const k = DECISIONS[f.id];
+          const opt = f.options.find(o => o.key === k);
+          lines.push(`- ${f.label}：${opt ? opt.title : '待讨论'}`);
+        });
+        const text = lines.join('\n');
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(() => showToast(`已复制 ${q.code} 决策摘要`)).catch(() => fallbackCopy(text));
+        } else {
+          fallbackCopy(text);
+        }
+      });
+
+      updateProgressBadge();
+    }
+
+    function fallbackCopy(text) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand('copy');
+        showToast('已复制 Q1 决策摘要');
+      } catch (e) {
+        showToast('复制失败，请手动记录选择');
+      }
+      document.body.removeChild(ta);
+    }
+
+    /* ============================================================
+       SECTION 01: X-RAY EXPLORER LOGIC
+       ============================================================ */
+    let activeMod = 'runner_port';
+    let activeTab = 'arch';
+    let activeScenarioIdx = 0;
+
+    function escapeHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function selectMod(id) {
+      activeMod = id;
+      const m = MODULES[id];
+      document.querySelectorAll('.chip').forEach(ch => {
+        const cid = ch.dataset.id;
+        ch.classList.remove('active', 'is-upstream', 'is-downstream', 'is-dim');
+        if (cid === id) ch.classList.add('active');
+        else if (m.upstream.includes(cid)) ch.classList.add('is-upstream');
+        else if (m.downstream.includes(cid)) ch.classList.add('is-downstream');
+        else ch.classList.add('is-dim');
+      });
+      renderInspector();
+    }
+
+    function selectTab(tab) {
+      activeTab = tab;
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+      renderInspector();
+    }
+
+    function selectScenario(idx) {
+      activeScenarioIdx = idx;
+      activeTab = 'scenarios';
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === 'scenarios'));
+      renderInspector();
+    }
+
+    function renderInspector() {
+      const m = MODULES[activeMod];
+      document.getElementById('insp-kicker').textContent = m.kicker;
+      document.getElementById('insp-title').textContent = m.title;
+      document.getElementById('insp-purpose').textContent = m.purpose;
+      document.getElementById('insp-style').textContent = m.style;
+
+      const body = document.getElementById('insp-body');
+      if (activeTab === 'arch') {
+        const upHtml = m.upstream.length
+          ? m.upstream.map(u => `<button type="button" class="rel-chip up" data-jump="${u}">↑ ${MODULES[u].title}</button>`).join('')
+          : '<span style="font-size:12px;color:var(--text-faint)">外部入口 / 最上游调用方</span>';
+        const downHtml = m.downstream.length
+          ? m.downstream.map(d => `<button type="button" class="rel-chip down" data-jump="${d}">↓ ${MODULES[d].title}</button>`).join('')
+          : '<span style="font-size:12px;color:var(--text-faint)">底层驱动或终端底座</span>';
+
+        body.innerHTML = `
+          <div class="kv-block">
+            <div class="kv-label">上游调用方（青色高亮 · 点击跳转）</div>
+            <div class="rel-chips">${upHtml}</div>
+          </div>
+          <div class="kv-block">
+            <div class="kv-label">下游依赖（靛蓝高亮 · 点击跳转）</div>
+            <div class="rel-chips">${downHtml}</div>
+          </div>
+          <div class="kv-block">
+            <div class="kv-label">核心边界与工程铁律</div>
+            <ul class="bullet-list">${m.rules.map(r => `<li>${r}</li>`).join('')}</ul>
+          </div>
+        `;
+        body.querySelectorAll('[data-jump]').forEach(btn => {
+          btn.addEventListener('click', () => selectMod(btn.dataset.jump));
+        });
+      } else if (activeTab === 'code') {
+        body.innerHTML = `
+          <div class="code-meta">${m.codeMeta}</div>
+          <pre class="code-box">${escapeHtml(m.code)}</pre>
+        `;
+      } else if (activeTab === 'change') {
+        body.innerHTML = m.changes.map(c => `
+          <div class="kv-block">
+            <div class="kv-label">演进触发条件</div>
+            <div style="font-weight:700;margin-bottom:5px;">${c.when}</div>
+            <div style="color:var(--text-muted)">${c.action}</div>
+          </div>
+        `).join('');
+      } else {
+        const strip = SCENARIOS.map((sc, i) => `
+          <button type="button" class="sc-pill ${i === activeScenarioIdx ? 'active' : ''}" data-scidx="${i}">
+            ${sc.code} · ${sc.name.slice(0, 13)}
+          </button>
+        `).join('');
+        const sc = SCENARIOS[activeScenarioIdx];
+        const rail = sc.steps.map(st => `
+          <div class="trace-card ${st.mod === activeMod ? 'hit' : ''}">
+            <div class="trace-step">${st.step} · ${MODULES[st.mod].title}</div>
+            <div class="trace-title">${st.title}</div>
+            <p class="trace-desc">${st.desc}</p>
+            ${st.items.map(it => `
+              <div class="trace-item">
+                <div class="trace-item-head">
+                  <span>${it.title}</span>
+                  <span class="tag-mini">${it.kind}</span>
+                </div>
+                <div class="trace-item-body">${escapeHtml(it.body).replace(/\n/g, '<br>')}</div>
+              </div>
+            `).join('')}
+          </div>
+        `).join('');
+        body.innerHTML = `
+          <div class="sc-strip">${strip}</div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;"><strong>验证目标：</strong>${sc.verify}（点击 Trace 条目展开载荷）</div>
+          <div class="trace-rail">${rail}</div>
+        `;
+        body.querySelectorAll('.sc-pill').forEach(p => {
+          p.addEventListener('click', () => selectScenario(Number(p.dataset.scidx)));
+        });
+        body.querySelectorAll('.trace-item').forEach(it => {
+          it.addEventListener('click', () => it.classList.toggle('open'));
+        });
+      }
+    }
+
+    document.querySelectorAll('.chip').forEach(ch => {
+      ch.addEventListener('click', () => selectMod(ch.dataset.id));
+    });
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => selectTab(btn.dataset.tab));
+    });
+
+    /* ============================================================
+       SECTION 02: SCENARIOS TABLE
+       ============================================================ */
+    const tbody = document.getElementById('scenarios-tbody');
+    tbody.innerHTML = SCENARIOS.map((sc, i) => `
+      <tr>
+        <td><code class="ic">${sc.code}</code></td>
+        <td><strong>${sc.name}</strong></td>
+        <td>${sc.mods.map(k => `<code class="ic">${MODULES[k].title}</code>`).join(' ')}</td>
+        <td>${sc.verify}</td>
+        <td><button type="button" class="jump-btn" data-jump-sc="${i}">在透视台演练 →</button></td>
+      </tr>
+    `).join('');
+    tbody.querySelectorAll('[data-jump-sc]').forEach(b => {
+      b.addEventListener('click', () => {
+        selectScenario(Number(b.dataset.jumpSc));
+        document.getElementById('sec-xray').scrollIntoView({ behavior: 'smooth' });
+      });
+    });
+
+    /* ============================================================
+       SECTION 03: INTERACTIVE ER / CONTRACT KEY DIAGRAM
+       ============================================================ */
+    const ER_NOTES = {
+      all: '<strong>Runner 契约与状态总览：</strong>控制面与执行机之间零共享库，靠 4 组逻辑键串联跨节点派发、磁盘隔离、幂等中断与只追加日志。',
+      run_id: '<strong>run_id（全局幂等与中断键）：</strong>由控制面生成（<code class="ic">run_&lt;ulid&gt;</code>），贯穿 <code class="ic">RunRequest</code>、Runner <code class="ic">active_runs</code> 幂等表、<code class="ic">interrupt()</code> 与 Ledger <code class="ic">runs</code>。',
+      runner_id: '<strong>runner_id（节点与亲和路由键）：</strong>标识 Mac 本机或某台 VPS；控制面 <code class="ic">NodeRegistry</code> 记录在线状态、槽位与 <code class="ic">work_key → runner_id</code> 亲和绑定。',
+      work_key: '<strong>namespace + work_key（磁盘隔离与回收键）：</strong>联合 <code class="ic">owner_scope</code> 唯一锁定一个 <code class="ic">hb-*</code> 或 <code class="ic">ws-*</code> worktree，确保多项目同机互不干扰与三关安全回收。',
+      exec_sid: '<strong>executor_session_id（原生会话续接键）：</strong>由 Runner 执行完毕回传并存入控制面会话表；下一轮仅在 <code class="ic">executor_id</code> 一致时传回以触发 <code class="ic">--resume</code>。'
+    };
+
+    function selectErKey(key) {
+      document.querySelectorAll('.er-pill').forEach(b => b.classList.toggle('active', b.dataset.er === key));
+      document.getElementById('er-note').innerHTML = ER_NOTES[key];
+      const on = g => key === 'all' || g.includes(key);
+
+      function box(x, y, w, h, title, sub, rows, groups) {
+        const op = on(groups) ? '1' : '0.28';
+        const rowsSvg = rows.map((r, i) => {
+          const ry = y + 52 + i * 20;
+          const hl = key !== 'all' && r.g && r.g.includes(key);
+          return `<text x="${x + 12}" y="${ry}" font-size="10.5" font-family="var(--font-mono)" font-weight="${hl ? '700' : '500'}" fill="${hl ? 'var(--accent)' : 'var(--text-primary)'}">${r.t}</text>`;
+        }).join('');
+        return `
+          <g style="opacity:${op};transition:opacity 0.18s">
+            <rect x="${x}" y="${y}" width="${w}" height="${h}" rx="11" fill="var(--bg-card)" stroke="${on(groups) && key !== 'all' ? 'var(--accent)' : 'var(--border)'}" stroke-width="${on(groups) && key !== 'all' ? '1.8' : '1.2'}"/>
+            <rect x="${x}" y="${y}" width="${w}" height="32" rx="11" fill="var(--bg-subtle)"/>
+            <text x="${x + 12}" y="${y + 20}" font-size="11.8" font-weight="700" font-family="var(--font-mono)" fill="var(--text-primary)">${title}</text>
+            <text x="${x + w - 10}" y="${y + 20}" text-anchor="end" font-size="10" fill="var(--text-faint)">${sub}</text>
+            ${rowsSvg}
+          </g>
+        `;
+      }
+
+      document.getElementById('er-svg').innerHTML = `
+        ${box(14, 18, 224, 150, 'NodeRegistry & Affinity', '控制面', [
+          { t: 'PK  runner_id · conn_epoch', g: ['runner_id'] },
+          { t: 'CAP executors · slots · projects', g: ['runner_id'] },
+          { t: 'MAP (ns, work_key) -> runner_id', g: ['runner_id', 'work_key'] },
+          { t: 'SES executor_session_id (粘滞)', g: ['exec_sid'] }
+        ], ['runner_id', 'work_key', 'exec_sid'])}
+
+        ${box(268, 18, 224, 150, 'RunRequest / RunResult', 'RunnerPort', [
+          { t: 'PK  run_id (幂等键)', g: ['run_id'] },
+          { t: 'KEY namespace · owner · work_key', g: ['work_key'] },
+          { t: 'EX  executor_id · exec_sid', g: ['exec_sid'] },
+          { t: 'RES status · error_kind · log_ref', g: ['run_id'] }
+        ], ['run_id', 'work_key', 'exec_sid'])}
+
+        ${box(522, 18, 200, 150, 'active_runs', 'Runner 宿主', [
+          { t: 'PK  run_id (去重缓存)', g: ['run_id'] },
+          { t: 'PID pgid · cancel_event', g: ['run_id'] },
+          { t: 'LOG logs/runs/<run_id>.log', g: ['run_id'] },
+          { t: 'NODE runner_id · slot_id', g: ['runner_id'] }
+        ], ['run_id', 'runner_id'])}
+
+        ${box(748, 18, 200, 150, 'workspaces', 'Runner 本地盘', [
+          { t: 'PK  (ns, owner_scope, work_key)', g: ['work_key'] },
+          { t: 'DIR hb-issue-N / ws-hash16', g: ['work_key'] },
+          { t: 'STA creating | ready | reclaiming', g: ['work_key'] },
+          { t: 'GATE ref=0 + 三关回收', g: ['work_key'] }
+        ], ['work_key'])}
+
+        ${box(220, 224, 520, 152, 'Observability / Ledger (只追加 runs + 外置 .log)', '旁路可观测', [
+          { t: 'PK  run_id · status · error_kind · duration_ms', g: ['run_id'] },
+          { t: 'FK  runner_id (节点维度成功率与耗时分布)', g: ['runner_id'] },
+          { t: 'FK  namespace · work_key · executor_id · executor_session_id', g: ['work_key', 'exec_sid'] },
+          { t: 'LOG log_ref -> logs/runs/YYYY-MM-DD/<run_id>.log (sha256)', g: ['run_id'] }
+        ], ['run_id', 'runner_id', 'work_key', 'exec_sid'])}
+
+        <line x1="238" y1="92" x2="268" y2="92" stroke="${on(['runner_id','work_key','exec_sid']) ? 'var(--accent)' : 'var(--svg-edge-idle)'}" stroke-width="1.6"/>
+        <line x1="492" y1="92" x2="522" y2="92" stroke="${on(['run_id']) ? 'var(--accent)' : 'var(--svg-edge-idle)'}" stroke-width="1.6"/>
+        <line x1="722" y1="92" x2="748" y2="92" stroke="${on(['work_key']) ? 'var(--teal)' : 'var(--svg-edge-idle)'}" stroke-width="1.6"/>
+        <path d="M 380 168 L 380 224" fill="none" stroke="${on(['run_id']) ? 'var(--indigo)' : 'var(--svg-edge-idle)'}" stroke-width="1.6" stroke-dasharray="4 3"/>
+        <path d="M 622 168 L 622 224" fill="none" stroke="${on(['run_id','runner_id']) ? 'var(--indigo)' : 'var(--svg-edge-idle)'}" stroke-width="1.6" stroke-dasharray="4 3"/>
+        <path d="M 126 168 L 126 298 L 220 298" fill="none" stroke="${on(['runner_id']) ? 'var(--indigo)' : 'var(--svg-edge-idle)'}" stroke-width="1.4" stroke-dasharray="4 3"/>
+      `;
+    }
+
+    document.querySelectorAll('.er-pill').forEach(p => {
+      p.addEventListener('click', () => selectErKey(p.dataset.er));
+    });
+
+    /* Theme Toggle */
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+      const root = document.documentElement;
+      const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', next);
+      document.getElementById('theme-icon').textContent = next === 'dark' ? '☀' : '☾';
+      document.getElementById('theme-label').textContent = next === 'dark' ? '浅色' : '深色';
+    });
+
+    /* Init */
+    renderWorkshop();
+    selectMod('runner_port');
+    selectErKey('all');
+  </script>
+</body>
+</html>
