@@ -77,6 +77,8 @@ class ExecutorFailed(RuntimeError):
         super().__init__(*args)
         # The run ledger's classification of the last failed attempt; None without a ledger.
         self.route = route
+        # True once the failed batch is marked failed; otherwise it is still pending and would fail again at once.
+        self.batch_settled = False
 
 
 class _RunInterrupted(Exception):
@@ -880,6 +882,7 @@ class AgentWorker:
             ledger_error = exc
             all_failed_ids = batch_ids + [e.event_id for e in folded_events]
             self._inbox.mark_failed(all_failed_ids, str(exc.__cause__ or exc))
+            exc.batch_settled = True
             _drop_registration()
             if exc.route is not None:
                 self._alert_failed_run(

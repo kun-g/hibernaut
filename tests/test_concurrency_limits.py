@@ -411,6 +411,55 @@ class TestOneInboxWithSeveralExecutors(PoolCase):
         self.assertEqual(self.probe.started, ["block-hold", "t0", "t1", "t2", "t3"])
         self.assertEqual(self.probe.peak("executor", "sde"), 1)
 
+    async def test_events_left_behind_run_after_the_batch_ahead_of_them_fails(self):
+        self.probe.broken.add("bad")
+        async with self.daemon(executors={"sde": {"max_concurrency": 1}}, projects={"a": TASKS}) as daemon:
+            self.post(daemon, "proj:a:s", "block-sde", executor="sde")
+            await self.until(lambda: self.probe.active_texts() == ["block-sde"])
+            with self.assertLogs(MAIN_LOGGER, level="ERROR") as logs:
+                self.post(daemon, "proj:a", "bad", executor="claude")
+                self.post(daemon, "proj:a", "later", executor="sde")
+                await self.until(lambda: len(daemon.inbox.list_events(inbox_id="proj:a", status="failed", limit=5)) == 1)
+                await self.until(lambda: daemon.pool.limiter.active == 1)
+            self.assertEqual(len(logs.records), 1, logs.output)
+            self.assertFalse(daemon.pool._idle_event.is_set())
+            self.probe.release("block-sde")
+            # No further wake: the failed event is out of the way, so the inbox was queued again for sde.
+            await self.until(lambda: "later" in self.probe.finished)
+            await self.idle(daemon)
+        self.assertEqual(self.probe.peak("executor", "sde"), 1)
+
+    async def test_a_slot_freed_during_the_dispatch_is_used_without_another_wake(self):
+        async with self.daemon(executors={"sde": {"max_concurrency": 1}}, projects={"a": TASKS}) as daemon:
+            self.post(daemon, "proj:a:s", "block-sde", executor="sde")
+            await self.until(lambda: self.probe.active_texts() == ["block-sde"])
+            for text, executor in (("block-chat", "claude"), ("task", "sde"), ("chat", "claude")):
+                self.post(daemon, "proj:a", text, executor=executor)
+            await self.until(lambda: self.probe.active_texts() == ["block-chat", "block-sde"])
+            self.probe.release("block-sde")
+            await self.until(lambda: "block-sde" in self.probe.finished)
+            self.probe.release("block-chat")
+            await self.until(lambda: "chat" in self.probe.finished)
+            await self.idle(daemon)
+        # In inbox order: what follows the event that had to wait does not overtake it.
+        self.assertEqual(self.probe.started, ["block-sde", "block-chat", "task", "chat"])
+
+    async def test_an_event_that_becomes_covered_during_the_dispatch_continues_in_it(self):
+        async with self.daemon(executors={"sde": {"max_concurrency": 1}, "claude": {"max_concurrency": 1}},
+                               projects={"a": TASKS}) as daemon:
+            self.post(daemon, "proj:a", "first", executor="claude", key="task")
+            await self.idle(daemon)
+            # Claimed together: the follow-up's session is on claude until the sde batch ahead of it rebinds it.
+            self.post(daemon, "proj:a", "block-task", executor="sde", key="task")
+            self.post(daemon, "proj:a", "follow-up", key="task")
+            await self.until(lambda: self.probe.active_texts() == ["block-task"])
+            self.post(daemon, "proj:a:other", "other-sde", executor="sde")
+            await self.settle()
+            self.probe.release("block-task")
+            await self.idle(daemon)
+        self.assertEqual(self.probe.started, ["first", "block-task", "follow-up", "other-sde"])
+        self.assertEqual(self.probe.peak("executor", "sde"), 1)
+
     async def test_an_unrunnable_event_ahead_of_a_waiting_one_does_not_spin(self):
         async with self.daemon(executors={"sde": {"max_concurrency": 1}}, projects={"a": TASKS}) as daemon:
             with self.assertLogs(MAIN_LOGGER, level="ERROR") as logs:

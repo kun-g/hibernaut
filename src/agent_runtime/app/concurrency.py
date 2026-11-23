@@ -141,6 +141,7 @@ class ExecutorQuotaHold:
     # One per worker. An inbox holds one executor's slot per dispatch but may have batches for several executors, some
     # arriving mid-run. From the first event that needs another limited executor's slot on, nothing more is claimed in
     # this dispatch, so inbox order is kept; on_defer makes the pool queue the inbox again under that event's executor.
+    # Only that first event is checked again: later ones would overtake it.
     def __init__(
         self,
         inbox_id: str,
@@ -156,18 +157,20 @@ class ExecutorQuotaHold:
         self._on_defer = on_defer
         self._inner = inner
         self._admitted: set[str] = set()
-        self._deferring = False
+        self._blocking: str | None = None
 
     def __call__(self, event: Event) -> str | None:
         reason = self._inner(event) if self._inner is not None else None
         if reason is not None:
             return reason
         # Admitted events are checked again: a replay can put one back to pending for another executor.
-        if (not self._deferring or event.event_id in self._admitted) and self._covered(event):
+        if (self._blocking in (None, event.event_id) or event.event_id in self._admitted) and self._covered(event):
+            if self._blocking == event.event_id:
+                self._blocking = None
             self._admitted.add(event.event_id)
             return None
-        if not self._deferring:
-            self._deferring = True
+        if self._blocking is None:
+            self._blocking = event.event_id
             self._on_defer(self._inbox_id)
         return "waiting for an executor slot"
 

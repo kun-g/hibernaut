@@ -262,13 +262,13 @@ class AsyncWorkerPool:
                 await self._changed.wait()
                 continue
 
-            completed = False
+            settled = False
             try:
                 # Inside the try: a factory that refuses the inbox (AmbiguousProjectMatch) leaves its events pending.
                 worker = self._worker_factory(inbox_id, worker_id)
                 self._active[inbox_id] = worker
                 batch_reports = await worker.process_inbox(inbox_id)
-                completed = True
+                settled = True
                 self.reports.extend(batch_reports)
                 if batch_reports and self._on_run_reports is not None:
                     try:
@@ -278,7 +278,8 @@ class AsyncWorkerPool:
                             "Post-run callback failed for inbox %s",
                             inbox_id,
                         )
-            except ExecutorFailed:
+            except ExecutorFailed as exc:
+                settled = exc.batch_settled
                 logging.getLogger(__name__).exception(
                     "Executor failed for inbox %s; batch remains pending",
                     inbox_id,
@@ -295,9 +296,9 @@ class AsyncWorkerPool:
                 self._active.pop(inbox_id, None)
                 self._limiter.release(inbox_id)
                 self._changed.set()
-                # After a failure the inbox waits for its next wake, as it does without limits; requeueing it here
-                # would retry an event that cannot run in a loop.
-                deferred = completed and inbox_id in self._deferred
+                # A batch that failed but stays pending (no such executor, ambiguous project) waits for the next wake:
+                # requeueing it here would retry it in a loop.
+                deferred = settled and inbox_id in self._deferred
                 self._deferred.discard(inbox_id)
                 if self._handoff is not None:
                     # The lease is released now; the current pool picks up whatever arrived meanwhile.
