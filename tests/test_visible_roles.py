@@ -26,6 +26,7 @@ from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStor
 from agent_runtime.app.config import load_config
 from agent_runtime.app.main import build_daemon_from_config, serve_configured
 from agent_runtime.core.models import Emit, SessionRef, Suspend
+from tests.async_deadline import expire_when_ready
 from tests.fakes import InMemoryPermission
 from tests.test_coder_reviewer import CHANGES_REQUESTED, _Capture, fake_command, git
 from tests.test_sde_executor import BUGGY, EVIDENCE, FIXED, PASS, PROXY, dev, event, make_base_repo
@@ -368,24 +369,10 @@ class TestVisibleSDE(VisibleCase):
 
     async def test_timeout_closes_the_terminal_and_keeps_the_conversation_resumable(self):
         self.set_plan(sde=[{"hang": True}])
-        # The timeout fires once the agent runs, however long that takes on a busy machine.
-        turns: list[asyncio.Timeout] = []
-        real = asyncio.timeout
-
-        def timeout(delay):
-            turn = real(delay)
-            if delay == 600.0:
-                turns.append(turn)
-            return turn
-
-        with patch("asyncio.timeout", timeout):
-            task = asyncio.create_task(
-                self.sde(review=False, timeout=600.0).execute([event(self.payload())], None, self.caps))
-            while not task.done() and not self.calls("sde", "interactive"):
-                await asyncio.sleep(0.02)
-            (turn,) = turns
-            turn.reschedule(asyncio.get_running_loop().time())
-            outcome = await task
+        outcome = await expire_when_ready(
+            self.sde(review=False, timeout=600.0).execute([event(self.payload())], None, self.caps),
+            600.0, lambda: bool(self.calls("sde", "interactive")),
+        )
         assert isinstance(outcome, Emit), outcome
         self.assertIn("development failed: timed out after 600.0", outcome.messages[0])
         (handle,) = self.orca.terminals

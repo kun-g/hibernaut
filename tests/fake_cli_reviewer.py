@@ -4,6 +4,7 @@
 # "stdout"/"stderr", "write" files into the working directory, "sleep" seconds and "exit" with a code.
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -23,7 +24,10 @@ with open(os.environ["FAKE_CLI_LOG"], "a", encoding="utf-8") as log:
 
 for rel, content in step.get("write", {}).items():
     (Path.cwd() / rel).write_text(content, encoding="utf-8")
-time.sleep(float(step.get("sleep", 0)))
+if step.get("wait_for_stop"):
+    signal.pause()
+if "sleep" in step:
+    time.sleep(float(step["sleep"]))
 sys.stdout.write(step.get("stdout", ""))
 sys.stderr.write(step.get("stderr", ""))
 sys.exit(int(step.get("exit", 0)))

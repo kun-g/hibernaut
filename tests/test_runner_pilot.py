@@ -14,6 +14,7 @@ import sys
 import textwrap
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
@@ -729,6 +730,34 @@ class Deployment:
     def start_runner(self) -> None:
         self.runner = start_service(self.runner_config, self.runner_log)
 
+    def start_gated_runner(self, monkeypatch: pytest.MonkeyPatch) -> Path:
+        gate = self.root / "hold-check"
+        real_git = shutil.which("git")
+        assert real_git is not None
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        shim = bin_dir / "git"
+        shim.write_text(
+            "#!/bin/sh\nfor arg do\n"
+            f'  if [ "$arg" = cat-file ] && [ -p {shlex.quote(str(gate))} ]; then\n'
+            f"    {{ : > {shlex.quote(str(gate.with_suffix('.ready')))}; read -r go; }} < {shlex.quote(str(gate))}\n"
+            "    break\n  fi\ndone\n"
+            f'exec {shlex.quote(real_git)} "$@"\n'
+        )
+        shim.chmod(0o755)
+        with monkeypatch.context() as env:
+            env.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+            self.start_runner()
+        return gate
+
+    def force_stop_hb(self) -> None:
+        assert self.hb is not None
+        self.hb.terminate()
+        self.until(lambda: "Stopping: waiting for runs in progress" in self.hb_log.read_text())
+        self.hb.terminate()
+        assert self.hb.wait(timeout=20) == 0, self.logs()
+        self.hb = None
+
     def stop_runner(self) -> int:
         assert self.runner is not None
         self.runner.send_signal(signal.SIGTERM)
@@ -845,6 +874,20 @@ def pilot(tmp_path: Path) -> Iterator[Deployment]:
         assert leaked == []
 
 
+@contextmanager
+def hold_protocol_check(gate: Path) -> Iterator[Path]:
+    ready = gate.with_suffix(".ready")
+    ready.unlink(missing_ok=True)
+    os.mkfifo(gate)
+    # The runner publishes ready after opening its read end. RDWR also lets cleanup release a killed reader.
+    with os.fdopen(os.open(gate, os.O_RDWR), "wb", buffering=0) as pipe:
+        try:
+            yield ready
+        finally:
+            gate.unlink()
+            pipe.write(b"resume\n")
+
+
 def _runner_run(deployment: Deployment, run: sqlite3.Row) -> Path:
     # From the ledger row to the node's own log, whose digest the ledger recorded.
     line = next(x for x in deployment.ledger_log(run).splitlines() if x.startswith("runner://"))
@@ -918,42 +961,19 @@ def test_a_new_event_interrupts_the_check_and_leaves_no_partial_result(pilot: De
 def test_a_forced_stop_ends_the_worker_process_and_the_next_start_finishes_the_task(
     pilot: Deployment, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Gate the first protocol check's object read. On replay the same request can complete immediately.
-    gate = pilot.root / "hold-check"
-    os.mkfifo(gate)
-    reading = pilot.root / "reading-object"
-    real_git = shutil.which("git")
-    assert real_git is not None
-    bin_dir = pilot.root / "bin"
-    bin_dir.mkdir()
-    shim = bin_dir / "git"
-    shim.write_text(
-        f"#!/bin/sh\nfor arg do\n"
-        f'  if [ "$arg" = cat-file ] && [ -p {shlex.quote(str(gate))} ]; then\n'
-        f"    touch {shlex.quote(str(reading))}\n    read -r go < {shlex.quote(str(gate))}\n  fi\ndone\n"
-        f'exec {shlex.quote(real_git)} "$@"\n'
-    )
-    shim.chmod(0o755)
     pilot.write(enabled=True)
     pilot.start_hb()
-    with monkeypatch.context() as env:
-        env.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
-        pilot.start_runner()
-    held = pilot.check(key=KEY)
-    pilot.until(reading.exists)
-    worker = pilot.worker()
-    assert pilot.hb is not None
-    pilot.hb.send_signal(signal.SIGTERM)
-    pilot.until(lambda: "Stopping: waiting for runs in progress" in pilot.hb_log.read_text())
-    pilot.hb.send_signal(signal.SIGTERM)
-    assert pilot.hb.wait(timeout=20) == 0, pilot.logs()
-    assert not alive(worker)
-    assert (pilot.status(held), pilot.outbox(PILOT)) == ("pending", [])
-    (run,) = pilot.runs()
-    assert (run["outcome_kind"], run["runner_id"]) == ("interrupted", RUNNER_ID)
-    assert _runner_run(pilot, run).is_file()
-    pilot.hb = None
-    gate.unlink()
+    gate = pilot.start_gated_runner(monkeypatch)
+    with hold_protocol_check(gate) as entered:
+        held = pilot.check(key=KEY)
+        pilot.until(entered.exists)
+        worker = pilot.worker()
+        pilot.force_stop_hb()
+        assert not alive(worker)
+        assert (pilot.status(held), pilot.outbox(PILOT)) == ("pending", [])
+        (run,) = pilot.runs()
+        assert (run["outcome_kind"], run["runner_id"]) == ("interrupted", RUNNER_ID)
+        assert _runner_run(pilot, run).is_file()
     # Same port, same token; the Runner reconnects on its own.
     pilot.start_hb()
     pilot.until(lambda: pilot.status(held) == "done", timeout=60)
@@ -980,21 +1000,25 @@ def test_stopping_the_runner_service_fails_the_task_and_frees_everything(pilot: 
     assert pilot.runs()[-1]["emit_status"] == "done"
 
 
-def test_turning_the_route_off_drains_it_and_restores_the_original_path(pilot: Deployment) -> None:
+def test_turning_the_route_off_drains_it_and_restores_the_original_path(
+    pilot: Deployment, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pilot.write(enabled=False)
     pilot.start_hb()
-    pilot.start_runner()
+    gate = pilot.start_gated_runner(monkeypatch)
     assert not pilot.relay_open()
     pilot.assert_original_path(PILOT)  # off: the pilot inbox is an ordinary inbox
 
     pilot.reload(enabled=True)
     assert pilot.relay_open()
     pilot.finished(pilot.check())
-    in_flight = pilot.check(key=KEY, hold_seconds=3)
-    worker = pilot.worker()
-    pilot.reload(enabled=False)
-    # The Run in flight keeps its Relay until it has ended, on its own terms.
-    assert alive(worker) and pilot.relay_open()
+    with hold_protocol_check(gate) as entered:
+        in_flight = pilot.check(key=KEY)
+        pilot.until(entered.exists)
+        worker = pilot.worker()
+        pilot.reload(enabled=False)
+        # The Run in flight keeps its Relay until it has ended, on its own terms.
+        assert alive(worker) and pilot.relay_open()
     pilot.finished(in_flight)
     assert recomputed_manifest(pilot.runner_repo, pilot.commit) in pilot.outbox(PILOT)[-1]
     pilot.until(lambda: not pilot.relay_open())
@@ -1025,14 +1049,9 @@ def test_interrupted_work_left_by_a_rollback_is_not_run_elsewhere(pilot: Deploym
     pilot.start_runner()
     held = pilot.check(key=KEY, hold_seconds=60)
     worker = pilot.worker()
-    assert pilot.hb is not None
-    pilot.hb.terminate()
-    time.sleep(0.5)
-    pilot.hb.terminate()
-    pilot.hb.wait(timeout=20)
+    pilot.force_stop_hb()
     assert not alive(worker)
     assert pilot.stop_runner() == 0
-    pilot.hb = None
     pilot.write(enabled=False)
     pilot.start_hb()
     pilot.finished(held)

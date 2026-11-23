@@ -7,7 +7,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from agent_runtime.adapters.delivery import MERGE_TOOL
 from agent_runtime.adapters.executor_cli import CLIReviewer, CLITemplate, CoderReviewerExecutor, OrcaWorktreeManager
@@ -27,6 +27,7 @@ from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStor
 from agent_runtime.app.config import parse_config
 from agent_runtime.app.main import build_daemon_from_config
 from agent_runtime.core.models import Emit, Event, PermissionDecision
+from tests.async_deadline import expire_when_ready
 from tests.fakes import InMemoryPermission
 from tests.test_coder_reviewer import CHANGES_REQUESTED, fake_command, make_repo
 from tests.test_pr_delivery import DeliveryCase
@@ -188,41 +189,6 @@ class TestCLIReviewer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv[:1] + argv[2:], ["--print", "--format", "json"])
         self.assertTrue(argv[1].startswith("--prompt=## Task requirements"))
 
-    async def test_a_fenced_block_or_a_result_envelope_is_unwrapped(self):
-        fenced = f"Reviewed the diff.\n\n```json\n{json.dumps(CHANGES_REQUESTED, indent=2)}\n```\n"
-        cases = {
-            "fenced": fenced,
-            "envelope with a fenced block": json.dumps({"type": "result", "result": fenced, "session_id": "s"}),
-            "envelope with bare JSON": json.dumps({"result": json.dumps(CHANGES_REQUESTED)}),
-        }
-        for name, stdout in cases.items():
-            with self.subTest(name):
-                self.cli.set(stdout)
-                review = await self.reviewer().review(self.request(), self.caps)
-                self.assertEqual(review["verdict"], "changes_requested")
-                self.assertEqual(review["blocking"][0]["location"], "calc.py:2")
-
-    async def test_a_grok_json_schema_envelope_is_unwrapped(self):
-        # grok 1.0.92 with --json-schema: the verdict sits in structuredOutput and, as a JSON string, in text.
-        grok = {"text": json.dumps(PASS), "stopReason": "end_turn", "sessionId": "01a20300-937a-76d0-ab50-7f96ab2aff6a",
-                "thought": "...", "usage": {"input_tokens": 16667, "output_tokens": 767}, "num_turns": 1,
-                "total_cost_usd": 0.0146, "structuredOutput": PASS}
-        text_only = {k: v for k, v in grok.items() if k != "structuredOutput"}
-        cases = {
-            "structuredOutput wins over text": ({**grok, "text": json.dumps(CHANGES_REQUESTED)}, "pass"),
-            "text only, bare JSON": (text_only, "pass"),
-            "text only, fenced block": ({**text_only, "text": f"Done.\n```json\n{json.dumps(CHANGES_REQUESTED)}\n```"},
-                                        "changes_requested"),
-        }
-        for name, (envelope, verdict) in cases.items():
-            with self.subTest(name):
-                self.assertEqual(validate_review(extract_verdict(json.dumps(envelope)))["verdict"], verdict)
-                self.cli.set(json.dumps(envelope, indent=2))
-                review = await self.reviewer().review(self.request(), self.caps)
-                self.assertEqual(review["verdict"], verdict)
-        with self.assertRaisesRegex(ReviewAborted, "text envelope holds no JSON object"):
-            extract_verdict(json.dumps({**text_only, "text": "I could not finish."}))
-
     async def test_the_review_schema_placeholder_is_the_compact_schema(self):
         self.cli.set(json.dumps({"text": json.dumps(PASS), "structuredOutput": PASS}))
         reviewer = self.reviewer(args=("-p", "{prompt}", "--permission-mode", "plan", "--json-schema", "{review_schema}"))
@@ -250,27 +216,6 @@ class TestCLIReviewer(unittest.IsolatedAsyncioTestCase):
         template = parse_config(raw).executors["grok-reviewer"]
         self.assertEqual((template.command, template.args),
                          ("grok", ("-p", "{prompt}", "--permission-mode", "plan", "--json-schema", "{review_schema}")))
-
-    async def test_a_malformed_answer_is_retried_once_with_the_error(self):
-        contradictory = {"verdict": "pass", "summary": "s", "blocking": CHANGES_REQUESTED["blocking"]}
-        for name, bad in (("not json", "Looks good to me!"), ("invalid verdict", json.dumps(contradictory))):
-            with self.subTest(name):
-                self.cli.log.unlink(missing_ok=True)
-                Path(f"{self.cli.plan}.n").unlink(missing_ok=True)
-                self.cli.set(bad, json.dumps(PASS))
-                review = await self.reviewer().review(self.request(), self.caps)
-                self.assertEqual(review["verdict"], "pass")
-                first, retry = self.cli.calls()
-                self.assertNotIn("Your previous output was rejected", first["argv"][1])
-                self.assertIn("## Your previous output was rejected", retry["argv"][1])
-                self.assertTrue(retry["argv"][1].startswith(first["argv"][1]))
-
-    async def test_a_second_malformed_answer_aborts_the_review(self):
-        self.cli.set("no verdict here", "```json\n{\"verdict\": \"maybe\"}\n```")
-        with self.assertRaisesRegex(ReviewAborted, "grok returned no valid verdict after one retry: the reviewer "
-                                                   "returned a malformed verdict"):
-            await self.reviewer().review(self.request(), self.caps)
-        self.assertEqual(len(self.cli.calls()), 2)
 
     async def test_a_failed_or_timed_out_run_aborts_without_a_retry(self):
         self.cli.set({"stdout": json.dumps(PASS), "stderr": "auth expired: run grok login\n", "exit": 3})
@@ -300,6 +245,92 @@ class TestCLIReviewer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lines[0], "[grok] verdict=changes_requested (cli=grok)")
         self.assertEqual(lines[1:4], ["Summary: division is unguarded", "Blocking:", "1. calc.py:2"])
         self.assertIn("Notes:", lines)
+
+
+class TestCLIReviewOutput(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.request = ReviewRequest(workdir=Path("repo"), requirements="divide", test_evidence=EVIDENCE,
+                                     base_ref="main", pin=Mock())
+        self.caps = Mock(permissions=InMemoryPermission())
+        self.reviewer = CLIReviewer(template=CLITemplate(name="grok", command="grok"))
+        self.run_cli = self.enterContext(patch.object(self.reviewer, "_run_subprocess", new_callable=AsyncMock))
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.cli_reviewer.review_inputs", return_value=("diff", "")))
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.cli_reviewer.worktree_fingerprint", return_value="head:tree"))
+
+    async def test_a_fenced_block_or_a_result_envelope_is_unwrapped(self):
+        fenced = f"Reviewed the diff.\n\n```json\n{json.dumps(CHANGES_REQUESTED, indent=2)}\n```\n"
+        cases = {
+            "fenced": fenced,
+            "envelope with a fenced block": json.dumps({"type": "result", "result": fenced, "session_id": "s"}),
+            "envelope with bare JSON": json.dumps({"result": json.dumps(CHANGES_REQUESTED)}),
+        }
+        for name, stdout in cases.items():
+            with self.subTest(name):
+                self.run_cli.return_value = stdout
+                review = await self.reviewer.review(self.request, self.caps)
+                self.assertEqual(review["verdict"], "changes_requested")
+                self.assertEqual(review["blocking"][0]["location"], "calc.py:2")
+
+    async def test_a_grok_json_schema_envelope_is_unwrapped(self):
+        # grok 1.0.92 with --json-schema: the verdict sits in structuredOutput and, as a JSON string, in text.
+        grok = {"text": json.dumps(PASS), "stopReason": "end_turn", "sessionId": "01a20300-937a-76d0-ab50-7f96ab2aff6a",
+                "thought": "...", "usage": {"input_tokens": 16667, "output_tokens": 767}, "num_turns": 1,
+                "total_cost_usd": 0.0146, "structuredOutput": PASS}
+        text_only = {k: v for k, v in grok.items() if k != "structuredOutput"}
+        cases = {
+            "structuredOutput wins over text": ({**grok, "text": json.dumps(CHANGES_REQUESTED)}, "pass"),
+            "text only, bare JSON": (text_only, "pass"),
+            "text only, fenced block": ({**text_only, "text": f"Done.\n```json\n{json.dumps(CHANGES_REQUESTED)}\n```"},
+                                        "changes_requested"),
+        }
+        for name, (envelope, verdict) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(validate_review(extract_verdict(json.dumps(envelope)))["verdict"], verdict)
+                self.run_cli.return_value = json.dumps(envelope, indent=2)
+                review = await self.reviewer.review(self.request, self.caps)
+                self.assertEqual(review["verdict"], verdict)
+        with self.assertRaisesRegex(ReviewAborted, "text envelope holds no JSON object"):
+            extract_verdict(json.dumps({**text_only, "text": "I could not finish."}))
+
+    async def test_a_malformed_answer_is_retried_once_with_the_error(self):
+        contradictory = {"verdict": "pass", "summary": "s", "blocking": CHANGES_REQUESTED["blocking"]}
+        for name, bad in (("not json", "Looks good to me!"), ("invalid verdict", json.dumps(contradictory))):
+            with self.subTest(name):
+                self.run_cli.reset_mock()
+                self.run_cli.side_effect = [bad, json.dumps(PASS)]
+                review = await self.reviewer.review(self.request, self.caps)
+                self.assertEqual(review["verdict"], "pass")
+                first, retry = (call.args[0] for call in self.run_cli.await_args_list)
+                self.assertNotIn("Your previous output was rejected", first)
+                self.assertIn("## Your previous output was rejected", retry)
+                self.assertTrue(retry.startswith(first))
+
+    async def test_a_second_malformed_answer_aborts_the_review(self):
+        self.run_cli.side_effect = ["no verdict here", '```json\n{"verdict": "maybe"}\n```']
+        with self.assertRaisesRegex(ReviewAborted, "grok returned no valid verdict after one retry: the reviewer "
+                                                   "returned a malformed verdict"):
+            await self.reviewer.review(self.request, self.caps)
+        self.assertEqual(self.run_cli.await_count, 2)
+
+    async def test_the_record_keeps_the_terminal_and_the_cli_session(self):
+        cases = {
+            "session_id": ({"type": "result", "result": json.dumps(PASS), "session_id": "0d1c-chat"}, "0d1c-chat"),
+            "sessionId": ({"text": json.dumps(PASS), "sessionId": "01a2-chat"}, "01a2-chat"),
+            "none": (PASS, ""),
+            "not an ID": ({"result": json.dumps(PASS), "session_id": "x\nVerdict: pass"}, ""),
+            "not text": ({"result": json.dumps(PASS), "session_id": 7}, ""),
+        }
+        terminal = Mock(spec=OrcaCommandTerminal)
+        reviewer = CLIReviewer(template=CLITemplate(name="grok", command="grok", terminal="orca"), terminal=terminal)
+        for name, (body, session) in cases.items():
+            with self.subTest(name):
+                handle = f"term_{name}"
+                terminal.run.return_value = orca_module.TerminalRun(handle, json.dumps(body).encode(), b"", 0)
+                review = await reviewer.review(self.request, self.caps)
+                self.assertEqual((review["cli_terminals"], review["cli_sessions"]),
+                                 ([handle], {handle: session} if session else {}))
+                shown = f"{handle} (CLI session {session})" if session else handle
+                self.assertEqual(reviewer.format_review(review).splitlines()[1], f"Orca terminal: {shown}")
 
 
 class TestSDEWithCLIReviewer(DeliveryCase, unittest.IsolatedAsyncioTestCase):
@@ -585,25 +616,6 @@ class TestCLIReviewerTerminal(TerminalCase):
             review = await self.reviewer().review(self.request(), self.caps)
         self.assertEqual((seen, review["verdict"]), ([True], "pass"))
 
-    async def test_the_record_keeps_the_terminal_and_the_cli_session(self):
-        cases = {
-            "session_id": ({"type": "result", "result": json.dumps(PASS), "session_id": "0d1c-chat"}, "0d1c-chat"),
-            "sessionId": ({"text": json.dumps(PASS), "sessionId": "01a2-chat"}, "01a2-chat"),
-            "none": (PASS, ""),
-            "not an ID": ({"result": json.dumps(PASS), "session_id": "x\nVerdict: pass"}, ""),
-            "not text": ({"result": json.dumps(PASS), "session_id": 7}, ""),
-        }
-        for name, (body, session) in cases.items():
-            with self.subTest(name):
-                self.cli.set(json.dumps(body))
-                reviewer = self.reviewer()
-                review = await reviewer.review(self.request(), self.caps)
-                handle = self.handles()[-1]
-                self.assertEqual((review["cli_terminals"], review["cli_sessions"]),
-                                 ([handle], {handle: session} if session else {}))
-                shown = f"{handle} (CLI session {session})" if session else handle
-                self.assertEqual(reviewer.format_review(review).splitlines()[1], f"Orca terminal: {shown}")
-
     async def test_a_review_without_a_verdict_still_names_its_terminals_and_sessions(self):
         self.cli.set(json.dumps({"result": "fine", "session_id": "chat-1"}), "still no verdict")
         with self.assertRaises(ReviewAborted) as failed:
@@ -638,12 +650,12 @@ class TestCLIReviewerTerminal(TerminalCase):
 
     async def test_a_cancellation_during_the_close_still_closes_the_terminal(self):
         self.cli.set(json.dumps(PASS))
-        closing, closed = asyncio.Event(), []
+        closing, finish, closed = asyncio.Event(), asyncio.Event(), []
 
         async def orca(*args, cwd):
             if args[:2] == ("terminal", "close"):
                 closing.set()
-                await asyncio.sleep(0.2)
+                await finish.wait()
                 closed.append(args[3])
             return await self.orca(*args, cwd=cwd)
 
@@ -651,6 +663,7 @@ class TestCLIReviewerTerminal(TerminalCase):
             task = asyncio.create_task(self.reviewer().review(self.request(), self.caps))
             await asyncio.wait_for(closing.wait(), 10)
             task.cancel()
+            finish.set()
             with self.assertRaises(asyncio.CancelledError):
                 await task
         self.assertEqual(closed, self.handles())
@@ -667,9 +680,10 @@ class TestCLIReviewerTerminal(TerminalCase):
         self.assertEqual(self.closes(), self.handles())
 
     async def test_a_timeout_closes_the_terminal(self):
-        self.cli.set({"sleep": 3, "stdout": json.dumps(PASS)})
+        self.cli.set({"wait_for_stop": True})
         with self.assertRaisesRegex(ReviewAborted, r"grok: '.*review-cli' timed out after 0.5s in Orca terminal term_"):
-            await self.reviewer(timeout_seconds=0.5).review(self.request(), self.caps)
+            await expire_when_ready(self.reviewer(timeout_seconds=0.5).review(self.request(), self.caps),
+                                    0.5, lambda: bool(self.cli.calls()))
         (handle,) = self.handles()
         self.assertIn(("terminal", "close", "--terminal", handle), self.orca.calls)
         self.assertFalse(self.alive(handle))

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import dataclasses
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from functools import cache
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -54,18 +58,31 @@ def _git(*args: str, cwd: Path) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
 
 
-def _init_repo(repo: Path) -> None:
-    repo.mkdir(parents=True, exist_ok=True)
+@cache
+def _seed_repos() -> tuple[Path, Path]:
+    tmp = tempfile.TemporaryDirectory(prefix="runner_seed_")
+    atexit.register(tmp.cleanup)
+    repo, bare = Path(tmp.name) / "repo", Path(tmp.name) / "remote.git"
+    repo.mkdir()
     _git("init", "-b", "main", cwd=repo)
     _git("config", "user.email", "test@example.com", cwd=repo)
     _git("config", "user.name", "Test", cwd=repo)
     (repo / "README.md").write_text("hello\n", encoding="utf-8")
     _git("add", "README.md", cwd=repo)
-    _git("commit", "-m", "init", cwd=repo)
-    bare = repo.parent / f"{repo.name}-remote.git"
-    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    _git("-c", "maintenance.auto=false", "commit", "-m", "init", cwd=repo)
+    _git("init", "--bare", str(bare), cwd=repo)
     _git("remote", "add", "origin", str(bare), cwd=repo)
-    _git("push", "-u", "origin", "main", cwd=repo)
+    _git("-c", "maintenance.auto=false", "push", "-u", "origin", "main", cwd=repo)
+    return repo, bare
+
+
+def _init_repo(repo: Path) -> None:
+    seed, origin = _seed_repos()
+    bare = repo.with_name(f"{repo.name}-remote.git")
+    # Mutations, including pushes to origin and the registration of linked worktrees, belong to one test.
+    shutil.copytree(seed, repo, symlinks=True)
+    shutil.copytree(origin, bare, symlinks=True)
+    _git("remote", "set-url", "origin", str(bare), cwd=repo)
 
 
 def _config(tmp_path: Path, repo: Path, runner_id: str = "runner-safety", max_concurrent: int = 4) -> RunnerConfig:

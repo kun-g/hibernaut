@@ -55,6 +55,7 @@ from agent_runtime.core.models import (
 )
 from agent_runtime.engine.forwarding import carried_spec
 from agent_runtime.engine.worker import AgentWorker
+from tests.async_deadline import expire_when_ready
 from tests.fakes import InMemoryOutbox, InMemoryPermission, RecordingChannel
 from tests.test_coder_reviewer import fake_command, git, make_repo
 from tests.test_sde_executor import make_base_repo
@@ -988,7 +989,10 @@ class TerminalTests(SuspendCase):
         self.set_plan({"pidfile": str(pids)})
         executor = self.executor()
         executor._profile = replace(executor._profile, timeout_seconds=6.0)  # pyright: ignore[reportPrivateUsage]
-        outcome = await executor.execute([self.event()], None, self.caps)
+        outcome = await expire_when_ready(
+            executor.execute([self.event()], None, self.caps), 6.0,
+            lambda: pids.exists() and len(pids.read_text().split()) == 2,
+        )
         assert isinstance(outcome, Emit)
         self.assertEqual(outcome.status, "failed")
         self.assertIn("timed out after 6s", outcome.messages[0])
