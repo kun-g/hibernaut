@@ -157,9 +157,10 @@ class ExecutorQuotaHold:
 
     def __call__(self, event: Event) -> str | None:
         reason = self._inner(event) if self._inner is not None else None
-        if reason is not None or event.event_id in self._admitted:
+        if reason is not None:
             return reason
-        if not self._deferring and self._covered(event):
+        # Admitted events are checked again: a replay can put one back to pending for another executor.
+        if (not self._deferring or event.event_id in self._admitted) and self._covered(event):
             self._admitted.add(event.event_id)
             return None
         if not self._deferring:

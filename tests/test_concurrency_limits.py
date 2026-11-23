@@ -424,6 +424,54 @@ class TestOneInboxWithSeveralExecutors(PoolCase):
             self.assertEqual(daemon.pool._limiter.active, 0)
 
 
+class TestReplay(PoolCase):
+    # hibernaut_replay_event puts an already handled event back to pending, optionally for another executor.
+    def replay(self, daemon, event_id, **arguments):
+        assert daemon.mcp_server is not None
+        reply = daemon.mcp_server.handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "hibernaut_replay_event", "arguments": {"event_id": event_id, **arguments}}})
+        assert reply is not None
+        self.assertIn("result", reply, reply)
+        self.assertFalse(reply["result"].get("isError", False), reply)
+
+    async def test_an_event_replayed_for_a_full_executor_mid_dispatch_waits_for_its_slot(self):
+        async with self.daemon(executors={"sde": {"max_concurrency": 1}}, projects={"a": TASKS}) as daemon:
+            self.post(daemon, "proj:a:issue-1", "block-sde", executor="sde")
+            first = self.post(daemon, "proj:a", "first", executor="claude")
+            self.post(daemon, "proj:a", "block-chat", executor="claude")
+            await self.until(lambda: self.probe.active_texts() == ["block-chat", "block-sde"])
+            # This dispatch already ran the event on claude; its slot does not cover the replay on sde.
+            self.replay(daemon, first.event_id, executor_id="sde", force=True)
+            self.probe.release("block-chat")
+            await self.until(lambda: "block-chat" in self.probe.finished)
+            await self.settle()
+            self.assertEqual(self.probe.active_texts(), ["block-sde"])
+            self.assertEqual(self.probe.started.count("first"), 1)
+            self.probe.release("block-sde")
+            await self.idle(daemon)
+        self.assertEqual(self.probe.finished.count("first"), 2)
+        self.assertEqual(self.probe.peak("executor", "sde"), 1)
+
+    async def test_a_failed_event_replayed_on_another_executor_takes_that_executors_quota(self):
+        self.probe.broken.add("bad")
+        async with self.daemon(executors={"sde": {"max_concurrency": 1}}, projects={"a": TASKS}) as daemon:
+            self.post(daemon, "proj:a:issue-1", "block-sde", executor="sde")
+            with self.assertLogs(MAIN_LOGGER, level="ERROR"):
+                bad = self.post(daemon, "proj:a:issue-2", "bad", executor="claude")
+                await self.until(lambda: len(daemon.inbox.list_events(inbox_id="proj:a:issue-2", status="failed",
+                                                                      limit=5)) == 1)
+                await self.until(lambda: daemon.pool.limiter.active == 1)
+            self.probe.broken.clear()
+            self.replay(daemon, bad.event_id, executor_id="sde")
+            await self.settle()
+            self.assertEqual(self.probe.active_texts(), ["block-sde"])
+            self.assertFalse(daemon.pool._idle_event.is_set())
+            self.probe.release("block-sde")
+            await self.idle(daemon)
+        self.assertEqual(self.probe.finished, ["block-sde", "bad"])
+        self.assertEqual(self.probe.peak("executor", "sde"), 1)
+
+
 class TestInterruptPolicy(PoolCase):
     policy = "interrupt"
 
