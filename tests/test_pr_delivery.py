@@ -576,45 +576,46 @@ class TestMerge(DeliveryCase):
         self.assertEqual(self.main_file("other.py"), "b = 1")
         self.assertEqual(self.gh_state()["prs"][1]["title"], "Pkg 0.5.1: divide rejects zero")
 
-    def test_main_version_moving_between_ci_and_merge_recomputes_before_merging(self):
-        a = self.task("task-a", {"calc.py": "a = 1\n"})
-        b = self.task("task-b", {"other.py": "b = 1\n"})
-        self.delivery().deliver(self.request(a), permissions=InMemoryPermission())
-        merged_a: list[object] = []
+    def competing_release(self):
+        branch = "hb/task-a"
+        a = self.task("task-a", {VERSION_FILE: '"""pkg"""\n__version__ = "0.5.0"\n', "calc.py": "a = 1\n"})
+        git(a, "push", "-q", "origin", branch)
+        head = git(a, "rev-parse", "HEAD")
+        gh = self.delivery()._gh
+        gh(a, "pr", "create", "--base", "main", "--head", branch, "--title", "Release 0.5.0", "--body", "")
 
-        def merge_a_while_b_waits(_seconds):
-            if not merged_a:
-                merged_a.append(self.merging().deliver(self.request(a), permissions=InMemoryPermission()))
+        def merge_on_first_poll(seconds):
+            self.sleeps.append(seconds)
+            if len(self.sleeps) == 1:
+                gh(a, "pr", "merge", "1", "--squash", "--match-head-commit", head)
+
+        return merge_on_first_poll
+
+    def test_main_version_moving_between_ci_and_merge_recomputes_before_merging(self):
+        b = self.task("task-b", {"other.py": "b = 1\n"})
+        merge_a_while_b_waits = self.competing_release()
 
         pending = [{"name": "gates", "state": "IN_PROGRESS", "bucket": "pending"}]
         self.set_gh(checks_sequence=[pending])
         rb = self.merging(sleep=merge_a_while_b_waits).deliver(self.request(b, kind="fix"),
                                                              permissions=InMemoryPermission())
-        self.assertEqual(merged_a[0].state, "merged")  # type: ignore[attr-defined]
+        self.assertEqual(self.gh_state()["prs"][0]["state"], "MERGED")
         self.assertEqual((rb.state, rb.problem, rb.version), ("merged", "", "0.5.1"))
         self.assertIn('"0.5.1"', self.main_file())
         self.assertEqual(rb.merge_sha, git(self.bare, "rev-parse", "main"))
 
     def test_a_pr_that_conflicts_while_waiting_for_ci_is_prepared_again_without_waiting_for_the_timeout(self):
-        a = self.task("task-a", {"calc.py": "a = 1\n"})
         b = self.task("task-b", {"other.py": "b = 1\n"})
-        self.delivery().deliver(self.request(a), permissions=InMemoryPermission())
-        merged_a: list[object] = []
-        waits: list[float] = []
-
-        def merge_a_while_b_waits(seconds):
-            waits.append(seconds)
-            if not merged_a:
-                merged_a.append(self.merging().deliver(self.request(a), permissions=InMemoryPermission()))
+        merge_a_while_b_waits = self.competing_release()
 
         pending = [{"name": "gates", "state": "IN_PROGRESS", "bucket": "pending"}]
         # Both PRs set the version: once a merges, b conflicts and GitHub reports no checks for it.
         self.set_gh(checks_sequence=[pending], dirty_blocks_ci=True)
         rb = self.merging(sleep=merge_a_while_b_waits, ci_timeout_seconds=600).deliver(
             self.request(b, kind="fix"), permissions=InMemoryPermission())
-        self.assertEqual(merged_a[0].state, "merged")  # type: ignore[attr-defined]
+        self.assertEqual(self.gh_state()["prs"][0]["state"], "MERGED")
         self.assertEqual((rb.state, rb.problem, rb.version), ("merged", "", "0.5.1"))
-        self.assertEqual(len(waits), 1)
+        self.assertEqual(len(self.sleeps), 1)
         self.assertIn("PR #2 conflicts with origin/main while waiting for CI; merging origin/main again",
                       rb.history)
         self.assertIn('"0.5.1"', self.main_file())

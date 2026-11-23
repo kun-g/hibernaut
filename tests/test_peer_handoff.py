@@ -236,8 +236,12 @@ class PeerCase(unittest.IsolatedAsyncioTestCase):
 
         def stop() -> None:
             receiver.stop()
+            # Wake accept() so the receiver sees the stop before its next heartbeat poll.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as wake:
+                wake.connect(receiver.socket_path)
             thread.join(timeout=5)
             receiver.close()
+            self.assertFalse(thread.is_alive())
         self.addCleanup(stop)
         return receiver
 

@@ -13,6 +13,7 @@ import sys
 import time
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -81,7 +82,7 @@ def test_report_names_the_commit_and_recomputes_with_git_and_sha256_alone(
     (repo / PROTOCOL_FILES[0]).write_text("tampered", encoding="utf-8")
     delays = []
     monkeypatch.chdir(repo)
-    monkeypatch.setattr(protocol_check.time, "sleep", delays.append)
+    monkeypatch.setattr(protocol_check, "time", SimpleNamespace(sleep=delays.append))
     with io.TextIOWrapper(io.BytesIO(CheckRequest(head, hold_seconds=1).to_json().encode())) as stdin:
         monkeypatch.setattr(sys, "stdin", stdin)
         assert protocol_check.main() == 0
