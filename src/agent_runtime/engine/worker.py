@@ -17,12 +17,16 @@ from agent_runtime.core.models import (
     RunOutcome,
     TASK_CONTEXT_KEY,
     TASK_SYNC_KIND,
+    TRACE_METADATA_KEY,
     SessionRef,
     Silent,
     Suspend,
     TaskLink,
+    explicit_trace_id,
     new_id,
     resolve_executor_id,
+    resolve_trace_id,
+    resolve_trigger_event,
     utc_now_iso,
 )
 from agent_runtime.core.ports import (
@@ -64,6 +68,7 @@ class RunReport:
     outcome: RunOutcome
     # Kept on the report: a session closed after its Run no longer carries it.
     correlation_key: str | None = None
+    trace_id: str | None = None
 
 
 class ExecutorFailed(RuntimeError):
@@ -152,6 +157,14 @@ def _task_link(events: list[Event], session_ref: SessionRef | None) -> TaskLink 
                 hop_count=hop_count if isinstance(hop_count, int) and not isinstance(hop_count, bool) else None,
             )
     return session_ref.task_link if session_ref is not None else None
+
+
+def _run_trace_id(events: list[Event], link: TaskLink | None) -> str:
+    # An approval resume carries no trace of its own; the session's Taskboard task does.
+    trigger = resolve_trigger_event(events)
+    if explicit_trace_id(trigger) is None and link is not None and link.trace_id:
+        return link.trace_id
+    return resolve_trace_id(trigger)
 
 
 def _task_fields(link: TaskLink, action: str, stage: str | None = None) -> dict[str, Any]:
@@ -376,6 +389,7 @@ class AgentWorker:
                                     session_id=closed_sid,
                                     event_ids=tuple(batch_ids),
                                     outcome=Silent(),
+                                    trace_id=_run_trace_id(batch, _task_link(batch, session_ref)),
                                 )
                             )
                             continue
@@ -782,7 +796,9 @@ class AgentWorker:
             superseded = _superseded([previous_link], claimed_link, released)
             released.update(link.task_id for link in superseded)
             if not resuming:
-                extra = self._report_metadata(batch, batch_correlation_key, executor.executor_id, run_id)
+                extra = self._report_metadata(
+                    batch, batch_correlation_key, executor.executor_id, run_id, start_link
+                )
                 self._sync_task_switch(inbox_id, extra, active_session.session_id, superseded, claimed_link)
 
         def _drop_registration() -> None:
@@ -824,7 +840,13 @@ class AgentWorker:
                     inbox_id,
                     active_session.session_id,
                     claimed_link,
-                    self._report_metadata(batch + folded_events, batch_correlation_key, executor.executor_id, run_id),
+                    self._report_metadata(
+                        batch + folded_events,
+                        batch_correlation_key,
+                        executor.executor_id,
+                        run_id,
+                        _task_link(batch + folded_events, active_session),
+                    ),
                 )
             raise
         except BaseException:
@@ -851,7 +873,9 @@ class AgentWorker:
             final_corr,
             final_work_key,
             executor,
-            report_metadata=self._report_metadata(batch + folded_events, final_corr, executor.executor_id, run_id),
+            report_metadata=self._report_metadata(
+                batch + folded_events, final_corr, executor.executor_id, run_id, final_link
+            ),
             task_link=final_link,
             superseded=_superseded([previous_link, claimed_link], final_link, released),
             claim_with_result=final_link is not None
@@ -871,6 +895,7 @@ class AgentWorker:
             event_ids=tuple(all_done_ids),
             outcome=outcome,
             correlation_key=final_corr,
+            trace_id=_run_trace_id(batch + folded_events, final_link),
         )
         if isinstance(outcome, Emit) and outcome.close_session and final_session_id is not None:
             # After the result and its events are written, so the reclaim gates no longer see them.
@@ -995,11 +1020,17 @@ class AgentWorker:
 
     @classmethod
     def _report_metadata(
-        cls, events: list[Event], correlation_key: str | None, executor_id: str, run_id: str
+        cls,
+        events: list[Event],
+        correlation_key: str | None,
+        executor_id: str,
+        run_id: str,
+        link: TaskLink | None,
     ) -> dict[str, Any]:
         # Routing hints a channel needs to answer where the work came from; extra keys are ignored by
         # channels that do not read them.
-        meta: dict[str, Any] = {"run_id": run_id}
+        trace_id = _run_trace_id(events, link)
+        meta: dict[str, Any] = {"run_id": run_id, TRACE_METADATA_KEY: trace_id}
         if correlation_key:
             meta["correlation_key"] = correlation_key
         for key in _REPLY_PAYLOAD_KEYS:
@@ -1009,7 +1040,11 @@ class AgentWorker:
                     meta[key] = value
                     break
         task_events = [e for e in events if not cls._is_approval_decision(e)] or events
-        context: dict[str, Any] = {"source": task_events[0].source, "executor_id": executor_id}
+        context: dict[str, Any] = {
+            "source": task_events[0].source,
+            "executor_id": executor_id,
+            "trace_id": trace_id,
+        }
         title = _task_title(events)
         if title:
             context["title"] = title

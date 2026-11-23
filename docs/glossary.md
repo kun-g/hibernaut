@@ -11,6 +11,8 @@
 | **inbox_id** | 唯一标识单个逻辑 Inbox 的路由键（如 `user:main`、`proj:hibernaut`、`hibernaut:issue-42`） | 全链路一等字段 | `worker_leases` 租约锁主键；L3 据此路由项目 Memory 与仓库；与 Project 严格保持 **1 个 Project → 多个 inbox_id（1:N）** |
 | **Event** | 进入 Event Inbox 的单条不可变输入信封（经 Switchboard 转入的 GitHub 和飞书事件、Drive 轮询任务、用户消息、定时触发、审批回复） | 单次触发 | 必属某个 `inbox_id`，确定会话后即时回填 `session_id`；状态为 `pending / processing / done / failed`（去重记 `dropped`） |
 | **correlation_key** | 外部业务实体的确定性关联键（如 `github:kun-g/hibernaut#42`、`gdrive:<file_id>`、`feishu:<chat>:<thread>`），由 L3 入站适配器提取 | 隶属于某个 `inbox_id` | 通过 `SessionStorePort.find_by_correlation_key()` 映射到当前活跃/挂起 `session_id`，跨外部源自动续接并支持会话轮换 |
+| **trace_id / `_trace_id`** | 一条因果链的标识：事件 payload 的 `trace_id`，否则 `_trace_id`，都没有时为该事件自己的 `event_id` | 跨 Inbox、跨 Run | 由 L0 `resolve_trace_id()` 读取，不改写事件；Run 的结果写入 `RunReport.trace_id` 与 Outbox 元数据 `_trace_id` |
+| **parent_event_id** | 事件 payload 里指向直接来源事件的 `event_id`（新事件指旧事件） | 单条事件 | `hibernaut_list_events` 透出；旧事件不因有了后继而改写 |
 | **Session / session_id** | 跨多次 Run 的逻辑会话与挂起断点上下文单元 | 隶属于某个 `inbox_id` | 显式 4 态（`active / suspended / archived / closed`）；绑定 `executor_id`、`executor_session_id`、`work_key` 与可选 `parent_session_id` |
 | **work_key** | 托管动态 `hb-*` worktree 的复用与引用计数键（默认沿用 `correlation_key`） | 单件活（Task / Issue） | 仅当某 `work_key` 下 `active / suspended` 会话引用数归零（`ref=0`）且过三关检查才允许安全回收目录 |
 | **Run** | Worker 被唤醒后执行的一轮短生命周期推理与工具循环（一次 `ExecutorPort.execute` 调用） | 单次唤醒周期 | 消费同一 `inbox_id` 的一批事件，结束时产出 `RunOutcome` 并落盘休眠 |

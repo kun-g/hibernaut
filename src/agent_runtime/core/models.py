@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, TypeAlias
@@ -17,13 +18,16 @@ EmitStatus: TypeAlias = Literal["done", "failed", "stopped", "refused"]
 EMIT_STATUSES: tuple[EmitStatus, ...] = ("done", "failed", "stopped", "refused")
 DeliveryState: TypeAlias = Literal["local", "pr_open", "merged"]
 MergeHold: TypeAlias = Literal["", "review", "ci", "other"]
-# Outbox metadata key the worker fills with {title, source, executor_id, status, delivery}; status is an EmitStatus
+# Outbox metadata key the worker fills with {title, source, executor_id, trace_id, status, delivery}; status is an EmitStatus
 # or "awaiting_approval", delivery the Emit's DeliveryOutcome as a dict when it has one. Nested so channels that pass
 # top-level keys on are unaffected.
 TASK_CONTEXT_KEY = "task_context"
 # Outbox kind of a message that only syncs a Taskboard task's state (claim, complete, release); channels that show
 # messages to a person skip it.
 TASK_SYNC_KIND = "task_sync"
+# Outbox metadata key of the Run's trace. Not the top-level "trace_id", which is the Taskboard task's trace that
+# channels report back.
+TRACE_METADATA_KEY = "_trace_id"
 
 
 def utc_now_iso() -> str:
@@ -54,6 +58,28 @@ class Event:
     session_id: str | None = None
     correlation_key: str | None = None
     status: EventStatus = "pending"
+
+
+def explicit_trace_id(event: Event) -> str | None:
+    for key in ("trace_id", "_trace_id"):
+        value = event.payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def resolve_trace_id(event: Event) -> str:
+    return explicit_trace_id(event) or event.event_id
+
+
+def resolve_trigger_event(events: Sequence[Event]) -> Event:
+    # The one event a batch descends from: the last that carries a trace, else the first (its event_id is the trace).
+    if not events:
+        raise ValueError("a trigger event needs at least one event")
+    for event in reversed(events):
+        if explicit_trace_id(event) is not None:
+            return event
+    return events[0]
 
 
 @dataclass(frozen=True, slots=True)
