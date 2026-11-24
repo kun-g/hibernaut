@@ -559,7 +559,8 @@ class TestCLIGroupSignals(unittest.TestCase):
         self.assertTrue(is_running())
 
     def test_the_rest_of_the_group_has_the_grace_to_end_after_its_leader_ended(self):
-        # The child may finish its cleanup once the supervisor sees it still running without its leader.
+        # Block SIGTERM before reporting ready so even a signal arriving before sigwait stays pending.
+        # The child finishes cleanup once the supervisor observes it outliving the leader.
         ready = self.root / "ready"
         finish = ready.with_suffix(".finish")
         os.mkfifo(finish)
@@ -586,7 +587,9 @@ class TestCLIGroupSignals(unittest.TestCase):
             return live
 
         with patch.object(cli_terminal, "_group_running", new=observe):
-            cli_terminal.end_group(proc, grace=5)
+            started = time.monotonic()
+            cli_terminal.end_group(proc, grace=30)
+            self.assertLess(time.monotonic() - started, 20)
         self.assertEqual(proc.returncode, -signal.SIGTERM)
         self.assertEqual(ready.with_suffix(".done").read_text(), "cleaned")
         self.assert_never_after_reaping()

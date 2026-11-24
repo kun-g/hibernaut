@@ -37,6 +37,10 @@ class AutoModePermissionAdapter:
             "read_file",
             "search_files",
             "list_files",
+            # Offered only in an inbox whose [[runtime.inbox_bindings]] has system_tools = true.
+            "check_projects",
+            "onboard_project",
+            "complete_project",
             # Each is granted per project in [projects.<name>.delivery] (open_pr, auto_merge); move one to the
             # defer list to also ask a person every time.
             "delivery.open_pr",

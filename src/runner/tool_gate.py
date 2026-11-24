@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any, Callable, Final, Mapping, cast
 
 from runner.protocol import ToolAuthorizer, ToolCall, ToolDecision
+
+_log = logging.getLogger(__name__)
 
 MAX_TOOL_CALL_BYTES: Final = 512 * 1024
 DECISION_TIMEOUT_SECONDS: Final = 60.0
@@ -36,11 +39,14 @@ class ToolGate:
         stopped: Callable[[], bool],
         on_defer: Callable[[], None],
         decision_timeout_seconds: float = DECISION_TIMEOUT_SECONDS,
+        # The node's own limit: says why a call does not run here, whatever the authorizer would answer.
+        guard: Callable[[str, Mapping[str, Any]], str | None] | None = None,
     ) -> None:
         self._run_id = run_id
         self._authorizer = authorizer
         self._stopped = stopped
         self._on_defer = on_defer
+        self._guard = guard
         self._decision_timeout = decision_timeout_seconds
         self._lock = asyncio.Lock()
         self._handlers: set[asyncio.Task[None]] = set()
@@ -126,6 +132,9 @@ class ToolGate:
         async with self._lock:
             if (refusal := self._refusal()) is not None:
                 return refusal
+            if self._guard is not None and (reason := self._guard(call.tool_name, call.args)) is not None:
+                _log.warning("run %s: %s call refused on this node: %s", self._run_id, call.tool_name, reason)
+                return _block(reason)
             try:
                 decision = await asyncio.wait_for(self._authorizer(call), timeout=self._decision_timeout)
             except TimeoutError:

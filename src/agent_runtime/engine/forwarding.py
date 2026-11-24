@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from typing import Any, Never, assert_never, cast
+from typing import Any, Literal, Never, assert_never, cast
 
 from agent_runtime.core.models import (
     FORWARD_SOURCE,
@@ -29,6 +29,8 @@ from agent_runtime.core.models import (
 from agent_runtime.core.ports import PermissionPort, SessionStorePort
 
 _AGENT_SOURCES = (FORWARD_SOURCE, RETURN_SOURCE)
+# Who put an event here: a person in their own one-to-one chat, or somebody on this host.
+EventOrigin = Literal["chat", "operator"]
 # Which project documents the task needs travels with it; everything else the receiver learns from the text.
 _INHERITED_KEYS = ("activities", "base_ref")
 
@@ -102,6 +104,8 @@ def carried_spec(event: Event) -> ForwardSpec | None:
         reply_channel=_text(payload.get("reply_channel")),
         reply_target=_text(payload.get("reply_target")),
         origin_key=_text(payload.get("origin_key")),
+        task_key=_text(payload.get("task_key")),
+        return_key=_text(payload.get("return_key")),
         delegation_id=forwarded_piece(event) or None,
         work_key=_text(payload.get("work_key")) if payload.get("forwarded_from") == event.inbox_id else None,
         replayed=is_replay(event),
@@ -115,10 +119,15 @@ def is_replay(event: Event) -> bool:
     )
 
 
+def is_supplement(event: Event) -> bool:
+    return event.source == FORWARD_SOURCE and event.payload.get("supplement") is True
+
+
 def forwarded_piece(event: Event) -> str | None:
     # The piece of work a forward asks a result for, "" for one that asks for none, None for any other event. Work
-    # handed on inside an inbox without asking for a result is the same work, so it is None too.
-    if event.source != FORWARD_SOURCE:
+    # handed on inside an inbox without asking for a result is the same work, so it is None too, and so is what is added
+    # to a task that was sent before.
+    if event.source != FORWARD_SOURCE or is_supplement(event):
         return None
     if _text(event.payload.get("return_to")) is None:
         return None if event.payload.get("forwarded_from") == event.inbox_id else ""
@@ -391,7 +400,8 @@ def return_payload(
     }
     for key, value in (("title", title), ("parent_session_id", spec.parent_session_id),
                        ("child_session_id", session_id), ("origin_key", spec.origin_key),
-                       ("delegation_id", spec.delegation_id)):
+                       ("delegation_id", spec.delegation_id), ("task_key", spec.return_key),
+                       ("from_task", spec.task_key)):
         if value:
             payload[key] = value
     if spec.replayed:
@@ -400,6 +410,10 @@ def return_payload(
         payload["delivery"] = {"state": delivery.state, "pr_url": delivery.pr_url, "hold": delivery.hold,
                                "hold_detail": delivery.hold_detail}
     return payload
+
+
+def _waiting_key(spec: ForwardSpec) -> str | None:
+    return spec.return_key or spec.origin_key
 
 
 def return_event(
@@ -415,7 +429,7 @@ def return_event(
         payload=payload,
         session_id=parent,
         # A named session keeps its own key; the conversation's key would move that key away from its holder.
-        correlation_key=spec.origin_key if parent is None else None,
+        correlation_key=_waiting_key(spec) if parent is None else None,
     )
 
 
@@ -427,7 +441,7 @@ def cancel_event(
     waiting = _asking_session(sessions, spec)
     if spec.return_to is None or waiting is None:
         return None
-    if not is_open(waiting) and (waiting.status != "archived" or spec.origin_key is None):
+    if not is_open(waiting) and (waiting.status != "archived" or _waiting_key(spec) is None):
         return None
     return Event(
         inbox_id=spec.return_to,
@@ -444,7 +458,7 @@ def cancel_event(
         },
         session_id=waiting.session_id if is_open(waiting) else None,
         # An archived session handed its conversation on to another one.
-        correlation_key=None if is_open(waiting) else spec.origin_key,
+        correlation_key=None if is_open(waiting) else _waiting_key(spec),
     )
 
 
@@ -466,6 +480,14 @@ def out_of_hops(spec: ForwardSpec) -> bool:
     return spec.hop_count > MAX_FORWARD_HOPS
 
 
+def _sent_from(routes: Callable[[str], InboxRoute | None], inbox_id: str, asker: str) -> bool:
+    # The asking inbox may forward to the project of this one now: the one case a result leaves its project.
+    here, there = routes(inbox_id), routes(asker)
+    return here is not None and there is not None and any(
+        (main := routes(item)) is not None and main.project == here.project for item in there.forward_to
+    )
+
+
 def return_refusal(
     spec: ForwardSpec,
     *,
@@ -479,7 +501,9 @@ def return_refusal(
     assert spec.return_to is not None
     if routes is not None:
         here, there = routes(inbox_id), routes(spec.return_to)
-        if here is None or there is None or here.project != there.project:
+        if here is None or there is None or (
+            here.project != there.project and not _sent_from(routes, inbox_id, spec.return_to)
+        ):
             return ForwardRefused(f"return_to '{spec.return_to}' is not an inbox of this project", "block")
     if out_of_hops(spec):
         return ForwardRefused(
@@ -520,6 +544,9 @@ class ForwardStage:
     # Everything the Run has consumed so far, folded events included.
     events: Callable[[], Sequence[Event]]
     approval: Callable[[str], bool]
+    # Events of an inbox that are pending or in progress.
+    queued: Callable[[str], Sequence[Event]] = lambda _inbox_id: ()
+    origin: Callable[[Event], EventOrigin | None] = lambda _event: None
     staged: list[Event] = field(default_factory=list[Event])
 
     def reset(self) -> None:
@@ -534,6 +561,7 @@ class ForwardStage:
         tags: Sequence[str] = (),
         target_agent: str | None = None,
         return_to: str | None = None,
+        continues: str | None = None,
         approved_request_id: str | None = None,
     ) -> Event:
         target = target_inbox.strip()
@@ -549,9 +577,16 @@ class ForwardStage:
             raise ForwardRefused(
                 f"this work was already forwarded {hops} hop(s) (limit {MAX_FORWARD_HOPS}); answer it here instead"
             )
-        binding_route = self._check_inbox("target_inbox", target)
+        # Only from a scope outside every project, and only to the inboxes its binding lists.
+        crossing = self._crosses(target)
+        binding_route = self._check_inbox("target_inbox", target, crossing)
+        if binding_route is not None and binding_route.system and not self.from_person():
+            raise ForwardRefused(f"'{target}' takes only what a person asks for in this turn, in their own chat or on "
+                                 "this host; ask them")
         relayed = target == self.inbox_id
         agent = _text(target_agent)
+        if crossing and agent is not None:
+            raise ForwardRefused(f"target_agent cannot be named for '{target}': that project's rules pick the agent")
         if agent is None and relayed:
             # Left open, the event would stick to this agent's own session.
             agent = self.default_agent(target, tags)
@@ -567,10 +602,22 @@ class ForwardStage:
             raise ForwardRefused(f"agent '{self.agent_id}' cannot forward to itself in '{target}'")
         back = _text(return_to)
         owed = spec.return_to if spec is not None else None
+        added = _text(continues)
+        if added is not None:
+            self._check_added(target, added, crossing, back, owed, self._root(spec))
+        base = (spec.task_key if spec is not None else None) or self._root(spec)
+        joins = spec is not None and not crossing and back in (None, self.inbox_id, owed) and self._joins(
+            target, agent, base, spec
+        )
+        if joins:
+            # What the receiver owes for the task answers this too.
+            back = owed = None
         # Anything but a part this session gets back itself goes on whole, with what is owed for it: an agent that
         # answered outside or another inbox would answer the same work a second time.
         whole = back is None or back != self.inbox_id
         passing = owed is not None and whole and back in (None, owed)
+        if crossing and (back not in (None, self.inbox_id) or (passing and owed != self.inbox_id)):
+            raise ForwardRefused(f"return_to must be '{self.inbox_id}' for work sent to another project")
         if owed is not None and whole and not passing:
             raise ForwardRefused(f"return_to must be '{self.inbox_id}', or '{owed}' to hand this work on")
         if (passing and any(map(passed_on, self.staged))) or (spec is not None and spec.handed_on and whole):
@@ -586,7 +633,7 @@ class ForwardStage:
         if back is not None:
             if back == target and not relayed:
                 raise ForwardRefused(f"return_to '{back}' is the target inbox itself")
-            self._check_inbox("return_to", back)
+            self._check_inbox("return_to", back, passing and self._owed_across(back))
         wanted = tuple(dict.fromkeys(t for tag in tags if (t := tag.strip())))
         decision = self.permissions.check(FORWARD_TOOL, {
             "inbox_id": self.inbox_id,
@@ -598,31 +645,106 @@ class ForwardStage:
             "title": title,
             "text": body,
             "tags": list(wanted),
+            **({"continues": added} if added is not None else {}),
         })
         if decision.action == "block":
             raise ForwardRefused(decision.reason, "block")
         if decision.action == "defer" and not (approved_request_id and self.approval(approved_request_id)):
             raise ForwardRefused(decision.reason, "defer")
-        event = self._event(target, agent, body, title.strip(), wanted, back, hops, spec, events, passing)
+        event = self._event(target, agent, body, title.strip(), wanted, back, hops, spec, events, passing, crossing,
+                            added, joins)
         self.staged.append(event)
         # A copy: the caller may do what it likes with its receipt, what was checked above is what goes out.
         return deepcopy(event)
 
-    def _check_inbox(self, name: str, inbox_id: str) -> InboxRoute | None:
+    def drop_refused(self) -> list[tuple[Event, str]]:
+        # What the configuration in force no longer lets out of this inbox, judged again before anything is queued.
+        dropped: list[tuple[Event, str]] = []
+        for evt in list(self.staged):
+            if evt.inbox_id == self.inbox_id:
+                continue
+            try:
+                self._check_inbox("target_inbox", evt.inbox_id, self._crosses(evt.inbox_id))
+            except ForwardRefused as exc:
+                self.staged.remove(evt)
+                dropped.append((evt, str(exc)))
+        return dropped
+
+    def from_person(self) -> bool:
+        events = self.events()
+        saved = self.session.forward
+        return any(self.origin(evt) is not None for evt in events) or (
+            saved is not None and saved.from_person and any(map(is_approval, events))
+        )
+
+    def _crosses(self, target: str) -> bool:
+        if self.routes is None:
+            return False
+        here, there = self.routes(self.inbox_id), self.routes(target)
+        return here is not None and there is not None and here.project != there.project and target in here.forward_to
+
+    def _owed_across(self, asker: str) -> bool:
+        return self.routes is not None and _sent_from(self.routes, self.inbox_id, asker)
+
+    def _root(self, spec: ForwardSpec | None) -> str | None:
+        return (spec.origin_key if spec is not None else None) or self.correlation_key
+
+    def _check_added(
+        self, target: str, key: str, crossing: bool, back: str | None, owed: str | None, root: str | None
+    ) -> None:
+        if not crossing:
+            raise ForwardRefused("continues names a task sent to another project")
+        if back is not None or owed is not None:
+            raise ForwardRefused("continues takes no return_to: the task it adds to is answered as it was sent")
+        session = self.sessions.find_by_correlation_key(target, key)
+        known = session.forward if session is not None else None
+        origins = [known.origin_key] if known is not None and known.task_key == key else [
+            _text(evt.payload.get("origin_key")) for evt in (*self.queued(target), *self.staged)
+            if evt.inbox_id == target and evt.source == FORWARD_SOURCE and evt.payload.get("task_key") == key
+        ]
+        if not key.startswith(f"forward:{self.inbox_id}:forward:") or root not in origins:
+            raise ForwardRefused(
+                f"'{key}' is not an open task of this conversation in '{target}'; send it as new work, with everything "
+                "the receiver needs"
+            )
+
+    def _joins(self, target: str, agent: str | None, base: str | None, spec: ForwardSpec) -> bool:
+        # What was added to a task follows it to the session that owes its result, handed on or waited for here. A
+        # session that owes nothing takes it like any other follow-up.
+        if spec.task_key is None or base is None or not any(map(is_supplement, self.events())):
+            return False
+        holder = self.sessions.find_by_correlation_key(target, self._key(target, agent, base) or base)
+        known = holder.forward if holder is not None else None
+        if known is None or known.task_key != spec.task_key or known.return_to is None:
+            return False
+        return known.delegation_id in spec.pending_returns or spec.return_to is None
+
+    def _key(self, target: str, agent: str | None, base: str | None) -> str | None:
+        if target != self.inbox_id or base is None:
+            return base
+        # A prefix, so no channel reads the task id out of the child's key.
+        holder = self.sessions.find_by_correlation_key(target, base)
+        return base if holder is not None and holder.agent_id == agent else f"forward:{agent}:{base}"
+
+    def _check_inbox(self, name: str, inbox_id: str, other_project: bool = False) -> InboxRoute | None:
         if self.routes is None:
             return None
         here, there = self.routes(self.inbox_id), self.routes(inbox_id)
-        if here is None or there is None or there.project != here.project:
-            raise ForwardRefused(f"{name} '{inbox_id}' is not an inbox of this project")
+        if here is not None and here.system:
+            raise ForwardRefused(f"'{self.inbox_id}' passes no work on; answer it here")
+        if here is None or there is None or (there.project != here.project and not other_project):
+            listed = f", nor one of {', '.join(here.forward_to)}" if here is not None and here.forward_to else ""
+            raise ForwardRefused(f"{name} '{inbox_id}' is not an inbox of this project{listed}")
         if there.has_bindings and there.binding is None:
             raise ForwardRefused(f"{name} '{inbox_id}' is covered by no inbox binding of project '{there.project}'")
         return there
 
     def _event(
         self, target: str, agent: str | None, text: str, title: str, tags: Sequence[str], return_to: str | None,
-        hops: int, spec: ForwardSpec | None, events: Sequence[Event], passing: bool,
+        hops: int, spec: ForwardSpec | None, events: Sequence[Event], passing: bool, crossing: bool,
+        added: str | None, joins: bool,
     ) -> Event:
-        root = (spec.origin_key if spec is not None else None) or self.correlation_key
+        root = self._root(spec)
         trace_id, parent_event_id = run_lineage(events, self.session)
         payload: dict[str, Any] = {
             "text": text,
@@ -647,25 +769,33 @@ class ForwardStage:
         replayed = (passing and spec is not None and spec.replayed) or any(map(is_replay, events))
         for key, value in (("title", title), ("tags", list(tags)), ("agent_id", agent), ("return_to", return_to),
                            ("origin_key", root), ("delegation_id", piece), ("parent_session_id", parent),
-                           ("replayed", replayed)):
+                           ("replayed", replayed), ("supplement", joins or added is not None)):
             if value:
                 payload[key] = value
-        key = root
-        if target == self.inbox_id:
-            if self.work_key:
-                # The relay works in the same worktree; review_of is how a reviewer names the developer's one.
-                payload["work_key"] = payload["review_of"] = self.work_key
-            if root is not None:
-                # A prefix, so no channel reads the task id out of the child's key.
-                holder = self.sessions.find_by_correlation_key(target, root)
-                key = root if holder is not None and holder.agent_id == agent else f"forward:{agent}:{root}"
+        if crossing:
+            # A task of its own: whatever else this conversation sends there has another key.
+            task = added or ":".join(filter(None, ("forward", self.inbox_id, external_id, root)))
+            waiting = spec.task_key if spec is not None else None
+            key: str | None = task
+        else:
+            task = spec.task_key if spec is not None else None
+            waiting = task
+            key = self._key(target, agent, task or root)
+        if passing and spec is not None:
+            waiting = spec.return_key
+        if target == self.inbox_id and self.work_key:
+            # The relay works in the same worktree; review_of is how a reviewer names the developer's one.
+            payload["work_key"] = payload["review_of"] = self.work_key
+        for name, value in (("task_key", task), ("return_key", waiting if return_to else None)):
+            if value:
+                payload[name] = value
         return Event(
             inbox_id=target,
             source=FORWARD_SOURCE,
             external_id=external_id,
             # Values taken over from the events must not stay shared with them.
             payload=deepcopy(payload),
-            correlation_key=self._distinct(target, key),
+            correlation_key=key if joins or added is not None else self._distinct(target, key),
         )
 
     def _distinct(self, target: str, key: str | None) -> str | None:
@@ -691,7 +821,7 @@ class ForwardStage:
     def hand_over(self, link: TaskLink) -> bool:
         # The task goes with the first piece this session gets no result for: its agent finishes the work.
         for index, evt in enumerate(self.staged):
-            if "return_to" in evt.payload and not passed_on(evt):
+            if is_supplement(evt) or ("return_to" in evt.payload and not passed_on(evt)):
                 continue
             fields: dict[str, Any] = {"task_id": link.task_id, "task_trace_id": link.trace_id}
             if link.hop_count is not None:

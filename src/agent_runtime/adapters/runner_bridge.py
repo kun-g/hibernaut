@@ -135,8 +135,11 @@ class RunnerExecutorBridge:
         executor_calls_tools: bool | None = None,
         authorize_tools: bool = False,
         node_wait_seconds: float = 0.0,
+        readonly: bool = False,
     ) -> None:
         self._runner = runner
+        # Every Run is read-only, whatever its events ask for.
+        self._readonly = readonly
         # None means unknown. An executor that may call tools runs only with authorize_tools, which puts each call to
         # PermissionPort.check() before it is made: anything else would let the CLI act before a block or defer applies.
         self._executor_calls_tools = executor_calls_tools
@@ -182,7 +185,11 @@ class RunnerExecutorBridge:
         state = _DeferState.load(session.checkpoint) if pending_id else None
         answers = [ev for ev in events if pending_id and ev.payload.get("approval_request_id") == pending_id]
         fresh = [ev for ev in events if ev not in answers] if state is not None else list(events)
-        readonly = any(bool(ev.payload.get("readonly")) for ev in events) or (state is not None and state.readonly)
+        readonly = (
+            self._readonly
+            or any(bool(ev.payload.get("readonly")) for ev in events)
+            or (state is not None and state.readonly)
+        )
         interactive = any(bool(ev.payload.get("interactive")) for ev in events) or (state is not None and state.interactive)
         policy = _ToolPolicy(permissions=caps.permissions, spent=self._spent_approvals)
         # What the Run was asked to do, without the notes about approvals: a later approval of it starts from here.

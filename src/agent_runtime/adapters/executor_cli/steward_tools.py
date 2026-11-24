@@ -44,6 +44,19 @@ class EventLister(Protocol):
     ) -> list[Event]: ...
 
 
+class SystemTools(Protocol):
+    # What a Steward with system tools may do to the deployment; each call blocks, so it runs in a thread. A failure is
+    # raised as ToolError with the reason and what was left behind.
+    def check(self) -> str: ...
+
+    def onboard(self, *, repo: str, name: str | None, description: str | None) -> str: ...
+
+    def complete(self, *, name: str, description: str | None) -> str: ...
+
+    # Whether a path must not be shown to it: the deployment file and what is written beside it.
+    def hides(self, path: Path) -> bool: ...
+
+
 _MATCH = re.compile(rb"([^\0]+)\0(\d+)[\0:]([^\n]*)\n")
 
 
@@ -156,6 +169,33 @@ def _schema(required: Sequence[str] = (), **properties: dict[str, Any]) -> dict[
     return {"type": "object", "properties": properties, "required": list(required)}
 
 
+def _system_definitions() -> list[dict[str, Any]]:
+    description = {**_TEXT, "description": "One sentence saying what the project is, in the person's words."}
+    found = [
+        {"name": "check_projects",
+         "description": "List the projects Hibernaut is set up for, and what each lacks: a Steward for its main inbox, a "
+                        "description, a place in the general Steward's list.",
+         "inputSchema": _schema()},
+        {"name": "onboard_project",
+         "description": "Set a GitHub repository up as a project: clone it, register it in Orca, create the trigger label "
+                        "where that is allowed, and add the project with its Steward to the configuration. What is there "
+                        "already stays as it is.",
+         "inputSchema": _schema(
+             ("repo",), repo={**_TEXT, "description": "owner/name on GitHub."},
+             name={**_TEXT, "description": "The project's name. Leave it out for the repository's own name in lower case."},
+             description=description,
+         )},
+        {"name": "complete_project",
+         "description": "Add what a project lacks according to check_projects, and nothing else: values that are set stay.",
+         "inputSchema": _schema(
+             ("name",), name={**_TEXT, "description": "The project's name, from check_projects."}, description=description,
+         )},
+    ]
+    for tool in found:
+        tool["inputSchema"] = {**cast(dict[str, Any], tool["inputSchema"]), "additionalProperties": False}
+    return found
+
+
 @dataclass(slots=True)
 class StewardTools:
     # The tools of one Steward run. Every call passes PermissionPort.check under its own tool name first.
@@ -164,7 +204,12 @@ class StewardTools:
     inbox_id: str
     sessions: SessionStorePort
     events: EventLister
+    # The inboxes whose sessions and events it may list.
     in_project: Callable[[str], bool]
+    # Set for a Steward of no project.
+    projectless: bool = False
+    # Set only for a Steward whose inbox has system tools; without it they are neither offered nor served.
+    system: SystemTools | None = None
     calls: int = 0
     # Forwards this Run took; they go out once it ends in anything but a failure.
     forwarded: int = 0
@@ -172,10 +217,13 @@ class StewardTools:
     deferred: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
 
     @staticmethod
-    def definitions() -> list[dict[str, Any]]:
-        inbox = {**_TEXT, "description": "An inbox of this project; leave out for the default."}
+    def definitions(*, projectless: bool = False, system: bool = False) -> list[dict[str, Any]]:
+        where = "your own inbox or a project in the routing manifest" if projectless else "this project"
+        memory = "your inbox's memory" if projectless else "the project memory"
+        whose = "your inbox's" if projectless else "the project's"
+        inbox = {**_TEXT, "description": f"An inbox of {where}; leave out for the default."}
         glob = {**_TEXT, "description": "Limit to these paths, e.g. src/**/*.py or docs/**."}
-        return [
+        tools: list[dict[str, Any]] = [
             {"name": "forward_to_inbox",
              "description": "Hand work to another agent through its inbox. Nothing waits for it: end your turn after "
                             "forwarding. Without return_to that agent answers the person directly; with return_to "
@@ -186,8 +234,12 @@ class StewardTools:
                  target_inbox={**_TEXT, "description": "An inbox id from the routing manifest."},
                  text={**_TEXT, "description": "The complete task: the receiver sees this, not your conversation."},
                  title=_TEXT, tags=_TEXTS,
-                 target_agent={**_TEXT, "description": "Leave out to let the inbox's rules pick the agent."},
+                 target_agent={**_TEXT, "description": "Only for your own inbox: a project's rules pick its agent."
+                               if projectless else "Leave out to let the inbox's rules pick the agent."},
                  return_to=_TEXT,
+                 **({"continues": {**_TEXT, "description": "The key of a task you sent there before, from this "
+                                   "conversation: text adds to that task, in its session and worktree. Leave "
+                                   "return_to out."}} if projectless else {}),
              )},
             {"name": "read_file",
              "description": f"Read a file of the checkout, with line numbers, at most {_MAX_LINES} lines at a time. "
@@ -201,25 +253,25 @@ class StewardTools:
                             "read are left out.",
              "inputSchema": _schema(("pattern",), pattern=_TEXT, glob=glob)},
             {"name": "list_files", "description": "List the checkout's files.", "inputSchema": _schema(glob=glob)},
-            {"name": "read_memory", "description": "Read a file of the project memory, e.g. notes/release.md.",
+            {"name": "read_memory", "description": f"Read a file of {memory}, e.g. notes/release.md.",
              "inputSchema": _schema(("path",), path=_TEXT)},
             {"name": "write_memory",
-             "description": "Replace a file of the project memory. reported.md is appended to instead; instructions.md "
+             "description": f"Replace a file of {memory}. reported.md is appended to instead; instructions.md "
                             "waits for a person's approval.",
              "inputSchema": _schema(("path", "content"), path=_TEXT, content=_TEXT)},
             {"name": "memory_search",
-             "description": "Full-text search over the project's and the shared memory, and with include_kb the "
-                            "read-only knowledge mounts.",
+             "description": f"Full-text search over {whose} and the shared "
+                            "memory, and with include_kb the read-only knowledge mounts.",
              "inputSchema": _schema(
                  ("query",), query=_TEXT, top_k={"type": "integer"}, include_shared=_FLAG, include_kb=_FLAG,
                  include_archived=_FLAG,
              )},
             {"name": "memory_read",
-             "description": "Read a memory document or one Markdown section of it. uri: a path of the project memory, "
+             "description": f"Read a memory document or one Markdown section of it. uri: a path of {memory}, "
                             "or a proj://, shared://, global:// or kb:// URI from memory_search.",
              "inputSchema": _schema(("uri",), uri=_TEXT, heading=_TEXT, max_bytes={"type": "integer"})},
             {"name": "memory_propose_write",
-             "description": "Governed write to project memory: notes/ and progress/ apply at once (near-duplicates are "
+             "description": f"Governed write to {memory if projectless else 'project memory'}: notes/ and progress/ apply at once (near-duplicates are "
                             "refused unless supersedes or force_new is given), instructions.md and shared:// wait for "
                             "a person's approval. base_sha256 from memory_read makes it a compare-and-set.",
              "inputSchema": _schema(
@@ -229,9 +281,11 @@ class StewardTools:
                  content=_TEXT, rationale=_TEXT, section_heading=_TEXT, base_sha256=_TEXT, evidence_ref=_TEXT,
                  supersedes=_TEXTS, force_new=_FLAG,
              )},
-            {"name": "list_sessions", "description": "List this project's sessions, newest first.",
+            {"name": "list_sessions", "description": f"List the sessions of {where}, newest first."
+             if projectless else "List this project's sessions, newest first.",
              "inputSchema": _schema(inbox_id=inbox, status={"type": "string", "enum": list(_STATUSES)})},
-            {"name": "list_events", "description": "List this project's inbox events, newest first.",
+            {"name": "list_events", "description": f"List the inbox events of {where}, newest first."
+             if projectless else "List this project's inbox events, newest first.",
              "inputSchema": _schema(inbox_id=inbox, status=_TEXT, limit={"type": "integer"})},
             {"name": "git",
              "description": f"Read the checkout's history: {', '.join(GIT_COMMANDS)}. Spell options out, put paths after "
@@ -239,6 +293,10 @@ class StewardTools:
                             "to be readable to you; --stat and --name-only need none.",
              "inputSchema": _schema(("args",), args={**_TEXTS, "description": 'e.g. ["log", "--oneline", "-10"]'})},
         ]
+        if not system:
+            return tools
+        # It passes no work on.
+        return [*_system_definitions(), *(tool for tool in tools if tool["name"] != "forward_to_inbox")]
 
     async def call(self, name: object, arguments: object) -> tuple[str, bool]:
         # (answer, is_error)
@@ -257,6 +315,10 @@ class StewardTools:
             "list_events": self._list_events,
             "git": self._run_git,
         }
+        if self.system is not None:
+            del handlers["forward_to_inbox"]
+            handlers |= {"check_projects": self._check_projects, "onboard_project": self._onboard_project,
+                         "complete_project": self._complete_project}
         handler = handlers.get(name) if isinstance(name, str) else None
         if handler is None:
             return f"unknown tool {name}", True
@@ -273,8 +335,33 @@ class StewardTools:
         if decision.action != "allow":
             raise ToolError(f"{tool} is not permitted ({decision.action}): {decision.reason}")
 
+    def _system(self, tool: str, arguments: dict[str, Any], *keys: str) -> SystemTools:
+        assert self.system is not None
+        unknown = sorted(set(arguments) - set(keys))
+        if unknown:
+            raise ToolError(f"{tool} takes {', '.join(keys) or 'no arguments'}, not {', '.join(unknown)}")
+        self._allow(tool, arguments)
+        return self.system
+
+    async def _check_projects(self, arguments: dict[str, Any]) -> str:
+        system = self._system("check_projects", arguments)
+        return await asyncio.to_thread(system.check)
+
+    async def _onboard_project(self, arguments: dict[str, Any]) -> str:
+        repo, name = _required(arguments, "repo"), _optional(arguments, "name")
+        description = _optional(arguments, "description")
+        system = self._system("onboard_project", arguments, "repo", "name", "description")
+        return await asyncio.to_thread(system.onboard, repo=repo, name=name, description=description)
+
+    async def _complete_project(self, arguments: dict[str, Any]) -> str:
+        name, description = _required(arguments, "name"), _optional(arguments, "description")
+        system = self._system("complete_project", arguments, "name", "description")
+        return await asyncio.to_thread(system.complete, name=name, description=description)
+
     def _readable(self, path: str) -> bool:
         # Every way a file's content is shown passes the gate as a read of that file.
+        if self.system is not None and self.system.hides(self.checkout / path):
+            return False
         return self.caps.permissions.check("read_file", {"path": path}).action == "allow"
 
     async def _forward(self, arguments: dict[str, Any]) -> str:
@@ -286,6 +373,9 @@ class StewardTools:
             "target_agent": _optional(arguments, "target_agent"),
             "return_to": _optional(arguments, "return_to"),
         }
+        added = _optional(arguments, "continues")
+        if added is not None:
+            wanted["continues"] = added
         try:
             event = self.forward(wanted)
         except ForwardRefused as exc:
@@ -294,6 +384,10 @@ class StewardTools:
             self.deferred.append(wanted)
             return (f"Held for a person's approval: {exc}. Hibernaut asks for it when this turn ends and forwards the "
                     "work once it is approved; do not forward it again.")
+        if self.projectless and event.inbox_id != self.inbox_id:
+            did = "Added to task" if added is not None else "Forwarded as task"
+            return (f"{did} {event.correlation_key} in {event.inbox_id}; it is queued when this turn ends. To add to it "
+                    "later, forward there again with continues set to that key.")
         return f"Forwarded to {event.inbox_id}; it is queued when this turn ends."
 
     def forward(self, wanted: dict[str, Any], approved_request_id: str | None = None) -> Event:
@@ -308,6 +402,8 @@ class StewardTools:
         path = _real_path(self.checkout, _required(arguments, "path"))
         offset, limit = _count(arguments, "offset", 1), min(_count(arguments, "limit", _MAX_LINES), _MAX_LINES)
         self._allow("read_file", {"path": path})
+        if self.system is not None and self.system.hides(self.checkout / path):
+            raise ToolError(f"{path} is not a file of the checkout")
         return await asyncio.to_thread(_read_file, self.checkout, path, offset, limit)
 
     async def _search_files(self, arguments: dict[str, Any]) -> str:
@@ -357,7 +453,8 @@ class StewardTools:
     def _inbox(self, arguments: dict[str, Any]) -> str | None:
         inbox_id = _optional(arguments, "inbox_id")
         if inbox_id is not None and not self.in_project(inbox_id):
-            raise ToolError(f"'{inbox_id}' is not an inbox of this project")
+            where = "your inbox or of a project you may forward to" if self.projectless else "this project"
+            raise ToolError(f"'{inbox_id}' is not an inbox of {where}")
         return inbox_id
 
     async def _list_sessions(self, arguments: dict[str, Any]) -> str:
@@ -392,7 +489,7 @@ class StewardTools:
             "occurred_at": event.occurred_at, "session_id": event.session_id, "correlation_key": event.correlation_key,
         }
         for key in ("title", "text", "agent_id", "executor_id", "forwarded_from", "forwarded_by", "hop_count",
-                    "return_to"):
+                    "return_to", "from_task"):
             value = event.payload.get(key)
             if isinstance(value, str) and value:
                 row[key] = value[:_SNIPPET]
@@ -456,6 +553,6 @@ class StewardTools:
             return {"text": "malformed request", "error": True}
         item = cast(dict[str, Any], request)
         if item.get("op") == "tools":
-            return {"tools": self.definitions()}
+            return {"tools": self.definitions(projectless=self.projectless, system=self.system is not None)}
         text, error = await self.call(item.get("name"), item.get("arguments"))
         return {"text": text, "error": error}

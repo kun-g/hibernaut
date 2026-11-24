@@ -46,6 +46,7 @@ from agent_runtime.app.projects import (
     validate_project_rules,
     validate_workdir_bindings,
 )
+from agent_runtime.app.reload import ReloadStatus
 from agent_runtime.core.models import InboxRoute, NewEventPolicy
 from memory_hub import BaselineBudgetConfig, KnowledgeMountConfig, MemoryHubConfig
 from memory_hub.models import AccessRole
@@ -88,6 +89,12 @@ class ChannelsConfig:
 
 TerminalBackend = Literal["orca", "none"]
 TERMINAL_BACKENDS: tuple[TerminalBackend, ...] = ("orca", "none")
+@dataclass(frozen=True, slots=True)
+class OnboardingConfig:
+    # Lower-cased GitHub owners in whose repositories the system tools may create the trigger label.
+    label_owners: tuple[str, ...] = ()
+
+
 Handoff = Literal["mcp", "peer"]
 HANDOFFS: tuple[Handoff, ...] = ("mcp", "peer")
 
@@ -118,6 +125,8 @@ class ProjectConfig:
     agents: tuple[AgentConfig, ...] = ()
     # Inboxes of this project running at once; None leaves only runtime.max_concurrency.
     max_concurrency: int | None = None
+    # What the project is, for a Steward outside it that may send work here.
+    description: str = ""
 
     def route(self, inbox_id: str) -> InboxRoute:
         bound = next((b.binding for b in self.inbox_bindings if b.rule.matches(inbox_id)), None)
@@ -387,16 +396,20 @@ class RunnerLinkConfig:
     # Added to the permission policy; a tool in neither list, nor in the built-in ones, asks a person.
     allow_tools: frozenset[str] = frozenset()
     block_tools: frozenset[str] = frozenset()
+    # Every Run of these executors is read-only, whatever its events ask for.
+    readonly_only: bool = False
     # in_process
     runner_id: str = "local"
     max_concurrent: int | None = None
     worktree_backend: WorktreeBackend = "git"
     state_dir: str = ""
     logs_dir: str = ""
-    # relay: where this process listens for nodes, and the environment variable holding their shared token.
+    # relay: where this process listens for nodes, and the environment variable (or the owner-only file) holding their
+    # shared token.
     listen_host: str = "127.0.0.1"
     listen_port: int = 8790
     token_env: str = "HIBERNAUT_RUNNER_TOKEN"
+    token_file: str = ""
     affinity_db_path: str = ""
 
 
@@ -484,6 +497,7 @@ class HibernautConfig:
     runner: RunnerLinkConfig = field(default_factory=RunnerLinkConfig)
     memory_hub: MemoryHubLinkConfig = field(default_factory=MemoryHubLinkConfig)
     runner_pilot: RunnerPilotConfig = field(default_factory=RunnerPilotConfig)
+    onboarding: OnboardingConfig = field(default_factory=OnboardingConfig)
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
 
@@ -648,6 +662,18 @@ def parse_runner_pilot(raw: Any, *, base_dir: Path | None = None) -> RunnerPilot
     )
 
 
+_OWNER_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+def parse_onboarding(raw: Any) -> OnboardingConfig:
+    section = _Table(raw if raw is not None else {}, "onboarding", frozenset({"label_owners"}))
+    owners = tuple(dict.fromkeys(owner.lower() for owner in section.names("label_owners", ())))
+    for owner in owners:
+        if not _OWNER_RE.fullmatch(owner):
+            raise ValueError(f"onboarding.label_owners: {owner!r} is not a GitHub owner")
+    return OnboardingConfig(label_owners=owners)
+
+
 def _validate_runner_pilot(config: HibernautConfig) -> None:
     pilot = config.runner_pilot
     if not pilot.enabled:
@@ -665,6 +691,8 @@ def _validate_runner_pilot(config: HibernautConfig) -> None:
         raise ValueError("runner_pilot.port is channels.port")
     if config.runner.enabled and config.runner.mode == "relay" and pilot.port == config.runner.listen_port:
         raise ValueError("runner_pilot.port is runner.listen_port; each relay needs its own port")
+    if config.runner.enabled and config.runner.mode == "relay" and pilot.token_file == config.runner.token_file:
+        raise ValueError("runner_pilot.token_file is runner.token_file; each relay needs its own token")
     if config.memory_hub.http.enabled and pilot.port == config.memory_hub.http.listen_port:
         raise ValueError("runner_pilot.port is memory_hub.http.listen_port")
 
@@ -706,6 +734,11 @@ def parse_runner_link(
     enabled = item.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("runner.enabled must be true or false")
+    readonly_only = item.get("readonly_only", False)
+    if not isinstance(readonly_only, bool):
+        raise ValueError("runner.readonly_only must be true or false")
+    if "token_env" in item and "token_file" in item:
+        raise ValueError("runner.token_env and runner.token_file cannot both be set")
     mode = next((m for m in _RUNNER_MODES if m == item.get("mode", defaults.mode)), None)
     if mode is None:
         raise ValueError('runner.mode must be "in_process" or "relay"')
@@ -764,6 +797,7 @@ def parse_runner_link(
         node_wait_seconds=seconds("node_wait_seconds", defaults.node_wait_seconds, zero=True),
         allow_tools=frozenset(names("allow_tools")),
         block_tools=frozenset(names("block_tools")),
+        readonly_only=readonly_only,
         runner_id=text("runner_id", defaults.runner_id),
         max_concurrent=slots,
         worktree_backend=backend,
@@ -772,6 +806,7 @@ def parse_runner_link(
         listen_host=text("listen_host", defaults.listen_host),
         listen_port=port,
         token_env=text("token_env", defaults.token_env),
+        token_file=path("token_file"),
         affinity_db_path=path("affinity_db_path"),
     )
 
@@ -796,7 +831,7 @@ _MEMORY_ROLES: tuple[AccessRole, ...] = ("readonly", "propose", "admin")
 
 
 class _Table:
-    # One table of the [memory_hub] section: typed reads that name the offending key.
+    # One table of a section: typed reads that name the offending key.
     def __init__(self, raw: Any, where: str, keys: frozenset[str] | None = None) -> None:
         if not isinstance(raw, dict):
             raise ValueError(f"[{where}] must be a table")
@@ -935,7 +970,9 @@ async def config_changes(
     path: Path,
     stop: asyncio.Event,
     interval: float = 1.0,
+    reloads: ReloadStatus | None = None,
 ) -> AsyncIterator[HibernautConfig]:
+    # What is yielded is settled in `reloads` by whoever activates it.
     previous: bytes | None = None
     missing = False
     while not stop.is_set():
@@ -959,6 +996,9 @@ async def config_changes(
         if contents == previous:
             continue
         previous = contents
+        version = reloads.seen(contents) if reloads is not None else ""
+        error = ""
+        config: HibernautConfig | None = None
         try:
             raw = tomllib.loads(contents.decode("utf-8"))
             if not raw:
@@ -967,13 +1007,25 @@ async def config_changes(
             config = await asyncio.to_thread(parse_config, raw, base_dir=path.resolve().parent)
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
             detail = f": {exc}" if type(exc) is ValueError else ""
-            print(
-                f"[config] Invalid {path} ({type(exc).__name__}{detail}); keeping current settings.",
-                file=sys.stderr,
-                flush=True,
-            )
+            error = f"{type(exc).__name__}{detail}"
+        # Parsing takes a while, and an editor knows no lock: a version that is gone by now is not used.
+        try:
+            replaced = path.read_bytes() != contents
+        except OSError:
+            replaced = True
+        if replaced:
+            # It may also come back as it was.
+            previous = None
+            continue
+        if config is None:
+            print(f"[config] Invalid {path} ({error}); keeping current settings.", file=sys.stderr, flush=True)
+            if reloads is not None:
+                reloads.settle(version, f"invalid configuration ({error})")
             continue
         yield config
+        if reloads is not None and not reloads.settled(version):
+            # Dropped, as the file had changed again. It may be back as it was.
+            previous = None
 
 
 def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> HibernautConfig:
@@ -1172,11 +1224,14 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
                                                 declared=agents.keys()),
             agents=tuple(agents.values()),
             max_concurrency=_max_concurrency(f"projects.{name}", item),
+            description=_optional_text(f"projects.{name}", item, "description"),
         )
     validate_project_rules(projects.values())
     validate_project_bindings(projects.values())
     runtime = dataclasses.replace(runtime, inbox_bindings=parse_workdir_bindings(
         rt_raw.get("inbox_bindings"), declared=agents, resolve=lambda path: _resolve_path(path, base_dir),
+        stewards={name: role.workdir for name, role in roles.items() if role.role == STEWARD_ROLE},
+        main_inboxes={project.inbox_id: project.name for project in projects.values()},
     ))
     validate_workdir_bindings(runtime.inbox_bindings, projects.values(),
                               {name: role.workdir for name, role in roles.items() if role.workdir})
@@ -1256,6 +1311,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         runner=parse_runner_link(raw.get("runner"), agents=agents, templates=executors, base_dir=base_dir),
         memory_hub=parse_memory_hub(raw.get("memory_hub"), base_dir=base_dir),
         runner_pilot=parse_runner_pilot(raw.get("runner_pilot"), base_dir=base_dir),
+        onboarding=parse_onboarding(raw.get("onboarding")),
         config_dir=str(base_dir) if base_dir is not None else "",
     )
     _validate_runner_pilot(config)

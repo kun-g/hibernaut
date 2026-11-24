@@ -11,6 +11,7 @@ from typing import Any, Never, assert_never, cast
 from agent_runtime.core.models import (
     CLOSE_SOURCE,
     FORWARD_SOURCE,
+    INTERNAL_SOURCES,
     MCP_APPROVAL_SOURCE,
     RETURN_CANCELLED_SOURCE,
     AgentNotAllowed,
@@ -58,6 +59,7 @@ from agent_runtime.core.ports import (
 )
 from agent_runtime.engine.closing import close_session
 from agent_runtime.engine.forwarding import (
+    EventOrigin,
     ForwardStage,
     cancel_event,
     carries_forwards,
@@ -112,11 +114,12 @@ class _ScopedCapabilities:
         tags: Sequence[str] = (),
         target_agent: str | None = None,
         return_to: str | None = None,
+        continues: str | None = None,
         approved_request_id: str | None = None,
     ) -> Event:
         return self._forwards.forward(
             target_inbox, text, title=title, tags=tags, target_agent=target_agent, return_to=return_to,
-            approved_request_id=approved_request_id,
+            continues=continues, approved_request_id=approved_request_id,
         )
 
 
@@ -209,6 +212,7 @@ class _BatchEnd:
 # Payload keys that, with the agent an event names, pick where/how an executor runs (e.g. LocalCLIExecutor's workdir
 # and CLI template). Events that disagree on them must not share a Run.
 _TARGET_PAYLOAD_KEYS = ("explicit_workdir", "executor")
+_UNWELCOME = "A system inbox takes work only from a person, through an inbox that lists it or on this host"
 _STALE_APPROVAL = "Approval does not match a pending request in this session"
 _REPLY_PAYLOAD_KEYS = ("reply_channel", "reply_target")
 
@@ -334,6 +338,8 @@ class AgentWorker:
         global_default_executor: str | None = None,
         # inbox_id -> its project and binding; None runs without inbox bindings.
         routes: Callable[[str], InboxRoute | None] | None = None,
+        # Who put an event here, when it was a person; a system inbox takes nothing else.
+        origin: Callable[[Event], EventOrigin | None] | None = None,
         # Called with each inbox this worker queued an event into.
         on_forward: Callable[[str], object] | None = None,
         on_worktree_reclaim: Callable[[str], object] | None = None,
@@ -371,6 +377,7 @@ class AgentWorker:
         self._project_default_executor = project_default_executor
         self._global_default_executor = resolved_global
         self._routes = routes
+        self._origin: Callable[[Event], EventOrigin | None] = origin or (lambda _event: None)
         self._on_forward = on_forward
         self._on_worktree_reclaim = on_worktree_reclaim
         self._hold = hold
@@ -464,6 +471,10 @@ class AgentWorker:
                     break
 
                 claimed = [e for e in claimed if not self._belongs_elsewhere(inbox_id, e)]
+                unwelcome = [e.event_id for e in claimed if not self._welcome(inbox_id, e)]
+                if unwelcome:
+                    self._inbox.mark_failed(unwelcome, _UNWELCOME)
+                    claimed = [e for e in claimed if e.event_id not in unwelcome]
                 # Before any batch, so no message to the same session is settled with it and no decision on it counts.
                 with_parent = [e for e in claimed if e.source == CLOSE_SOURCE and e.payload.get("closed_parent")]
                 if with_parent:
@@ -698,6 +709,16 @@ class AgentWorker:
             replace(evt, payload=dict(replaced[evt.event_id])) if evt.event_id in replaced else evt
             for evt in batch
         ]
+
+    def _welcome(self, inbox_id: str, event: Event) -> bool:
+        route = self._route(inbox_id)
+        if route is None or not route.system or event.source in INTERNAL_SOURCES:
+            # A forward was judged where it was sent, and no public entrance takes an internal source.
+            return True
+        if self._is_approval_decision(event):
+            pending = self._sessions.find_by_request_id(str(event.payload["approval_request_id"]))
+            return pending is not None and pending.inbox_id == inbox_id
+        return self._origin(event) == "operator"
 
     def _claim(self, inbox_id: str) -> list[Event]:
         if self._hold is None:
@@ -1326,6 +1347,8 @@ class AgentWorker:
             for found in self._runnable(self._inbox.fetch_pending(inbox_id)):
                 if found.event_id in consumed_ids or found.source in (RETURN_CANCELLED_SOURCE, CLOSE_SOURCE):
                     continue
+                if not self._welcome(inbox_id, found):
+                    continue
                 if (
                     settled_return(found, self._sessions) or withdrawn_forward(found, self._sessions)
                     or returned_piece(found) in returned_pieces(batch + folded_events)
@@ -1366,6 +1389,8 @@ class AgentWorker:
             routes=self._routes,
             events=lambda: batch + folded_events,
             approval=lambda request_id: self._approved(request_id, batch, active_session),
+            queued=lambda queued_in: [*self._inbox.fetch_pending(queued_in), *self._inbox.fetch_processing(queued_in)],
+            origin=self._origin,
         )
         caps: RunCapabilities = _ScopedCapabilities(
             memory=self._memory,
@@ -1525,7 +1550,8 @@ class AgentWorker:
         handed_over = False
         if not carries_forwards(outcome):
             forwards.reset()
-        elif forwards.staged:
+        dropped = forwards.drop_refused()
+        if forwards.staged:
             if final_link is not None and not isinstance(outcome, Suspend):
                 handed_over = forwards.hand_over(final_link)
             sent = forwards.own_returns()
@@ -1544,6 +1570,8 @@ class AgentWorker:
         if isinstance(outcome, Suspend) and final_spec is None:
             # The approval that resumes it carries no lineage of its own.
             final_spec = with_lineage(ForwardSpec(target_inbox=inbox_id), consumed, active_session)
+        if isinstance(outcome, Suspend) and final_spec is not None:
+            final_spec = replace(final_spec, from_person=forwards.from_person())
         awaiting = final_spec is not None and bool(final_spec.pending_returns)
         trace_id = _run_trace_id(consumed, active_session)
         report_metadata = self._report_metadata(
@@ -1567,6 +1595,14 @@ class AgentWorker:
             returned = True
             # Queued or held, this session no longer owes it.
             final_spec = replace(final_spec, return_to=None, delegation_id=None)
+        for event, reason in dropped:
+            title = f" ({event.payload['title']})" if event.payload.get("title") else ""
+            self._outbox.enqueue(
+                inbox_id=inbox_id,
+                content=f"[hibernaut] Did not forward work to {event.inbox_id}{title}: {reason}.",
+                metadata={**self._with_status(report_metadata, "refused"), "session_id": active_session.session_id,
+                          "kind": "forward_refused", "outcome_kind": "error"},
+            )
         # Before the result is written, so a crash in between repeats the Run and its deduplicated forwards.
         for event in forwards.staged:
             self._queue_event(event)

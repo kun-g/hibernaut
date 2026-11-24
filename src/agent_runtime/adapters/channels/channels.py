@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import socket
 import sys
@@ -11,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from agent_runtime.adapters.channels.mcp_server import MCPServerAdapter
-from agent_runtime.engine.handler import EventHandler, ReservedSource
+from agent_runtime.engine.handler import EventHandler, RemoteRefused, ReservedSource
 
 
 class WebhookHTTPServer(ThreadingHTTPServer):
@@ -206,6 +207,12 @@ def webhook_request_handler(
             self.end_headers()
             self.wfile.write(encoded)
 
+        def _remote(self) -> bool:
+            # A request a proxy passed on comes from this host only in name.
+            if self.headers.get("Forwarded") or self.headers.get("X-Forwarded-For"):
+                return True
+            return not ipaddress.ip_address(str(self.client_address[0]).partition("%")[0]).is_loopback
+
         def do_POST(self) -> None:  # noqa: N802
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
@@ -221,7 +228,11 @@ def webhook_request_handler(
                         payload=dict(body.get("payload", {})),
                         session_id=body.get("session_id"),
                         correlation_key=body.get("correlation_key"),
+                        remote=self._remote(),
                     )
+                except RemoteRefused as exc:
+                    self._write_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+                    return
                 except ReservedSource as exc:
                     self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
@@ -236,7 +247,7 @@ def webhook_request_handler(
                 return
 
             if self.path == "/mcp" and mcp_adapter is not None and mcp_adapter.http_enabled:
-                resp = mcp_adapter.handle_http(raw, dict(self.headers.items()))
+                resp = mcp_adapter.handle_http(raw, dict(self.headers.items()), remote=self._remote())
                 self._write_json(resp.status_code, resp.body)
                 return
 

@@ -142,7 +142,7 @@ chmod 600 .env
 - **收事件**：在 GitHub App 的设置里打开 Webhook，URL 填 `https://<域名>/webhooks/github`，Secret 用 `SWITCHBOARD_GITHUB_WEBHOOK_SECRET`，订阅 Issues、Issue comment、Pull request、Pull request review、Pull request review comment。App 装到哪些账号，哪些仓库的事件就会发来，所以 `[routing] unmatched_policy` 要设为 `"reject"`；`[routing.github_owners]` 让某个账号下的新仓库自动路由到 `proj:<仓库名>`，不用再逐个改 `github_repos`。
 - **回写哪里**：运行结果默认不回帖到发起任务的 GitHub Issue，只留在 Hibernaut 本机 Outbox；任务显式带 `reply_channel = "github"`、`reply_target = "<owner>/<repo>#<n>"` 时才评论到那个 Issue。`[outbound] reply_to_origin` 列出允许自动回到来源的渠道（默认只有飞书）。
 - **回写评论**：`.env` 填 `SWITCHBOARD_GITHUB_APP_ID` 和 `SWITCHBOARD_GITHUB_APP_PRIVATE_KEY`（PEM 整体 base64 成一行），`[outbound] github_app_owners` 列出允许签令牌的账号。Switchboard 每次按仓库签一个只含 Issues、Pull requests 写权限、只覆盖该仓库的安装令牌（缓存到过期前 10 分钟），评论作者是 App 的 bot；名单外的仓库直接拒绝，不调 GitHub。启动日志出现 `[switchboard] GitHub comments as App <id> for <owners>`。私钥能给 App 的所有安装签令牌，只放在 Switchboard 的环境变量里。
-- **接入新仓库**：本机在 Hibernaut 检出里执行 `python3 scripts/onboard_project.py <owner>/<repo>`，它克隆仓库到 Hibernaut 检出旁边、建 `hibernaut` 标签、在 `hibernaut.toml` 追加 `[projects.<repo>]`（默认开 PR 供人合并，`--auto-merge` 改为自动合并），守护进程热加载后生效。重复执行不改动已有内容，`--dry-run` 只打印将做的事。
+- **接入新仓库**：本机在 Hibernaut 检出里执行 `python3 scripts/onboard_project.py <owner>/<repo>`，它克隆仓库到 Hibernaut 检出旁边、在 Orca 登记、建 `hibernaut` 标签、在 `hibernaut.toml` 追加 `[projects.<repo>]`（主 Inbox 归 Steward，加进全局 Steward 的 `forward_to`，`--description` 写说明；原文件留备份；默认开 PR 供人合并，`--auto-merge` 改为自动合并），守护进程热加载后生效。重复执行不改动已有内容，`--dry-run` 只打印将做的事。也可以跟全局 Steward 说，由系统 Steward（`sys:ops`）做同样的事，见 [`docs/inbox-conventions.md`](../../docs/inbox-conventions.md)。
 
 ## 本机 Hibernaut 配对
 

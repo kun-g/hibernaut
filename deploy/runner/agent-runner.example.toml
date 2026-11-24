@@ -1,0 +1,31 @@
+# 远端只读 Agent 节点的 Runner（docs/runner.md §10，部署步骤见 REMOTE.md）。复制到节点的部署目录，改成 agent-runner.toml；
+# 相对路径以本文件所在目录为准。多出的表或键、放宽的取值都会让服务拒绝启动。
+
+[runner]
+runner_id = "remote-node"            # 记入 Hibernaut 执行账本的节点名；不要写机器名
+max_concurrent = 1                   # 固定：单槽位
+readonly_only = true                 # 固定：拒绝写工作区
+worktree_backend = "git"             # 固定
+interactive_surface = "none"         # 固定
+state_dir = "state"                  # 工作区登记与单实例锁；与别的 Runner 服务分开
+logs_dir = "logs"                    # 每个 Run 一份 <日期>/<run_id>.log
+
+[namespaces.hb]
+prefix = "hb"
+allowed_callers = ["hibernaut"]      # 固定
+
+# 恰好一个项目；键与 hibernaut.toml 的 [projects.<name>] 相同。checkout_path 用专门的克隆。
+[projects.hibernaut]
+checkout_path = "/Users/YOU/runner-agent/hibernaut"
+default_base_ref = "origin/main"     # 查询看到的就是这个克隆里的该引用；由人 fetch
+
+# 恰好一个执行器；名字与 [runner] executors 里的 agent 相同。只认 cli、command、model 三个键：参数固定为只读、
+# 只有 Read / Grep / Glob 三个工具。
+[executors.remote-claude]
+cli = "claude"                       # 目前只支持 claude
+command = "/opt/homebrew/bin/claude" # 绝对路径
+# model = "sonnet"                   # 不填 = CLI 的默认模型
+
+[relay]
+url = "ws://127.0.0.1:8790/ws/runner" # 固定为 127.0.0.1：加密隧道在本机的入口
+token_file = "/Users/YOU/.config/hibernaut/runner-agent.token"

@@ -160,6 +160,11 @@ class ForwardSpec:
     reply_target: str | None = None
     # Correlation key of the external conversation this work belongs to.
     origin_key: str | None = None
+    # Session key of the task another scope sent into this project: its work never shares a session or worktree with
+    # another task of the same external conversation. None for work that stays in its own project.
+    task_key: str | None = None
+    # The task_key of the work that waits for the result, whose session the result goes to.
+    return_key: str | None = None
     # The piece of work return_to waits for, named by the forward that first sent it out; None when nothing is owed.
     delegation_id: str | None = None
     # Work key of the agent in the same inbox that passed the work on: the session goes on in that worktree.
@@ -183,6 +188,8 @@ class ForwardSpec:
     owed_failures: tuple[str, ...] = ()
     # Set only on the session that keeps a refused return; the result stays there after the decision.
     held: HeldReturn | None = None
+    # The suspended Run was one a person had asked for, so what they approve of it still is.
+    from_person: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +229,10 @@ class InboxRoute:
     project: str
     binding: InboxBinding | None = None
     has_bindings: bool = False
+    # What work may be forwarded to from this inbox, which belongs to no project: main inboxes and system inboxes.
+    forward_to: tuple[str, ...] = ()
+    # A system inbox: it takes work from a person only (see AgentWorker and ForwardStage), and passes none on.
+    system: bool = False
 
 
 class AgentNotAllowed(ValueError):

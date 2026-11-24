@@ -19,8 +19,10 @@
 | **Open Run / 脱离（detach）** | 进行中、可在进程重启后接回的 Run：`open_runs` 表里的登记加 `<state_dir>/runs/<session_id>/<run_id>/` 目录（执行器的 `state.json`）。停机时正在等 Orca 终端的 Run 被脱离：旧进程不等它、不关终端，新进程用 `resume()` 接着等结果 | 单个 Run | 正常结束时登记与目录一起删除；同一会话至多 1 个登记 |
 | **Inbox 绑定（`InboxBinding`）** | 项目配置里一条「inbox 正则 → 默认 agent、agent 白名单、选路规则」，写在 `[[projects.<name>.inbox_bindings]]`；第一个整串匹配 `inbox_id` 的生效 | 项目内 | Inbox 与 Agent 是 M:N：同一 Inbox 绑多个 Agent 时共用一把租约串行接力，同一 Agent 服务多个 Inbox 时彼此并发、worktree 隔离 |
 | **非项目 Inbox 绑定（`WorkdirBinding`）** | 不属于任何项目的 Inbox（`sys:*` / `user:*`）的绑定，写在 `[[runtime.inbox_bindings]]`：同 Inbox 绑定，另须显式写启动目录 `workdir`，可写 `checkout_access` | 部署级 | 可写的 `workdir` 只属于一个 Inbox；没有绑定也不匹配项目的 Inbox，事件保持 `pending`。使用规范见 [`inbox-conventions.md`](inbox-conventions.md) |
-| **转投（forward）/ 回投（return）** | 一个 Agent 经 `RunCapabilities.forward_to_inbox` 把工作排进另一个 Inbox 的事件（`agent:forward`）/ 该工作带 `return_to` 时把结果排回指定 Inbox 的事件（`agent:return`） | 同一项目内 | `hop_count` 记这件工作被主动转投的次数，上限 3（`MAX_FORWARD_HOPS`），回投不计；两种事件都过 `PermissionPort`。被拒的回投不外发，在单独的挂起会话里等人决定（held return），审批请求不带正文；不能回去的由 `agent:return_cancelled` 结束上级的这一项等待。内部来源名只由 Hibernaut 入队，公开入口拒绝 |
+| **转投（forward）/ 回投（return）** | 一个 Agent 经 `RunCapabilities.forward_to_inbox` 把工作排进另一个 Inbox 的事件（`agent:forward`）/ 该工作带 `return_to` 时把结果排回指定 Inbox 的事件（`agent:return`） | 同一项目内；另有一个方向例外：非项目绑定 → 其 `forward_to` 列出的项目主 Inbox 或系统 Inbox，及其结果回投 | `hop_count` 记这件工作被主动转投的次数，上限 3（`MAX_FORWARD_HOPS`），回投不计；两种事件都过 `PermissionPort`。被拒的回投不外发，在单独的挂起会话里等人决定（held return），审批请求不带正文；不能回去的由 `agent:return_cancelled` 结束上级的这一项等待。内部来源名只由 Hibernaut 入队，公开入口拒绝 |
 | **委派标识（`delegation_id`）** | 一项带 `return_to` 的转投的稳定标识：首次转出它的 `agent:forward` 的 `external_id`，随回投与取消事件走 | 上级会话的 `pending_returns` | 每项只有一个责任方：欠结果的会话把整件交给别人后就不再欠；发出方会话被关闭，它就结束，还没开始的不再开始；每项只结清一次，晚到的第二份结果丢弃；两项不同的委派不进同一批，还欠着或等着的会话不接另一项 |
+| **任务键（`task_key`）** | 从非项目 Inbox 转投进一个项目的一件活的会话键：`forward:<来源 inbox>:<转投事件 external_id>:<原键>` | 目标项目内的这条链 | 同一个外部对话派出的每件活各有一个，所以各有会话、`work_key` 与 worktree；转投回执、`list_sessions` / `list_events` 的 `correlation_key`、回投的 `from_task` 都给出它；`continues` 填它即往那件活里补充。对外答复仍按 `origin_key` |
+| **补充（supplement）** | 带 `continues` 的跨范围转投：不另立委派，并进任务键所指的会话；那个会话还欠着结果就由一份结果一起答 | 同一外部对话、同一来源 Inbox | 不带 `return_to`、不指定 agent；那件活已结束则被拒，按新活另投 |
 | **Worker / Lease** | 消费事件并拉起 Run 的无状态调度协程 / 以 `inbox_id` 为主键的限时互斥租约锁（`worker_leases`） | 每 `inbox_id` 单活 | 保证同一 `inbox_id` 同一时刻最多 1 个活跃 Run；进程崩溃后租约到期自动释放接管 |
 
 ## 2. 五大原语与运行终态
@@ -57,7 +59,11 @@
   - **Agent（业务主体）**：绑定 Role 与 Skills、权限边界、记忆视角和底层 Executor，在 `[agents.<id>]` 声明，标识为 `agent_id`。同一 Executor 可供多个 Agent 使用。
   - **`agent_id` vs. `executor_id`**：代码与存储沿用的 `executor_id`（`ExecutorPort.executor_id`、`sessions.executor_id`、事件 payload 的旧键）取值就是 `agent_id`；`[executors.<id>]` 写了 `role` 或 `command` 时同时是同名 Agent（旧写法）。
 - **Steward（项目管家）**：`role = "steward"` 的 Agent，项目主 Inbox 的前台：读事件后自己答复、转投给别的 Agent，或汇总回投的结果。在项目主检出（或配置的 `workdir`）里只读运行，每轮在 Orca 终端里一次性执行，不建 worktree，不能编辑文件或执行命令，没有内置工具，读文件也经逐次过门禁的 MCP 工具；可读写所在 Inbox 的 Memory、只读查询本项目的会话与事件。能路由到哪些 Inbox 和 Agent 由 Runtime 每次唤醒时现拼的路由清单（routing manifest）给出。
+- **全局 Steward**：绑在非项目 Inbox（`[[runtime.inbox_bindings]]`，`checkout_access = "readonly"`）上的 `steward` Agent，不属于任何项目。在绑定的 `workdir` 里只读运行；可转投到绑定 `forward_to`（转投白名单）列出的项目主 Inbox，只读查询自己的 Inbox 与这些项目的会话和事件，看不到项目的文件。
+- **系统 Steward**：绑在系统 Inbox 上的 `steward` Agent（`sys:ops`），由全局 Steward 转交，用三个系统工具（`check_projects`、`onboard_project`、`complete_project`）接入项目、检查和补齐项目的 Steward 绑定、说明与转投白名单。同样只读、没有命令行，不能再转投；需求见 [`requirements/system-steward.md`](requirements/system-steward.md)。
+- **系统 Inbox**：写了 `system_tools = true` 的 `[[runtime.inbox_bindings]]`：单个精确 `sys:<name>`、`checkout_access = "readonly"`、Agent 全是 `steward`。只收全局 Steward 替人转来的、本机运营者投的，以及它自己审批的答复。
 - **Runner Relay**：Hibernaut 进程内的 Runner 反向 WebSocket 端点（`RunnerRelayHub`），Runner 主动连入，凭共享令牌鉴权后接单。`[runner]` 的 `relay` 模式与试点路由各开各的。与 Switchboard 的 relay 无关。
 - **Runner 试点路由**：`[runner_pilot]` 配置的一条默认关闭的路由：只把一个任务级 Inbox 交给一台单槽位的独立 Runner，执行器固定为 `runner-protocol-check`（无工具的协议文件校验）。关闭时该 Inbox 按原路由执行。
+- **远端 Agent 节点**：经 `[runner]` 的 `relay` 模式连入的单槽位、单项目、只读 Runner（`python -m runner.agent_service`），只带一个 CLI 执行器，只执行显式指名该 agent 的事件。与只带协议校验程序的试点节点是两种服务，配置互不通用。
 - **候选提交（`candidate_commit`）**：试点任务载荷里要核验的 40 位完整提交号。与 SDE 交付中的候选分支无关。
 - **汇总摘要（manifest digest）**：试点核验的五份 Runner 协议文件按路径排序的 `<sha256>  <路径>` 清单（`shasum -a 256` 格式）的 SHA-256，用 git 与 `shasum` 即可独立复算。

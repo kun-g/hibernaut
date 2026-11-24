@@ -19,6 +19,14 @@ class ReservedSource(ValueError):
     pass
 
 
+# Set on what another host put in, whatever it sent itself.
+REMOTE_KEY = "_remote"
+
+
+class RemoteRefused(ValueError):
+    pass
+
+
 class EventHandler:
     def __init__(
         self,
@@ -27,6 +35,11 @@ class EventHandler:
     ) -> None:
         self._inbox = inbox
         self._on_wake = on_wake
+        self._local_only: Callable[[str], bool] = lambda _inbox_id: False
+
+    def keep_local(self, local_only: Callable[[str], bool]) -> None:
+        # The inboxes that take events put in on this host only.
+        self._local_only = local_only
 
     def ingest(
         self,
@@ -37,15 +50,18 @@ class EventHandler:
         payload: dict[str, Any],
         session_id: str | None = None,
         correlation_key: str | None = None,
+        remote: bool = False,
     ) -> IngestResult:
         # The public entrance: its callers name the source themselves.
+        if remote and self._local_only(inbox_id):
+            raise RemoteRefused(f"inbox {inbox_id!r} takes events from this host only")
         if source.strip() in INTERNAL_SOURCES:
             raise ReservedSource(f"source {source!r} is reserved for events Hibernaut queues itself")
         return self.queue(Event(
             inbox_id=inbox_id,
             source=source,
             external_id=external_id,
-            payload=dict(payload),
+            payload={**payload, REMOTE_KEY: True} if remote else dict(payload),
             session_id=session_id,
             correlation_key=correlation_key,
         ))

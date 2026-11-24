@@ -19,7 +19,7 @@ prompt = "" if interactive else sys.stdin.read()
 schema = argv[argv.index("--json-schema") + 1] if "--json-schema" in argv else ""
 allowed = argv[argv.index("--allowedTools") + 1] if "--allowedTools" in argv else ""
 role = "reviewer" if '"verdict"' in schema or "Bash(git diff:*)" in allowed else "sde"
-if "mcp__hibernaut_steward__forward_to_inbox" in allowed:
+if "mcp__hibernaut_steward__" in allowed:
     role = "steward"
 if probe:
     role = "probe"
@@ -244,6 +244,8 @@ elif role == "steward":
         sys.exit(step["exit"])
     if step.get("calls") and step.get("pidfile_after"):
         park(step["pidfile_after"])
+    while step.get("wait_for") and not Path(step["wait_for"]).exists():
+        time.sleep(0.02)
     output = step.get("output", {"action": "silent", "message": ""})
 else:
     step = step or {}

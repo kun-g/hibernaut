@@ -43,14 +43,33 @@ class TestConventionsDocument(unittest.TestCase):
         for name in (*NAMES, "[[runtime.inbox_bindings]]", "workdir", f"MAX_FORWARD_HOPS = {MAX_FORWARD_HOPS}"):
             self.assertIn(name, text)
 
+    def test_the_documents_give_the_system_steward_the_name_of_the_example(self):
+        agent = load_config(ROOT / "hibernaut.example.toml").runtime.workdir_binding("sys:ops").binding.default_agent
+        text = (ROOT / DOC).read_text(encoding="utf-8")
+        snippet = text.split('pattern = "sys:ops"', 1)[1].split("```", 1)[0]
+        self.assertIn(f'default_agent = "{agent}"\nagents = ["{agent}"]\n', snippet)
+        requirements = (ROOT / "docs/requirements/system-steward.md").read_text(encoding="utf-8")
+        self.assertIn(f"系统 Steward 的入口是 `sys:ops`，agent 名 `{agent}`。", requirements)
+
 
 class TestExampleConfig(unittest.TestCase):
     def test_the_example_loads_with_a_workdir_binding_and_an_agent_limit(self):
         config = load_config(ROOT / "hibernaut.example.toml")
-        bound = config.runtime.workdir_binding("sys:hb-ops")
+        bound = config.runtime.workdir_binding("sys:patrol")
         assert bound is not None
-        self.assertEqual((bound.binding.default_agent, bound.readonly), ("ops", False))
+        self.assertEqual((bound.binding.default_agent, bound.readonly, bound.system_tools), ("patrol", False, False))
         self.assertIsNotNone(config.agents["sde"].max_concurrency)
+
+    def test_the_example_binds_the_system_steward_and_sends_the_chat_s_steward_to_it(self):
+        config = load_config(ROOT / "hibernaut.example.toml")
+        system, chat = (config.runtime.workdir_binding(i) for i in ("sys:ops", "user:main"))
+        assert system is not None and chat is not None
+        self.assertEqual((system.binding.default_agent, system.readonly, system.system_tools),
+                         ("hibernaut-ops", True, True))
+        self.assertEqual(system.binding.agents, ("hibernaut-ops",))
+        self.assertNotIn("ops", config.agents)
+        self.assertIn("sys:ops", chat.forward_to)
+        self.assertEqual(config.onboarding.label_owners, ())
 
 
 if __name__ == "__main__":
