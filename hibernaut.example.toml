@@ -199,6 +199,25 @@ agents = ["patrol"]
 workdir = "/absolute/path/to/your/patrol-workdir"
 checkout_access = "readwrite"   # readwrite（默认）| readonly：可共享目录、可用正则；CLI 的只读由它自己的参数保证
 
+# 每 15 分钟在脚本目录运行一次磁盘检查。先准备目录和 disk-check.sh（例如内容为 df -Pk .），再启用。
+[executors.disk-check]
+command = "/bin/sh"
+args = ["./disk-check.sh"]
+
+[[runtime.inbox_bindings]]
+pattern = "sys:disk-check"
+workdir = "/absolute/path/to/your/check-scripts"
+checkout_access = "readonly"
+default_agent = "disk-check"
+agents = ["disk-check"]
+
+[[timers]]
+name = "disk-check"
+inbox_id = "sys:disk-check"
+interval_seconds = 900
+enabled = false                 # 默认 true
+payload = { volume = "local" }  # 可选，传给脚本的事件数据在 payload.data
+
 # 系统 Steward：接入项目、检查和补齐项目配置（工具 check_projects、onboard_project、complete_project）。改动写进本文件并热加载，
 # 原文件留备份；不改执行器、启动器、权限、交付检查和凭据，也不改自己和别的 sys:* 绑定。需求见 docs/requirements/system-steward.md。
 [[runtime.inbox_bindings]]

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from agent_runtime.core.models import Event, utc_now_iso
+from agent_runtime.core.models import CONFIG_TIMER_PREFIX, Event, utc_now_iso
 from agent_runtime.core.ports import InboxPort, TimerPort
 
 
@@ -29,12 +29,18 @@ class TimerScheduler:
             next_due_at: str | None = None
             if timer.kind == "schedule" and timer.recurrence_seconds is not None:
                 base_dt = datetime.fromisoformat(timer.due_at)
-                next_due_at = (base_dt + timedelta(seconds=timer.recurrence_seconds)).isoformat()
+                interval = timedelta(seconds=timer.recurrence_seconds)
+                now = datetime.fromisoformat(current_iso)
+                elapsed = (now if now.tzinfo else now.replace(tzinfo=timezone.utc)) - (
+                    base_dt if base_dt.tzinfo else base_dt.replace(tzinfo=timezone.utc)
+                )
+                periods = max(1, elapsed // interval + 1) if interval > timedelta(0) else 1
+                next_due_at = (base_dt + periods * interval).isoformat()
 
-            self._timers.mark_triggered(timer.timer_id, next_due_at=next_due_at)
+            configured = timer.timer_id.startswith(CONFIG_TIMER_PREFIX)
 
             # A named timer is a source of its own, so an inbox rule can send it to one agent.
-            name = timer.payload.get("timer_name")
+            name = timer.timer_id.removeprefix(CONFIG_TIMER_PREFIX) if configured else timer.payload.get("timer_name")
             event = Event(
                 inbox_id=timer.inbox_id,
                 source=f"timer:{name.strip() if isinstance(name, str) and name.strip() else timer.kind}",
@@ -43,12 +49,21 @@ class TimerScheduler:
                     "timer_id": timer.timer_id,
                     "timer_kind": timer.kind,
                     "due_at": timer.due_at,
-                    **timer.payload,
+                    **({"data": timer.payload} if configured else timer.payload),
                 },
                 session_id=timer.session_id,
+                correlation_key=timer.timer_id if configured else None,
             )
-            _, is_dup = self._inbox.append(event)
-            if not is_dup and self._on_wake is not None:
+            if configured:
+                assert next_due_at is not None
+                enqueued = self._timers.fire_configured(timer, event, next_due_at)
+                if not enqueued:
+                    continue
+            else:
+                self._timers.mark_triggered(timer.timer_id, next_due_at=next_due_at)
+                _, duplicate = self._inbox.append(event)
+                enqueued = not duplicate
+            if enqueued and self._on_wake is not None:
                 self._on_wake(timer.inbox_id)
             triggered_count += 1
 
