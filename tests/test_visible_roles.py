@@ -34,11 +34,17 @@ from tests.test_coder_reviewer import CHANGES_REQUESTED, _Capture, fake_command,
 from tests.test_sde_executor import BUGGY, EVIDENCE, FIXED, PASS, PROXY, dev, event, make_base_repo
 
 
+def poll_test_terminals(root):
+    # Use the real CLI and handoff files, including when a config reload builds a new daemon.
+    return patch.multiple(
+        "agent_runtime.app.main",
+        OrcaVisibleRunner=partial(OrcaVisibleRunner, poll_interval=0.01, handoff_root=root / "handoff"),
+        OrcaCommandTerminal=partial(OrcaCommandTerminal, poll_interval=0.01, root=root / "cli-runs"),
+    )
+
+
 def build_terminal_daemon(config, root, **kwargs):
-    # The CLI and its handoff files are real; a ready file can be observed on the test's polling interval.
-    with patch.multiple("agent_runtime.app.main",
-                        OrcaVisibleRunner=partial(OrcaVisibleRunner, poll_interval=0.01, handoff_root=root / "handoff"),
-                        OrcaCommandTerminal=partial(OrcaCommandTerminal, poll_interval=0.01, root=root / "cli-runs")):
+    with poll_test_terminals(root):
         return build_daemon_from_config(config, **kwargs)
 
 

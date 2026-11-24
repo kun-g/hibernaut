@@ -28,7 +28,7 @@ from tests.test_coder_reviewer import fake_command, git
 from tests.test_sde_executor import make_base_repo
 from tests.test_steward import arg, git_state
 from tests.test_switchboard_inbound import feishu_message
-from tests.test_visible_roles import FakeOrcaTerminals
+from tests.test_visible_roles import FakeOrcaTerminals, poll_test_terminals
 
 ASH = "user:main"
 CHAT = "feishu:p2p:oc_kun"
@@ -248,6 +248,7 @@ class AshCase(unittest.IsolatedAsyncioTestCase):
         self.plan = self.root / "plan.json"
         self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan)}))
         self.orca = FakeOrcaTerminals(self.root)
+        self.enterContext(poll_test_terminals(self.root))
         self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))

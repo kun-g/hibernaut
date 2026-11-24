@@ -35,7 +35,7 @@ from tests.test_global_steward import forward, reply
 from tests.test_sde_executor import make_base_repo
 from tests.test_steward import arg
 from tests.test_switchboard_inbound import feishu_message
-from tests.test_visible_roles import FakeOrcaTerminals
+from tests.test_visible_roles import FakeOrcaTerminals, poll_test_terminals
 
 ASH, OPS, CHAT = "user:main", "sys:ops", "feishu:p2p:oc_person"
 # Placeholder, not a real credential.
@@ -199,6 +199,7 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
         }))
         self.orca = FakeOrcaTerminals(self.root)
+        self.enterContext(poll_test_terminals(self.root))
         # Drain serving runs before removing the terminals they still await.
         self.addAsyncCleanup(self.orca.close_all)
         self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
