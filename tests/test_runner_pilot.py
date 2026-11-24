@@ -734,9 +734,9 @@ class Deployment:
         draft.write_text(text)
         draft.replace(self.config)
 
-    def reload(self, *, enabled: bool, expect: str = "[config] Reloaded") -> None:
+    def reload(self, *, enabled: bool, extra: str = "", expect: str = "[config] Reloaded") -> None:
         seen = self.hb_log.read_text().count(expect)
-        self.write(enabled=enabled)
+        self.write(enabled=enabled, extra=extra)
         self.until(lambda: self.hb_log.read_text().count(expect) > seen)
 
     def start_hb(self, *, fast_retry: bool = False) -> None:
@@ -1136,9 +1136,9 @@ def test_the_route_cannot_be_changed_while_open_or_opened_on_a_taken_port(pilot:
         pilot.start_hb()
         pilot.reload(enabled=True, expect="Cannot activate settings")
         pilot.assert_original_path(PILOT)
-    pilot.write(enabled=True, extra="timeout_seconds = 60\n")
-    pilot.until(pilot.relay_open)
-    pilot.write(enabled=True, extra="timeout_seconds = 61\n")
-    pilot.until(lambda: "changes need enabled = false first" in pilot.hb_log.read_text())
+    # The relay can already be listening while its generation is still being activated.
+    pilot.reload(enabled=True, extra="timeout_seconds = 60\n")
+    assert pilot.relay_open()
+    pilot.reload(enabled=True, extra="timeout_seconds = 61\n", expect="changes need enabled = false first")
     assert pilot.relay_open()
     pilot.assert_original_path(OTHER)
