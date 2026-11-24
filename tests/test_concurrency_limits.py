@@ -282,6 +282,11 @@ class PoolCase(unittest.IsolatedAsyncioTestCase):
     async def settle(self):
         await asyncio.sleep(0.1)
 
+    async def waiting_for_quota(self, daemon, *inboxes):
+        # Keys are retained after the pool considered an inbox and could not admit it.
+        expected = set(inboxes)
+        await self.until(lambda: expected <= daemon.pool._queued_keys.keys())
+
     async def idle(self, daemon):
         await daemon.pool.wait_until_idle(timeout_seconds=5)
 
@@ -296,7 +301,7 @@ class TestProjectLimit(PoolCase):
             for n, text in enumerate(texts):
                 self.post(daemon, f"proj:a:issue-{n}", text)
             await self.until(lambda: len(self.probe.active) == 2)
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:issue-2", "proj:a:issue-3")
             self.assertEqual(self.probe.active_texts(), texts[:2])
             self.assertFalse(daemon.pool._idle_event.is_set())
             # Another project is not affected.
@@ -319,7 +324,8 @@ class TestProjectLimit(PoolCase):
             for n, text in enumerate(texts):
                 self.post(daemon, f"proj:a:issue-{n}", text, executor="sde")
             await self.until(lambda: len(self.probe.active) == 3)
-            await self.settle()
+            self.assertTrue(daemon.pool.limiter.saturated())
+            self.assertEqual(list(daemon.pool._queue), ["proj:a:issue-3"])
             self.assertEqual(self.probe.active_texts(), texts[:3])
             self.probe.release(*texts)
             await self.idle(daemon)
@@ -344,9 +350,10 @@ class TestExecutorLimit(PoolCase):
             # The project default and the deployment default count as well as an explicit executor_id.
             self.post(daemon, "proj:b", "block-2")
             self.post(daemon, "proj:a:issue-3", "block-3", executor="sde")
+            inboxes = ["proj:a:issue-1", "proj:b", "proj:a:issue-3"]
             for n in (1, 2, 3):
                 await self.until(lambda: self.probe.active_texts() == [f"block-{n}"])
-                await self.settle()
+                await self.waiting_for_quota(daemon, *inboxes[n:])
                 self.assertEqual(self.probe.active_texts(), [f"block-{n}"])
                 self.probe.release(f"block-{n}")
             await self.idle(daemon)
@@ -368,7 +375,7 @@ class TestExecutorLimit(PoolCase):
             self.post(daemon, "proj:a:issue-2", "block-other", executor="sde", key="task:2")
             await self.until(lambda: self.probe.active_texts() == ["block-other"])
             self.post(daemon, "proj:a:issue-1", "follow-up", key="task:1")
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:issue-1")
             self.assertNotIn("follow-up", self.probe.started)
             self.probe.release("block-other")
             await self.idle(daemon)
@@ -398,7 +405,7 @@ class TestExecutorLimit(PoolCase):
             await self.until(lambda: self.probe.active_texts() == ["block-both"])
             self.post(daemon, "proj:a:issue-2", "block-project")
             self.post(daemon, "proj:b", "block-sde", executor="sde")
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:issue-2", "proj:b")
             self.assertEqual(self.probe.active_texts(), ["block-both"])
             # The slot it gives back is one of project a's and one of sde's: both waiting inboxes run at once.
             self.probe.release("block-both")
@@ -430,7 +437,7 @@ class TestOneInboxWithSeveralExecutors(PoolCase):
             self.post(daemon, "proj:a", "chat-2", key="chat")
             self.probe.release("block-chat")
             await self.until(lambda: "block-chat" in self.probe.finished)
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a")
             # Inbox order is kept: nothing queued behind the waiting event overtakes it.
             self.assertEqual(self.probe.active_texts(), ["block-sde"])
             self.assertNotIn("chat-2", self.probe.started)
@@ -448,7 +455,7 @@ class TestOneInboxWithSeveralExecutors(PoolCase):
             await self.until(lambda: self.probe.active_texts() == ["block-hold"])
             for n, executor in enumerate(("claude", "sde", "claude", "sde")):
                 self.post(daemon, "proj:a", f"t{n}", executor=executor)
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a")
             self.assertEqual(self.probe.started, ["block-hold", "t0"])
             self.probe.release("block-hold")
             await self.idle(daemon)
@@ -500,7 +507,7 @@ class TestOneInboxWithSeveralExecutors(PoolCase):
             self.post(daemon, "proj:a", "follow-up", key="task")
             await self.until(lambda: self.probe.active_texts() == ["block-task"])
             self.post(daemon, "proj:a:other", "other-sde", executor="sde")
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:other")
             self.probe.release("block-task")
             await self.idle(daemon)
         self.assertEqual(self.probe.started, ["first", "block-task", "follow-up", "other-sde"])
@@ -539,7 +546,7 @@ class TestReplay(PoolCase):
             self.replay(daemon, first.event_id, executor_id="sde", force=True)
             self.probe.release("block-chat")
             await self.until(lambda: "block-chat" in self.probe.finished)
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a")
             self.assertEqual(self.probe.active_texts(), ["block-sde"])
             self.assertEqual(self.probe.started.count("first"), 1)
             self.probe.release("block-sde")
@@ -558,7 +565,7 @@ class TestReplay(PoolCase):
                 await self.until(lambda: daemon.pool.limiter.active == 1)
             self.probe.broken.clear()
             self.replay(daemon, bad.event_id, executor_id="sde")
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:issue-2")
             self.assertEqual(self.probe.active_texts(), ["block-sde"])
             self.assertFalse(daemon.pool._idle_event.is_set())
             self.probe.release("block-sde")
@@ -576,7 +583,7 @@ class TestReplay(PoolCase):
         self.post(daemon, "proj:a:s", "block-sde", executor="sde")
         await self.until(lambda: self.probe.active_texts() == ["block-claude", "block-sde"])
         self.post(daemon, "proj:a:x", "second", executor="claude")
-        await self.settle()
+        await self.waiting_for_quota(daemon, "proj:a:x")
         self.assertEqual(daemon.pool._queued_keys["proj:a:x"].executor, "claude")
         return first
 
@@ -608,7 +615,7 @@ class TestReplay(PoolCase):
         async with self.daemon(**self.LIMITS) as daemon:
             first = await self.queued_for_claude(daemon)
             self.post(daemon, "proj:a:y", "later-sde", executor="sde")
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:y")
             # An HTTP thread stores the replay before its wake runs on the loop; a scan can come in between.
             daemon.inbox.replay(first.event_id, executor_id_override="sde", force=True)
             admitted = []
@@ -702,7 +709,7 @@ class TestFailuresReturnQuota(PoolCase):
             self.assertEqual(daemon.pool._limiter.active, 1)
             # One that names its own workdir runs, so it does count.
             self.post(daemon, "proj:orphan-2", "explicit", explicit_workdir=str(self.root))
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:orphan-2")
             self.assertNotIn("explicit", self.probe.started)
             self.probe.release("block-a")
             await self.idle(daemon)
@@ -1107,7 +1114,7 @@ class TestBuildDaemon(PoolCase):
         self.post(daemon, "y", "y", executor="sde")
         self.post(daemon, "z", "z")
         await self.until(lambda: "z" in self.probe.finished)
-        await self.settle()
+        await self.waiting_for_quota(daemon, "proj:a:2", "y")
         self.assertEqual(self.probe.active_texts(), ["block-a1", "block-x"])
         self.probe.release("block-a1", "block-x")
         await self.idle(daemon)
@@ -1138,7 +1145,7 @@ class TestLimitKeys(PoolCase):
             daemon.open_runs.open(session_id="s", inbox_id="proj:a:2", executor_id="sde", event_ids=[],
                                   code_version="")
             self.post(daemon, "proj:a:2", "light")
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:2")
             self.assertEqual(self.probe.active_texts(), ["block-sde"])
             daemon.open_runs.discard("s")
             daemon.pool.wake("proj:a:2")
@@ -1218,7 +1225,7 @@ class TestAgents(PoolCase):
             await self.until(lambda: self.probe.active_texts() == ["block-1"])
             self.post(daemon, "proj:a:2", "relay", executor="claude", key="task:2")
             await self.until(lambda: "relay" in self.probe.started)
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:2")
             self.assertEqual(self.probe.active, [("writer", "block-1")])
             self.probe.release("block-1")
             await self.until(lambda: self.probe.active == [("writer", "block-relayed")])
@@ -1281,7 +1288,7 @@ class TestAgents(PoolCase):
             await self.until(lambda: self.probe.active == [("sde", "block-1")])
             self.post(daemon, "proj:a", "block-front-desk")
             await self.until(lambda: ("steward", "block-front-desk") in self.probe.active)
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:2")
             self.assertEqual(self.probe.active, [("sde", "block-1"), ("steward", "block-front-desk")])
             self.probe.release("block-1")
             await self.until(lambda: ("sde", "block-2") in self.probe.active)
@@ -1309,7 +1316,7 @@ class TestAgents(PoolCase):
             await self.until(lambda: len(self.probe.active) == 2)
             # The driver is full although the second front desk inbox's agent has no limit of its own.
             self.post(daemon, "proj:a:2", "other", executor="steward")
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:2")
             self.assertNotIn("other", self.probe.started)
             self.probe.release("block-1")
             await self.until(lambda: "other" in self.probe.finished)

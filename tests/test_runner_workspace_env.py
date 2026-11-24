@@ -6,6 +6,7 @@ import dataclasses
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -76,6 +77,9 @@ class _Workspace:
             return []
         return [ast.literal_eval(line) for line in self.calls_log.read_text(encoding="utf-8").splitlines()]
 
+    def call_count(self) -> int:
+        return len(self.calls_log.read_bytes().splitlines()) if self.calls_log.exists() else 0
+
     def daemon(self, backend: str = "git") -> RunnerDaemon:
         cfg = dataclasses.replace(_config(self.tmp, self.repo), worktree_backend=backend)  # type: ignore[arg-type]
         return RunnerDaemon(cfg, drivers=_drivers())
@@ -92,8 +96,7 @@ def _write_shim(path: Path, text: str) -> None:
     path.chmod(0o755)
 
 
-@pytest.fixture
-def ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Workspace:
+def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, record_env: bool) -> _Workspace:
     repo = tmp_path / "repo"
     _init_repo(repo)
     _git("config", "maintenance.auto", "false", cwd=repo)
@@ -106,16 +109,32 @@ def ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Workspace:
     real_git = shutil.which("git")
     assert real_git is not None
     values = {"python": sys.executable, "log": str(log), "git": real_git, "root": str(orca_root)}
-    _write_shim(bin_dir / "git", _GIT_SHIM.format(**values))
+    if record_env:
+        git_script = _GIT_SHIM.format(**values)
+        hook = _SHIM.format(**values)
+    else:
+        # Refusal tests count actual launches across process boundaries, including Git hooks.
+        hook = f"#!/bin/sh\nprintf 'call\\n' >> {shlex.quote(str(log))}\n"
+        git_script = hook + f'exec {shlex.quote(real_git)} "$@"\n'
+    _write_shim(bin_dir / "git", git_script)
     _write_shim(bin_dir / "orca", _ORCA_SHIM.format(**values))
-    # Hooks run inside "git worktree add" and inherit its environment.
-    _write_shim(repo / ".git" / "hooks" / "post-checkout", _SHIM.format(**values))
+    _write_shim(repo / ".git" / "hooks" / "post-checkout", hook)
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     for name, value in SYNTHETIC.items():
         monkeypatch.setenv(name, value)
     return _Workspace(tmp=tmp_path, repo=repo, calls_log=log)
+
+
+@pytest.fixture
+def ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Workspace:
+    return workspace(tmp_path, monkeypatch, record_env=False)
+
+
+@pytest.fixture
+def traced_ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Workspace:
+    return workspace(tmp_path, monkeypatch, record_env=True)
 
 
 def _reclaim(merged: str | None = None) -> ReclaimRequest:
@@ -126,8 +145,9 @@ def _reclaim(merged: str | None = None) -> ReclaimRequest:
 
 @pytest.mark.parametrize("backend", ["git", "orca"])
 def test_every_workspace_command_gets_the_restricted_environment(
-    ws: _Workspace, caplog: pytest.LogCaptureFixture, backend: str
+    traced_ws: _Workspace, caplog: pytest.LogCaptureFixture, backend: str
 ) -> None:
+    ws = traced_ws
     caplog.set_level(logging.DEBUG)
     daemon = ws.daemon(backend)
 
@@ -205,7 +225,7 @@ def test_run_is_refused_before_any_workspace_command_on_a_proxy_with_credentials
         res = asyncio.run(daemon.run(_req("run_x", executor_id="cwd", readonly=readonly), caller_id="hibernaut"))
         assert (res.status, res.error_kind) == ("refused", "permission_denied")
         assert "HTTPS_PROXY" in (res.error_summary or "")
-        assert ws.calls() == []
+        assert ws.call_count() == 0
         for text in (json.dumps(res.to_dict()), caplog.text, ws.all_files_text()):
             assert MARK not in text
         # A refusal ran nothing: the same request runs once the configuration is fixed.
@@ -224,12 +244,12 @@ def test_reclaim_is_blocked_on_a_proxy_with_credentials_and_works_once_fixed(
     try:
         created = asyncio.run(daemon.run(_req("run_w", executor_id="cwd"), caller_id="hibernaut"))
         workdir = Path(json.loads(created.stdout_excerpt)["cwd"])
-        before = len(ws.calls())
+        before = ws.call_count()
         monkeypatch.setenv("ALL_PROXY", f"user:{MARK}@proxy.invalid:8080")
         blocked = asyncio.run(daemon.reclaim_workspace(_reclaim(), caller_id="hibernaut"))
         assert (blocked.reclaimed, blocked.status, blocked.blockers) == (False, "blocked", ("child_env_refused",))
         assert "ALL_PROXY" in blocked.reason and MARK not in blocked.reason + caplog.text
-        assert len(ws.calls()) == before and workdir.exists()
+        assert ws.call_count() == before and workdir.exists()
         rec = daemon.worktrees.get_record(
             namespace="hb", project_key="hibernaut", owner_scope="proj:hb", work_key="gh#1"
         )

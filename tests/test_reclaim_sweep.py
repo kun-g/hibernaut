@@ -397,16 +397,20 @@ class TestSweepAsksOrcaAboutMissingDirectories(SweepCase, unittest.TestCase):
 
 
 class TestSweepLoop(SweepCase, unittest.IsolatedAsyncioTestCase):
+    async def until(self, check):
+        async with asyncio.timeout(10):
+            while not check():
+                await asyncio.sleep(0.01)
+
     async def test_the_startup_sweep_reclaims_a_leftover_worktree(self):
         self.delivered()
         stop = asyncio.Event()
         loop = asyncio.create_task(self.sweeper().run_forever(interval_seconds=3600, stop_event=stop))
-        for _ in range(200):
-            if not self.wt.exists():
-                break
-            await asyncio.sleep(0.05)
-        stop.set()
-        await asyncio.wait_for(loop, timeout=10)
+        try:
+            await self.until(lambda: not self.wt.exists())
+        finally:
+            stop.set()
+            await asyncio.wait_for(loop, timeout=10)
         self.assertFalse(self.wt.exists())
         self.assertIsNone(self.workspaces.get("task:9"))
 
@@ -414,16 +418,15 @@ class TestSweepLoop(SweepCase, unittest.IsolatedAsyncioTestCase):
         self.delivered()
         event_id = self.queued_event()
         stop = asyncio.Event()
-        loop = asyncio.create_task(self.sweeper().run_forever(interval_seconds=0.05, stop_event=stop))
-        await asyncio.sleep(0.2)
-        self.assertTrue(self.wt.is_dir())
-        self.drop(event_id)
-        for _ in range(200):
-            if not self.wt.exists():
-                break
-            await asyncio.sleep(0.05)
-        stop.set()
-        await asyncio.wait_for(loop, timeout=10)
+        running = asyncio.create_task(self.sweeper().run_forever(interval_seconds=0.01, stop_event=stop))
+        try:
+            await self.until(lambda: any(event_id in entry for entry in self.logged))
+            self.assertTrue(self.wt.is_dir())
+            self.drop(event_id)
+            await self.until(lambda: not self.wt.exists())
+        finally:
+            stop.set()
+            await asyncio.wait_for(running, timeout=10)
         self.assertFalse(self.wt.exists())
 
     async def test_no_round_starts_once_the_process_is_stopping(self):
