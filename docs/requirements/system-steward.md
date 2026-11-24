@@ -60,5 +60,5 @@
 
 ## 按默认定
 
-- 系统 Steward 的入口是 `sys:ops`，agent 名 `ops`。
+- 系统 Steward 的入口是 `sys:ops`，agent 名 `hibernaut-ops`。
 - 默认 Steward 由接入脚本写入，不靠 agent 判断。
