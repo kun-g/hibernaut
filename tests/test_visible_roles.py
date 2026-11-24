@@ -12,12 +12,13 @@ import tempfile
 import time
 import unittest
 import uuid
+from functools import partial
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from agent_runtime.adapters.executor_cli import OrcaWorktreeManager
 from agent_runtime.adapters.executor_cli.claude_code import PROXY_PLACEHOLDER_KEY, ClaudeCodeLauncher, ClaudeCodeProfile
-from agent_runtime.adapters.executor_cli.orca import HANDOFF_SCRIPT, HANDOFF_TOOLS, OrcaVisibleRunner
+from agent_runtime.adapters.executor_cli.orca import HANDOFF_SCRIPT, HANDOFF_TOOLS, OrcaCommandTerminal, OrcaVisibleRunner
 from agent_runtime.adapters.executor_cli.reviewer import REVIEW_SCHEMA, CoderReviewerExecutor, worktree_fingerprint
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteSessionStoreAdapter, SQLiteTaskMetadataStore
@@ -27,9 +28,18 @@ from agent_runtime.app.config import load_config
 from agent_runtime.app.main import build_daemon_from_config, serve_configured
 from agent_runtime.core.models import Emit, SessionRef, Suspend
 from tests.async_deadline import expire_when_ready
+from tests.empty_guidance import empty_project_guidance
 from tests.fakes import InMemoryPermission
 from tests.test_coder_reviewer import CHANGES_REQUESTED, _Capture, fake_command, git
 from tests.test_sde_executor import BUGGY, EVIDENCE, FIXED, PASS, PROXY, dev, event, make_base_repo
+
+
+def build_terminal_daemon(config, root, **kwargs):
+    # The CLI and its handoff files are real; a ready file can be observed on the test's polling interval.
+    with patch.multiple("agent_runtime.app.main",
+                        OrcaVisibleRunner=partial(OrcaVisibleRunner, poll_interval=0.01, handoff_root=root / "handoff"),
+                        OrcaCommandTerminal=partial(OrcaCommandTerminal, poll_interval=0.01, root=root / "cli-runs")):
+        return build_daemon_from_config(config, **kwargs)
 
 
 class FakeOrcaTerminals:
@@ -142,6 +152,7 @@ def arg(call: dict, flag: str) -> str:
 
 class VisibleCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.enterContext(empty_project_guidance())
         self.root = Path(os.path.realpath(self.enterContext(tempfile.TemporaryDirectory())))
         self.repo = make_base_repo(self.root)
         git(self.repo, "checkout", "-qb", "hb/task-1")
@@ -578,7 +589,7 @@ class TestVisibleRolesThroughEvents(unittest.TestCase):
 
         async def scenario():
             config = load_config(path)
-            daemon = build_daemon_from_config(config)
+            daemon = build_terminal_daemon(config, root)
             daemon.workspaces.reserve_creating(work_key="task-42", repo_checkout=str(repo), workdir=str(workdir),
                                                branch="hb/task-42")
             daemon.workspaces.mark_ready("task-42", workdir=str(workdir), branch="hb/task-42")

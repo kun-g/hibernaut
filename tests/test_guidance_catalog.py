@@ -58,7 +58,6 @@ BODIES = ("VERSIONING-BODY", "TESTING-BODY", "ISSUES-BODY")
 EVIDENCE = "red: test_zero FAILED\ngreen: 1 passed"
 PASS = {"verdict": "pass", "summary": "ok", "blocking": []}
 VERSION_BUMP = {"VERSION": "1.1.0\n", "src/pkg/__init__.py": "__version__ = '1.1.0'\n"}
-NEW_TEST = {"tests/test_calc.py": "def test_divide_rejects_zero():\n    pass\n"}
 CITES_VERSIONING = {
     "verdict": "changes_requested",
     "summary": "version bumped in one place only",
@@ -225,6 +224,8 @@ class _Harness(unittest.IsolatedAsyncioTestCase):
         self.caps.is_interrupted.return_value = False
         self.caps.memory.load_baseline.return_value = {}
         self.launcher = ClaudeCodeLauncher(name="fake", command=fake_command(self.root))
+        # The reviewer only returns scripted text here. Guidance pins and changed paths still come from Git.
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.reviewer.worktree_fingerprint", return_value="head:tree"))
         self.repo = self.task_repo()
         self.start = head(self.repo)
 
@@ -289,34 +290,31 @@ class TestDevelopmentAndBuiltInReview(_Harness):
         self.assertEqual((record.guidance_commit, record.workdir, record.activities, record.tags),
                          (self.start, str(self.repo), ("versioning",), ("tests",)))
 
-    async def guidance_prompts(self, files, **extra):
+    async def guidance_prompts(self, paths, **extra):
         executor = self.sde()
         events = [event(self.payload(**extra))]
         state = await executor._new_state(events, events, None)
         developer = await executor._first_prompt(state, self.caps)
-        for rel, content in files.items():
-            path = self.repo / rel
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content)
         pin, selection = executor._guidance_inputs(state)
         request = ReviewRequest(workdir=self.repo, requirements=state.requirements, test_evidence=EVIDENCE,
                                 base_ref=state.base_ref, pin=pin, selection=selection)
-        diff, guidance = await review_inputs(request)
+        with patch("agent_runtime.adapters.executor_cli.reviewer._collect_diff", return_value=("diff", paths)):
+            diff, guidance = await review_inputs(request)
         return developer, review_prompt(request, guidance, diff)
 
     async def test_pure_test_task_selects_by_issue_label(self):
-        developer, reviewer = await self.guidance_prompts(NEW_TEST, labels=[{"name": "tests"}, {"name": "good first issue"}])
+        developer, reviewer = await self.guidance_prompts(["tests/test_calc.py"], labels=[{"name": "tests"}, {"name": "good first issue"}])
         self.assertEqual(bodies(developer), {"TESTING-BODY"})
         self.assertEqual(bodies(section(reviewer)), {"TESTING-BODY"})
 
     async def test_diff_adds_guidance_the_developer_was_not_given(self):
-        developer, reviewer = await self.guidance_prompts({**NEW_TEST, "VERSION": "2.0.0\n"}, tags=["tests"])
+        developer, reviewer = await self.guidance_prompts(["tests/test_calc.py", "VERSION"], tags=["tests"])
         self.assertEqual(bodies(developer), {"TESTING-BODY"})
         self.assertEqual(bodies(section(reviewer)), {"TESTING-BODY", "VERSIONING-BODY"})
         self.assertIn("Selected because: diff touches VERSION", reviewer)
 
     async def test_unmatched_task_gets_general_rules_and_catalog_only(self):
-        prompts = await self.guidance_prompts({"calc.py": "def divide(a, b):\n    return a / b\n"})
+        prompts = await self.guidance_prompts(["calc.py"])
         for prompt in prompts:
             self.assertIn("GENERAL-RULE", prompt)
             self.assertIn("- docs/testing.md: Writing tests", prompt)

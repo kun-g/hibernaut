@@ -16,11 +16,11 @@ from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteSessionStoreAdapter
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore, TerminalBinding
 from agent_runtime.app.config import load_config
-from agent_runtime.app.main import build_daemon_from_config, serve_configured
+from agent_runtime.app.main import serve_configured
 from agent_runtime.core.models import Emit, SessionRef
 from tests.test_coder_reviewer import _Capture, fake_command, git
 from tests.test_sde_executor import EVIDENCE, FIXED, PASS, dev, event, make_base_repo
-from tests.test_visible_roles import FakeOrcaTerminals, VisibleCase, arg
+from tests.test_visible_roles import FakeOrcaTerminals, VisibleCase, arg, build_terminal_daemon
 
 NATIVE = "11111111-2222-3333-4444-555555555555"
 
@@ -248,7 +248,7 @@ class TestIndependentEventsTalk(unittest.TestCase):
 
         async def scenario():
             config = load_config(path)
-            daemon = build_daemon_from_config(config)
+            daemon = build_terminal_daemon(config, root)
             for n, workdir in workdirs.items():
                 daemon.workspaces.reserve_creating(work_key=f"task-{n}", repo_checkout=str(repo),
                                                    workdir=str(workdir), branch=f"hb/task-{n}")

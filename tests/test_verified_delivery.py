@@ -26,6 +26,7 @@ from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore, TerminalBinding
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.core.models import Emit, Event, SessionRef, Suspend
+from tests.empty_guidance import empty_project_guidance
 from tests.fakes import InMemoryPermission
 from tests.test_coder_reviewer import fake_command
 from tests.test_pr_delivery import DeliveryCase, git
@@ -81,6 +82,7 @@ class FakeTerminal(OrcaVisibleRunner):
 class SDECase(DeliveryCase, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         super().setUp()
+        self.enterContext(empty_project_guidance())
         self.wt = self.clone("hb-task-1", "hb/task-1")
         self.log = self.root / "calls.jsonl"
         self.plan = self.root / "plan.json"

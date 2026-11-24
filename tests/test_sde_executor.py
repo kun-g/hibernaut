@@ -17,7 +17,6 @@ from unittest.mock import Mock, patch
 from agent_runtime.adapters.executor_cli import OrcaWorktreeManager
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.base_merge import SinceReview
-from agent_runtime.adapters.executor_cli.project_guidance import ProjectGuidance
 from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor, ReviewAborted, render_review, review_prompt, validate_review
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions
 from agent_runtime.adapters.storage_sqlite import (
@@ -34,6 +33,7 @@ from agent_runtime.app.config import load_config, parse_config
 from agent_runtime.app.main import build_daemon_from_config, serve_configured
 from agent_runtime.core.models import Emit, Event, PermissionDecision, SessionRef, Suspend
 from agent_runtime.engine import AgentWorker, EventHandler
+from tests.empty_guidance import empty_project_guidance
 from tests.fakes import InMemoryPermission
 from tests.test_coder_reviewer import (
     CHANGES_REQUESTED,
@@ -154,6 +154,7 @@ class TestSDEConfig(unittest.TestCase):
 
 class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.enterContext(empty_project_guidance())
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.repo = make_base_repo(self.root)
         git(self.repo, "checkout", "-qb", "hb/task-1")
@@ -382,7 +383,7 @@ class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
         self.history = []
         self.workspaces = SQLiteWorkspaceStore(self.db)
         self.manager = OrcaWorktreeManager(workspace_store=self.workspaces, session_store=self.sessions, backend="git")
-        self.enterContext(patch("agent_runtime.adapters.executor_cli.sde.load_guidance", side_effect=lambda pin: ProjectGuidance(pin, "", (), False)))
+        self.enterContext(empty_project_guidance())
         self.enterContext(patch("agent_runtime.adapters.executor_cli.sde._review_delta", return_value=("fix", ["calc.py"])))
         self.enterContext(patch("agent_runtime.adapters.executor_cli.sde.worktree_fingerprint", return_value="head:tree"))
         self.enterContext(patch("agent_runtime.adapters.executor_cli.reviewer.repo_root", return_value=self.repo))

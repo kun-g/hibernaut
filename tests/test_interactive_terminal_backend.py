@@ -13,11 +13,11 @@ from unittest.mock import patch
 
 from agent_runtime.adapters.executor_cli.orca import TerminalUnavailable
 from agent_runtime.app.config import load_config, parse_config
-from agent_runtime.app.main import build_daemon_from_config, serve_configured
+from agent_runtime.app.main import serve_configured
 from agent_runtime.core.models import Emit, Suspend
 from tests.test_coder_reviewer import _Capture, fake_command, git
 from tests.test_sde_executor import FIXED, PASS, dev, event, make_base_repo
-from tests.test_visible_roles import FakeOrcaTerminals, VisibleCase
+from tests.test_visible_roles import FakeOrcaTerminals, VisibleCase, build_terminal_daemon
 
 ROLES = {"sde": {"role": "sde"}, "coder-reviewer": {"role": "coder-reviewer"}}
 
@@ -189,7 +189,7 @@ class TestTerminalBackendThroughDaemon(unittest.TestCase):
     def run_events(self, events, done):
         async def scenario():
             config = load_config(self.path)
-            daemon = build_daemon_from_config(config)
+            daemon = build_terminal_daemon(config, self.root)
             daemon.workspaces.reserve_creating(work_key="orca-1", repo_checkout=str(self.repo),
                                                workdir=str(self.orca_wt), branch="hb/orca-1")
             daemon.workspaces.mark_ready("orca-1", workdir=str(self.orca_wt), branch="hb/orca-1")

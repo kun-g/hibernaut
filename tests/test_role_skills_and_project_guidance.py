@@ -173,6 +173,8 @@ class _Harness(unittest.IsolatedAsyncioTestCase):
         self.caps.is_interrupted.return_value = False
         self.caps.memory.load_baseline.return_value = {}
         self.launcher = ClaudeCodeLauncher(name="fake", command=fake_command(self.root))
+        # These scripted reviewers never write. The task pin and the evidence shown to each role use real commits.
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.reviewer.worktree_fingerprint", return_value="head:tree"))
 
     def set_plan(self, sde=(), reviewer=()):
         self.plan.write_text(json.dumps({"sde": list(sde), "reviewer": list(reviewer)}))
@@ -319,7 +321,6 @@ class TestSkillsAndGuidanceReachTheRoles(_Harness):
         # Each retry renders its real guidance from the checkpoint. The code diff and verdict are fixture inputs.
         reviewer = "agent_runtime.adapters.executor_cli.reviewer"
         self.enterContext(patch(f"{reviewer}._collect_diff", return_value=("divide fixed", ["calc.py"])))
-        self.enterContext(patch(f"{reviewer}.worktree_fingerprint", return_value="head:tree"))
         launches = self.enterContext(patch(f"{reviewer}.run_claude_code", side_effect=[
             ClaudeCodeError("reviewer crashed"), *({"structured_output": PASS} for _ in range(3)),
         ]))

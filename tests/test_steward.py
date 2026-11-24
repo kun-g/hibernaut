@@ -60,7 +60,7 @@ from tests.fakes import InMemoryOutbox, InMemoryPermission, RecordingChannel
 from tests.test_coder_reviewer import fake_command, git, make_repo
 from tests.test_sde_executor import make_base_repo
 from tests.test_terminal_processes import alive, until
-from tests.test_visible_roles import FakeOrcaTerminals
+from tests.test_visible_roles import FakeOrcaTerminals, build_terminal_daemon
 
 MAIN = "proj:x"
 SDE = "proj:x:sde"
@@ -1351,7 +1351,7 @@ class DaemonCase(unittest.IsolatedAsyncioTestCase):
         return tomllib.loads(CONFIG.format(root=self.root, repo=self.repo, command=fake_command(self.root)))
 
     async def run_daemon(self, *events: tuple[str, str | None, dict[str, Any]]) -> Any:
-        daemon = build_daemon_from_config(parse_config(self.raw()), channel=self.channel)
+        daemon = build_terminal_daemon(parse_config(self.raw()), self.root, channel=self.channel)
         self.addCleanup(daemon.db.close)
         stop = asyncio.Event()
         daemon.pool.bind(asyncio.get_running_loop())
