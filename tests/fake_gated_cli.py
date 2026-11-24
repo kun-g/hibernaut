@@ -46,6 +46,7 @@ for call in plan:
         note("waiting")
         while not os.path.exists(call["args"]["path"]):
             time.sleep(0.05)
+        note("released")
         continue
     denied, stop = None, False
     for reply in run_hooks("PreToolUse", {"hook_event_name": "PreToolUse", "tool_name": call["tool"], "tool_input": call["args"]}):

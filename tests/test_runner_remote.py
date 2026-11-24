@@ -14,6 +14,7 @@ import sys
 import textwrap
 import time
 import tomllib
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -696,17 +697,20 @@ def test_a_run_cut_off_with_its_node_is_run_again_once_the_node_is_back(remote: 
     remote.write()
     remote.start_hb()
     remote.start_node()
-    release = remote.node / "release-cli"
+    release = remote.node / f"release-cli-{uuid.uuid4().hex}"
+    assert not release.exists()
     held = remote.ask(("wait_for_file", {"path": str(release)}))
     remote.until(lambda: remote.cli("waiting"))
     assert remote.stop_node() == 0
     assert len(git("worktree", "list", cwd=remote.node_repo).splitlines()) == 1
     remote.assert_original_path(OTHER)
-    release.touch()
+    assert remote.cli("released") == []
+    release.touch(exist_ok=False)
     remote.node_log.write_text("")
     remote.start_node()
     remote.until(lambda: remote.status(held) == "done", timeout=60)
     assert remote.outbox(INBOX) == ["all done"] and len(remote.cli("start")) == 2
+    assert len(remote.cli("released")) == 1
     (run,) = remote.runs(INBOX)
     assert (run["runner_id"], run["emit_status"]) == (REMOTE_ID, "done") and remote.node_run_log(run).is_file()
 
