@@ -100,7 +100,7 @@ forward_to = ["proj:hibernaut", "proj:sure"]
 | `complete_project` | `name`，可选 `description` | 补上缺的，不动已有的值 |
 
 - **默认值由代码定**，命令行 `scripts/onboard_project.py` 用同一套：主 Inbox 归 `steward`，`proj:<p>:.+` 归 `sde`，`open_pr = true`、`auto_merge = false`。具体哪个 agent 取别的项目用得最多的；没有合适的就拒绝（命令行则照加项目，并注明没配 Steward）。没给说明时写中性的「GitHub 仓库 owner/repo」。主 Inbox 已有手写绑定、默认 agent 不是 Steward 的，列为待人做，不改。
-- **写配置**：只认上表的参数；整份能解析才写，先留备份（配置旁的 `<名字>.bak-<时间>`，0600）、原子替换；写前文件被人改过就放弃；写后等热加载生效，没生效就恢复原文件并说明。回执带 `added`、`backup` 和 `undo`。没有开热加载的进程里这些工具拒绝执行。
+- **写配置**：只认上表的参数；整份能解析才写，先留备份（配置旁的 `<名字>.bak-<时间>`，0600）、原子替换；写前文件被人改过就放弃；写后等热加载生效，没生效就恢复原文件并说明；确认生效前文件又被人改了，保留人改的那版并说明，不报已生效。回执带 `added`、`backup` 和 `undo`。没有开热加载的进程里这些工具拒绝执行。
 - **建标签**：只在 `[onboarding] label_owners` 列出的 owner 上建，默认空。服务器入口路由（Switchboard）永远只列为待人做。
 - **谁能到它**：全局 Steward 替人转来的、本机运营者投的（本机 `POST /events`、CLI）、它自己的审批。GitHub、群聊、Drive、定时器来的，项目转来的，以及远端或经代理的 `POST /events`（403）、`POST /mcp` 都到不了；后两者投给全局 Steward 的也不算人说的。全局 Steward 也只有在本轮处理的是人的单聊消息或本机运营者的事件时才能转给它；只因为一条回投醒来的那轮不行。
 - **看不到的**：`hibernaut.toml` 与它的备份不给 `read_file`、`search_files`、`git` 读，答复里没有 `env` 和令牌的值。

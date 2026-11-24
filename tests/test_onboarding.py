@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -15,6 +16,7 @@ from typing import Any
 from unittest.mock import patch
 
 from agent_runtime.adapters.executor_cli.steward_git import ToolError
+from agent_runtime.app import config as config_module
 from agent_runtime.app.config import HibernautConfig, load_config
 from agent_runtime.app.config_edit import ConfigFile
 from agent_runtime.app.onboarding import (
@@ -581,9 +583,21 @@ class SafetyTests(OnboardingCase):
     def test_c5_a_refused_version_somebody_changed_again_is_not_overwritten(self) -> None:
         self.reloads.refuse = "no"
         self.reloads.before_wait = lambda: self.path.write_text("# theirs\n") and None
-        text = self.refused("was not put back", self.onboard)
+        text = self.refused("changed by somebody else.*nothing was put back", self.onboard)
         self.assertNotIn("configuration is as it was", text)
         self.assertEqual(self.path.read_text(), "# theirs\n")
+
+    def test_c5_a_version_somebody_changed_before_it_was_confirmed_is_not_called_in_force(self) -> None:
+        for theirs in (self.before.replace("# the end", "# theirs"), "not = [valid\n"):
+            for call in (self.onboard, lambda: self.complete("bare")):
+                with self.subTest(theirs=theirs[-20:], call=call):
+                    self.path.write_text(self.before)
+                    self.reloads.before_wait = lambda theirs=theirs: self.path.write_text(theirs) and None
+                    text = self.refused("changed by somebody else.*their version stays", call)
+                    self.assertNotIn("configuration is as it was", text)
+                    self.assertNotIn("in force", text)
+                    self.assertEqual(self.path.read_text(), theirs)
+                    self.assertIn("the copy from before is", text)
 
     def test_c5_without_hot_reload_nothing_is_done(self) -> None:
         self.reloads.watch(None)
@@ -681,15 +695,34 @@ class ReloadStatusTests(unittest.TestCase):
         status.watch(Path("/x/h.toml"))
         with self.assertRaisesRegex(ReloadFailed, "within 0.05"):
             status.wait(b"a", 0.05)
-        status.seen(b"a")
+        version = status.seen(b"a")
         with self.assertRaises(ReloadFailed):
             status.wait(b"a", 0.05)
-        threading.Timer(0.05, status.settle).start()
+        threading.Timer(0.05, lambda: status.settle(version)).start()
         status.wait(b"a", 5)
-        status.seen(b"b")
-        status.settle("not valid")
+        status.settle(status.seen(b"b"), "not valid")
         with self.assertRaisesRegex(ReloadFailed, "not valid"):
             status.wait(b"b", 5)
+
+    def test_c5_settling_one_version_says_nothing_of_another(self) -> None:
+        status = ReloadStatus()
+        status.watch(Path("/x/h.toml"))
+        first = status.seen(b"a")
+        status.seen(b"b")
+        status.settle(first)
+        for contents in (b"a", b"b"):
+            with self.assertRaises(ReloadFailed):
+                status.wait(contents, 0.05)
+
+    def test_c5_a_version_another_one_replaced_is_not_waited_for(self) -> None:
+        status = ReloadStatus()
+        status.watch(Path("/x/h.toml"))
+        status.seen(b"a")
+        threading.Timer(0.05, lambda: status.seen(b"b")).start()
+        started = time.monotonic()
+        with self.assertRaisesRegex(ReloadFailed, "another version"):
+            status.wait(b"a", 30)
+        self.assertLess(time.monotonic() - started, 10)
 
     def test_c5_a_daemon_that_stops_ends_the_wait(self) -> None:
         status = ReloadStatus()
@@ -699,6 +732,59 @@ class ReloadStatusTests(unittest.TestCase):
         with self.assertRaises(ReloadFailed):
             status.wait(b"a", 30)
         self.assertLess(time.monotonic() - started, 10)
+
+
+class ConfigChangesTests(unittest.IsolatedAsyncioTestCase):
+    # A person's editor takes no part in the locks: it may write while a version is being parsed.
+    async def race(self, *writes: str) -> tuple[list[int], list[str | None]]:
+        # What is used, and the errors that were settled.
+        path = Path(self.enterContext(tempfile.TemporaryDirectory()), "h.toml")
+        path.write_text("[runtime]\nmax_concurrency = 1\n")
+        pending = list(writes)
+        real = config_module.parse_config
+
+        def parse(raw: dict[str, Any], *, base_dir: Path | None = None) -> HibernautConfig:
+            if pending:
+                path.write_text(pending.pop(0))
+            return real(raw, base_dir=base_dir)
+
+        reloads = ReloadStatus()
+        errors: list[str | None] = []
+        stop, found = asyncio.Event(), list[int]()
+
+        async def collect() -> None:
+            async for config in config_module.config_changes(path, stop, interval=0.01, reloads=reloads):
+                found.append(config.runtime.max_concurrency)
+
+        with (patch.object(config_module, "parse_config", parse),
+              patch.object(reloads, "settle", lambda *args: errors.append(args[-1] if args else None))):
+            task = asyncio.create_task(collect())
+            for _ in range(500):
+                await asyncio.sleep(0.01)
+                if (found or errors) and not pending:
+                    break
+            await asyncio.sleep(0.1)
+            stop.set()
+            await task
+        return found, errors
+
+    async def test_c5_a_version_replaced_while_it_was_parsed_is_not_used(self) -> None:
+        self.assertEqual(await self.race("[runtime]\nmax_concurrency = 2\n"), ([2], []))
+
+    async def test_c5_replaced_by_one_that_is_not_valid_neither_is_used(self) -> None:
+        found, errors = await self.race("[broken")
+        self.assertEqual(found, [])
+        [error] = errors
+        self.assertIn("invalid configuration", error or "")
+
+    async def test_c5_an_invalid_one_replaced_while_it_was_parsed_is_not_settled(self) -> None:
+        # "nonsense" parses as TOML and is refused by parse_config, after the file was put right.
+        found, errors = await self.race('[runtime]\nnew_event_policy = "nonsense"\n', "[runtime]\nmax_concurrency = 3\n")
+        self.assertEqual((found, errors), ([3], []))
+
+    async def test_c5_changed_and_changed_back_it_is_used(self) -> None:
+        found, errors = await self.race("[runtime]\nmax_concurrency = 2\n", "[runtime]\nmax_concurrency = 1\n")
+        self.assertEqual((found, errors), ([1], []))
 
 
 if __name__ == "__main__":

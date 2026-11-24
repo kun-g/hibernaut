@@ -1714,9 +1714,11 @@ async def serve_configured(
     reloads.watch(path)
     changes = config_changes(path, stop, interval=reload_interval, reloads=reloads)
 
+    version = reloads.latest
+
     def refuse(reason: str) -> None:
         print(f"[config] {reason}", file=sys.stderr, flush=True)
-        reloads.settle(reason)
+        reloads.settle(version, reason)
 
     # Before the first pool scans its inbox: held events are not looked at again until the next wake.
     await start_runner_pilot(runner_pilot)
@@ -1743,8 +1745,9 @@ async def serve_configured(
 
         try:
             async for candidate in changes:
+                version = reloads.latest
                 if candidate == config:
-                    reloads.settle()
+                    reloads.settle(version)
                     continue
                 if (candidate.runtime.db_path, candidate.runtime.memory_root, candidate.runtime.ledger_db_path) != (
                     config.runtime.db_path,
@@ -1826,7 +1829,7 @@ async def serve_configured(
                     server, server_thread = next_server, next_thread
                 daemon, config = replacement, candidate
                 print(f"[config] Reloaded {path}", file=sys.stderr, flush=True)
-                reloads.settle()
+                reloads.settle(version)
         finally:
             reloads.watch(None)
             await changes.aclose()

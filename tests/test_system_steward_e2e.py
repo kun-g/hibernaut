@@ -381,6 +381,40 @@ class EndToEndTests(ServedCase):
         self.assertEqual(self.path.read_text(), edited)
 
 
+    async def race(self, target: str, theirs: str) -> str:
+        # Somebody saves the file while the version the tool wrote is on its way into force.
+        await self.serve()
+        real = getattr(sys.modules[target.rpartition(".")[0]], target.rpartition(".")[2])
+        raced: list[bool] = []
+
+        def racing(*args: Any, **kwargs: Any) -> Any:
+            if not raced and "计算器" in self.path.read_text():
+                raced.append(True)
+                self.path.write_text(theirs)
+            return real(*args, **kwargs)
+
+        self.set_plan([{"calls": [forward(OPS, "补上")]},
+                       {"calls": [tool("complete_project", name="a", description="计算器")], **reply("没补成")}])
+        with patch(target, racing):
+            await self.message("补上")
+            await self.wait_for(lambda: any("没补成" in r for r in self.replies()), "the answer")
+        self.assertEqual(raced, [True])
+        failed, said = self.answers()[1]
+        self.assertTrue(failed, said)
+        self.assertIn("changed by somebody else", said)
+        self.assertEqual(self.path.read_text(), theirs)
+        return said
+
+    async def test_c5_an_edit_while_the_new_version_is_parsed_wins_and_is_told(self) -> None:
+        await self.race("agent_runtime.app.config.parse_config", self.text().replace("[projects.a]\n", "[projects.a]\n# mine\n"))
+
+    async def test_c5_an_edit_that_is_not_valid_is_told_as_well(self) -> None:
+        await self.race("agent_runtime.app.config.parse_config", "not = [valid\n")
+
+    async def test_c5_an_edit_while_the_new_version_is_activated_is_told(self) -> None:
+        await self.race("agent_runtime.app.main.build_daemon_from_config", "not = [valid\n")
+
+
 class BoundaryTests(ServedCase):
     async def test_c1_c2_the_system_steward_has_its_tools_and_nothing_to_run_or_edit_with(self) -> None:
         await self.serve()

@@ -17,8 +17,8 @@ class ReloadStatus:
     def __init__(self) -> None:
         self._changed = threading.Condition()
         self._watched: Path | None = None
-        self._version: str | None = None
-        self._settled = False
+        self._latest = ""
+        self._settled = ""
         self._error: str | None = None
 
     @staticmethod
@@ -35,21 +35,32 @@ class ReloadStatus:
         with self._changed:
             return self._watched
 
-    def seen(self, contents: bytes) -> None:
+    @property
+    def latest(self) -> str:
         with self._changed:
-            self._version, self._settled, self._error = self._digest(contents), False, None
+            return self._latest
 
-    def settle(self, error: str | None = None) -> None:
-        # The version seen last is in force, or was refused for this reason.
+    def seen(self, contents: bytes) -> str:
         with self._changed:
-            self._settled, self._error = True, error
+            self._latest, self._settled, self._error = self._digest(contents), "", None
+            self._changed.notify_all()
+            return self._latest
+
+    def settle(self, version: str, error: str | None = None) -> None:
+        # That version is in force, or was refused for this reason.
+        with self._changed:
+            self._settled, self._error = version, error
             self._changed.notify_all()
 
     def wait(self, contents: bytes, timeout: float = RELOAD_TIMEOUT_SECONDS) -> None:
         wanted = self._digest(contents)
         deadline = time.monotonic() + timeout
+        was_seen = False
         with self._changed:
-            while not (self._version == wanted and self._settled):
+            while not self._latest == self._settled == wanted:
+                if was_seen and self._latest != wanted:
+                    raise ReloadFailed("another version of it came after")
+                was_seen = self._latest == wanted
                 left = deadline - time.monotonic()
                 if self._watched is None or left <= 0:
                     raise ReloadFailed(f"the running Hibernaut did not take it up within {timeout:g} seconds")

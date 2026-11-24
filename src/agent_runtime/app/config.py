@@ -996,8 +996,9 @@ async def config_changes(
         if contents == previous:
             continue
         previous = contents
-        if reloads is not None:
-            reloads.seen(contents)
+        version = reloads.seen(contents) if reloads is not None else ""
+        error = ""
+        config: HibernautConfig | None = None
         try:
             raw = tomllib.loads(contents.decode("utf-8"))
             if not raw:
@@ -1006,13 +1007,20 @@ async def config_changes(
             config = await asyncio.to_thread(parse_config, raw, base_dir=path.resolve().parent)
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
             detail = f": {exc}" if type(exc) is ValueError else ""
-            print(
-                f"[config] Invalid {path} ({type(exc).__name__}{detail}); keeping current settings.",
-                file=sys.stderr,
-                flush=True,
-            )
+            error = f"{type(exc).__name__}{detail}"
+        # Parsing takes a while, and an editor knows no lock: a version that is gone by now is not used.
+        try:
+            replaced = path.read_bytes() != contents
+        except OSError:
+            replaced = True
+        if replaced:
+            # It may also come back as it was.
+            previous = None
+            continue
+        if config is None:
+            print(f"[config] Invalid {path} ({error}); keeping current settings.", file=sys.stderr, flush=True)
             if reloads is not None:
-                reloads.settle(f"invalid configuration ({type(exc).__name__}{detail})")
+                reloads.settle(version, f"invalid configuration ({error})")
             continue
         yield config
 

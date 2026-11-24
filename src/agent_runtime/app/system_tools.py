@@ -107,11 +107,24 @@ class SystemToolbox:
         if not self._allowed():
             raise OnboardError("this inbox has no system tools any more")
         backup = file.replace(original, updated)
+        reason = ""
         try:
             self._reloads.wait(updated, self._reload_timeout)
-            return backup
         except ReloadFailed as exc:
             reason = str(exc)
+        # An editor knows no lock: what is in force counts only while it is what the file says.
+        try:
+            current: bytes | None = file.read()
+        except OSError:
+            current = None
+        if current != updated:
+            raise OnboardError(
+                f"{file.path.name} was changed by somebody else before the new configuration was confirmed; their version "
+                "stays and nothing was put back. Whether the running Hibernaut took the change up for a while is not "
+                f"known; the copy from before is {backup}", config_kept=False,
+            )
+        if not reason:
+            return backup
         try:
             file.replace(updated, original, backup=False)
         except (ConfigChanged, OSError) as exc:
