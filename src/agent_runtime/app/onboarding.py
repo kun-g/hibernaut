@@ -183,7 +183,8 @@ def project_agents(config: HibernautConfig) -> ProjectAgents:
     if sde is None:
         raise OnboardError("no agent with role sde is declared in [agents]")
     options = config.roles[sde].sde
-    reviewer = options.reviewer if options is not None and options.review and options.reviewer in config.agents else None
+    candidates = options.candidates if options is not None and options.review else ()
+    reviewer = next((name for name in candidates if name in config.agents), None)
     return ProjectAgents(steward, sde, reviewer)
 
 

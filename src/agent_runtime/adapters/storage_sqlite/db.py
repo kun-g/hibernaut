@@ -179,6 +179,28 @@ CREATE TABLE IF NOT EXISTS open_runs (
 
 CREATE INDEX IF NOT EXISTS idx_open_runs_inbox
     ON open_runs (inbox_id, started_at);
+
+-- Reviewers that ran out of quota; no task chooses one before until (epoch seconds).
+CREATE TABLE IF NOT EXISTS reviewer_quota_marks (
+    executor_id TEXT PRIMARY KEY,
+    until REAL NOT NULL,
+    reason TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- The reviewer each task settled on: a session is one task, through every round, suspension and restart. executor_id
+-- is the sde whose candidates they are.
+CREATE TABLE IF NOT EXISTS reviewer_choices (
+    session_id TEXT NOT NULL,
+    executor_id TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    candidates_json TEXT NOT NULL,
+    notes_json TEXT NOT NULL,
+    left_reason TEXT NOT NULL,
+    left_name TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, executor_id)
+);
 """
 
 

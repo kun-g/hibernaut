@@ -66,6 +66,7 @@ from agent_runtime.adapters.executor_cli.reviewer import (
     CoderReviewerExecutor,
     ReviewAborted,
     Reviewer,
+    ReviewQuotaExhausted,
     ReviewRequest,
     format_blocking,
     render_terminals,
@@ -74,11 +75,22 @@ from agent_runtime.adapters.executor_cli.reviewer import (
     snapshot_diff,
     worktree_fingerprint,
 )
+from agent_runtime.adapters.executor_cli.reviewer_pool import PickedReviewer, ReviewerPool, SwitchNotice
 from agent_runtime.adapters.executor_cli.run_state import TurnSlot, read_state, write_state
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
 from agent_runtime.adapters.memory_fs import baseline_segments
 from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
-from agent_runtime.core.models import Emit, Event, RunDetached, RunOutcome, SessionRef, Silent, Suspend, new_id
+from agent_runtime.core.models import (
+    TASK_CONTEXT_KEY,
+    Emit,
+    Event,
+    RunDetached,
+    RunOutcome,
+    SessionRef,
+    Silent,
+    Suspend,
+    new_id,
+)
 from agent_runtime.core.ports import RunCapabilities, RunContext
 
 SDE_ROLE = "sde"
@@ -167,8 +179,13 @@ Acknowledge a defect it finds; the fix comes with the next task or answer from a
 @dataclass(frozen=True, slots=True)
 class SDEOptions:
     review: bool = True
-    reviewer: str = CODE_REVIEWER_ROLE
+    # One name, or an ordered list of review candidates.
+    reviewer: str | tuple[str, ...] = CODE_REVIEWER_ROLE
     max_review_rounds: int = 3
+
+    @property
+    def candidates(self) -> tuple[str, ...]:
+        return (self.reviewer,) if isinstance(self.reviewer, str) else self.reviewer
 
 
 def _no_blocking() -> list[dict[str, str]]:
@@ -183,14 +200,18 @@ def _no_project() -> dict[str, Any]:
     return {}
 
 
+def _no_reply() -> dict[str, str]:
+    return {}
+
+
 def _strs(raw: object) -> tuple[str, ...]:
     return tuple(str(v) for v in cast(list[object], raw)) if isinstance(raw, list) else ()
 
 
 @dataclass(slots=True)
 class _State:
-    stage: Literal["develop", "launch_pending", "terminal_pending", "needs_input", "review_pending", "delivery_pending",
-                   "incomplete"]
+    stage: Literal["develop", "launch_pending", "terminal_pending", "needs_input", "review_pending", "no_reviewer",
+                   "delivery_pending", "incomplete"]
     workdir: str
     base_ref: str
     requirements: str
@@ -244,6 +265,8 @@ class _State:
     # The delivery hand-back of passed work that has not been covered since: its kind, base_sha and the rounds the
     # pass took, and whether a person added requirements meanwhile.
     handback: dict[str, Any] = field(default_factory=_no_project)
+    # Where the task's results go (correlation_key, reply_channel, reply_target), for a notice sent while it runs.
+    reply: dict[str, str] = field(default_factory=_no_reply)
 
     def fields(self) -> dict[str, Any]:
         return {f: getattr(self, f) for f in self.__slots__}
@@ -287,15 +310,19 @@ class _Progress:
                      "prompt": prompt, "approved": sorted(approved), "turn": None}
         self._write()
 
-    def slot(self) -> TurnSlot:
-        # The recorded turn goes to the first slot of the resumed phase only.
+    def slot(self, reviewer: str = "") -> TurnSlot:
+        # The recorded turn goes to the first slot of the resumed phase only. With candidates (reviewer set) a turn
+        # belongs to the reviewer that started it, and no other one picks it up.
         assert self._state is not None
         saved, self._saved_turn = self._saved_turn, None
-        return TurnSlot(self.run, saved, self._record, notes=self._state.resume_log)
+        if reviewer and saved is not None and saved.get("reviewer", reviewer) != reviewer:
+            saved = None
 
-    def _record(self, turn: dict[str, Any] | None) -> None:
-        self._doc["turn"] = turn
-        self._write()
+        def record(turn: dict[str, Any] | None) -> None:
+            self._doc["turn"] = {**turn, "reviewer": reviewer} if reviewer and turn is not None else turn
+            self._write()
+
+        return TurnSlot(self.run, saved, record, notes=self._state.resume_log)
 
     def _write(self) -> None:
         assert self._state is not None
@@ -355,12 +382,15 @@ class SDEExecutor:
         delivery: PRDelivery | None = None,
         live_peers: Callable[[str], list[str]] | None = None,
         peer_reviewer: str | None = None,
+        pool: ReviewerPool | None = None,
     ) -> None:
-        if options.review and reviewer is None:
+        if options.review and reviewer is None and pool is None:
             raise ValueError(f"executors.{profile.name}: review is on but no reviewer was given")
         self._profile = profile
         self._options = options
         self._reviewer = reviewer
+        # Chooses each task's reviewer; None reviews every task with the one given.
+        self._pool = pool
         self._worktrees = worktree_manager
         # Looked up per task: the configured map also answers inboxes matched by a project's pattern.
         self._checkouts = inbox_checkout_map
@@ -375,7 +405,7 @@ class SDEExecutor:
         self._live_peers = live_peers
         # The code-reviewer executor whose independently dispatched reviews may message this developer.
         self._peer_reviewer = peer_reviewer or (
-            reviewer.executor_id if isinstance(reviewer, CoderReviewerExecutor) else options.reviewer
+            reviewer.executor_id if isinstance(reviewer, CoderReviewerExecutor) else options.candidates[0]
         )
 
     @property
@@ -476,6 +506,7 @@ class SDEExecutor:
         if resumed is not None:
             state = resumed
             state.inbox_id = state.inbox_id or events[0].inbox_id
+            state.reply = state.reply or _reply_route(events, session)
             state.resume_log += notes
             answer = _approval(events, pending_id)
             if answer is None:
@@ -493,6 +524,10 @@ class SDEExecutor:
                 if state.stage == "review_pending":
                     return await self._finish(session_id, native, state, caps, review="pending",
                                               note=f"retry declined; {state.reason}", progress=progress)
+                if state.stage == "no_reviewer":
+                    reason = "; ".join(ln.removeprefix("- ") for ln in state.reason.splitlines())
+                    return await self._finish(session_id, native, state, caps, review="pending",
+                                              note=f"retry declined; {reason}", progress=progress)
                 if state.stage == "delivery_pending":
                     return self._deliver(session_id, native, state, self._record(state),
                                          declined=f"delivery declined: {state.reason}")
@@ -523,6 +558,12 @@ class SDEExecutor:
                 # New requirements arrived with the approval: develop them, then review and deliver again.
                 state.rounds = 0
                 prompt = f"## Follow-up from a person\n{followups}"
+            elif state.stage == "no_reviewer":
+                # The work is as the developer left it; only the review waited for somebody to do it.
+                prompt = None
+                if followups:
+                    state.rounds = 0
+                    prompt = f"## Follow-up from a person\n{followups}"
             else:
                 state.rounds = 0
                 prompt = await self._fix_prompt(state) if state.blocking else None
@@ -582,7 +623,7 @@ class SDEExecutor:
             raise ReviewAborted(f"workdir {workdir} does not exist")
         state = _State(stage="develop", workdir=str(workdir), base_ref=last_text(targets, "base_ref") or "",
                        requirements=requirements, work_key=work_key, inbox_id=inbox_id, title=last_text(targets, "title") or "",
-                       issue=source_issue(targets, work_key))
+                       issue=source_issue(targets, work_key), reply=_reply_route(events, session))
         try:
             await asyncio.to_thread(self._pin, state, Selection.from_events(targets))
         except ValueError as exc:
@@ -736,6 +777,8 @@ class SDEExecutor:
     ) -> RunOutcome:
         # prompt=None goes straight to review (retrying one that could not complete). With progress every phase is
         # recorded in the Run's state.json before it starts.
+        # Reviewers that ran out of quota in the current round, with the reason.
+        tried: dict[str, str] = {}
         while True:
             if prompt is not None:
                 if isinstance(self._terminal, TerminalUnavailable):
@@ -773,9 +816,16 @@ class SDEExecutor:
                     prompt = _unfinished_prompt(unfinished)
                     continue
                 state.nudged = False
-            reviewer = self._reviewer
-            if not self._options.review or reviewer is None:
+            if not self._options.review or (self._reviewer is None and self._pool is None):
                 return await self._finish(session_id, native, state, caps, review="off", progress=progress)
+            picked = await asyncio.to_thread(self._pick, session_id, state, tried)
+            reviewer = picked.reviewer
+            if reviewer is None:
+                state.stage = "no_reviewer"
+                state.reason = "\n".join(["no review candidate is available",
+                                          *(f"- {name}: {why}" for name, why in picked.refused)])
+                return self._suspend(session_id, native, state)
+            chosen = reviewer.executor_id if self._pool is not None and self._pool.applies(session_id) else ""
             workdir = Path(state.workdir)
             since: SinceReview | None = None
             conflict = bool(state.recheck and state.handback.get("kind") == "conflict")
@@ -819,14 +869,33 @@ class SDEExecutor:
                                   label=f"review of {subject} round {_next_round(state)}",
                                   inbox_id=state.inbox_id),
                     caps,
-                    slot=progress.slot() if progress is not None else None,
+                    slot=progress.slot(chosen) if progress is not None else None,
                 )
+            except ReviewQuotaExhausted as exc:
+                problem = f"the review could not complete: {exc}"
+                if self._pool is not None:
+                    await asyncio.to_thread(self._pool.exhausted, session_id, reviewer.executor_id, reason=exc.reason,
+                                            round_no=_next_round(state))
+                if not chosen:
+                    return self._pending(session_id, native, state, problem)
+                if exc.terminals:
+                    state.review_terminals += exc.terminals
+                    state.review_runs.append(f"round {_next_round(state)} {chosen} out of quota "
+                                             f"{render_terminals(exc.terminals, exc.sessions)}")
+                if exc.changed:
+                    # The next reviewer would judge something nobody delivered.
+                    return self._pending(session_id, native, state, f"{problem}; it ran out of quota ({exc.reason}) and "
+                                         f"the working tree in {workdir} changed during the review: check it first")
+                tried[chosen] = exc.reason
+                prompt = None
+                continue
             except (ReviewAborted, ClaudeCodeError, ValueError) as exc:
                 return self._pending(session_id, native, state, f"the review could not complete: {exc}")
             if scope is not None:
                 # Whoever reviewed, the program decides what may block in a re-review.
                 review = await asyncio.to_thread(scope.narrow, review)
             blocking: list[dict[str, str]] = review["blocking"]
+            tried = {}
             state.rounds += 1
             counts = [f"{n} {what}" for n, what in
                       ((len(blocking), "blocking"), (review.get("downgraded", 0), "downgraded")) if n]
@@ -836,6 +905,7 @@ class SDEExecutor:
                     f"round {_next_round(state)} {render_terminals(terminals, review.get('cli_sessions', {}))}")
             state.history.append(
                 f"round {_next_round(state)} {review['verdict']}" + (f" ({', '.join(counts)})" if counts else "")
+                + (f" by {chosen}" if chosen else "")
             )
             state.review_notes = merge_notes(state.review_notes, review.get("notes", []))
             state.last_review = reviewer.format_review(review)
@@ -850,6 +920,20 @@ class SDEExecutor:
                     f"still changes_requested after {state.rounds} round(s)\n{format_blocking(blocking)}",
                 )
             prompt = await self._fix_prompt(state)
+
+    def _pick(self, session_id: str, state: _State, tried: Mapping[str, str]) -> PickedReviewer:
+        if self._pool is None:
+            return PickedReviewer(self._reviewer)
+        metadata: dict[str, Any] = {
+            **state.reply, "kind": "reviewer_switch", "outcome_kind": "emit", "session_id": session_id,
+            TASK_CONTEXT_KEY: {"executor_id": self.executor_id, "title": state.title or _first_line(state)},
+        }
+        notice = SwitchNotice(state.inbox_id, f"[{self.executor_id}] review of {state.work_key or state.workdir}", metadata)
+        return self._pool.pick(session_id, round_no=_next_round(state), tried=tried, notice=notice)
+
+    def _reviewers(self, session_id: str) -> list[str]:
+        account = self._pool.account(session_id) if self._pool is not None and self._options.review else ""
+        return [f"Reviewers: {account}"] if account else []
 
     def _since_review(self, state: _State, workdir: Path, snapshot: str) -> SinceReview:
         delivery = self._delivery
@@ -961,6 +1045,12 @@ class SDEExecutor:
                 *(record.render() if record is not None else []),
                 "Approve to retry the delivery step; reject to deliver it as it stands.",
             ])
+        elif state.stage == "no_reviewer":
+            prompt = (
+                f"[{name}] review pending: {state.reason}\n"
+                f"The change in {state.workdir} has not passed review. "
+                "Approve to choose a reviewer again; reject to deliver it marked unreviewed."
+            )
         else:
             retry = "with another fix round" if state.blocking else "the review"
             prompt = (
@@ -970,6 +1060,8 @@ class SDEExecutor:
             )
         if state.handback_log:
             prompt += "\n" + "\n".join(state.handback_log)
+        if state.stage in ("review_pending", "no_reviewer", "delivery_pending"):
+            prompt += "".join(f"\n{ln}" for ln in self._reviewers(session_id))
         if state.resume_log:
             prompt += "\n" + "\n".join(f"Restart: {n}" for n in state.resume_log)
         return Suspend(
@@ -1014,17 +1106,17 @@ class SDEExecutor:
             return self._deliver(session_id, native, state)
         if progress is not None:
             progress.phase("deliver", state, native, approved=approved)
-        first_line = next((ln.strip("# ").strip() for ln in state.requirements.splitlines() if ln.strip()), "")
         request = DeliveryRequest(
             work_key=self._work_key(state),
             workdir=Path(state.workdir),
-            title=state.title or first_line,
+            title=state.title or _first_line(state),
             summary=state.summary,
             test_evidence=state.test_evidence,
             change_kind=state.change_kind,
             rationale=state.change_rationale,
             review=review,
-            review_detail="; ".join([self._review_status(state), *state.history]),
+            review_detail="\n\n".join(["; ".join([self._review_status(state), *state.history]),
+                                       *self._reviewers(session_id)]),
             issue=state.issue,
             followups=tuple(state.review_notes),
         )
@@ -1135,6 +1227,7 @@ class SDEExecutor:
             lines.append(f"Review history: {'; '.join(state.history)}")
         if state.review_runs:
             lines.append(f"Review runs: {'; '.join(state.review_runs)}")
+        lines += self._reviewers(session_id)
         if state.last_review:
             lines.append(f"Last review:\n{state.last_review}")
         lines += _review_followups(state)
@@ -1161,6 +1254,7 @@ class SDEExecutor:
             lines.append(f"Review history: {'; '.join(state.history)}")
         if state.review_runs:
             lines.append(f"Review runs: {'; '.join(state.review_runs)}")
+        lines += self._reviewers(session_id)
         lines += _review_followups(state)
         if state.followups:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
@@ -1173,6 +1267,20 @@ class SDEExecutor:
 
 def _stays() -> bool:
     return False
+
+
+def _first_line(state: _State) -> str:
+    return next((ln.strip("# ").strip() for ln in state.requirements.splitlines() if ln.strip()), "")
+
+
+def _reply_route(events: Sequence[Event], session: SessionRef | None) -> dict[str, str]:
+    # The route the worker gives the task's results.
+    spec = session.forward if session is not None else None
+    key = (spec.origin_key if spec is not None else None) or (session.correlation_key if session is not None else None)
+    found = {"correlation_key": key or events[0].correlation_key}
+    for name in ("reply_channel", "reply_target"):
+        found[name] = last_text(events, name) or (getattr(spec, name) if spec is not None else None)
+    return {k: v for k, v in found.items() if v}
 
 
 def _next_round(state: _State) -> int:
