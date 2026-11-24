@@ -76,7 +76,7 @@ _SCRIPT = """
         el('div', 'row', null, el('strong', '', p.target), el('span', 'pill', p.scope)),
         el('div', 'meta', p.reason));
       const detail = full.get(p.proposal_id);
-      if (detail) node.append(el('div', 'meta', '提议者 ' + detail.proposed_by), el('pre', '', detail.content));
+      if (detail) node.append(el('div', 'meta', '提议者 ' + detail.proposed_by + (detail.op ? ' · ' + detail.op : '')), el('pre', '', detail.content));
       if (detail && detail.reviewable) {
         const base = 'api/proposals/' + encodeURIComponent(p.proposal_id);
         node.append(el('div', 'row', null,

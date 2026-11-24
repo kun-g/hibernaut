@@ -10,6 +10,10 @@ from typing import Any
 
 import pytest
 
+from agent_runtime.app.config import parse_config
+from agent_runtime.app.main import build_daemon_from_config
+from agent_runtime.app.projects import build_routing_manifest
+from agent_runtime.adapters.executor_cli.role_skills import parse_skills, render_skills
 from agent_runtime.adapters.memory_fs import (
     ExpertMount,
     GovernedMemoryHub,
@@ -19,7 +23,15 @@ from agent_runtime.adapters.memory_fs import (
     call_memory_tool,
     open_role_store,
 )
-from collaboration import ExpertPoolRegistry, RoleSkillMemoryStore
+from collaboration import (
+    CloseoutCoordinator,
+    CloseoutDecision,
+    CloseoutStore,
+    DigestAssembler,
+    ExpertPoolRegistry,
+    ExpertProfile,
+    RoleSkillMemoryStore,
+)
 from memory_hub import KnowledgeMountConfig, MemoryHubConfig
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +61,20 @@ def test_import_contracts_isolate_collaboration_both_ways() -> None:
 
 def test_collaboration_is_type_checked_strictly() -> None:
     assert "src/collaboration" in json.loads((ROOT / "pyrightconfig.json").read_text())["include"]
+
+
+def test_records_carry_exactly_what_their_schemas_declare(tmp_path: Path) -> None:
+    card = CloseoutCoordinator(CloseoutStore(tmp_path / "closeouts")).emit_draft(
+        session_id="s", agent_id="architect", project_key="hibernaut", summary="done",
+        decisions=(CloseoutDecision("D1", "t", "A"),),
+    )
+    profile = ExpertProfile(agent_id="a", role_id="architect", display_name="A", executor_id="a", skills=(),
+                            quality_gates=())
+    digest = DigestAssembler().assemble(window_label="24h", tasks=[], runs=[], role_proposals=[], closeouts=[card])
+    for name, record in (("closeout_card", card), ("expert_profile", profile), ("digest_snapshot", digest)):
+        schema = json.loads((ROOT / "schemas/v1" / f"{name}.schema.json").read_text())
+        assert schema["additionalProperties"] is False
+        assert set(record.to_dict()) == set(schema["properties"]) >= set(schema["required"]), name
 
 
 # --- 2. role:// and the four-layer mount of a drafted expert ----------------------------------------------------
@@ -278,3 +304,192 @@ def test_a_proposal_under_an_id_of_its_own_is_queued_once_whatever_the_target(hu
         hub.queue_proposal(proposal, proposal_id="../x")
     kb = WriteProposal(target_uri="kb://pkb/card.md", op="append", content="x", rationale="r")
     assert hub.queue_proposal(kb, proposal_id="prop_0123456789ac").status == "rejected_readonly"
+
+
+# --- 3. configuration: the shared pool and what each project drafts from it -------------------------------------
+
+
+def config_of(tmp_path: Path, **over: Any) -> dict[str, Any]:
+    for name in ("hibernaut", "workshop", "home"):
+        (tmp_path / name).mkdir(exist_ok=True)
+    raw: dict[str, Any] = {
+        "runtime": {
+            "db_path": str(tmp_path / "hb.db"), "memory_root": str(tmp_path / "memory"), "default_agent": "cli",
+            "inbox_bindings": [
+                {"pattern": "user:main", "default_agent": "cli", "agents": ["cli"], "workdir": str(tmp_path / "home")},
+            ],
+        },
+        "executors": {"cli": {"command": "true"}},
+        "agents": {
+            "pool:architect": {"executor": "cli"}, "pool:sde-backend": {"executor": "cli"},
+            "steward": {"executor": "cli"},
+        },
+        "projects": {
+            "hibernaut": {
+                "repo": "o/hibernaut", "checkout": str(tmp_path / "hibernaut"), "worktree_backend": "git",
+                "inbox_id": ["proj:hibernaut", "proj:hibernaut:.+"], "default_agent": "steward",
+                "experts": ["architect", "sde-backend"], "expert_readonly_projects": ["workshop"],
+                "inbox_bindings": [
+                    {"pattern": "proj:hibernaut:.+", "default_agent": "cli", "agents": ["cli"]},
+                ],
+            },
+            "workshop": {
+                "repo": "o/workshop", "checkout": str(tmp_path / "workshop"), "worktree_backend": "git",
+                "inbox_id": ["proj:workshop", "proj:workshop:.+"], "default_agent": "steward", "experts": ["architect"],
+            },
+        },
+        "collaboration": {"enabled": True},
+        "experts": {"architect": {}, "sde-backend": {"max_concurrency": 1, "skills": ["sqlite-wal"]}},
+    }
+    for key, value in over.items():
+        if value is None:
+            raw.pop(key)
+        else:
+            raw[key] = value
+    return raw
+
+
+def with_project(raw: dict[str, Any], **over: Any) -> dict[str, Any]:
+    raw["projects"]["hibernaut"] |= over
+    return raw
+
+
+def test_projects_draft_shared_experts_from_one_pool(tmp_path: Path) -> None:
+    cfg = parse_config(config_of(tmp_path))
+    hibernaut, workshop = cfg.projects["hibernaut"], cfg.projects["workshop"]
+    for inbox in ("proj:hibernaut:architect", "proj:hibernaut:architect:d7-memory"):
+        binding = hibernaut.route(inbox).binding
+        assert binding is not None and (binding.default_agent, binding.agents) == ("pool:architect", ("pool:architect",))
+    other = workshop.route("proj:workshop:architect").binding
+    assert other is not None and other.default_agent == "pool:architect"
+    # The bindings written by hand keep the rest, and a project that has none is as open as before.
+    manual = hibernaut.route("proj:hibernaut:anything").binding
+    assert manual is not None and manual.default_agent == "cli"
+    assert hibernaut.route("proj:hibernaut:architecture").binding is manual
+    assert workshop.route("proj:workshop:anything").binding is None
+    assert not workshop.route("proj:workshop:architect").has_bindings
+    assert workshop.route("proj:workshop:sde-backend").binding is None
+
+    mount = cfg.expert_plan("proj:hibernaut:architect:d7-memory")
+    assert mount is not None and (mount.project_key, mount.role_id) == ("hibernaut", "architect")
+    assert [(s.uri, s.write_mode) for s in mount.slices] == [
+        ("proj://hibernaut/", "rw"), ("role://architect/", "propose"), ("shared://notes/", "ro"), ("kb://pkb/", "ro"),
+        ("proj://workshop/", "ro"),
+    ]
+    assert cfg.expert_plan("proj:hibernaut") is None and cfg.expert_plan("proj:workshop:sde-backend") is None
+    profiles = {p.role_id: p for p in cfg.collaboration.experts}
+    assert profiles["architect"].display_name == "系统架构师" and profiles["architect"].executor_id == "cli"
+    assert profiles["sde-backend"].skills == ("sqlite-wal",)
+    # The pool's cap is the agent's, across all projects that draft it.
+    assert cfg.agents["pool:sde-backend"].max_concurrency == 1
+    assert cfg.agents["pool:architect"].max_concurrency == profiles["architect"].max_concurrency
+
+
+def test_an_agents_own_cap_wins_over_the_pools(tmp_path: Path) -> None:
+    raw = config_of(tmp_path)
+    raw["agents"]["pool:sde-backend"]["max_concurrency"] = 4
+    assert parse_config(raw).agents["pool:sde-backend"].max_concurrency == 4
+
+
+def test_the_steward_is_told_which_experts_its_project_drafts(tmp_path: Path) -> None:
+    cfg = parse_config(config_of(tmp_path))
+    manifest = build_routing_manifest(cfg.projects["hibernaut"])
+    assert "`proj:hibernaut:architect`" in manifest and "`pool:architect`" in manifest
+    assert manifest.index("proj:hibernaut:architect") < manifest.index("`proj:hibernaut:.+`")
+    assert "pool:sde-backend" not in build_routing_manifest(cfg.projects["workshop"]).split("Inboxes")[1]
+
+
+def test_collaboration_is_off_unless_turned_on(tmp_path: Path) -> None:
+    raw = with_project(config_of(tmp_path, collaboration=None, experts=None))
+    for project in raw["projects"].values():
+        project.pop("experts", None)
+        project.pop("expert_readonly_projects", None)
+    cfg = parse_config(raw)
+    assert not cfg.collaboration.enabled and cfg.expert_plan("proj:hibernaut:architect") is None
+    daemon = build_daemon_from_config(cfg)
+    try:
+        assert daemon.collaboration is None
+        assert not (tmp_path / "memory" / "roles").exists()
+    finally:
+        daemon.close()
+
+
+def _drop(raw: dict[str, Any], *path: str) -> dict[str, Any]:
+    target = raw
+    for key in path[:-1]:
+        target = target[key]
+    target.pop(path[-1])
+    return raw
+
+
+@pytest.mark.parametrize(("change", "message"), [
+    (lambda raw: _drop(raw, "collaboration"), "collaboration"),
+    (lambda raw: raw | {"collaboration": {"enabled": True, "push_everything": True}}, "push_everything"),
+    (lambda raw: raw | {"collaboration": {"enabled": True, "chief_inbox": "proj:hibernaut"}}, "chief_inbox"),
+    (lambda raw: raw | {"collaboration": {"enabled": True, "chief_inbox": "user:nobody"}}, "chief_inbox"),
+    (lambda raw: raw | {"collaboration": {"enabled": True, "hub": {"listen_port": 70000}}}, "listen_port"),
+    (lambda raw: raw | {"collaboration": {"enabled": True, "hub": {"base_path": "hub"}}}, "base_path"),
+    (lambda raw: raw | {"collaboration": {"enabled": True, "taskboard": {"mcp_url": "file:///x"}}}, "mcp_url"),
+    (lambda raw: raw | {"experts": {"Bad Role": {}}}, "Bad Role"),
+    (lambda raw: raw | {"experts": {"architect": {"agent": "nobody"}}}, "nobody"),
+    (lambda raw: raw | {"experts": {"architect": {"temperature": 1}}}, "temperature"),
+    (lambda raw: raw | {"experts": {"architect": {}, "sde-backend": {"agent": "pool:architect"}}}, "pool:architect"),
+    (lambda raw: with_project(raw, experts=["nobody"]), "nobody"),
+    (lambda raw: with_project(raw, experts=["architect", "architect"]), "twice"),
+    (lambda raw: with_project(raw, expert_readonly_projects=["hibernaut"]), "hibernaut"),
+    (lambda raw: with_project(raw, expert_readonly_projects=["nowhere"]), "nowhere"),
+    (lambda raw: with_project(raw, inbox_id=["proj:hibernaut"], inbox_bindings=[]), "proj:hibernaut:architect"),
+    (lambda raw: with_project(raw, inbox_id=["hb:main", "proj:hibernaut:.+"]), "proj:<"),
+    (lambda raw: with_project(raw, inbox_bindings=[{"pattern": "proj:hibernaut:architect", "default_agent": "cli"}]),
+     "proj:hibernaut:architect"),
+    (lambda raw: raw | {"memory_hub": {"inbox_projects": {"proj:hibernaut:architect": "workshop"}}}, "inbox_projects"),
+])
+def test_unusable_collaboration_settings_are_refused(tmp_path: Path, change: Any, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_config(change(config_of(tmp_path)))
+
+
+def test_a_drafted_experts_runs_get_the_mounts(tmp_path: Path) -> None:
+    daemon = build_daemon_from_config(parse_config(config_of(tmp_path)))
+    try:
+        memory = daemon.partitions.memory_for("proj:hibernaut:architect:d7")
+        assert "mounts.md" in dict(baseline_segments(memory).stable)
+        assert memory.propose({
+            "target_uri": SKILLS, "op": "append", "content": "x", "rationale": "r"})["status"] == "pending_approval"
+        plain = daemon.partitions.memory_for("proj:hibernaut:other")
+        assert "mounts.md" not in dict(baseline_segments(plain).stable)
+    finally:
+        daemon.close()
+
+
+# --- 4. the Chief of Staff --------------------------------------------------------------------------------------
+
+
+def test_a_steward_may_add_the_chief_of_staff_skill() -> None:
+    listed = parse_skills("agents.chief", "steward", ["builtin:steward", "builtin:chief-of-staff"], ROOT)
+    assert [path.parent.name for path in listed] == ["steward", "chief-of-staff"]
+    text = render_skills(listed)
+    assert "Thin Global Personal Chief of Staff" in text
+    # Left out, a steward is the steward it was.
+    assert [path.parent.name for path in parse_skills("agents.s", "steward", None, ROOT)] == ["steward"]
+
+
+@pytest.mark.parametrize("role", ["sde", "code-reviewer"])
+def test_no_other_role_takes_the_chief_of_staff_skill(role: str) -> None:
+    with pytest.raises(ValueError, match="'builtin:chief-of-staff' is not available for role"):
+        parse_skills("agents.x", role, ["builtin:chief-of-staff"], ROOT)
+
+
+def test_the_chief_of_staff_serves_user_main_beside_thick_project_stewards(tmp_path: Path) -> None:
+    raw = config_of(tmp_path)
+    work = tmp_path / "chief"
+    work.mkdir()
+    raw["agents"]["chief"] = {"role": "steward", "executor": "claude-code",
+                              "skills": ["builtin:steward", "builtin:chief-of-staff"]}
+    raw["executors"]["claude-code"] = {"harness": "claude-code"}
+    raw["runtime"]["inbox_bindings"] = [{
+        "pattern": "user:main", "default_agent": "chief", "agents": ["chief"], "workdir": str(work),
+        "checkout_access": "readonly", "forward_to": ["proj:hibernaut"],
+    }]
+    (bound,) = parse_config(raw, base_dir=tmp_path).runtime.inbox_bindings
+    assert bound.binding.default_agent == "chief" and bound.forward_to == ("proj:hibernaut",)

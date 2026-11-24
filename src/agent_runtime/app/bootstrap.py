@@ -8,6 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from agent_runtime.adapters.channels import ConsoleChannelAdapter
+from agent_runtime.adapters.collaboration_bridge import (
+    CloseoutMemorySink,
+    CollaborationRuntime,
+    HubState,
+    ProjectProposalReviewer,
+    TaskboardMCPClient,
+)
 from agent_runtime.adapters.executor_whitebox import (
     LLMBackend,
     RuleBasedDemoLLM,
@@ -15,7 +22,7 @@ from agent_runtime.adapters.executor_whitebox import (
 )
 from agent_runtime.adapters.ledger_bridge import RunLedger
 from agent_runtime.adapters.memory_bridge import ScopedMemoryHTTPServer
-from agent_runtime.adapters.memory_fs import FileSystemMemoryAdapter, GovernedMemoryHub
+from agent_runtime.adapters.memory_fs import FileSystemMemoryAdapter, GovernedMemoryHub, open_role_store
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
@@ -27,6 +34,7 @@ from agent_runtime.adapters.storage_sqlite import (
 )
 from agent_runtime.adapters.runner_bridge import RunnerExecutorBridge
 from agent_runtime.app.config import (
+    CollaborationConfig,
     HibernautConfig,
     MemoryHTTPConfig,
     ProjectConfig,
@@ -40,6 +48,7 @@ from agent_runtime.engine import (
     OutboxDispatcher,
     TimerScheduler,
 )
+from collaboration import CloseoutCoordinator, CloseoutStore, CollaborationHubServer, ExpertPoolRegistry
 from memory_hub import AuthPrincipal, MemoryHubConfig, StaticTokenAuth
 from runner.cli_drivers import CLIDriver
 from runner.config import NamespacePolicy, ProjectCheckout, RunnerConfig
@@ -302,6 +311,69 @@ def open_memory_http(
             flush=True,
         )
     return server
+
+
+def open_collaboration(
+    config: CollaborationConfig,
+    hub: GovernedMemoryHub,
+    *,
+    environ: MutableMapping[str, str] | None = None,
+) -> CollaborationRuntime | None:
+    if not config.enabled:
+        return None
+    env = os.environ if environ is None else environ
+    taskboard: TaskboardMCPClient | None = None
+    if config.taskboard.mcp_url:
+        taskboard = TaskboardMCPClient(config.taskboard.mcp_url, _take_token(env, config.taskboard.token_env, "taskboard"))
+    roles = open_role_store(hub)
+    return CollaborationRuntime(
+        role_store=roles,
+        closeouts=CloseoutStore(hub.root / "closeouts"),
+        memory_sink=CloseoutMemorySink(hub, roles, {p.role_id for p in config.experts}),
+        pool=ExpertPoolRegistry(config.experts),
+        taskboard=taskboard,
+    )
+
+
+def open_collaboration_hub(
+    config: CollaborationConfig,
+    runtime: CollaborationRuntime,
+    coordinator: CloseoutCoordinator,
+    *,
+    hub: GovernedMemoryHub,
+    ledger: RunLedger | None,
+    environ: MutableMapping[str, str] | None = None,
+) -> CollaborationHubServer | None:
+    link = config.hub
+    if not link.enabled:
+        return None
+    env = os.environ if environ is None else environ
+    server = CollaborationHubServer(
+        host=link.listen_host, port=link.listen_port, base_path=link.base_path,
+        bearer_token=_take_token(env, link.token_env, "hub"), reviewer=link.reviewer,
+        role_store=runtime.role_store, closeout_store=runtime.closeouts, closeout_coordinator=coordinator,
+        expert_pool=runtime.pool, project_reviewer=ProjectProposalReviewer(hub),
+        state_provider=HubState(hub=hub, ledger=ledger, taskboard=runtime.taskboard),
+    )
+    server.start_background()
+    host, port = server.address
+    print(f"[hibernaut] [collaboration] hub on http://{host}:{port}{link.base_path}/", file=sys.stderr, flush=True)
+    if host not in _LOOPBACK_ADDRESSES:
+        print(
+            "[hibernaut] [collaboration] WARNING: the hub speaks plain HTTP; put TLS in front of it before other hosts "
+            "use it.",
+            file=sys.stderr,
+            flush=True,
+        )
+    return server
+
+
+def _take_token(env: MutableMapping[str, str], name: str, section: str) -> str:
+    # Executor subprocesses inherit os.environ; moving the token out keeps it away from agents.
+    token = env.pop(name, "").strip()
+    if not token:
+        raise ValueError(f"collaboration.{section} needs {name} in the environment")
+    return token
 
 
 def _runner_dir(config: HibernautConfig, configured: str) -> Path:

@@ -40,8 +40,10 @@ RETURN_SOURCE = "agent:return"
 RETURN_CANCELLED_SOURCE = "agent:return_cancelled"
 # Closes the session it names, a held result included, when the control plane could not take the inbox's lease.
 CLOSE_SOURCE = "agent:close"
+# A closeout the Owner confirmed, on its way to the Chief of Staff; an agent wrote it.
+CLOSEOUT_SOURCE = "agent:closeout"
 # Only Hibernaut queues these, and the worker trusts them for it; no public entrance accepts them.
-INTERNAL_SOURCES = frozenset({FORWARD_SOURCE, RETURN_SOURCE, RETURN_CANCELLED_SOURCE, CLOSE_SOURCE})
+INTERNAL_SOURCES = frozenset({FORWARD_SOURCE, RETURN_SOURCE, RETURN_CANCELLED_SOURCE, CLOSE_SOURCE, CLOSEOUT_SOURCE})
 MCP_APPROVAL_SOURCE = "mcp:approval"
 
 

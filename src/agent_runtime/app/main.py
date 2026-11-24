@@ -36,6 +36,13 @@ from agent_runtime.adapters.channels.channels import webhook_request_handler
 from agent_runtime.adapters.channels.ingress import event_origin
 from agent_runtime.adapters.channels.switchboard_bridge import SwitchboardChannelAdapter, SwitchboardInboundBridge
 from agent_runtime.adapters.channels.switchboard_relay import SwitchboardBus, SwitchboardRelayLink
+from agent_runtime.adapters.collaboration_bridge import (
+    ChiefOfStaffInboxSink,
+    CollaborationControlPlane,
+    CollaborationRuntime,
+    ProjectCloseoutCoordinator,
+    TaskboardFollowUpSink,
+)
 from agent_runtime.adapters.delivery import DeliveryConfig, PRDelivery, merged_head
 from agent_runtime.adapters.executor_cli import (
     CODE_REVIEWER_ROLE,
@@ -78,7 +85,7 @@ from agent_runtime.adapters.memory_bridge import (
     MemoryGarbageCollector,
     ScopedMemoryHTTPServer,
 )
-from agent_runtime.adapters.memory_fs import GovernedMemoryHub, WorkspacePartitionRegistry, check_inbox_id
+from agent_runtime.adapters.memory_fs import ExpertMount, GovernedMemoryHub, WorkspacePartitionRegistry, check_inbox_id
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter, CredentialProxyClient, read_private_token
 from agent_runtime.adapters.runner_pilot import ClosedRouteExecutor, ProtocolCheckExecutor, RunnerPilotRelay
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
@@ -95,7 +102,14 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteTaskMetadataStore,
     SQLiteWorkspaceStore,
 )
-from agent_runtime.app.bootstrap import RunnerHandle, open_memory_http, open_memory_hub, open_runner
+from agent_runtime.app.bootstrap import (
+    RunnerHandle,
+    open_collaboration,
+    open_collaboration_hub,
+    open_memory_http,
+    open_memory_hub,
+    open_runner,
+)
 from agent_runtime.app.concurrency import (
     ConcurrencyLimiter,
     ConcurrencyLimits,
@@ -105,6 +119,8 @@ from agent_runtime.app.concurrency import (
     LimitRoute,
 )
 from agent_runtime.app.config import (
+    CollaborationHubConfig,
+    CollaborationTaskboardConfig,
     HibernautConfig,
     MemoryHTTPConfig,
     ProjectConfig,
@@ -125,6 +141,7 @@ from agent_runtime.app.projects import (
     build_global_manifest,
     build_routing_manifest,
     build_system_manifest,
+    project_memory_key,
 )
 from agent_runtime.app.reload import ReloadStatus
 from agent_runtime.app.system_tools import SystemToolbox
@@ -139,6 +156,7 @@ from agent_runtime.engine import (
 )
 from agent_runtime.engine.worker import ExecutorFailed
 from agent_runtime.adapters.ledger_bridge import RunLedger
+from collaboration import CloseoutCoordinator, NotificationPolicyEngine
 from memory_hub import MemoryHubConfig
 from runner.protocol_check import PROTOCOL_CHECK_EXECUTOR_ID
 from switchboard.ports import AuditSinkPort
@@ -433,6 +451,8 @@ class AlwaysOnDaemon:
     # One per process, whatever the config generation; closed, with its HTTP service, by the generation that opened it.
     memory_hub: GovernedMemoryHub | None = None
     memory_http: ScopedMemoryHTTPServer | None = None
+    # Likewise one per process, with its hub server.
+    collaboration: CollaborationRuntime | None = None
     memory_gc: MemoryGarbageCollector | None = None
     memory_gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
     # One per process too; a reload points it at the new configuration once that is in force.
@@ -564,6 +584,8 @@ class AlwaysOnDaemon:
                 )
 
     def close(self) -> None:
+        if self.collaboration is not None:
+            self.collaboration.close()
         if self.memory_http is not None:
             self.memory_http.shutdown()
         if self.memory_hub is not None:
@@ -741,6 +763,7 @@ def build_daemon(
     limiter: ConcurrencyLimiter | None = None,
     memory_hub: GovernedMemoryHub | None = None,
     memory_gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS,
+    expert_mounts: Callable[[str], ExpertMount | None] = lambda inbox_id: None,
 ) -> AlwaysOnDaemon:
     db = database if database is not None else SQLiteDatabase(db_path)
     if ledger is None and (database is None or ledger_db_path):
@@ -761,7 +784,7 @@ def build_daemon(
     workspaces = SQLiteWorkspaceStore(db)
     if memory_hub is None:
         memory_hub = open_memory_hub(MemoryHubConfig(memory_root=str(memory_root)), ledger=ledger)
-    partitions = WorkspacePartitionRegistry(memory_root, hub=memory_hub)
+    partitions = WorkspacePartitionRegistry(memory_root, hub=memory_hub, mounts=expert_mounts)
     permissions = AutoModePermissionAdapter()
     resolved_channel: ChannelPort = (
         channel if channel is not None else ConsoleChannelAdapter(echo=outbox_dir is None)
@@ -1055,6 +1078,7 @@ def build_daemon_from_config(
     runner: RunnerHandle | None = None,
     limiter: ConcurrencyLimiter | None = None,
     memory_hub: GovernedMemoryHub | None = None,
+    collaboration: CollaborationRuntime | None = None,
     forward_targets: ForwardTargets | None = None,
     reloads: ReloadStatus | None = None,
 ) -> AlwaysOnDaemon:
@@ -1067,7 +1091,10 @@ def build_daemon_from_config(
 
     resolved_channel = channel if channel is not None else ConsoleChannelAdapter(echo=not config.channels.outbox_dir)
     if switchboard is not None:
-        resolved_channel = SwitchboardChannelAdapter(switchboard_bus(switchboard).publish, fallback=resolved_channel)
+        resolved_channel = SwitchboardChannelAdapter(
+            switchboard_bus(switchboard).publish, fallback=resolved_channel,
+            push_policy=NotificationPolicyEngine() if config.collaboration.enabled else None,
+        )
 
     mcp_token = (
         (os.environ.get(config.channels.mcp_token_env) or None)
@@ -1125,12 +1152,19 @@ def build_daemon_from_config(
     if memory_hub is None:
         memory_hub = open_memory_hub(config.memory_hub.hub_config(config.runtime.memory_root), ledger=ledger)
     memory_hub.is_projectless = projectless_inboxes(config)
+    if collaboration is None:
+        collaboration = open_collaboration(config.collaboration, memory_hub)
+
+    def _expert_mount(inbox_id: str) -> ExpertMount | None:
+        plan = config.expert_plan(inbox_id)
+        return ExpertMount(plan, collaboration.role_store) if plan is not None and collaboration is not None else None
 
     daemon = build_daemon(
         db_path=config.runtime.db_path,
         database=database,
         memory_hub=memory_hub,
         memory_gc_interval_seconds=config.memory_hub.gc_interval_seconds,
+        expert_mounts=_expert_mount,
         limits=limits,
         project_for=_project_name,
         memory_root=config.runtime.memory_root,
@@ -1610,13 +1644,60 @@ def build_daemon_from_config(
     if switchboard is not None and attach:
         attach_switchboard(daemon, switchboard, config.switchboard.consumer_id)
 
+    coordinator: CloseoutCoordinator | None = None
+    if collaboration is not None:
+        daemon.collaboration = collaboration
+        coordinator = mount_collaboration(daemon, collaboration, config, router)
+
     if opened_hub:
         # Last, so settings refused above leave no listener behind. A reload passes the running hub, whose service goes
         # on; its settings cannot change without a restart.
-        daemon.memory_http = open_memory_http(config.memory_hub.http, memory_hub)
+        if collaboration is not None and coordinator is not None:
+            # It keeps this generation's handler, whose wakes a reload forwards to the pool in force.
+            collaboration.hub_server = open_collaboration_hub(
+                config.collaboration, collaboration, coordinator, hub=memory_hub, ledger=daemon.ledger
+            )
+        try:
+            daemon.memory_http = open_memory_http(config.memory_hub.http, memory_hub)
+        except BaseException:
+            if collaboration is not None:
+                collaboration.close()
+            raise
     if attach:
         daemon.timers.reconcile(config.timers)
     return daemon
+
+
+def mount_collaboration(
+    daemon: AlwaysOnDaemon, runtime: CollaborationRuntime, config: HibernautConfig, router: ProjectRouter[ProjectConfig]
+) -> CloseoutCoordinator:
+    keys = {key for p in router.projects if (key := project_memory_key(p.inbox_id)) is not None}
+    coordinator = ProjectCloseoutCoordinator(
+        runtime.closeouts,
+        chief=ChiefOfStaffInboxSink(daemon.handler.queue, config.collaboration.chief_inbox),
+        taskboard=TaskboardFollowUpSink(runtime.taskboard) if runtime.taskboard is not None else None,
+        memory=runtime.memory_sink,
+        knows_project=keys.__contains__,
+    )
+    assert daemon.mcp_server is not None
+    daemon.mcp_server.mount_collaboration(CollaborationControlPlane(
+        roles=runtime.role_store,
+        pool=runtime.pool,
+        closeout=coordinator,
+        drafted={(e.plan.project_key, e.plan.role_id): e.plan for p in router.projects for e in p.expert_bindings},
+        budget_chars=config.collaboration.expert_budget_chars,
+    ))
+    return coordinator
+
+
+def companion_config(config: HibernautConfig, environ: Mapping[str, str]) -> HibernautConfig:
+    # The stdio MCP companion runs no agent, so it opens no runner, and the HTTP services belong to the daemon.
+    link = config.collaboration
+    taskboard = link.taskboard if environ.get(link.taskboard.token_env, "").strip() else CollaborationTaskboardConfig()
+    return replace(
+        config, runner=RunnerLinkConfig(), memory_hub=replace(config.memory_hub, http=MemoryHTTPConfig()),
+        collaboration=replace(link, hub=CollaborationHubConfig(), taskboard=taskboard),
+    )
 
 
 def take_switchboard_secrets(environ: MutableMapping[str, str] | None = None) -> dict[str, str]:
@@ -1774,6 +1855,9 @@ async def serve_configured(
                 if candidate.memory_hub != config.memory_hub:
                     refuse("[memory_hub] changes require a restart.")
                     continue
+                if candidate.collaboration != config.collaboration:
+                    refuse("[collaboration] and [experts] changes require a restart.")
+                    continue
                 address = (candidate.channels.host, candidate.channels.port)
                 next_server: WebhookHTTPServer | None = None
                 next_pilot: RunnerPilotRelay | None = None
@@ -1789,6 +1873,7 @@ async def serve_configured(
                         runner=daemon.runner,
                         limiter=shared_limiter,
                         memory_hub=daemon.memory_hub,
+                        collaboration=daemon.collaboration,
                         forward_targets=daemon.forward_targets,
                         reloads=reloads,
                         attach=False,
@@ -1987,12 +2072,7 @@ def main() -> None:
             except ValueError as exc:
                 # The rest of the daemon runs; the pilot inbox is held, never run on another executor.
                 print(f"[runner_pilot] {exc}; the pilot inbox stays held.", file=sys.stderr, flush=True)
-        # Nor does it run any agent, so it opens no runner; the memory HTTP service belongs to the daemon too.
-        companion = (
-            replace(cfg, runner=RunnerLinkConfig(), memory_hub=replace(cfg.memory_hub, http=MemoryHTTPConfig()))
-            if args.mcp_stdio
-            else cfg
-        )
+        companion = companion_config(cfg, os.environ) if args.mcp_stdio else cfg
         daemon = build_daemon_from_config(
             companion, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot, attach=not args.mcp_stdio
         )

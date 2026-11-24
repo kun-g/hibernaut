@@ -8,6 +8,7 @@ from typing import Any, TextIO, cast, get_args
 from agent_runtime import __version__
 from agent_runtime.adapters.channels.http_types import WebhookResponse
 from agent_runtime.adapters.executor_cli.worktree import OrcaWorktreeManager
+from agent_runtime.adapters.collaboration_bridge import CollaborationControlPlane
 from agent_runtime.adapters.ledger_bridge import RunLedger
 from agent_runtime.adapters.memory_bridge import MemoryControlPlane
 from agent_runtime.adapters.storage_sqlite.stores import (
@@ -233,6 +234,7 @@ class MCPServerAdapter:
     ) -> None:
         self._handler = handler
         self._memory = memory
+        self._collaboration: CollaborationControlPlane | None = None
         self._ledger = ledger
         # (inbox_id or None, work_key) -> the manager of the project that owns that workspace, if any.
         self._worktree_manager_for = worktree_manager_for
@@ -243,6 +245,9 @@ class MCPServerAdapter:
         self._worktree_manager = worktree_manager
         self._outbox = outbox
         self._bearer_token = bearer_token.strip() if bearer_token else None
+
+    def mount_collaboration(self, plane: CollaborationControlPlane) -> None:
+        self._collaboration = plane
 
     @property
     def http_enabled(self) -> bool:
@@ -321,7 +326,8 @@ class MCPServerAdapter:
             return self._ok_response(req_id, {})
         if method == "tools/list":
             memory_tools = self._memory.definitions() if self._memory is not None else []
-            return self._ok_response(req_id, {"tools": [*_TOOL_DEFINITIONS, *memory_tools]})
+            collaboration = self._collaboration.definitions() if self._collaboration is not None else []
+            return self._ok_response(req_id, {"tools": [*_TOOL_DEFINITIONS, *memory_tools, *collaboration]})
         if method == "tools/call":
             return self._handle_tool_call(req_id, params, remote)
 
@@ -353,6 +359,8 @@ class MCPServerAdapter:
     def _dispatch_tool(self, tool_name: str, args: dict[str, Any], remote: bool) -> dict[str, Any]:
         if self._memory is not None and self._memory.handles(tool_name):
             return self._memory.call(tool_name, args)
+        if self._collaboration is not None and self._collaboration.handles(tool_name):
+            return self._collaboration.call(tool_name, args)
         if tool_name == "hibernaut_ingest_event":
             inbox_id = str(args["inbox_id"])
             source = str(args["source"])
