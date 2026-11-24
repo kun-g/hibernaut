@@ -118,9 +118,7 @@ class TestRemoteBranchDeletion(DeliveryCase):
 
 class TestReclaimDeletesTheMergedBranch(ReclaimCase, unittest.TestCase):
     def merged_and_pruned(self):
-        head = self.commit()
-        git(self.wt, "push", "-q", "origin", "hb/task-9")
-        merge = self.squash_merge()
+        head, merge = self.squashed_task()
         self.merged_pr(head, merge)
         return head
 
@@ -292,9 +290,7 @@ class TestMergedTaskReclaimEndToEnd(ReclaimCase, unittest.IsolatedAsyncioTestCas
         self.cfg = parse_delivery("d", {"open_pr": True, "auto_merge": True}, repo="o/r")
 
     def merged_record(self):
-        head = self.commit()
-        git(self.wt, "push", "-q", "origin", "hb/task-9")
-        merge = self.squash_merge()
+        head, merge = self.squashed_task()
         self.merged_pr(head, merge)
         self.deliveries.save("task:9", DeliveryRecord(state="merged", branch="hb/task-9", pushed_sha=head,
                                                       verified_sha=head, merge_sha=merge).to_dict())

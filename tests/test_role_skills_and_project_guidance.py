@@ -3,6 +3,7 @@ import fnmatch
 import http.client
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sqlite3
@@ -14,7 +15,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from agent_runtime.adapters.executor_cli import OrcaWorktreeManager
-from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
+from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeError, ClaudeCodeLauncher, ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
 from agent_runtime.adapters.executor_cli.role_skills import BUILTIN_SKILLS_DIR, builtin_skill
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions
@@ -200,10 +201,16 @@ class _Harness(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSkillsAndGuidanceReachTheRoles(_Harness):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        root = Path(cls.enterClassContext(tempfile.TemporaryDirectory()))
+        cls.template = make_repo(root, "alpha", ALPHA_AGENTS, {"docs/issues.md": "issue template"})
+        git(cls.template, "checkout", "-qb", "hb/task-1")
+
     def setUp(self):
         super().setUp()
-        self.repo = make_repo(self.root, "alpha", ALPHA_AGENTS, {"docs/issues.md": "issue template"})
-        git(self.repo, "checkout", "-qb", "hb/task-1")
+        self.repo = shutil.copytree(self.template, self.root / "alpha")
 
     def payload(self, **extra):
         return {"executor_id": "sde", "text": "divide must reject zero", "explicit_workdir": str(self.repo),
@@ -308,7 +315,14 @@ class TestSkillsAndGuidanceReachTheRoles(_Harness):
 
     async def test_resumed_review_retry_uses_the_pinned_commit_and_old_checkpoints_keep_theirs(self):
         start = head(self.repo)
-        self.set_plan(sde=[dev(FIXED)], reviewer=[{"error": "reviewer crashed"}, PASS])
+        self.set_plan(sde=[dev(FIXED)])
+        # Each retry renders its real guidance from the checkpoint. The code diff and verdict are fixture inputs.
+        reviewer = "agent_runtime.adapters.executor_cli.reviewer"
+        self.enterContext(patch(f"{reviewer}._collect_diff", return_value=("divide fixed", ["calc.py"])))
+        self.enterContext(patch(f"{reviewer}.worktree_fingerprint", return_value="head:tree"))
+        launches = self.enterContext(patch(f"{reviewer}.run_claude_code", side_effect=[
+            ClaudeCodeError("reviewer crashed"), *({"structured_output": PASS} for _ in range(3)),
+        ]))
         executor = self.sde()
         outcome = await executor.execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Suspend), outcome
@@ -316,32 +330,32 @@ class TestSkillsAndGuidanceReachTheRoles(_Harness):
         (self.repo / "AGENTS.md").write_text("ALPHA-RULE changed while suspended\n")
         git(self.repo, "commit", "-qam", "edit while suspended")
 
-        def resume(checkpoint):
+        async def retry_guidance(checkpoint):
             session = SessionRef(session_id="s", inbox_id="proj:x", executor_id="sde", status="suspended",
                                  checkpoint=checkpoint, pending_request_id=outcome.request_id)
-            return executor.execute([event({"approval_request_id": outcome.request_id, "approved": True})],
-                                    session, self.caps)
+            previous = launches.await_count
+            resumed = await executor.execute([event({"approval_request_id": outcome.request_id, "approved": True})],
+                                             session, self.caps)
+            self.assertIsInstance(resumed, Emit)
+            self.assertEqual(launches.await_count, previous + 1)
+            return launches.await_args.kwargs["prompt"].split("## Test evidence", 1)[0]
 
-        def guidance():
-            return self.calls("reviewer")[-1]["prompt"].split("## Test evidence", 1)[0]
-
-        resumed = await resume(outcome.session_checkpoint)
-        assert isinstance(resumed, Emit), resumed
-        self.assertIn("make check", guidance())
-        self.assertNotIn("changed while suspended", guidance())
+        guidance = await retry_guidance(outcome.session_checkpoint)
+        self.assertIn("make check", guidance)
+        self.assertNotIn("changed while suspended", guidance)
         # A checkpoint from the previous release stored AGENTS.md with its commit: that commit is reused.
         legacy = json.loads(outcome.session_checkpoint)
         legacy["sde"]["project"] = {"workdir": str(self.repo.resolve()), "path": "AGENTS.md", "commit": start,
                                     "text": "ignored"}
         del legacy["sde"]["work_key"]
-        await resume(json.dumps(legacy))
-        self.assertIn(f"Source: {start}:AGENTS.md", guidance())
-        self.assertIn("make check", guidance())
+        guidance = await retry_guidance(json.dumps(legacy))
+        self.assertIn(f"Source: {start}:AGENTS.md", guidance)
+        self.assertIn("make check", guidance)
         # Older still, no guidance recorded at all: the worktree's current commit, labelled as such.
         del legacy["sde"]["project"]
-        await resume(json.dumps(legacy))
-        self.assertIn("ALPHA-RULE changed while suspended", guidance())
-        self.assertIn(f"Pinned to commit {head(self.repo)} (worktree HEAD on resume", guidance())
+        guidance = await retry_guidance(json.dumps(legacy))
+        self.assertIn("ALPHA-RULE changed while suspended", guidance)
+        self.assertIn(f"Pinned to commit {head(self.repo)} (worktree HEAD on resume", guidance)
 
     async def test_independent_review_reads_the_merge_base_of_the_reviewed_worktree(self):
         (self.repo / "calc.py").write_text("def divide(a, b):\n    return a / b\n")

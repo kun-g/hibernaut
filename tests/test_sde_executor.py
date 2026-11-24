@@ -333,7 +333,8 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls(), [])
 
     async def test_subscription_stops_on_paid_credentials(self):
-        self.set_plan(sde=[dev(FIXED)])
+        # A wrong init must fail even if the CLI immediately offers a usable reply. Leave no Git child to reap.
+        self.set_plan(sde=[dev(status="needs_input", question="which divisor?")])
         with patch.dict(os.environ, {"FAKE_API_KEY_SOURCE": "apiKeyHelper"}):
             outcome = await self.executor().execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Emit), outcome

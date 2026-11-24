@@ -1,14 +1,19 @@
+import atexit
+import functools
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from agent_runtime.adapters.delivery import DeliveryRecord
 from agent_runtime.adapters.executor_cli import CommandResult, OrcaWorktreeManager
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, RoleReply
-from agent_runtime.adapters.executor_cli.sde import SDE_SCHEMA, SDEExecutor, SDEOptions, inspect_worktree
+from agent_runtime.adapters.executor_cli.sde import SDE_SCHEMA, SDEExecutor, SDEOptions, _State, inspect_worktree
 from agent_runtime.adapters.executor_cli.worktree import _default_runner
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteDatabase,
@@ -232,8 +237,21 @@ class TestTerminalExit(SDECase):
         # Closing the terminal reclaims nothing.
         self.assertTrue(self.wt.is_dir())
 
+    async def finish_open_pr(self, *, close=False, auto_merge=False, live_peers=None):
+        delivery = self.delivery(close_terminal=close, auto_merge=auto_merge)
+        sha = "a" * 40
+        record = DeliveryRecord(state="pr_open", pr_url="https://github.example/o/r/pull/1", head_sha=sha,
+                                pushed_sha=sha, verified_sha=sha, checked_sha=sha, checks=[{"command": "test", "exit_code": 0}])
+        terminal = FakeTerminal([], self.snapshot)
+        executor = self.executor(delivery=delivery, terminal=terminal, live_peers=live_peers)
+        state = _State(stage="develop", work_key="task:1", workdir=str(self.wt), base_ref="origin/main",
+                       requirements="fix divide", change_kind="fix", terminal="term-1")
+        with patch.object(delivery, "deliver", return_value=record):
+            outcome = await executor._finish("session", "native-1", state, self.caps, review="off")
+        return outcome, terminal
+
     async def test_terminal_stays_when_closing_is_not_configured(self):
-        outcome, terminal = await self.run_task([step({"calc.py": "x = 1\n"})], self.delivery())
+        outcome, terminal = await self.finish_open_pr()
         assert isinstance(outcome, Emit), outcome
         self.assertEqual(terminal.released, [])
         self.assertIn("Terminal: kept term-1 (close_terminal is off)", outcome.messages[0])
@@ -248,17 +266,15 @@ class TestTerminalExit(SDECase):
         self.assertEqual(terminal.released, [])
 
     async def test_a_live_reviewer_exchange_keeps_the_terminal(self):
-        outcome, terminal = await self.run_task(
-            [step({"calc.py": "x = 1\n"})], self.delivery(close_terminal=True),
-            live_peers=lambda key: [f"review session r1 on review:{key} (active)"])
+        outcome, terminal = await self.finish_open_pr(
+            close=True, live_peers=lambda key: [f"review session r1 on review:{key} (active)"])
         assert isinstance(outcome, Emit), outcome
         self.assertEqual(terminal.released, [])
         self.assertIn("Terminal: kept term-1 (review session r1 on review:task:1 (active))", outcome.messages[0])
 
     async def test_authorized_merge_policy_keeps_the_terminal_until_the_pr_is_merged(self):
         # auto_merge needs review=pass; with review off the PR stays open, so the target is not reached.
-        outcome, terminal = await self.run_task([step({"calc.py": "x = 1\n"})],
-                                                self.delivery(close_terminal=True, auto_merge=True))
+        outcome, terminal = await self.finish_open_pr(close=True, auto_merge=True)
         assert isinstance(outcome, Emit), outcome
         self.assertEqual(terminal.released, [])
         self.assertIn("merging is authorized but the PR is not merged", outcome.messages[0])
@@ -321,6 +337,23 @@ class TestRunnerRelease(DeliveryCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(binding.handle, "term-1")
 
 
+@functools.cache
+def _squashed_history(seed):
+    tmp = tempfile.TemporaryDirectory(prefix="reclaim-history-")
+    atexit.register(tmp.cleanup)
+    repo = shutil.copytree(seed, Path(tmp.name) / "primary")
+    git(repo, "checkout", "-qb", "task")
+    (repo / "calc.py").write_text("x = 1\n")
+    git(repo, "commit", "-qam", "work")
+    head = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "-q", "main")
+    git(repo, "merge", "--squash", "task")
+    git(repo, "commit", "-qm", "work (#3)")
+    merge = git(repo, "rev-parse", "HEAD")
+    git(repo, "repack", "-ad")
+    return repo / ".git/objects/pack", head, merge
+
+
 class ReclaimCase(DeliveryCase):
     def setUp(self):
         super().setUp()
@@ -349,12 +382,15 @@ class ReclaimCase(DeliveryCase):
         git(self.wt, "commit", "-qm", "work")
         return git(self.wt, "rev-parse", "HEAD")
 
-    def squash_merge(self):
-        # This fixture has no upstream changes: a squash has the task's tree and the old main as its only parent.
-        git(self.primary, "merge-base", "--is-ancestor", "origin/main", "hb/task-9")
-        merge = git(self.primary, "commit-tree", "hb/task-9^{tree}", "-p", "origin/main", "-m", "work (#3)")
-        git(self.primary, "push", "-q", "--atomic", "origin", f"{merge}:refs/heads/main", ":refs/heads/hb/task-9")
-        return merge
+    def squashed_task(self):
+        # Only immutable objects are reused. Each case owns the refs, index and linked worktree it will reclaim.
+        pack, head, merge = _squashed_history(self._tmpl_seed)
+        for db in (self.primary / ".git", self.bare):
+            shutil.copytree(pack, db / "objects/pack", dirs_exist_ok=True)
+        git(self.wt, "merge", "-q", "--ff-only", head)
+        git(self.primary, "update-ref", "refs/remotes/origin/main", merge)
+        git(self.bare, "update-ref", "refs/heads/main", merge)
+        return head, merge
 
     def merged_pr(self, head, merge):
         self.gh["merged"] = CommandResult(0, json.dumps(
@@ -384,9 +420,7 @@ class TestReclaimEvidence(ReclaimCase, unittest.TestCase):
         self.assertTrue(self.wt.is_dir())
 
     def test_squash_merged_branch_is_reclaimed_on_merge_evidence(self):
-        head = self.commit()
-        git(self.wt, "push", "-q", "origin", "hb/task-9")
-        merge = self.squash_merge()
+        head, merge = self.squashed_task()
         self.assertFalse(self.manager().reclaim("task:9").reclaimed)
         self.merged_pr(head, merge)
         result = self.manager().reclaim("task:9")
@@ -395,9 +429,7 @@ class TestReclaimEvidence(ReclaimCase, unittest.TestCase):
         self.assertIsNone(self.workspaces.get("task:9"))
 
     def test_a_commit_after_the_squash_merge_keeps_the_worktree(self):
-        head = self.commit()
-        git(self.wt, "push", "-q", "origin", "hb/task-9")
-        merge = self.squash_merge()
+        head, merge = self.squashed_task()
         self.merged_pr(head, merge)
         self.commit("x = 2\n")
         result = self.manager().reclaim("task:9")
@@ -405,9 +437,7 @@ class TestReclaimEvidence(ReclaimCase, unittest.TestCase):
         self.assertIn("unpushed commits", result.reason)
 
     def test_merge_commit_missing_from_the_remote_is_not_evidence(self):
-        head = self.commit()
-        git(self.wt, "push", "-q", "origin", "hb/task-9")
-        self.squash_merge()
+        head, _ = self.squashed_task()
         self.merged_pr(head, "e" * 40)
         self.assertFalse(self.manager().reclaim("task:9").reclaimed)
 

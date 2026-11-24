@@ -192,10 +192,13 @@ class TestSDEDelivery(SDEDeliveryCase):
         self.assertEqual(self.gh_state().get("prs", []), [])
 
     async def test_approving_a_deferred_merge_merges_with_the_recorded_sha(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
+        (self.wt / "calc.py").write_text("x = 1\n")
+        git(self.wt, "commit", "-qam", "fix divide")
+        state = _State(stage="develop", workdir=str(self.wt), base_ref="origin/main", requirements="fix divide",
+                       change_kind="fix", rounds=1, work_key="task:1", inbox_id="proj:x")
         self.caps.permissions = InMemoryPermission({MERGE_TOOL: PermissionDecision("defer", "merge needs a person")})
         executor = self.executor(delivery=self.delivery(auto_merge=True))
-        outcome = await executor.execute([event(self.payload())], None, self.caps)
+        outcome = await executor._finish("session", "native", state, self.caps, review="pass")
         assert isinstance(outcome, Suspend), outcome
         self.assertIn("delivery.merge needs approval", outcome.prompt)
         self.assertIn("PR: https://github.example/o/r/pull/1", outcome.prompt)

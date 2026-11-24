@@ -45,9 +45,7 @@ class SweepCase(ReclaimCase):
 
     def delivered(self):
         # What a merged PR delivery leaves behind: the branch pushed, squash-merged and pruned, the record merged.
-        head = self.commit()
-        git(self.wt, "push", "-q", "origin", "hb/task-9")
-        merge = self.squash_merge()
+        head, merge = self.squashed_task()
         self.merged_pr(head, merge)
         self.deliveries.save("task:9", {"state": "merged", "branch": "hb/task-9", "pushed_sha": head,
                                         "merge_sha": merge})
@@ -112,9 +110,8 @@ class TestSweepRetriesSkippedReclaims(SweepCase, unittest.TestCase):
         self.assertFalse(self.wt.exists())
 
     def test_a_merged_pr_at_the_worktree_head_is_evidence_without_a_delivery_record(self):
-        head = self.commit()
-        git(self.wt, "push", "-q", "origin", "hb/task-9")
-        self.merged_pr(head, self.squash_merge())
+        head, merge = self.squashed_task()
+        self.merged_pr(head, merge)
         [outcome] = self.sweeper().sweep_once()
         self.assertTrue(outcome.reclaimed, outcome.reason)
         self.assertFalse(self.wt.exists())
@@ -140,9 +137,8 @@ class TestSweepKeepsWorktreesInUse(SweepCase, unittest.TestCase):
         self.assertTrue(self.wt.is_dir())
 
     def test_a_merged_pr_at_another_head_is_not_evidence(self):
-        head = self.commit()
-        git(self.wt, "push", "-q", "origin", "hb/task-9")
-        self.merged_pr("f" * 40, self.squash_merge())
+        head, merge = self.squashed_task()
+        self.merged_pr("f" * 40, merge)
         self.assertNotEqual(head, "f" * 40)
         self.assertFalse(self.sweeper().sweep_once()[0].reclaimed)
         self.assertTrue(self.wt.is_dir())
