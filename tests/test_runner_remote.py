@@ -696,11 +696,13 @@ def test_a_run_cut_off_with_its_node_is_run_again_once_the_node_is_back(remote: 
     remote.write()
     remote.start_hb()
     remote.start_node()
-    held = remote.ask(("sleep", {"seconds": 8}))
-    remote.until(lambda: remote.cli("start"))
+    release = remote.node / "release-cli"
+    held = remote.ask(("wait_for_file", {"path": str(release)}))
+    remote.until(lambda: remote.cli("waiting"))
     assert remote.stop_node() == 0
     assert len(git("worktree", "list", cwd=remote.node_repo).splitlines()) == 1
     remote.assert_original_path(OTHER)
+    release.touch()
     remote.node_log.write_text("")
     remote.start_node()
     remote.until(lambda: remote.status(held) == "done", timeout=60)
