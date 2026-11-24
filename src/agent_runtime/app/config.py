@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import math
 import re
@@ -38,6 +39,7 @@ from agent_runtime.app.projects import (
     AgentConfig,
     InboxRule,
     ProjectBinding,
+    ProjectRouter,
     WorkdirBinding,
     parse_inbox_bindings,
     parse_inbox_rules,
@@ -47,7 +49,7 @@ from agent_runtime.app.projects import (
     validate_workdir_bindings,
 )
 from agent_runtime.app.reload import ReloadStatus
-from agent_runtime.core.models import InboxRoute, NewEventPolicy
+from agent_runtime.core.models import ConfiguredTimer, InboxRoute, NewEventPolicy
 from memory_hub import BaselineBudgetConfig, KnowledgeMountConfig, MemoryHubConfig
 from memory_hub.models import AccessRole
 from memory_hub.partition import sanitize_segment
@@ -500,6 +502,46 @@ class HibernautConfig:
     onboarding: OnboardingConfig = field(default_factory=OnboardingConfig)
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
+    timers: tuple[ConfiguredTimer, ...] = ()
+
+
+def _parse_timers(raw: object, runtime: RuntimeConfig, projects: Mapping[str, ProjectConfig]) -> tuple[ConfiguredTimer, ...]:
+    if not isinstance(raw, list):
+        raise ValueError("timers must be an array of tables")
+    result: dict[str, ConfiguredTimer] = {}
+    router = ProjectRouter(projects.values())
+    for i, item in enumerate(raw):
+        where = f"timers[{i}]"
+        if not isinstance(item, dict) or item.keys() - {"name", "inbox_id", "interval_seconds", "enabled", "payload"}:
+            raise ValueError(f"{where} must be a timer table with known keys")
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip() or name != name.strip() or name in result:
+            raise ValueError(f"{where}.name must be a unique, non-blank name without surrounding whitespace")
+        inbox = item.get("inbox_id")
+        if not isinstance(inbox, str):
+            raise ValueError(f"{where}.inbox_id must be a string")
+        sanitize_segment(inbox, field_name=f"{where}.inbox_id")
+        bound = runtime.workdir_binding(inbox)
+        if bound and bound.system_tools:
+            raise ValueError(f"{where}: {inbox} has system_tools")
+        project = router.resolve(inbox)
+        if not bound and (not project or (project.inbox_bindings and not project.route(inbox).binding)):
+            raise ValueError(f"{where}.inbox_id {inbox!r} has no binding")
+        interval = item.get("interval_seconds")
+        if type(interval) is not int or not 1 <= interval <= 2**31 - 1:
+            raise ValueError(f"{where}.interval_seconds must be an integer from 1 to 2147483647")
+        enabled = item.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"{where}.enabled must be true or false")
+        payload = item.get("payload", {})
+        if not isinstance(payload, dict):
+            raise ValueError(f"{where}.payload must be a table")
+        try:
+            json.dumps(payload, allow_nan=False)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"{where}.payload must contain JSON values") from exc
+        result[name] = ConfiguredTimer(name, inbox, interval, payload, enabled)
+    return tuple(result.values())
 
 
 def _resolve_path(raw: str, base_dir: Path | None) -> str:
@@ -1296,6 +1338,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
     )
 
     config = HibernautConfig(
+        timers=_parse_timers(raw.get("timers", []), runtime, projects),
         runtime=runtime,
         channels=channels,
         executors=executors,
