@@ -13,6 +13,7 @@ from agent_runtime.app.inbox_patterns import UncomparablePattern, common_match
 from agent_runtime.core.models import Event, InboxBinding, InboxMatchRule, InboxRoute
 from agent_runtime.core.ports import SessionStorePort
 from agent_runtime.engine.worker import ExecutorFailed
+from collaboration import ExpertPoolRegistry, MemoryMountPlan
 
 _log = logging.getLogger(__name__)
 
@@ -130,6 +131,12 @@ class ProjectBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class ExpertBinding(ProjectBinding):
+    # The inboxes of one expert the project drafts from the shared pool, and the memory its Runs there get.
+    plan: MemoryMountPlan
+
+
+@dataclass(frozen=True, slots=True)
 class WorkdirBinding:
     # An inbox of no project: its agents start in this directory, which no event can change.
     rule: InboxRule
@@ -204,6 +211,56 @@ def parse_inbox_bindings(
             raise ValueError(f"{where}: {rule.text!r} is not an inbox of projects.{project} (see its inbox_id)")
         bindings.append(ProjectBinding(rule=rule, binding=_binding(where, item, rule, declared)))
     return tuple(bindings)
+
+
+def project_memory_key(inbox_id: str) -> str | None:
+    key = inbox_id.removeprefix("proj:")
+    return key if key != inbox_id and ":" not in key else None
+
+
+def draft_experts(
+    project: str,
+    roles: Sequence[str],
+    *,
+    inbox_id: str,
+    inbox_rules: Sequence[InboxRule],
+    manual: Sequence[ProjectBinding],
+    readonly_projects: tuple[str, ...],
+    pool: ExpertPoolRegistry,
+    budget_chars: int,
+) -> tuple[ExpertBinding, ...]:
+    where = f"projects.{project}.experts"
+    key = project_memory_key(inbox_id)
+    if key is None:
+        raise ValueError(f"{where}: an expert's inbox is proj:<project>:<role>, so the project's primary inbox_id must "
+                         f"be proj:<project>, not {inbox_id!r}")
+    drafted: list[ExpertBinding] = []
+    for role in roles:
+        try:
+            resolved = pool.resolve_for_project(
+                role_id=role, project_key=key, extra_readonly_projects=readonly_projects, budget_chars=budget_chars
+            )
+        except KeyError:
+            declared = ", ".join(p.role_id for p in pool.list_profiles()) or "none"
+            raise ValueError(f"{where}: '{role}' is not declared in [experts] (declared: {declared})") from None
+        except ValueError as exc:
+            raise ValueError(f"{where}: {exc}") from exc
+        scope = resolved.inbox_scope
+        for inbox in (scope, f"{scope}:task"):
+            if not any(rule.matches(inbox) for rule in inbox_rules):
+                raise ValueError(f"{where}: {inbox!r} is not an inbox of projects.{project}; add "
+                                 f"\"proj:{re.escape(key)}:.+\" to its inbox_id")
+        rule = InboxRule.parse(f"{re.escape(scope)}(:.+)?")
+        for bound in manual:
+            if bound.rule.literal is not None and rule.matches(bound.rule.literal):
+                raise ValueError(f"{where}: inbox {bound.rule.literal!r} is the expert's; take it out of "
+                                 f"projects.{project}.inbox_bindings")
+        agent = resolved.profile.agent_id
+        drafted.append(ExpertBinding(
+            rule=rule, binding=InboxBinding(inbox=scope, default_agent=agent, agents=(agent,), rules=()),
+            plan=resolved.mount_plan,
+        ))
+    return tuple(drafted)
 
 
 def parse_workdir_bindings(
@@ -412,6 +469,9 @@ class _Bound(Protocol):
     def inbox_bindings(self) -> tuple[ProjectBinding, ...]: ...
 
     @property
+    def expert_bindings(self) -> tuple[ExpertBinding, ...]: ...
+
+    @property
     def default_agent(self) -> str | None: ...
 
     @property
@@ -439,7 +499,7 @@ def validate_project_bindings(projects: Iterable[_Bound]) -> None:
     # never apply there.
     listed = list(projects)
     for proj in listed:
-        for bound in proj.inbox_bindings:
+        for bound in (*proj.expert_bindings, *proj.inbox_bindings):
             for other in listed:
                 if other.name == proj.name:
                     continue
@@ -505,13 +565,16 @@ def build_system_manifest(inbox_id: str, binding: InboxBinding, agents: Sequence
 
 def build_routing_manifest(project: _Bound) -> str:
     # What a Steward needs to route work, rendered from the loaded config on every wake.
-    used = {name for b in project.inbox_bindings for name in (*b.binding.agents, b.binding.default_agent)}
+    used = {name for b in (*project.expert_bindings, *project.inbox_bindings)
+            for name in (*b.binding.agents, b.binding.default_agent)}
     if any(not b.binding.agents for b in project.inbox_bindings) or not project.inbox_bindings:
         used = {a.name for a in project.agents}
     default = f"`{project.default_agent}`" if project.default_agent else "the runtime's default agent"
     parts = [f"Project `{project.name}`. Its default agent is {default}.", "", "Agents:"]
     parts += [_agent_line(a) for a in project.agents if a.name in used]
     parts += ["", "Inboxes (the first that matches an inbox id applies):"]
+    parts += [f"- `{e.binding.inbox}`, and `{e.binding.inbox}:<task>` for one task: shared expert `{e.plan.role_id}`, "
+              f"agent `{e.binding.default_agent}` only" for e in project.expert_bindings]
     if not project.inbox_bindings:
         parts += [f"- {_inbox_text(rule)}: default agent {default}" for rule in project.inbox_rules]
     for bound in project.inbox_bindings:

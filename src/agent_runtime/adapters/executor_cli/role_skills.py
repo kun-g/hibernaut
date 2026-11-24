@@ -10,6 +10,8 @@ BUILTIN_PREFIX = "builtin:"
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().with_name("skills")
 # Old role names still accepted in deployment files and builtin: entries.
 ROLE_ALIASES = {"coder-reviewer": "code-reviewer"}
+# Built-in skills a role may list besides its own; none of them replaces it.
+ROLE_EXTRA_SKILLS: dict[str, tuple[str, ...]] = {"steward": ("chief-of-staff",)}
 
 
 def canonical_role(role: str) -> str:
@@ -23,10 +25,11 @@ def builtin_skill(role: str) -> Path:
 def resolve_skill(where: str, role: str, entry: str, base_dir: Path) -> Path:
     raw = entry.strip()
     if raw.startswith(BUILTIN_PREFIX):
-        # A role may only name its own built-in skill, so one role's rules never leak into another.
-        if canonical_role(raw.removeprefix(BUILTIN_PREFIX)) != canonical_role(role):
+        # A role may only name its own built-in skills, so one role's rules never leak into another.
+        own, name = canonical_role(role), canonical_role(raw.removeprefix(BUILTIN_PREFIX))
+        if name != own and name not in ROLE_EXTRA_SKILLS.get(own, ()):
             raise ValueError(f"{where}: '{raw}' is not available for role '{role}' (use '{BUILTIN_PREFIX}{role}')")
-        path = builtin_skill(role)
+        path = builtin_skill(name)
     else:
         path = Path(raw).expanduser()
         if not path.is_absolute():

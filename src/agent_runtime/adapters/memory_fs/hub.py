@@ -106,6 +106,16 @@ class GovernedMemoryHub(MemoryHub):
         with self.exclusive():
             return super().propose_write(proposal)
 
+    def queue_proposal(self, proposal: WriteProposal, *, proposal_id: str) -> WriteResult:
+        if not _PROPOSAL_ID_RE.fullmatch(proposal_id):
+            raise ValueError(f"Invalid proposal id: {proposal_id!r}")
+        with self.exclusive():
+            return super().queue_proposal(proposal, proposal_id=proposal_id)
+
+    def commit(self, message: str) -> bool:
+        with self.exclusive():
+            return self._git_commit_if_enabled(message)
+
     def approve_proposal(self, proposal_id: str, *, actor: str) -> WriteResult:
         # The id becomes a file name in proposals/.
         if not _PROPOSAL_ID_RE.fullmatch(proposal_id):

@@ -418,6 +418,26 @@ gh_command = "gh"
 # allowed_projects = ["hibernaut"]
 # allow_kb = false                       # 能否读知识库挂载
 
+# 个人人机协作（默认关闭，docs/architecture.md §15）。改 [collaboration] 或 [experts] 需要重启。
+# [collaboration]
+# enabled = true
+# chief_inbox = "user:main"              # 幕僚长的 Inbox，须有一条精确的 [[runtime.inbox_bindings]]；
+#                                        # 其 steward 写 skills = ["builtin:steward", "builtin:chief-of-staff"]
+# expert_budget_chars = 6500             # 每个专家启动时的记忆预算（字符）
+# [collaboration.taskboard]              # 不写则收口卡不能带后续任务，简报里也没有任务
+# mcp_url = "https://taskboard.example.com/taskboard/mcp"
+# token_env = "HIBERNAUT_TASKBOARD_MCP_TOKEN"   # 启动时取出并从环境里删除
+# [collaboration.hub]                    # 态势看板与审批页；明文 HTTP，跨主机时前面要有 TLS
+# enabled = true
+# listen_host = "127.0.0.1"
+# listen_port = 8796
+# base_path = ""                         # 放在同域子路径下时写，例如 "/hub"
+# token_env = "HIBERNAUT_COLLABORATION_TOKEN"   # 启动时取出并从环境里删除
+# reviewer = "owner"                     # 用这个令牌做的批准与确认记在谁名下
+# [experts.architect]                    # 共享专家；项目里写 experts = ["architect"] 抽调，
+# agent = "pool:architect"               # 须有 [agents."pool:architect"]；项目可再写 expert_readonly_projects = ["workshop"] 只读挂载别的项目记忆
+# max_concurrency = 2
+
 # Runner 只读试点（默认关闭，docs/runner.md §9；启用、验证与回退步骤见 deploy/runner/README.md）。打开后只有 inbox_id 这一个
 # 任务级 Inbox 改由独立 Runner 上的固定校验程序执行，任务须带 payload.candidate_commit；其他 Inbox 不受影响。
 # Relay 只监听 127.0.0.1。令牌文件须为本用户所有、权限 0600。运行中只能改 enabled，改其他项先关闭。

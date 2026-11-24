@@ -38,6 +38,11 @@
 | **RunOutcome（Silent / Emit / Suspend）** | 单轮 Run 的强类型三选一终态：静默退出（`Silent`）、发消息入 Outbox（`Emit`）、保存断点并立刻放锁等待人工审批（`Suspend`） | L0 领域契约，强制耗尽匹配 |
 | **执行账本（Ledger）/ RunRecord / AuditRecord** | 独立包 `src/ledger/` 与独立 SQLite 文件 `ledger.db`：每个结束的 Run 追加一条 `RunRecord`（结局、执行器、耗时、错误类别、日志引用 `log_ref`、token 与费用），各服务的点状审计追加为 `AuditRecord`；只追加、只读查询，写失败不影响主路径 | 全局 1 套，与主库分开；`run_id` 即 Outbox 元数据里的 `run_id`，重放事件的新 Run 以 `replay_of_run_id` 指向被重放的失败 Run |
 | **文件 Outbox** | `[channels] outbox_dir` 下每条投递的 Outbox 消息一个 Markdown 文件，开头是任务上下文头（任务、来源、状态、需要人做什么等） | 本机给人看的副本，与现有通道并存，不替代它们 |
+| **共享专家（expert）/ 专家池** | `[experts.<role>]` 声明、不属于任何项目的 Agent；项目用 `experts` 抽调后，在 `proj:<project>:<role>[:<task>]` 里工作 | 跨项目共享 Agent 与 `role://` 记忆；每个 Inbox 只挂一个项目的读写记忆 |
+| **角色记忆（`role://<role>/`）** | 一个角色在所有项目里共用的技能记忆，存于 `<memory_root>/roles/<role>/` | Run 只能提案，人在 hub 上批准后生效，批准时做 CAS 校验 |
+| **收口卡（`CloseoutCard`）** | 一次与专家的直接会话的结论：摘要、决定、后续任务、记忆提案。`draft → confirmed → synced`，或 `discarded` | 人确认后才回流到幕僚长 Inbox（`agent:closeout` 事件）、Taskboard 与提案队列，幂等 |
+| **幕僚长（Chief of Staff）** | 服务 `user:main`、带 `builtin:chief-of-staff` Skill 的全局 Steward，只澄清、分派、汇总 | 与各项目 Steward 分工；不拆项目内的活 |
+| **Hub（协作看板）** | `[collaboration.hub]` 起的 HTTP 页面，按需拉取简报、审批提案、确认收口卡 | 与只读的 Dashboard（`src/dashboard/`）是两个服务；与 Switchboard 的 RelayHub 无关 |
 
 ## 3. 生态分域与易混概念澄清
 

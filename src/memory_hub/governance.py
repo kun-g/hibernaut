@@ -149,9 +149,14 @@ class WriteGovernanceGate:
         except Exception:
             pass
 
-    def propose_write(self, proposal: WriteProposal) -> WriteResult:
+    def propose_write(self, proposal: WriteProposal, *, queue_as: str | None = None) -> WriteResult:
+        # queue_as: wait for approval whatever the target's policy, under this id; queued once, however often proposed.
         parsed = parse_memory_uri(proposal.target_uri)
         policy = classify_write_policy(parsed)
+        if queue_as is not None and policy != "DENY_RUNTIME":
+            if (self._store.proposals_dir / f"{queue_as}.json").is_file():
+                return self._queued(proposal, queue_as)
+            policy = "REQUIRE_APPROVAL"
         if policy == "DENY_RUNTIME":
             return WriteResult(
                 status="rejected_readonly",
@@ -204,7 +209,7 @@ class WriteGovernanceGate:
                 )
 
         if policy == "REQUIRE_APPROVAL":
-            prop_id = generate_id("prop")
+            prop_id = queue_as or generate_id("prop")
             record: dict[str, Any] = {
                 "proposal_id": prop_id,
                 "status": "pending",
@@ -216,12 +221,7 @@ class WriteGovernanceGate:
             }
             prop_path = self._store.proposals_dir / f"{prop_id}.json"
             atomic_write_text(prop_path, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
-            return WriteResult(
-                status="pending_approval",
-                target_uri=proposal.target_uri,
-                proposal_id=prop_id,
-                message=f"Queued for human approval as {prop_id}",
-            )
+            return self._queued(proposal, prop_id)
 
         atomic_write_text(target_path, new_text)
         if parsed.scheme == "proj":
@@ -232,6 +232,15 @@ class WriteGovernanceGate:
             target_uri=proposal.target_uri,
             new_sha256=sha256_text(new_text),
             message="Applied atomically",
+        )
+
+    @staticmethod
+    def _queued(proposal: WriteProposal, proposal_id: str) -> WriteResult:
+        return WriteResult(
+            status="pending_approval",
+            target_uri=proposal.target_uri,
+            proposal_id=proposal_id,
+            message=f"Queued for human approval as {proposal_id}",
         )
 
     def approve_proposal(self, proposal_id: str, *, actor: str) -> WriteResult:

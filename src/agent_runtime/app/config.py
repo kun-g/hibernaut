@@ -38,19 +38,23 @@ from agent_runtime.adapters.memory_bridge import DEFAULT_GC_INTERVAL_SECONDS
 from agent_runtime.adapters.permissions.security import proxy_service_url
 from agent_runtime.app.projects import (
     AgentConfig,
+    ExpertBinding,
     InboxRule,
     ProjectBinding,
     ProjectRouter,
     WorkdirBinding,
+    draft_experts,
     parse_inbox_bindings,
     parse_inbox_rules,
     parse_workdir_bindings,
+    project_memory_key,
     validate_project_bindings,
     validate_project_rules,
     validate_workdir_bindings,
 )
 from agent_runtime.app.reload import ReloadStatus
 from agent_runtime.core.models import ConfiguredTimer, InboxRoute, NewEventPolicy
+from collaboration import ExpertPoolRegistry, ExpertProfile, MemoryMountPlan, default_expert_profiles
 from memory_hub import BaselineBudgetConfig, KnowledgeMountConfig, MemoryHubConfig
 from memory_hub.models import AccessRole
 from memory_hub.partition import sanitize_segment
@@ -124,6 +128,8 @@ class ProjectConfig:
     rules: tuple[InboxRule, ...] = ()
     # Which agents each inbox of the project may run; the first binding matching an inbox applies.
     inbox_bindings: tuple[ProjectBinding, ...] = ()
+    # The shared experts this project drafts; they come before its own bindings.
+    expert_bindings: tuple[ExpertBinding, ...] = ()
     # Every declared agent, for the routing manifest.
     agents: tuple[AgentConfig, ...] = ()
     # Inboxes of this project running at once; None leaves only runtime.max_concurrency.
@@ -132,7 +138,7 @@ class ProjectConfig:
     description: str = ""
 
     def route(self, inbox_id: str) -> InboxRoute:
-        bound = next((b.binding for b in self.inbox_bindings if b.rule.matches(inbox_id)), None)
+        bound = next((b.binding for b in (*self.expert_bindings, *self.inbox_bindings) if b.rule.matches(inbox_id)), None)
         return InboxRoute(project=self.name, binding=bound, has_bindings=bool(self.inbox_bindings))
 
     @property
@@ -509,6 +515,38 @@ class MemoryHubLinkConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class CollaborationTaskboardConfig:
+    # Taskboard's MCP endpoint, for follow-up tasks of confirmed closeouts and the digest; "" leaves both without it.
+    mcp_url: str = ""
+    token_env: str = "HIBERNAUT_TASKBOARD_MCP_TOKEN"
+
+
+@dataclass(frozen=True, slots=True)
+class CollaborationHubConfig:
+    enabled: bool = False
+    listen_host: str = "127.0.0.1"
+    listen_port: int = 8796
+    # The path prefix below which a reverse proxy serves it; "" when it has a host name of its own.
+    base_path: str = ""
+    # The environment variable holding the Owner's token; the process takes it out of its environment.
+    token_env: str = "HIBERNAUT_COLLABORATION_TOKEN"
+    # Who approvals and confirmations made with that token are recorded as.
+    reviewer: str = "owner"
+
+
+@dataclass(frozen=True, slots=True)
+class CollaborationConfig:
+    enabled: bool = False
+    # Where the Chief of Staff hears of confirmed closeouts: one exact [[runtime.inbox_bindings]] inbox.
+    chief_inbox: str = "user:main"
+    # Startup memory of one drafted expert, shared out over its mounts.
+    expert_budget_chars: int = 6500
+    taskboard: CollaborationTaskboardConfig = field(default_factory=CollaborationTaskboardConfig)
+    hub: CollaborationHubConfig = field(default_factory=CollaborationHubConfig)
+    experts: tuple[ExpertProfile, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class RunnerPilotConfig:
     # One task inbox checked by one standalone Runner (docs/runner.md §8); off unless a deployment turns it on.
     enabled: bool = False
@@ -539,12 +577,16 @@ class HibernautConfig:
     peer: PeerHandoffConfig = field(default_factory=PeerHandoffConfig)
     runner: RunnerLinkConfig = field(default_factory=RunnerLinkConfig)
     memory_hub: MemoryHubLinkConfig = field(default_factory=MemoryHubLinkConfig)
+    collaboration: CollaborationConfig = field(default_factory=CollaborationConfig)
     runner_pilot: RunnerPilotConfig = field(default_factory=RunnerPilotConfig)
     onboarding: OnboardingConfig = field(default_factory=OnboardingConfig)
     availability: AvailabilityConfig = field(default_factory=AvailabilityConfig)
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
     timers: tuple[ConfiguredTimer, ...] = ()
+
+    def expert_plan(self, inbox_id: str) -> MemoryMountPlan | None:
+        return next((e.plan for p in self.projects.values() for e in p.expert_bindings if e.rule.matches(inbox_id)), None)
 
 
 def _parse_timers(raw: object, runtime: RuntimeConfig, projects: Mapping[str, ProjectConfig]) -> tuple[ConfiguredTimer, ...]:
@@ -1002,11 +1044,9 @@ def _memory_http(table: _Table) -> MemoryHTTPConfig:
     enabled = table.flag("enabled", False)
     if enabled and not tokens:
         raise ValueError(f"{table.where}.enabled needs at least one [{table.where}.tokens.<subject>]")
-    port = table.count("listen_port", defaults.listen_port, least=0)
-    if port > 65535:
-        raise ValueError(f"{table.where}.listen_port must be a port number (0 picks a free one)")
     return MemoryHTTPConfig(
-        enabled=enabled, listen_host=table.text("listen_host", defaults.listen_host), listen_port=port,
+        enabled=enabled, listen_host=table.text("listen_host", defaults.listen_host),
+        listen_port=_port(table, defaults.listen_port),
         tokens=tuple(tokens),
     )
 
@@ -1043,6 +1083,133 @@ def parse_memory_hub(raw: Any, *, base_dir: Path | None = None) -> MemoryHubLink
         gc_interval_seconds=float(interval),
         http=_memory_http(section.table("http", frozenset({"enabled", "listen_host", "listen_port", "tokens"}))),
     )
+
+
+def _port(table: _Table, default: int) -> int:
+    port = table.count("listen_port", default, least=0)
+    if port > 65535:
+        raise ValueError(f"{table.where}.listen_port must be a port number (0 picks a free one)")
+    return port
+
+
+def parse_collaboration(
+    raw: Any, experts_raw: Any, *, agents: Mapping[str, AgentConfig]
+) -> CollaborationConfig:
+    if raw is None:
+        if experts_raw is not None:
+            raise ValueError("[experts] needs [collaboration] enabled = true")
+        return CollaborationConfig()
+    section = _Table(raw, "collaboration", frozenset({"enabled", "chief_inbox", "expert_budget_chars", "taskboard", "hub"}))
+    if not section.flag("enabled", False):
+        if experts_raw is not None:
+            raise ValueError("[experts] needs [collaboration] enabled = true")
+        return CollaborationConfig()
+    defaults = CollaborationConfig()
+    board = section.table("taskboard", frozenset({"mcp_url", "token_env"}))
+    mcp_url = board.text("mcp_url") if "mcp_url" in board.raw else ""
+    if mcp_url and not mcp_url.startswith(("http://", "https://")):
+        raise ValueError(f"{board.where}.mcp_url must be an http(s) URL")
+    hub = section.table("hub", frozenset({"enabled", "listen_host", "listen_port", "base_path", "token_env", "reviewer"}))
+    base_path = hub.text("base_path") if hub.raw.get("base_path", "") != "" else ""
+    if base_path and not re.fullmatch(r"(/[A-Za-z0-9._-]+)+", base_path):
+        raise ValueError(f"{hub.where}.base_path must be a path such as \"/hub\", without a slash at the end")
+    return CollaborationConfig(
+        enabled=True,
+        chief_inbox=section.text("chief_inbox", defaults.chief_inbox),
+        expert_budget_chars=section.count("expert_budget_chars", defaults.expert_budget_chars, least=1000),
+        taskboard=CollaborationTaskboardConfig(
+            mcp_url=mcp_url, token_env=board.text("token_env", defaults.taskboard.token_env)
+        ),
+        hub=CollaborationHubConfig(
+            enabled=hub.flag("enabled", False),
+            listen_host=hub.text("listen_host", defaults.hub.listen_host),
+            listen_port=_port(hub, defaults.hub.listen_port),
+            base_path=base_path,
+            token_env=hub.text("token_env", defaults.hub.token_env),
+            reviewer=hub.text("reviewer", defaults.hub.reviewer),
+        ),
+        experts=_parse_experts({} if experts_raw is None else experts_raw, agents),
+    )
+
+
+def _parse_experts(raw: Any, agents: Mapping[str, AgentConfig]) -> tuple[ExpertProfile, ...]:
+    known = {p.role_id: p for p in default_expert_profiles()}
+    keys = frozenset({"agent", "display_name", "skills", "quality_gates", "max_concurrency", "allow_direct_channel"})
+    experts: list[ExpertProfile] = []
+    for role, table in _Table(raw, "experts").tables(keys).items():
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", role):
+            raise ValueError(f"experts.{role}: a role is lower-case letters, digits, '_' and '-'")
+        base = known.get(role) or ExpertProfile(
+            agent_id=f"pool:{role}", role_id=role, display_name=role, executor_id="", skills=(), quality_gates=()
+        )
+        agent = table.text("agent", base.agent_id)
+        if agent not in agents:
+            raise ValueError(f"experts.{role}: agent '{agent}' is not declared in [agents]")
+        taken = next((e.role_id for e in experts if e.agent_id == agent), None)
+        if taken is not None:
+            raise ValueError(f"experts.{role}: agent '{agent}' already is expert '{taken}'")
+        experts.append(dataclasses.replace(
+            base, agent_id=agent, executor_id=agents[agent].executor,
+            display_name=table.text("display_name", base.display_name),
+            skills=table.names("skills", base.skills),
+            quality_gates=table.names("quality_gates", base.quality_gates),
+            max_concurrency=table.count("max_concurrency", base.max_concurrency),
+            allow_direct_channel=table.flag("allow_direct_channel", base.allow_direct_channel),
+        ))
+    return tuple(experts)
+
+
+def _draft(
+    project: ProjectConfig, item: Mapping[str, Any], collaboration: CollaborationConfig, pool: ExpertPoolRegistry,
+    memory_keys: Mapping[str, str | None],
+) -> ProjectConfig:
+    where = f"projects.{project.name}"
+    table = _Table(item, where)
+    roles, readonly = (table.names(key, ()) for key in ("experts", "expert_readonly_projects"))
+    if not roles and not readonly:
+        return project
+    if not collaboration.enabled:
+        raise ValueError(f"{where}.experts needs [collaboration] enabled = true")
+    for key, names in (("experts", roles), ("expert_readonly_projects", readonly)):
+        twice = sorted({n for n in names if names.count(n) > 1})
+        if twice:
+            raise ValueError(f"{where}.{key} lists {', '.join(twice)} twice")
+    for name in readonly:
+        if name == project.name or memory_keys.get(name) is None:
+            raise ValueError(f"{where}.expert_readonly_projects: '{name}' is not another project whose primary inbox_id "
+                             "is proj:<project>")
+    return dataclasses.replace(project, expert_bindings=draft_experts(
+        project.name, roles, inbox_id=project.inbox_id, inbox_rules=project.inbox_rules, manual=project.inbox_bindings,
+        readonly_projects=tuple(key for name in readonly if (key := memory_keys[name]) is not None),
+        pool=pool, budget_chars=collaboration.expert_budget_chars,
+    ))
+
+
+def _validate_collaboration(config: HibernautConfig) -> None:
+    link = config.collaboration
+    if not link.enabled:
+        return
+    chief = next((b for b in config.runtime.inbox_bindings if b.rule.literal == link.chief_inbox), None)
+    if chief is None or chief.system_tools:
+        raise ValueError(f"collaboration.chief_inbox: {link.chief_inbox!r} is not the exact pattern of a "
+                         "[[runtime.inbox_bindings]] entry without system_tools")
+    if config.runtime.workdir_binding(link.chief_inbox) is not chief:
+        raise ValueError(f"collaboration.chief_inbox: an earlier binding matches {link.chief_inbox!r} first")
+    for inbox, key in config.memory_hub.inbox_projects.items():
+        plan = config.expert_plan(inbox)
+        if plan is not None and plan.project_key != key:
+            raise ValueError(f"memory_hub.inbox_projects.{inbox}: the inbox belongs to an expert drafted into "
+                             f"'{plan.project_key}'")
+    if not link.hub.enabled or not link.hub.listen_port:
+        return
+    http, pilot = config.memory_hub.http, config.runner_pilot
+    for used, port, where in (
+        (http.enabled, http.listen_port, "memory_hub.http.listen_port"),
+        (pilot.enabled, pilot.port, "runner_pilot.port"),
+        (True, config.channels.port, "channels.port"),
+    ):
+        if used and port == link.hub.listen_port:
+            raise ValueError(f"collaboration.hub.listen_port is {where}")
 
 
 def load_config(path: str | Path) -> HibernautConfig:
@@ -1268,6 +1435,13 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             raise (exc if name in legacy else _as_agent_error(name, exc)) from exc
         roles[name] = dataclasses.replace(role_cfg, sde=options)
 
+    collaboration = parse_collaboration(raw.get("collaboration"), raw.get("experts"), agents=agents)
+    for profile in collaboration.experts:
+        if agents[profile.agent_id].max_concurrency is None:
+            agents[profile.agent_id] = dataclasses.replace(
+                agents[profile.agent_id], max_concurrency=profile.max_concurrency
+            )
+
     projects: dict[str, ProjectConfig] = {}
     for name, item in raw.get("projects", {}).items():
         _warn_obsolete(item, f"projects.{name}", "GitHub ingress", "github_poll", "poll_labels")
@@ -1311,6 +1485,12 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             max_concurrency=_max_concurrency(f"projects.{name}", item),
             description=_optional_text(f"projects.{name}", item, "description"),
         )
+    pool = ExpertPoolRegistry(collaboration.experts)
+    memory_keys = {name: project_memory_key(project.inbox_id) for name, project in projects.items()}
+    projects = {
+        name: _draft(project, raw["projects"][name], collaboration, pool, memory_keys)
+        for name, project in projects.items()
+    }
     validate_project_rules(projects.values())
     validate_project_bindings(projects.values())
     runtime = dataclasses.replace(runtime, inbox_bindings=parse_workdir_bindings(
@@ -1396,10 +1576,12 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         peer=parse_peer(raw.get("peer"), base_dir=base_dir),
         runner=parse_runner_link(raw.get("runner"), agents=agents, templates=executors, base_dir=base_dir),
         memory_hub=parse_memory_hub(raw.get("memory_hub"), base_dir=base_dir),
+        collaboration=collaboration,
         runner_pilot=parse_runner_pilot(raw.get("runner_pilot"), base_dir=base_dir),
         onboarding=parse_onboarding(raw.get("onboarding")),
         availability=parse_availability(raw.get("availability"), base_dir=base_dir),
         config_dir=str(base_dir) if base_dir is not None else "",
     )
     _validate_runner_pilot(config)
+    _validate_collaboration(config)
     return config

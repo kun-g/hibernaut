@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_runtime.adapters.memory_fs.expert_mount import ExpertMount, is_role_uri
 from agent_runtime.adapters.memory_fs.hub import GovernedMemoryHub
 from agent_runtime.adapters.memory_fs.legacy import adopt_legacy_memory
 from agent_runtime.adapters.memory_fs.tool_args import read_document, required, search_query, write_proposal
@@ -55,10 +56,16 @@ class PartitionedMemoryAdapter:
         inbox_id: str,
         hub: GovernedMemoryHub,
         workspace_dir: str | Path | None = None,
+        # Of a drafted expert's inbox; any other Run keeps to its project and knows no role:// memory.
+        mount: ExpertMount | None = None,
     ) -> None:
         self._inbox_id = inbox_id
         self._hub = hub
         self._legacy = LegacyMemoryPortAdapter(hub, inbox_id)
+        if mount is not None and mount.plan.project_key != self._legacy.project_key:
+            raise ValueError(f"inbox {inbox_id!r} has the memory of project '{self._legacy.project_key}', but its expert "
+                             f"is drafted into '{mount.plan.project_key}'")
+        self._mount = mount
         self._workspace_dir = Path(workspace_dir).resolve() if workspace_dir is not None else None
 
     @property
@@ -74,33 +81,55 @@ class PartitionedMemoryAdapter:
         return self._workspace_dir
 
     def load_baseline(self) -> dict[str, str]:
-        return self._legacy.load_baseline()
+        baseline = self._legacy.load_baseline()
+        if self._mount is None:
+            return baseline
+        bundle = self.load_baseline_bundle()
+        extended = {b.uri.rsplit("/", 1)[-1]: b.content for b in bundle.stable_prefix if b.uri.startswith(("role:", "mount:"))}
+        return {**bundle.to_legacy_dict(), **extended}
 
     def load_baseline_bundle(self) -> BaselineBundle:
-        return self._legacy.load_baseline_bundle()
+        bundle = self._legacy.load_baseline_bundle()
+        return bundle if self._mount is None else self._mount.extend(bundle)
 
     def read_on_demand(self, path: str) -> str:
+        if self._mount is not None and is_role_uri(path):
+            return self._mount.read(path).content
         self._parse(path)
         return self._legacy.read_on_demand(path)
 
     def write(self, path: str, content: str) -> None:
-        self._parse(path)
+        if self._mount is not None and is_role_uri(path):
+            self._mount.write(path, content)
+            return
+        self._writable(path)
         self._legacy.write(path, content)
 
     # True when write() only queues a proposal: the port returns nothing, so a tool asks this to say what happened.
     def needs_approval(self, path: str) -> bool:
+        if self._mount is not None and is_role_uri(path):
+            return True
         return classify_write_policy(self._parse(path)) == "REQUIRE_APPROVAL"
 
     # The memory_* tools: argument objects in, JSON objects out, always within this inbox's project.
 
     def search(self, args: Mapping[str, Any]) -> dict[str, Any]:
-        return self._hub.search(search_query(self.project_key, args)).to_dict()
+        found = self._hub.search(search_query(self.project_key, args)).to_dict()
+        mount = self._mount
+        if mount is not None:
+            found["items"] = [hit for hit in found["items"] if mount.shows(str(hit["uri"]))]
+        return found
 
     def read_document(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        if self._mount is not None and is_role_uri(required(args, "uri")):
+            return self._mount.read_document(args)
         return read_document(self._hub, self._parse(required(args, "uri")).raw_uri, args)
 
     def propose(self, args: Mapping[str, Any], *, actor: str = "") -> dict[str, Any]:
-        uri = self._parse(required(args, "target_uri")).raw_uri
+        target = required(args, "target_uri")
+        if self._mount is not None and is_role_uri(target):
+            return self._mount.propose(target, args, actor=actor)
+        uri = self._writable(target).raw_uri
         return self._hub.propose_write(write_proposal(uri, args, author=actor or None)).to_dict()
 
     def proposal(self, proposal_id: str) -> dict[str, Any]:
@@ -117,13 +146,29 @@ class PartitionedMemoryAdapter:
     def _parse(self, path: str) -> ParsedUri:
         # A URI may name any project; a Run stays in its own.
         parsed = parse_memory_uri(path if "://" in path else f"proj://{self.project_key}/{path.lstrip('/')}")
+        if self._mount is not None:
+            self._mount.mode(parsed)
+            return parsed
         if parsed.scheme == "proj" and parsed.scope != self.project_key:
             raise PermissionError(f"{path} is outside the memory of project '{self.project_key}'")
         return parsed
 
+    def _writable(self, path: str) -> ParsedUri:
+        parsed = self._parse(path)
+        if self._mount is not None and self._mount.mode(parsed) != "rw":
+            raise PermissionError(f"{path} is mounted read-only")
+        return parsed
+
 
 class WorkspacePartitionRegistry:
-    def __init__(self, memory_root: str | Path, *, hub: GovernedMemoryHub | None = None) -> None:
+    def __init__(
+        self,
+        memory_root: str | Path,
+        *,
+        hub: GovernedMemoryHub | None = None,
+        mounts: Callable[[str], ExpertMount | None] = lambda inbox_id: None,
+    ) -> None:
+        self._mounts = mounts
         self._hub = hub if hub is not None else GovernedMemoryHub(MemoryHubConfig(memory_root=str(memory_root)))
         self._bindings: dict[str, PartitionBinding] = {}
         self._workspaces: dict[str, Path] = {}
@@ -181,7 +226,9 @@ class WorkspacePartitionRegistry:
         # Before any Run: an inbox whose memory has no usable directory is refused, not failed event by event.
         self._hub.lay_out(binding.memory_dir.name)
         adopt_legacy_memory(self._hub, inbox_id)
-        return PartitionedMemoryAdapter(inbox_id=inbox_id, hub=self._hub, workspace_dir=binding.workspace_dir)
+        return PartitionedMemoryAdapter(
+            inbox_id=inbox_id, hub=self._hub, workspace_dir=binding.workspace_dir, mount=self._mounts(inbox_id)
+        )
 
     def workspace_for(self, inbox_id: str) -> Path | None:
         return self.binding_for(inbox_id).workspace_dir

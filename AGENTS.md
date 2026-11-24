@@ -14,6 +14,7 @@
 - **`src/ccpeer/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`switchboard`、`taskboard`、`runner`、`memory_hub`（`.importlinter` 契约 `ccpeer-zero-business-deps`）。
 - **`src/runner/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`taskboard`、`switchboard`、`workshop`、`memory_hub`、`ledger`（`.importlinter` 契约 `runner-zero-business-deps`）。控制面经 `agent_runtime/adapters/runner_bridge.py` 单向依赖它。
 - **`src/memory_hub/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`switchboard`、`taskboard`、`runner`、`ledger`（`.importlinter` 契约 `memory-hub-zero-business-deps`），`switchboard`、`runner`、`taskboard` 也禁止导入它（`business-packages-no-memory-hub`）。控制面经 `agent_runtime/adapters/memory_fs/` 与 `memory_bridge.py` 单向依赖它。
+- **`src/collaboration/`**：独立包，只依赖标准库与自身；禁止导入 `agent_runtime`、`switchboard`、`taskboard`、`runner`、`ledger`、`ccpeer`、`dashboard`、`memory_hub`（`.importlinter` 契约 `collaboration-zero-business-deps`），这些业务包也禁止导入它（`business-packages-no-collaboration`）。控制面经 `agent_runtime/adapters/collaboration_bridge.py` 与 `memory_fs/expert_mount.py` 单向依赖它。
 
 ## 2. 核心词汇表与并发红线
 
@@ -56,7 +57,7 @@ pyright
 
 - `lint-imports`：验证 `.importlinter` 全部架构分层与反向依赖契约（0 broken）。
 - `pytest -n auto --dist worksteal -v`：并行跑全量，验证 AST 静态边界测试、Port 契约测试、多 `inbox_id` 并发隔离及 `NewEventPolicy`（`defer`/`fold`/`interrupt`）端到端测试。串行 `pytest -v` 只在排查并行相关的失败时用。
-- `pyright`：对 `src/agent_runtime/core`、`src/agent_runtime/engine`、`src/switchboard`、`src/ccpeer`、`src/taskboard`、`src/runner` 与 `src/ledger` 执行 strict 静态类型检查（0 errors, 0 warnings）。
+- `pyright`：对 `src/agent_runtime/core`、`src/agent_runtime/engine`、`src/switchboard`、`src/ccpeer`、`src/taskboard`、`src/runner`、`src/ledger`、`src/dashboard` 与 `src/collaboration` 执行 strict 静态类型检查（0 errors, 0 warnings）。
 
 ## 6. 文档增量协作闭环规范
 

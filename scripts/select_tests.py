@@ -104,7 +104,7 @@ RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     ("deploy/runner/**", ("tests/test_runner_service.py",)),
-    ("schemas/v1/**", ("tests/test_ledger_all.py", "tests/test_memory_hub.py")),
+    ("schemas/v1/**", ("tests/test_ledger_all.py", "tests/test_memory_hub.py", "tests/test_collaboration_wiring.py")),
     ("docs/dispatch/**", ("tests/test_sde_delivery.py",)),
     ("docs/process/versioning.md", ("tests/test_sde_delivery.py",)),
     ("guidance.toml", ("tests/test_sde_delivery.py",)),

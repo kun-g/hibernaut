@@ -5,12 +5,15 @@ import hashlib
 import json
 import sys
 from collections.abc import Callable, Mapping
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
+from collaboration import NotificationPolicyEngine
+from collaboration.models import NotificationKind
+from switchboard.addressing import address_target, reply_target
 from switchboard.envelope import CanonicalEvent
 from switchboard.ports import DeliverStatus
 
-from agent_runtime.core.models import TASK_SYNC_KIND
+from agent_runtime.core.models import CLOSEOUT_SOURCE, TASK_CONTEXT_KEY, TASK_SYNC_KIND
 from agent_runtime.core.ports import ChannelPort
 
 SWITCHBOARD_SOURCE_PREFIX = "sb:"
@@ -55,6 +58,12 @@ _OUTCOME_BY_KIND: Mapping[str, str] = {
     "silent": "silent",
     TASK_SYNC_KIND: "done",
 }
+
+
+_FEISHU = "feishu"
+# Outbox kinds that mean work is stuck until a person acts; every other one is a result.
+_BLOCKER_KINDS = frozenset({"run_failed", "resume_failed", "agent_refused", "return_withheld", "forward_refused"})
+_BLOCKED_STATUSES = frozenset({"failed", "stopped", "refused"})
 
 
 class IngestSink(Protocol):
@@ -149,15 +158,51 @@ def _external_id(inbox_id: str, content: str, metadata: Mapping[str, Any]) -> st
     return f"outbox:{digest}"
 
 
+def _task_context(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
+    context: object = metadata.get(TASK_CONTEXT_KEY)
+    return cast(dict[str, Any], context) if isinstance(context, dict) else {}
+
+
+def is_feishu_push(metadata: Mapping[str, Any]) -> bool:
+    # A message nobody is waiting for in Feishu. What answers a person there goes to the conversation they started.
+    key = metadata.get("correlation_key")
+    origin = reply_target(key if isinstance(key, str) else None)
+    target = origin
+    if metadata.get("reply_channel") and metadata.get("reply_target"):
+        channel = str(metadata["reply_channel"])
+        target = channel, address_target(channel, str(metadata["reply_target"]))
+    if target is None or target[0] != _FEISHU:
+        return False
+    if target != origin:
+        return True
+    source = str(_task_context(metadata).get("source") or "")
+    started_elsewhere = source.startswith((SWITCHBOARD_SOURCE_PREFIX, "timer:", "gdrive:"))
+    if source == f"{SWITCHBOARD_SOURCE_PREFIX}{_FEISHU}":
+        return False
+    return not source or started_elsewhere or source == CLOSEOUT_SOURCE
+
+
+def notification_kind(metadata: Mapping[str, Any]) -> tuple[NotificationKind, bool]:
+    # The kind, and whether it is a blocker that only a person can clear.
+    if outcome_kind_for(metadata) == "suspend":
+        return "approval_card", False
+    if metadata.get("kind") in _BLOCKER_KINDS:
+        return "blocker_alert", False
+    return "run_completed", _task_context(metadata).get("status") in _BLOCKED_STATUSES
+
+
 class SwitchboardChannelAdapter:
     def __init__(
         self,
         publish: Callable[[CanonicalEvent], Any],
         *,
         fallback: ChannelPort | None = None,
+        # Decides what may be pushed to Feishu unasked (D8-B); None leaves every message as it is.
+        push_policy: NotificationPolicyEngine | None = None,
     ) -> None:
         self._publish = publish
         self._fallback = fallback
+        self.push_policy = push_policy
 
     def build_report(self, inbox_id: str, content: str, metadata: Mapping[str, Any]) -> CanonicalEvent | None:
         outcome = outcome_kind_for(metadata)
@@ -189,6 +234,10 @@ class SwitchboardChannelAdapter:
         if outcome == "suspend" and "approval_request_id" not in report and legacy_request_id:
             # Outbox rows written before the worker added approval_request_id carry only request_id.
             report["approval_request_id"] = legacy_request_id
+        withheld = self._withheld(metadata)
+        if withheld is not None:
+            # Published as a mere sync, which no Switchboard posts to a person; Taskboard still gets its task action.
+            report |= {"outcome_kind": "done", "notification_channel": withheld}
         subject = metadata.get("title") or metadata.get("subject") or "Hibernaut update"
         return CanonicalEvent(
             source="hibernaut",
@@ -201,6 +250,15 @@ class SwitchboardChannelAdapter:
             body=content,
             metadata=report,
         )
+
+    def _withheld(self, metadata: Mapping[str, Any]) -> str | None:
+        if self.push_policy is None or not is_feishu_push(metadata):
+            return None
+        kind, blocked = notification_kind(metadata)
+        decision = self.push_policy.route(
+            kind=kind, correlation_key=str(metadata.get("correlation_key") or ""), is_urgent_blocker=blocked
+        )
+        return None if decision.channel == "feishu_push" else decision.channel
 
     def routes_to_switchboard(self, metadata: Mapping[str, Any]) -> bool:
         if self._fallback is None:
