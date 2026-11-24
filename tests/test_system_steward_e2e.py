@@ -199,6 +199,8 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
         }))
         self.orca = FakeOrcaTerminals(self.root)
+        # Drain serving runs before removing the terminals they still await.
+        self.addAsyncCleanup(self.orca.close_all)
         self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -211,9 +213,6 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
         self.board.board.bus.subscribe("taskboard", lambda e: None)
         self.path = self.home / "hibernaut.toml"
         self.sent = 0
-
-    async def asyncTearDown(self) -> None:
-        await self.orca.close_all()
 
     def text(self) -> str:
         return CONFIG.format(root=self.root, home=self.home, repo=self.repo, command=fake_command(self.root),
@@ -656,6 +655,7 @@ class BoundaryTests(ServedCase):
     async def test_c6_a_removed_entry_stops_the_run_that_started_before(self) -> None:
         await self.serve()
         go_on = self.root / "go-on"
+        self.addCleanup(go_on.touch)  # Release the run before draining, even if an assertion fails.
         self.set_plan([{"calls": [forward(OPS, "go", title="Plan")], "wait_for": str(go_on), **reply("sent")}])
         await self.message("go")
         await self.wait_for(lambda: bool(self.answers()), "the forward")
@@ -669,6 +669,7 @@ class BoundaryTests(ServedCase):
     async def test_c1_tools_taken_away_by_a_reload_stop_in_the_run_that_has_them(self) -> None:
         await self.serve()
         gate = self.root / "gate"
+        self.addCleanup(gate.touch)
         self.set_plan([{"calls": [tool("check_projects")], "wait_for": str(gate), **reply("x")}])
         self.daemon.handler.ingest(inbox_id=OPS, source="cli", external_id="1", payload={"text": "go"})
         await self.wait_for(lambda: len(self.answers()) == 1, "the first call")
