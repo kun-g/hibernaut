@@ -14,6 +14,9 @@ venv/
 
 # Local runtime state & secrets
 /hibernaut.toml
+# Backups and half-written versions beside it, when a project is onboarded or its settings filled in
+/hibernaut.toml.bak-*
+/.hibernaut.toml.*
 *.db
 *.db-wal
 *.db-shm

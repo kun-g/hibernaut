@@ -33,6 +33,7 @@ from agent_runtime.adapters.channels import (
     local_events_url,
 )
 from agent_runtime.adapters.channels.channels import webhook_request_handler
+from agent_runtime.adapters.channels.ingress import event_origin
 from agent_runtime.adapters.channels.switchboard_bridge import SwitchboardChannelAdapter, SwitchboardInboundBridge
 from agent_runtime.adapters.channels.switchboard_relay import SwitchboardBus, SwitchboardRelayLink
 from agent_runtime.adapters.delivery import DeliveryConfig, PRDelivery, merged_head
@@ -123,7 +124,10 @@ from agent_runtime.app.projects import (
     WorkdirBinding,
     build_global_manifest,
     build_routing_manifest,
+    build_system_manifest,
 )
+from agent_runtime.app.reload import ReloadStatus
+from agent_runtime.app.system_tools import SystemToolbox
 from agent_runtime.core.models import Event, InboxBinding, InboxRoute, NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, OutboxPort, RunCapabilities
 from agent_runtime.engine import (
@@ -393,6 +397,10 @@ class ForwardTargets:
         bound = self._in_force(inbox_id)
         return tuple(target for target in own if bound is not None and target in bound.forward_to)
 
+    def has_system_tools(self, inbox_id: str) -> bool:
+        bound = self._in_force(inbox_id)
+        return bound is not None and bound.system_tools
+
 
 @dataclass
 class AlwaysOnDaemon:
@@ -429,6 +437,7 @@ class AlwaysOnDaemon:
     memory_gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
     # One per process too; a reload points it at the new configuration once that is in force.
     forward_targets: ForwardTargets | None = None
+    reloads: ReloadStatus = field(default_factory=ReloadStatus)
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def register_partition(
@@ -1039,12 +1048,15 @@ def build_daemon_from_config(
     demo: bool = False,
     gdrive_client: DriveClientProtocol | None = None,
     switchboard: SwitchboardHandle | None = None,
+    # False for a reload, whose daemon may be dropped yet: what Switchboard delivers goes to the one in force.
+    attach: bool = True,
     ledger: RunLedger | None = None,
     runner_pilot: RunnerPilotRelay | None = None,
     runner: RunnerHandle | None = None,
     limiter: ConcurrencyLimiter | None = None,
     memory_hub: GovernedMemoryHub | None = None,
     forward_targets: ForwardTargets | None = None,
+    reloads: ReloadStatus | None = None,
 ) -> AlwaysOnDaemon:
     if demo and config.runner_pilot.enabled:
         raise ValueError("runner_pilot.enabled cannot be used with --demo")
@@ -1151,6 +1163,7 @@ def build_daemon_from_config(
 
     targets = forward_targets if forward_targets is not None else ForwardTargets(config)
     daemon.forward_targets = targets
+    daemon.reloads = reloads if reloads is not None else ReloadStatus()
 
     if config.runner.enabled and not demo:
         # A reload passes the running one, whose settings cannot change without a restart.
@@ -1210,7 +1223,14 @@ def build_daemon_from_config(
                 allowed = route.forward_to if route is not None else ()
                 return tuple(p for target in allowed for p in config.projects.values() if p.inbox_id == target)
 
+            def systems(inbox_id: str) -> tuple[WorkdirBinding, ...]:
+                route = _route(inbox_id)
+                return tuple(b for b in config.runtime.inbox_bindings
+                             if b.system_tools and route is not None and b.rule.literal in route.forward_to)
+
             def readable(inbox_id: str, asked: str) -> bool:
+                if any(b.rule.literal == asked for b in systems(inbox_id)):
+                    return True
                 try:
                     project = router.resolve(asked)
                 except AmbiguousProjectMatch:
@@ -1228,11 +1248,17 @@ def build_daemon_from_config(
                 workdir=bound.workdir,
                 branch=role.branch,
                 scope=GlobalScope(
-                    manifest=lambda inbox_id: build_global_manifest(
+                    manifest=lambda inbox_id: build_system_manifest(
+                        inbox_id, bound.binding, tuple(config.agents.values())
+                    ) if bound.system_tools else build_global_manifest(
                         inbox_id, bound.binding, tuple(config.agents.values()), listed(inbox_id),
-                        config.runtime.default_agent,
+                        config.runtime.default_agent, systems(inbox_id),
                     ),
                     readable=readable,
+                    system=SystemToolbox(
+                        reloads=daemon.reloads,
+                        allowed=lambda: targets.has_system_tools(bound.rule.literal or ""),
+                    ) if bound.system_tools else None,
                 ),
             )
 
@@ -1467,6 +1493,7 @@ def build_daemon_from_config(
                 executors={PROTOCOL_CHECK_EXECUTOR_ID: executor},
                 project_default_executor=PROTOCOL_CHECK_EXECUTOR_ID,
                 routes=_route,
+                origin=event_origin,
                 on_forward=daemon.pool.wake,
                 # The runner reclaims its own read-only worktrees; no worktree of this process is involved.
                 on_worktree_reclaim=None,
@@ -1509,6 +1536,7 @@ def build_daemon_from_config(
                 project_default_executor=project.default_agent if project is not None else None,
                 global_default_executor=config.runtime.default_agent,
                 routes=_route,
+                origin=event_origin,
                 on_forward=daemon.pool.wake,
                 on_worktree_reclaim=reclaim,
                 hold=executor_quota_hold(inbox_id, pool=daemon.pool, limits=limits, keys=limit_keys,
@@ -1564,6 +1592,9 @@ def build_daemon_from_config(
             memory=MemoryControlPlane(memory_hub, daemon.ledger),
         )
 
+    daemon.handler.keep_local(
+        lambda inbox_id: (bound := config.runtime.workdir_binding(inbox_id)) is not None and bound.system_tools
+    )
     if resolved_gdrive_client is not None:
         daemon.gdrive_poller = DriveTaskPoller(
             daemon.handler,
@@ -1576,7 +1607,7 @@ def build_daemon_from_config(
             failed_folder_id=config.gdrive.failed_folder_id or None,
         )
 
-    if switchboard is not None:
+    if switchboard is not None and attach:
         attach_switchboard(daemon, switchboard, config.switchboard.consumer_id)
 
     if opened_hub:
@@ -1681,7 +1712,16 @@ async def serve_configured(
         if listeners is not None
         else WebhookHTTPServer(address, daemon.http_handler())
     )
-    changes = config_changes(path, stop, interval=reload_interval)
+    reloads = daemon.reloads
+    reloads.watch(path)
+    changes = config_changes(path, stop, interval=reload_interval, reloads=reloads)
+
+    version = reloads.latest
+
+    def refuse(reason: str) -> None:
+        print(f"[config] {reason}", file=sys.stderr, flush=True)
+        reloads.settle(version, reason)
+
     # Before the first pool scans its inbox: held events are not looked at again until the next wake.
     await start_runner_pilot(runner_pilot)
 
@@ -1707,48 +1747,30 @@ async def serve_configured(
 
         try:
             async for candidate in changes:
+                version = reloads.latest
                 if candidate == config:
+                    reloads.settle(version)
                     continue
                 if (candidate.runtime.db_path, candidate.runtime.memory_root, candidate.runtime.ledger_db_path) != (
                     config.runtime.db_path,
                     config.runtime.memory_root,
                     config.runtime.ledger_db_path,
                 ):
-                    print(
-                        "[config] Storage path changes require a restart.",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    refuse("Storage path changes require a restart.")
                     continue
                 if candidate.switchboard != config.switchboard:
-                    print(
-                        "[config] [switchboard] changes require a restart.",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    refuse("[switchboard] changes require a restart.")
                     continue
                 if config.runner_pilot.enabled and candidate.runner_pilot.enabled and (
                     candidate.runner_pilot != config.runner_pilot
                 ):
-                    print(
-                        "[config] [runner_pilot] changes need enabled = false first; keeping current settings.",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    refuse("[runner_pilot] changes need enabled = false first; keeping current settings.")
                     continue
                 if replace(candidate.runner, executors=()) != replace(config.runner, executors=()):
-                    print(
-                        "[config] [runner] changes require a restart.",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    refuse("[runner] changes require a restart.")
                     continue
                 if candidate.memory_hub != config.memory_hub:
-                    print(
-                        "[config] [memory_hub] changes require a restart.",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    refuse("[memory_hub] changes require a restart.")
                     continue
                 address = (candidate.channels.host, candidate.channels.port)
                 next_server: WebhookHTTPServer | None = None
@@ -1766,35 +1788,50 @@ async def serve_configured(
                         limiter=shared_limiter,
                         memory_hub=daemon.memory_hub,
                         forward_targets=daemon.forward_targets,
+                        reloads=reloads,
+                        attach=False,
                     )
                     handler = replacement.http_handler()
                     if address != (config.channels.host, config.channels.port):
                         next_server = WebhookHTTPServer(address, handler)
                 except (OSError, ValueError, OverflowError) as exc:
-                    print(
-                        f"[config] Cannot activate settings ({type(exc).__name__}); "
-                        "keeping current settings.",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    if reloads.on_disk(version):
+                        refuse(f"Cannot activate settings ({type(exc).__name__}); keeping current settings.")
+                    if next_pilot is not None and next_pilot is not runner_pilot:
+                        await next_pilot.stop()
+                    continue
+                finally:
+                    # Building it applies the candidate's to the shared hub, but the current settings are in force still.
                     if daemon.memory_hub is not None:
                         daemon.memory_hub.is_projectless = projectless_inboxes(config)
+
+                # Stop the old services first so two dispatchers never send the same Outbox row.
+                await generation.stop_services()
+                # An editor knows no lock. Nothing is awaited from here until the version is settled.
+                if not reloads.on_disk(version):
+                    print(f"[config] {path} changed again before it was in force; reading it again.",
+                          file=sys.stderr, flush=True)
+                    generation.start_services(tasks, outbox_interval_seconds=outbox_interval_seconds, halt=stop)
+                    if next_server is not None:
+                        next_server.server_close()
                     if next_pilot is not None and next_pilot is not runner_pilot:
                         await next_pilot.stop()
                     continue
 
+                if daemon.memory_hub is not None:
+                    daemon.memory_hub.is_projectless = projectless_inboxes(candidate)
                 if replacement.runner is not None:
                     replacement.runner.apply(candidate)
                 if replacement.forward_targets is not None:
                     replacement.forward_targets.activate(candidate)
                 previous = generation
-                # Stop the old services first so two dispatchers never send the same Outbox row.
-                await previous.stop_services()
                 # Apply the new caps only after activation succeeds; retired Runs stay counted in shared_limiter.
                 shared_limiter.reconfigure(candidate.runtime.max_concurrency, concurrency_limits(candidate))
                 generation = _Generation.start(replacement, tasks, outbox_interval_seconds=outbox_interval_seconds,
                                                halt=stop)
                 generations = [g for g in generations if g.runs is not None and not g.runs.done()] + [generation]
+                if switchboard is not None:
+                    attach_switchboard(replacement, switchboard, candidate.switchboard.consumer_id)
                 # From here every wake reaching the old pool, from its in-flight requests or released leases,
                 # is forwarded to the new one.
                 previous.retire_pool(wake_current)
@@ -1804,16 +1841,20 @@ async def serve_configured(
                         [g.runs for g in generations if g is not generation and g.runs is not None],
                     )))
                 runner_pilot = next_pilot
+                replaced_listener: tuple[WebhookHTTPServer, threading.Thread] | None = None
                 if next_server is None:
                     server.RequestHandlerClass = handler
                 else:
-                    next_thread = _serve_in_thread(next_server)
-                    # Accepted requests finish against the old adapters before the old listener closes.
-                    await _close_server(server, server_thread)
-                    server, server_thread = next_server, next_thread
+                    replaced_listener = server, server_thread
+                    server, server_thread = next_server, _serve_in_thread(next_server)
                 daemon, config = replacement, candidate
+                reloads.settle(version)
+                if replaced_listener is not None:
+                    # Accepted requests finish against the old adapters before the old listener closes.
+                    await _close_server(*replaced_listener)
                 print(f"[config] Reloaded {path}", file=sys.stderr, flush=True)
         finally:
+            reloads.watch(None)
             await changes.aclose()
             # A stop drains first: ingress and services keep running until every pool, retired or current, has
             # finished its Runs; only then do the listener (after its accepted requests) and the services close.
@@ -1857,6 +1898,14 @@ class _Generation:
             daemon.run_services(services_stop, outbox_interval_seconds=outbox_interval_seconds, halt=halt)
         )
         return cls(daemon, services, services_stop, pool_stop, runs)
+
+    def start_services(
+        self, tasks: asyncio.TaskGroup, *, outbox_interval_seconds: float, halt: asyncio.Event | None = None
+    ) -> None:
+        self.services_stop = asyncio.Event()
+        self.services = tasks.create_task(
+            self.daemon.run_services(self.services_stop, outbox_interval_seconds=outbox_interval_seconds, halt=halt)
+        )
 
     async def stop_services(self) -> None:
         self.services_stop.set()

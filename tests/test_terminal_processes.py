@@ -557,13 +557,16 @@ class TestCLIGroupSignals(unittest.TestCase):
         self.assertTrue(is_running())
 
     def test_the_rest_of_the_group_has_the_grace_to_end_after_its_leader_ended(self):
-        # The leader is gone with the first SIGTERM; its child ends by itself, only later.
+        # The leader is gone with the first SIGTERM; its child ends by itself, only later. The child sleeps in short
+        # steps: a long sleep begun after the signal would outlive it, and a signal just before `wait` would be missed.
         done = self.root / "done"
         proc, child = self.popen(
             f"sh -c 'trap \"sleep 0.2; echo cleaned > {done}; exit\" TERM; echo $$ > \"$READY\"; "
-            "while :; do sleep 60 & wait; done' & wait")
+            "while :; do sleep 0.05; done' & wait")
         self.addCleanup(lambda: alive(int(child)) and os.kill(int(child), signal.SIGKILL))
+        started = time.monotonic()
         cli_terminal.end_group(proc, grace=30)
+        self.assertLess(time.monotonic() - started, 20)
         self.assertEqual(proc.returncode, -signal.SIGTERM)
         self.assertEqual(done.read_text() if done.exists() else "killed", "cleaned\n")
         self.assert_never_after_reaping()

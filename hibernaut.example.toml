@@ -162,9 +162,16 @@ args = ["-c"]
 timeout_seconds = 300.0
 
 # 普通 CLI 执行器也可以换个名字当 agent（不写 role；model、skills 等只有 Claude Code 角色能写）。
-[agents.ops]
+[agents.patrol]
 executor = "grok"
 description = "巡检与例行检查"
+
+# 系统 Steward 的 agent：照样是只读 steward；接入和补配置的能力来自下面 sys:ops 绑定的 system_tools，不来自 agent。
+[agents.ops]
+role = "steward"
+executor = "model-gateway"
+description = "系统 Steward：接入项目、检查和补齐项目配置"
+skills = ["builtin:steward"]    # 在带 system_tools 的绑定里换成内置的 steward-system
 
 # 可选：不属于任何项目的 Inbox（sys:* / user:*）。没有项目检出，启动目录 workdir 必填（支持 ~，相对路径以本文件所在目录为准，不自动创建，
 # 不存在则事件保持 pending）。键同 [[projects.<name>.inbox_bindings]]，第一个整串匹配的生效；不能与项目的 inbox_id 重叠。
@@ -172,11 +179,22 @@ description = "巡检与例行检查"
 # 可用不带 role 的 CLI agent；checkout_access = "readonly" 的绑定还可用 steward（sde、code-reviewer 拒绝）。
 # 没有绑定也不匹配项目的 Inbox，事件保持 pending。规范见 docs/inbox-conventions.md。
 [[runtime.inbox_bindings]]
-pattern = "sys:hb-ops"
+pattern = "sys:patrol"
+default_agent = "patrol"
+agents = ["patrol"]
+workdir = "/absolute/path/to/your/patrol-workdir"
+checkout_access = "readwrite"   # readwrite（默认）| readonly：可共享目录、可用正则；CLI 的只读由它自己的参数保证
+
+# 系统 Steward：接入项目、检查和补齐项目配置（工具 check_projects、onboard_project、complete_project）。改动写进本文件并热加载，
+# 原文件留备份；不改执行器、启动器、权限、交付检查和凭据，也不改自己和别的 sys:* 绑定。需求见 docs/requirements/system-steward.md。
+[[runtime.inbox_bindings]]
+pattern = "sys:ops"
 default_agent = "ops"
 agents = ["ops"]
-workdir = "/absolute/path/to/your/ops-workdir"
-checkout_access = "readwrite"   # readwrite（默认）| readonly：可共享目录、可用正则；CLI 的只读由它自己的参数保证
+workdir = "/absolute/path/to/your/hibernaut"   # 主检出
+checkout_access = "readonly"
+system_tools = true             # 默认 false。只能写在 pattern 为单个精确 sys:<name>、readonly、agent 全是 steward 的绑定上，否则拒绝加载；
+#                               # 这样的 Inbox 不能再转投，只收全局 Steward 替人转来的、本机运营者投的和它自己的审批
 
 # 全局 Steward：接个人对话（如飞书单聊），能答的自己答，新活转投到 forward_to 列出的项目。目录以这里的 workdir 为准（Orca 已登记的 Git 检出），
 # agent 自己写了 workdir 须是同一个目录。同一个对话派出的每件活各有会话与 worktree。
@@ -186,7 +204,11 @@ default_agent = "steward"
 agents = ["steward"]
 workdir = "/absolute/path/to/your/workspace"
 checkout_access = "readonly"
-forward_to = ["proj:hibernaut"]   # 可选：每项是某个项目的主 inbox（inbox_id 的第一个精确 ID），否则拒绝加载；省略则不能转投出本绑定
+forward_to = ["proj:hibernaut", "sys:ops"]   # 可选：每项是某个项目的主 inbox（inbox_id 的第一个精确 ID）或带 system_tools 的 Inbox，否则拒绝加载；省略则不能转投出本绑定
+
+# 可选：接入项目时可以建标签的仓库 owner。默认空 = 不建，列为待人做
+# [onboarding]
+# label_owners = ["your-github-name"]
 
 [projects.hibernaut]
 # 字符串：一个精确 inbox_id（原有写法，不当正则）。数组：每项直接是正则，须整串匹配（fullmatch），不用加 "re:"（旧写法仍可用）；
@@ -213,10 +235,10 @@ default_agent = "steward"
 [[projects.hibernaut.inbox_bindings]]
 pattern = "proj:hibernaut"      # 正则，须整串匹配；不含正则语法即精确 ID
 default_agent = "steward"
-agents = ["steward", "code-reviewer", "ops"]   # 白名单；省略则不限
+agents = ["steward", "code-reviewer", "patrol"]   # 白名单；省略则不限
 # 条件写几项就须同时满足：source（如 "sb:github"、"timer:<payload 的 timer_name>"）、event_type、tags（payload 的 tags / labels 须包含列出的全部）
 rules = [
-  { source = "timer:ops", agent = "ops" },
+  { source = "timer:patrol", agent = "patrol" },
   { tags = ["review"], agent = "code-reviewer" },
 ]
 

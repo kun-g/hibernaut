@@ -44,6 +44,19 @@ class EventLister(Protocol):
     ) -> list[Event]: ...
 
 
+class SystemTools(Protocol):
+    # What a Steward with system tools may do to the deployment; each call blocks, so it runs in a thread. A failure is
+    # raised as ToolError with the reason and what was left behind.
+    def check(self) -> str: ...
+
+    def onboard(self, *, repo: str, name: str | None, description: str | None) -> str: ...
+
+    def complete(self, *, name: str, description: str | None) -> str: ...
+
+    # Whether a path must not be shown to it: the deployment file and what is written beside it.
+    def hides(self, path: Path) -> bool: ...
+
+
 _MATCH = re.compile(rb"([^\0]+)\0(\d+)[\0:]([^\n]*)\n")
 
 
@@ -156,6 +169,33 @@ def _schema(required: Sequence[str] = (), **properties: dict[str, Any]) -> dict[
     return {"type": "object", "properties": properties, "required": list(required)}
 
 
+def _system_definitions() -> list[dict[str, Any]]:
+    description = {**_TEXT, "description": "One sentence saying what the project is, in the person's words."}
+    found = [
+        {"name": "check_projects",
+         "description": "List the projects Hibernaut is set up for, and what each lacks: a Steward for its main inbox, a "
+                        "description, a place in the general Steward's list.",
+         "inputSchema": _schema()},
+        {"name": "onboard_project",
+         "description": "Set a GitHub repository up as a project: clone it, register it in Orca, create the trigger label "
+                        "where that is allowed, and add the project with its Steward to the configuration. What is there "
+                        "already stays as it is.",
+         "inputSchema": _schema(
+             ("repo",), repo={**_TEXT, "description": "owner/name on GitHub."},
+             name={**_TEXT, "description": "The project's name. Leave it out for the repository's own name in lower case."},
+             description=description,
+         )},
+        {"name": "complete_project",
+         "description": "Add what a project lacks according to check_projects, and nothing else: values that are set stay.",
+         "inputSchema": _schema(
+             ("name",), name={**_TEXT, "description": "The project's name, from check_projects."}, description=description,
+         )},
+    ]
+    for tool in found:
+        tool["inputSchema"] = {**cast(dict[str, Any], tool["inputSchema"]), "additionalProperties": False}
+    return found
+
+
 @dataclass(slots=True)
 class StewardTools:
     # The tools of one Steward run. Every call passes PermissionPort.check under its own tool name first.
@@ -168,6 +208,8 @@ class StewardTools:
     in_project: Callable[[str], bool]
     # Set for a Steward of no project.
     projectless: bool = False
+    # Set only for a Steward whose inbox has system tools; without it they are neither offered nor served.
+    system: SystemTools | None = None
     calls: int = 0
     # Forwards this Run took; they go out once it ends in anything but a failure.
     forwarded: int = 0
@@ -175,13 +217,13 @@ class StewardTools:
     deferred: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
 
     @staticmethod
-    def definitions(*, projectless: bool = False) -> list[dict[str, Any]]:
+    def definitions(*, projectless: bool = False, system: bool = False) -> list[dict[str, Any]]:
         where = "your own inbox or a project in the routing manifest" if projectless else "this project"
         memory = "your inbox's memory" if projectless else "the project memory"
         whose = "your inbox's" if projectless else "the project's"
         inbox = {**_TEXT, "description": f"An inbox of {where}; leave out for the default."}
         glob = {**_TEXT, "description": "Limit to these paths, e.g. src/**/*.py or docs/**."}
-        return [
+        tools: list[dict[str, Any]] = [
             {"name": "forward_to_inbox",
              "description": "Hand work to another agent through its inbox. Nothing waits for it: end your turn after "
                             "forwarding. Without return_to that agent answers the person directly; with return_to "
@@ -251,6 +293,10 @@ class StewardTools:
                             "to be readable to you; --stat and --name-only need none.",
              "inputSchema": _schema(("args",), args={**_TEXTS, "description": 'e.g. ["log", "--oneline", "-10"]'})},
         ]
+        if not system:
+            return tools
+        # It passes no work on.
+        return [*_system_definitions(), *(tool for tool in tools if tool["name"] != "forward_to_inbox")]
 
     async def call(self, name: object, arguments: object) -> tuple[str, bool]:
         # (answer, is_error)
@@ -269,6 +315,10 @@ class StewardTools:
             "list_events": self._list_events,
             "git": self._run_git,
         }
+        if self.system is not None:
+            del handlers["forward_to_inbox"]
+            handlers |= {"check_projects": self._check_projects, "onboard_project": self._onboard_project,
+                         "complete_project": self._complete_project}
         handler = handlers.get(name) if isinstance(name, str) else None
         if handler is None:
             return f"unknown tool {name}", True
@@ -285,8 +335,33 @@ class StewardTools:
         if decision.action != "allow":
             raise ToolError(f"{tool} is not permitted ({decision.action}): {decision.reason}")
 
+    def _system(self, tool: str, arguments: dict[str, Any], *keys: str) -> SystemTools:
+        assert self.system is not None
+        unknown = sorted(set(arguments) - set(keys))
+        if unknown:
+            raise ToolError(f"{tool} takes {', '.join(keys) or 'no arguments'}, not {', '.join(unknown)}")
+        self._allow(tool, arguments)
+        return self.system
+
+    async def _check_projects(self, arguments: dict[str, Any]) -> str:
+        system = self._system("check_projects", arguments)
+        return await asyncio.to_thread(system.check)
+
+    async def _onboard_project(self, arguments: dict[str, Any]) -> str:
+        repo, name = _required(arguments, "repo"), _optional(arguments, "name")
+        description = _optional(arguments, "description")
+        system = self._system("onboard_project", arguments, "repo", "name", "description")
+        return await asyncio.to_thread(system.onboard, repo=repo, name=name, description=description)
+
+    async def _complete_project(self, arguments: dict[str, Any]) -> str:
+        name, description = _required(arguments, "name"), _optional(arguments, "description")
+        system = self._system("complete_project", arguments, "name", "description")
+        return await asyncio.to_thread(system.complete, name=name, description=description)
+
     def _readable(self, path: str) -> bool:
         # Every way a file's content is shown passes the gate as a read of that file.
+        if self.system is not None and self.system.hides(self.checkout / path):
+            return False
         return self.caps.permissions.check("read_file", {"path": path}).action == "allow"
 
     async def _forward(self, arguments: dict[str, Any]) -> str:
@@ -327,6 +402,8 @@ class StewardTools:
         path = _real_path(self.checkout, _required(arguments, "path"))
         offset, limit = _count(arguments, "offset", 1), min(_count(arguments, "limit", _MAX_LINES), _MAX_LINES)
         self._allow("read_file", {"path": path})
+        if self.system is not None and self.system.hides(self.checkout / path):
+            raise ToolError(f"{path} is not a file of the checkout")
         return await asyncio.to_thread(_read_file, self.checkout, path, offset, limit)
 
     async def _search_files(self, arguments: dict[str, Any]) -> str:
@@ -476,6 +553,6 @@ class StewardTools:
             return {"text": "malformed request", "error": True}
         item = cast(dict[str, Any], request)
         if item.get("op") == "tools":
-            return {"tools": self.definitions(projectless=self.projectless)}
+            return {"tools": self.definitions(projectless=self.projectless, system=self.system is not None)}
         text, error = await self.call(item.get("name"), item.get("arguments"))
         return {"text": text, "error": error}

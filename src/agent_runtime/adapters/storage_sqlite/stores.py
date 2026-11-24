@@ -638,6 +638,7 @@ def _forward_from_json(raw: object, inbox_id: str) -> ForwardSpec | None:
         return_key=text("return_key"),
         delegation_id=text("delegation_id"),
         work_key=text("work_key"),
+        from_person=item.get("from_person") is True,
         pending_returns=texts("pending_returns"),
         cancelled_returns=texts("cancelled_returns"),
         settled_returns=pairs("settled_returns"),

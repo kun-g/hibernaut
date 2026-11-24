@@ -259,7 +259,7 @@ class MCPServerAdapter:
         provided = auth.removeprefix("Bearer ").strip()
         return hmac.compare_digest(self._bearer_token, provided)
 
-    def handle_http(self, raw_body: bytes, headers: Mapping[str, str]) -> WebhookResponse:
+    def handle_http(self, raw_body: bytes, headers: Mapping[str, str], *, remote: bool = False) -> WebhookResponse:
         if not self._verify_bearer(headers):
             return WebhookResponse(status_code=401, body={"error": "unauthorized"})
         try:
@@ -274,7 +274,7 @@ class MCPServerAdapter:
                 status_code=400,
                 body=self._error_response(None, -32600, "Invalid Request"),
             )
-        reply = self.handle_rpc(message)
+        reply = self.handle_rpc(message, remote=remote)
         if reply is None:
             return WebhookResponse(status_code=202, body={})
         return WebhookResponse(status_code=200, body=reply)
@@ -301,7 +301,7 @@ class MCPServerAdapter:
                 stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
                 stdout.flush()
 
-    def handle_rpc(self, request: dict[str, Any]) -> dict[str, Any] | None:
+    def handle_rpc(self, request: dict[str, Any], *, remote: bool = False) -> dict[str, Any] | None:
         method = request.get("method")
         req_id = request.get("id")
         params = request.get("params") if isinstance(request.get("params"), dict) else {}
@@ -323,17 +323,17 @@ class MCPServerAdapter:
             memory_tools = self._memory.definitions() if self._memory is not None else []
             return self._ok_response(req_id, {"tools": [*_TOOL_DEFINITIONS, *memory_tools]})
         if method == "tools/call":
-            return self._handle_tool_call(req_id, params)
+            return self._handle_tool_call(req_id, params, remote)
 
         if req_id is None:
             return None
         return self._error_response(req_id, -32601, f"Method not found: {method}")
 
-    def _handle_tool_call(self, req_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+    def _handle_tool_call(self, req_id: Any, params: dict[str, Any], remote: bool) -> dict[str, Any]:
         tool_name = str(params.get("name") or "")
         args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
         try:
-            payload = self._dispatch_tool(tool_name, args)
+            payload = self._dispatch_tool(tool_name, args, remote)
         except KeyError:
             return self._error_response(req_id, -32602, f"Unknown tool: {tool_name}")
         except (TypeError, ValueError) as exc:
@@ -350,7 +350,7 @@ class MCPServerAdapter:
             },
         )
 
-    def _dispatch_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    def _dispatch_tool(self, tool_name: str, args: dict[str, Any], remote: bool) -> dict[str, Any]:
         if self._memory is not None and self._memory.handles(tool_name):
             return self._memory.call(tool_name, args)
         if tool_name == "hibernaut_ingest_event":
@@ -371,6 +371,7 @@ class MCPServerAdapter:
                 payload=payload,
                 session_id=session_id,
                 correlation_key=correlation_key,
+                remote=remote,
             )
             return {
                 "event_id": result.event_id,

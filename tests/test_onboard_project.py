@@ -19,6 +19,48 @@ checkout = "/tmp/hibernaut"
 """
 
 
+WITH_STEWARDS = """# mine
+[runtime]
+db_path = "./hb.db"
+
+[[runtime.inbox_bindings]]
+pattern = "user:main"
+default_agent = "ash"
+agents = ["ash"]
+workdir = "/tmp/workspace"
+checkout_access = "readonly"
+forward_to = ["proj:hibernaut"]  # by hand
+
+[executors.claude-code]
+
+[agents.ash]
+role = "steward"
+executor = "claude-code"
+
+[agents.front]
+role = "steward"
+executor = "claude-code"
+
+[agents.coder]
+role = "sde"
+executor = "claude-code"
+review = false
+
+[projects.hibernaut]
+inbox_id = ["proj:hibernaut", "proj:hibernaut:.+"]
+repo = "kun-g/hibernaut"
+checkout = "/tmp/hibernaut"
+
+[[projects.hibernaut.inbox_bindings]]
+pattern = "proj:hibernaut"
+default_agent = "front"
+
+[[projects.hibernaut.inbox_bindings]]
+pattern = "proj:hibernaut:.+"
+default_agent = "coder"
+"""
+
+
 class FakeGh:
     def __init__(self, *, labels: set[str] | None = None, origin: str = "") -> None:
         self.labels = labels or set()
@@ -74,6 +116,7 @@ class OnboardTests(unittest.TestCase):
             plan.steps,
             [
                 f"checkout: {self.repos / 'new-tool'} (existing)",
+                f"orca: {self.repos / 'new-tool'} (existing)",
                 "label: hibernaut (existing)",
                 "hibernaut.toml: [projects.new-tool] already serves kun-g/new-tool",
             ],
@@ -85,6 +128,27 @@ class OnboardTests(unittest.TestCase):
         onboard(["kun-g/new-tool", "--config", str(self.config), "--dry-run"], run=gh)
         self.assertEqual(self.config.read_text(), BASE)
         self.assertFalse(any(c[:2] == ["gh", "label"] or c[:3] == ["gh", "repo", "clone"] for c in gh.calls))
+        self.assertFalse(any(c[:3] == ["orca", "repo", "add"] for c in gh.calls))
+        self.assertEqual(list(self.config.parent.iterdir()), [self.config])
+
+    def test_r5_a_new_project_gets_the_same_steward_defaults_and_a_backup(self) -> None:
+        self.config.write_text(WITH_STEWARDS)
+        plan = onboard(["kun-g/new-tool", "--config", str(self.config), "--description", "一个工具"], run=FakeGh())
+        config = load_config(self.config)
+        project = config.projects["new-tool"]
+        self.assertEqual(project.description, "一个工具")
+        self.assertEqual([(b.rule.text, b.binding.default_agent) for b in project.inbox_bindings],
+                         [("proj:new-tool", "front"), ("proj:new-tool:.+", "coder")])
+        self.assertEqual(config.runtime.workdir_binding("user:main").forward_to, ("proj:hibernaut", "proj:new-tool"))
+        assert plan.backup is not None
+        self.assertEqual(plan.backup.read_text(), WITH_STEWARDS)
+        after = self.config.read_text().replace(', "proj:new-tool"]', "]")
+        self.assertTrue(after.startswith(WITH_STEWARDS))
+
+    def test_r5_without_a_steward_in_the_config_the_project_is_added_and_that_is_said(self) -> None:
+        plan = onboard(["kun-g/new-tool", "--config", str(self.config)], run=FakeGh())
+        self.assertIn("new-tool", load_config(self.config).projects)
+        self.assertTrue(any("teward" in line for line in plan.by_hand), plan.by_hand)
 
     def test_refuses_a_checkout_of_another_repository(self) -> None:
         (self.repos / "new-tool" / ".git").mkdir(parents=True)
