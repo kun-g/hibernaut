@@ -750,20 +750,24 @@ def test_worktree_commands_do_not_block_the_event_loop(tmp_path: Path) -> None:
         daemon.close()
 
 
-def test_concurrent_resolves_with_same_hint_get_distinct_worktrees(tmp_path: Path) -> None:
-    # Resolves now run in worker threads, so two work_keys can allocate names while the other is still creating.
+@pytest.mark.parametrize("hold_first", [False, True], ids=["concurrent", "name-reserved"])
+def test_concurrent_resolves_with_same_hint_get_distinct_worktrees(tmp_path: Path, hold_first: bool) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
+    second_created = threading.Event()
 
-    both_creating = threading.Barrier(2, timeout=5)
-
-    class _SlowBackend(GitWorktreeBackend):
+    class _HeldReservation(GitWorktreeBackend):
         def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> CreatedWorktree:
-            both_creating.wait()
-            return super().create(primary_checkout=primary_checkout, workdir=workdir, branch=branch, base_ref=base_ref)
+            # The second work key must reserve a distinct name before the first directory even exists.
+            if workdir.name == "hb-same-hint":
+                assert second_created.wait(5), "the second key did not get past the first reservation"
+            created = super().create(primary_checkout=primary_checkout, workdir=workdir, branch=branch, base_ref=base_ref)
+            second_created.set()
+            return created
 
     cfg = _config(tmp_path, repo)
-    mgr = WorktreeManager(db_path=cfg.state_dir / "runner_workspaces.db", backend=_SlowBackend())
+    backend = _HeldReservation() if hold_first else GitWorktreeBackend()
+    mgr = WorktreeManager(db_path=cfg.state_dir / "runner_workspaces.db", backend=backend)
     daemon = RunnerDaemon(cfg, drivers=_drivers(), worktree_manager=mgr)
 
     def _with_hint(run_id: str, work_key: str) -> RunRequest:

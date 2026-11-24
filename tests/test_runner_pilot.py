@@ -14,7 +14,7 @@ import sys
 import textwrap
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
@@ -780,7 +780,7 @@ class Deployment:
         shim.write_text(
             "#!/bin/sh\nfor arg do\n"
             f'  if [ "$arg" = cat-file ] && [ -p {shlex.quote(str(gate))} ]; then\n'
-            f"    {{ : > {shlex.quote(str(gate.with_suffix('.ready')))}; read -r go; }} < {shlex.quote(str(gate))}\n"
+            f"    {{ printf '%s\\n' \"$PPID\" > {shlex.quote(str(gate.with_suffix('.ready')))}; read -r go; }} < {shlex.quote(str(gate))}\n"
             "    break\n  fi\ndone\n"
             f'exec {shlex.quote(real_git)} "$@"\n'
         )
@@ -814,13 +814,21 @@ class Deployment:
                     proc.kill()
                     proc.wait()
 
-    def until(self, check: Callable[[], Any], timeout: float = 25.0) -> Any:
+    def until(self, check: Callable[[], Any], timeout: float = 25.0, *, interval: float = 0.05) -> Any:
         deadline = time.monotonic() + timeout
         while not (value := check()):
             assert self.hb is None or self.hb.poll() is None, self.logs()
             assert time.monotonic() < deadline, self.logs()
-            time.sleep(0.05)
+            time.sleep(interval)
         return value
+
+    def gated_worker(self, ready: Path) -> int:
+        # The Git shim identifies the exact process that requested the blocked object read.
+        pid = int(self.until(lambda: ready.is_file() and ready.read_text().strip(), interval=0.01))
+        parent, command = subprocess.check_output(["ps", "-ww", "-p", str(pid), "-o", "ppid=", "-o", "command="],
+                                                  text=True).strip().split(None, 1)
+        assert self.runner and int(parent) == self.runner.pid and "protocol_check.py" in command
+        return pid
 
     def logs(self) -> str:
         return "\n".join(p.read_text() for p in (self.hb_log, self.runner_log) if p.exists())
@@ -851,15 +859,19 @@ class Deployment:
         return str(data["event_id"])
 
     def rows(self, sql: str, *params: Any, db: str = "hb.db") -> list[sqlite3.Row]:
-        with sqlite3.connect(self.root / db, timeout=5) as conn:
+        with closing(sqlite3.connect(self.root / db, timeout=5)) as conn:
             conn.row_factory = sqlite3.Row
             return conn.execute(sql, params).fetchall()
 
     def status(self, event_id: str) -> str:
         return str(self.rows("SELECT status FROM event_inbox WHERE event_id = ?", event_id)[0]["status"])
 
-    def finished(self, *event_ids: str) -> None:
-        self.until(lambda: all(self.status(e) == "done" for e in event_ids))
+    def finished(self, *event_ids: str, timeout: float = 25.0) -> None:
+        with closing(sqlite3.connect(self.root / "hb.db", timeout=5)) as db:
+            def all_done() -> bool:
+                return all(db.execute("SELECT status FROM event_inbox WHERE event_id = ?", (e,)).fetchone() == ("done",)
+                           for e in event_ids)
+            self.until(all_done, timeout=timeout, interval=0.01)
 
     def outbox(self, inbox: str) -> list[str]:
         return [r["content"] for r in self.rows("SELECT content FROM outbox WHERE inbox_id = ? ORDER BY seq", inbox)]
@@ -895,9 +907,9 @@ class Deployment:
     def check(self, inbox: str = PILOT, **payload: Any) -> str:
         return self.post(inbox, candidate_commit=self.commit, **payload)
 
-    def assert_original_path(self, inbox: str) -> None:
+    def assert_original_path(self, inbox: str, *, key: str | None = None) -> None:
         before = len(self.outbox(inbox))
-        self.finished(self.post(inbox))
+        self.finished(self.post(inbox, key=key))
         assert self.outbox(inbox)[before:] == [f"original path: t{self.seq}"]
         assert (self.runs(inbox)[-1]["executor_id"], self.runs(inbox)[-1]["runner_id"]) == ("cli", "local")
 
@@ -1002,12 +1014,11 @@ def test_a_forced_stop_ends_the_worker_process_and_the_next_start_finishes_the_t
     pilot: Deployment, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pilot.write(enabled=True)
-    pilot.start_hb()
-    gate = pilot.start_gated_runner(monkeypatch)
+    pilot.start_hb(fast_retry=True)
+    gate = pilot.start_gated_runner(monkeypatch, fast_retry=True)
     with hold_protocol_check(gate) as entered:
         held = pilot.check(key=KEY)
-        pilot.until(entered.exists)
-        worker = pilot.worker()
+        worker = pilot.gated_worker(entered)
         pilot.force_stop_hb()
         assert not alive(worker)
         assert (pilot.status(held), pilot.outbox(PILOT)) == ("pending", [])
@@ -1015,8 +1026,8 @@ def test_a_forced_stop_ends_the_worker_process_and_the_next_start_finishes_the_t
         assert (run["outcome_kind"], run["runner_id"]) == ("interrupted", RUNNER_ID)
         assert _runner_run(pilot, run).is_file()
     # Same port, same token; the Runner reconnects on its own.
-    pilot.start_hb()
-    pilot.until(lambda: pilot.status(held) == "done", timeout=60)
+    pilot.start_hb(fast_retry=True)
+    pilot.finished(held, timeout=60)
     assert len(pilot.outbox(PILOT)) == 1 and pilot.runs()[-1]["emit_status"] == "done"
 
 
@@ -1047,15 +1058,15 @@ def test_turning_the_route_off_drains_it_and_restores_the_original_path(
     pilot.start_hb(fast_retry=True)
     gate = pilot.start_gated_runner(monkeypatch, fast_retry=True)
     assert not pilot.relay_open()
-    pilot.assert_original_path(PILOT)  # off: the pilot inbox is an ordinary inbox
+    ordinary_key = "github:fixture/test#9000"
+    pilot.assert_original_path(PILOT, key=ordinary_key)  # off: the pilot inbox is an ordinary inbox
 
     pilot.reload(enabled=True)
     assert pilot.relay_open()
     pilot.finished(pilot.check())
     with hold_protocol_check(gate) as entered:
         in_flight = pilot.check(key=KEY)
-        pilot.until(entered.exists)
-        worker = pilot.worker()
+        worker = pilot.gated_worker(entered)
         pilot.reload(enabled=False)
         # The Run in flight keeps its Relay until it has ended, on its own terms.
         assert alive(worker) and pilot.relay_open()
@@ -1065,13 +1076,11 @@ def test_turning_the_route_off_drains_it_and_restores_the_original_path(
     assert pilot.runs()[-1]["runner_id"] == RUNNER_ID
     pilot.assert_original_path(PILOT)
     # A session of the pilot must not keep pointing its correlation key at the closed route.
-    before = len(pilot.outbox(PILOT))
-    pilot.finished(pilot.post(PILOT, key=KEY))
-    assert pilot.outbox(PILOT)[before:] == [f"original path: t{pilot.seq}"]
-    # Leftover work addressed to the check ends with a notice instead of running elsewhere.
+    pilot.assert_original_path(PILOT, key=KEY)
+    # Leftover work addressed to the check ends with a notice. An existing ordinary task can then continue.
     pilot.finished(pilot.check(executor_id=PROTOCOL_CHECK_EXECUTOR_ID))
     assert "试点路由未对本 Inbox 开放" in pilot.outbox(PILOT)[-1]
-    pilot.assert_original_path(PILOT)
+    pilot.assert_original_path(PILOT, key=ordinary_key)
 
     pilot.reload(enabled=True)
     assert pilot.runner is not None and pilot.runner.poll() is None
