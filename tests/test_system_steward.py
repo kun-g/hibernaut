@@ -34,13 +34,13 @@ class BindingConfigTests(unittest.TestCase):
                 *(extra or []),
                 clean({"pattern": ASH, "default_agent": "ash", "agents": ["ash"], "workdir": str(self.root / "work"),
                        "checkout_access": "readonly", "forward_to": ["proj:a", OPS], **(ash or {})}),
-                clean({"pattern": OPS, "default_agent": "ops", "agents": ["ops"], "workdir": str(self.root / "a"),
-                       "checkout_access": "readonly", "system_tools": True, **ops}),
+                clean({"pattern": OPS, "default_agent": "hibernaut-ops", "agents": ["hibernaut-ops"],
+                       "workdir": str(self.root / "a"), "checkout_access": "readonly", "system_tools": True, **ops}),
             ]},
             "executors": {"cli": {"command": "x"}, "claude-code": {"harness": "claude-code"}},
             "agents": {
                 "ash": {"role": "steward", "executor": "claude-code"},
-                "ops": {"role": "steward", "executor": "claude-code", "description": "onboards projects"},
+                "hibernaut-ops": {"role": "steward", "executor": "claude-code", "description": "onboards projects"},
                 "front": {"role": "steward", "executor": "claude-code"},
                 "plain": {"executor": "cli"},
             },
@@ -84,13 +84,13 @@ class BindingConfigTests(unittest.TestCase):
         for access in ("readwrite", None):
             self.refused("readonly", checkout_access=access)
             self.refused("readonly", checkout_access=access, default_agent="plain", agents=["plain"])
-        self.refused("system_tools.*'plain'", agents=["ops", "plain"])
+        self.refused("system_tools.*'plain'", agents=["hibernaut-ops", "plain"])
         self.refused("system_tools.*'plain'", agents=None, rules=[{"tags": ["x"], "agent": "plain"}])
 
     def test_c1_left_out_agents_are_the_stewards_it_names_and_no_cli_agent(self) -> None:
         bound = self.parse(agents=None).runtime.workdir_binding(OPS)
         assert bound is not None
-        self.assertEqual(bound.binding.agents, ("ops",))
+        self.assertEqual(bound.binding.agents, ("hibernaut-ops",))
 
     def test_c6_it_may_not_forward_on(self) -> None:
         self.refused("system_tools.*forward_to", forward_to=["proj:a"])

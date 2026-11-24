@@ -51,8 +51,8 @@ forward_to = ["proj:old", "sys:ops"]   # who may get work
 
 [[runtime.inbox_bindings]]
 pattern = "sys:ops"
-default_agent = "ops"
-agents = ["ops"]
+default_agent = "hibernaut-ops"
+agents = ["hibernaut-ops"]
 workdir = "{root}"
 checkout_access = "readonly"
 system_tools = true
@@ -64,7 +64,7 @@ ANTHROPIC_AUTH_TOKEN = "placeholder-gateway-token"   # keep
 
 [agents]
 ash = {{ role = "steward", executor = "claude-code" }}
-ops = {{ role = "steward", executor = "claude-code" }}
+hibernaut-ops = {{ role = "steward", executor = "claude-code" }}
 front = {{ role = "steward", executor = "claude-code" }}
 reviewer = {{ role = "code-reviewer", executor = "claude-code" }}
 sde = {{ role = "sde", executor = "claude-code", reviewer = "reviewer" }}
@@ -425,7 +425,7 @@ class CompleteTests(OnboardingCase):
         self.assertTrue(bare.inbox_bindings[0].binding.allows("sde"))
 
     def test_r8_an_unknown_project_is_told(self) -> None:
-        for name in ("nope", "runtime", "old.delivery", "projects.old", 'x"]', "sys:ops", "ops"):
+        for name in ("nope", "runtime", "old.delivery", "projects.old", 'x"]', "sys:ops", "hibernaut-ops"):
             with self.subTest(name=name):
                 self.refused("there is no project", lambda: self.complete(name))
         self.unchanged()
