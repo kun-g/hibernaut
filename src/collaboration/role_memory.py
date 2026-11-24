@@ -4,9 +4,13 @@ import hashlib
 import json
 import re
 import uuid
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from collaboration._files import ExclusiveLock, atomic_write_text
 from collaboration.models import (
     MemoryMountPlan,
     MemoryMountSlice,
@@ -16,6 +20,7 @@ from collaboration.models import (
 
 _ROLE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _PROJECT_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_PROPOSAL_ID_RE = re.compile(r"rprop-[0-9a-f]{12}")
 
 
 class CASConflictError(ValueError):
@@ -28,7 +33,7 @@ def _sha256_text(content: str) -> str:
 
 def _validate_role_id(role_id: str) -> str:
     cleaned = role_id.strip()
-    if not _ROLE_ID_RE.match(cleaned):
+    if not _ROLE_ID_RE.fullmatch(cleaned):
         raise ValueError(f"Invalid role_id: {role_id!r}")
     return cleaned
 
@@ -43,12 +48,21 @@ def _validate_rel_path(rel_path: str) -> str:
 
 
 class RoleSkillMemoryStore:
-    def __init__(self, root_dir: Path | str) -> None:
+    def __init__(
+        self,
+        root_dir: Path | str,
+        *,
+        # What holds off every other writer of root_dir; its own lock file unless the deployment has one already.
+        exclusive: Callable[[], AbstractContextManager[None]] | None = None,
+        on_approved: Callable[[RoleMemoryProposal], None] | None = None,
+    ) -> None:
         self._root = Path(root_dir).expanduser().resolve()
         self._roles_dir = self._root / "roles"
         self._proposals_dir = self._root / "proposals" / "roles"
         self._roles_dir.mkdir(parents=True, exist_ok=True)
         self._proposals_dir.mkdir(parents=True, exist_ok=True)
+        self._exclusive = exclusive or ExclusiveLock(self._root / ".roles.lock").hold
+        self._on_approved = on_approved
 
     @property
     def root(self) -> Path:
@@ -57,8 +71,11 @@ class RoleSkillMemoryStore:
     def _target_path(self, role_id: str, rel_path: str) -> Path:
         role = _validate_role_id(role_id)
         rel = _validate_rel_path(rel_path)
-        target = (self._roles_dir / role / rel).resolve()
-        target.relative_to(self._roles_dir.resolve())
+        role_dir = self._roles_dir / role
+        target = (role_dir / rel).resolve()
+        # Its own directory, not just anywhere in roles/: a link must not lead into another role's memory.
+        if target == role_dir or not target.is_relative_to(role_dir):
+            raise ValueError(f"Invalid relative path: {rel_path!r}")
         return target
 
     def read_role_doc(self, role_id: str, rel_path: str = "skills.md") -> tuple[str, str]:
@@ -89,16 +106,51 @@ class RoleSkillMemoryStore:
         rel_path: str = "skills.md",
         base_sha256: str | None = None,
     ) -> RoleMemoryProposal:
-        role = _validate_role_id(role_id)
-        rel = _validate_rel_path(rel_path)
+        with self._exclusive():
+            return self._queue(
+                f"rprop-{uuid.uuid4().hex[:12]}", role_id, rel_path, content, reason, proposed_by, base_sha256
+            )
+
+    def propose_skill_append(
+        self,
+        *,
+        proposal_id: str,
+        role_id: str,
+        addition: str,
+        reason: str,
+        proposed_by: str,
+        rel_path: str = "skills.md",
+    ) -> RoleMemoryProposal:
+        # The caller derives proposal_id from what it proposes, so proposing the same thing again changes nothing.
+        with self._exclusive():
+            try:
+                return self.get_proposal(proposal_id)
+            except KeyError:
+                pass
+            current, sha = self.read_role_doc(role_id, rel_path)
+            content = f"{current.rstrip()}\n\n{addition.strip()}\n" if current.strip() else f"{addition.strip()}\n"
+            return self._queue(proposal_id, role_id, rel_path, content, reason, proposed_by, sha)
+
+    def _queue(
+        self,
+        proposal_id: str,
+        role_id: str,
+        rel_path: str,
+        content: str,
+        reason: str,
+        proposed_by: str,
+        base_sha256: str | None,
+    ) -> RoleMemoryProposal:
+        role, rel = _validate_role_id(role_id), _validate_rel_path(rel_path)
+        if not content.strip():
+            raise ValueError("a role skill proposal needs content")
         _, current_sha = self.read_role_doc(role, rel)
-        expected_sha = current_sha if base_sha256 is None else base_sha256
-        if expected_sha != current_sha:
+        if base_sha256 is not None and base_sha256 != current_sha:
             raise CASConflictError(
-                f"CAS mismatch for role://{role}/{rel}: expected {expected_sha}, actual {current_sha}"
+                f"CAS mismatch for role://{role}/{rel}: expected {base_sha256}, actual {current_sha}"
             )
         proposal = RoleMemoryProposal(
-            proposal_id=f"rprop-{uuid.uuid4().hex[:12]}",
+            proposal_id=proposal_id,
             role_id=role,
             rel_path=rel,
             content=content,
@@ -113,14 +165,17 @@ class RoleSkillMemoryStore:
 
     def list_proposals(self, *, status: str | None = None) -> list[RoleMemoryProposal]:
         out: list[RoleMemoryProposal] = []
-        for path in sorted(self._proposals_dir.glob("*.json")):
-            item = self._load_proposal(path)
+        for path in sorted(self._proposals_dir.glob("rprop-*.json")):
+            try:
+                item = self._load_proposal(path)
+            except (KeyError, TypeError, ValueError):
+                continue
             if status is None or item.status == status:
                 out.append(item)
         return out
 
     def get_proposal(self, proposal_id: str) -> RoleMemoryProposal:
-        path = self._proposals_dir / f"{proposal_id}.json"
+        path = self._proposal_path(proposal_id)
         if not path.is_file():
             raise KeyError(f"Unknown role proposal: {proposal_id}")
         return self._load_proposal(path)
@@ -132,33 +187,28 @@ class RoleSkillMemoryStore:
         reviewed_by: str,
         review_note: str = "",
     ) -> RoleMemoryProposal:
-        proposal = self.get_proposal(proposal_id)
-        if proposal.status != "pending":
-            raise ValueError(f"Proposal {proposal_id} is already {proposal.status}")
-        target = self._target_path(proposal.role_id, proposal.rel_path)
-        _, current_sha = self.read_role_doc(proposal.role_id, proposal.rel_path)
-        if proposal.base_sha256 != current_sha:
-            raise CASConflictError(
-                f"Cannot approve {proposal_id}: role://{proposal.role_id}/{proposal.rel_path} changed since proposal"
+        with self._exclusive():
+            proposal = self._pending(proposal_id)
+            target = self._target_path(proposal.role_id, proposal.rel_path)
+            _, current_sha = self.read_role_doc(proposal.role_id, proposal.rel_path)
+            if current_sha == _sha256_text(proposal.content) != proposal.base_sha256:
+                # Written by an approval that crashed before it recorded itself.
+                pass
+            elif proposal.base_sha256 != current_sha:
+                raise CASConflictError(
+                    f"Cannot approve {proposal_id}: role://{proposal.role_id}/{proposal.rel_path} "
+                    "changed since proposal"
+                )
+            else:
+                atomic_write_text(target, proposal.content)
+            approved = replace(
+                proposal, status="approved", reviewed_by=reviewed_by, reviewed_at=utc_now_iso(),
+                review_note=review_note,
             )
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(proposal.content, encoding="utf-8")
-        updated = RoleMemoryProposal(
-            proposal_id=proposal.proposal_id,
-            role_id=proposal.role_id,
-            rel_path=proposal.rel_path,
-            content=proposal.content,
-            reason=proposal.reason,
-            proposed_by=proposal.proposed_by,
-            base_sha256=proposal.base_sha256,
-            status="approved",
-            created_at=proposal.created_at,
-            reviewed_by=reviewed_by,
-            reviewed_at=utc_now_iso(),
-            review_note=review_note,
-        )
-        self._save_proposal(updated)
-        return updated
+            self._save_proposal(approved)
+            if self._on_approved is not None:
+                self._on_approved(approved)
+            return approved
 
     def reject_proposal(
         self,
@@ -167,29 +217,28 @@ class RoleSkillMemoryStore:
         reviewed_by: str,
         review_note: str = "",
     ) -> RoleMemoryProposal:
+        with self._exclusive():
+            rejected = replace(
+                self._pending(proposal_id), status="rejected", reviewed_by=reviewed_by, reviewed_at=utc_now_iso(),
+                review_note=review_note,
+            )
+            self._save_proposal(rejected)
+            return rejected
+
+    def _pending(self, proposal_id: str) -> RoleMemoryProposal:
         proposal = self.get_proposal(proposal_id)
         if proposal.status != "pending":
             raise ValueError(f"Proposal {proposal_id} is already {proposal.status}")
-        updated = RoleMemoryProposal(
-            proposal_id=proposal.proposal_id,
-            role_id=proposal.role_id,
-            rel_path=proposal.rel_path,
-            content=proposal.content,
-            reason=proposal.reason,
-            proposed_by=proposal.proposed_by,
-            base_sha256=proposal.base_sha256,
-            status="rejected",
-            created_at=proposal.created_at,
-            reviewed_by=reviewed_by,
-            reviewed_at=utc_now_iso(),
-            review_note=review_note,
-        )
-        self._save_proposal(updated)
-        return updated
+        return proposal
+
+    def _proposal_path(self, proposal_id: str) -> Path:
+        if not _PROPOSAL_ID_RE.fullmatch(proposal_id):
+            raise KeyError(f"Unknown role proposal: {proposal_id}")
+        return self._proposals_dir / f"{proposal_id}.json"
 
     def _save_proposal(self, proposal: RoleMemoryProposal) -> None:
-        path = self._proposals_dir / f"{proposal.proposal_id}.json"
-        path.write_text(json.dumps(proposal.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        text = json.dumps(proposal.to_dict(), ensure_ascii=False, indent=2)
+        atomic_write_text(self._proposal_path(proposal.proposal_id), text)
 
     def _load_proposal(self, path: Path) -> RoleMemoryProposal:
         raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
@@ -220,7 +269,7 @@ def build_four_layer_mount_plan(
 ) -> MemoryMountPlan:
     role = _validate_role_id(role_id)
     cleaned_project = project_key.strip()
-    if not cleaned_project or not _PROJECT_KEY_RE.match(cleaned_project):
+    if not cleaned_project or not _PROJECT_KEY_RE.fullmatch(cleaned_project):
         raise ValueError(f"Invalid project_key: {project_key!r}")
     if cleaned_project in extra_readonly_projects:
         raise ValueError(f"Project {cleaned_project!r} cannot be mounted both RW and RO")
@@ -253,7 +302,7 @@ def build_four_layer_mount_plan(
     ]
     for ro_proj in extra_readonly_projects:
         ro_clean = ro_proj.strip()
-        if not ro_clean or not _PROJECT_KEY_RE.match(ro_clean):
+        if not ro_clean or not _PROJECT_KEY_RE.fullmatch(ro_clean):
             raise ValueError(f"Invalid readonly project_key: {ro_proj!r}")
         slices.append(
             MemoryMountSlice(

@@ -13,7 +13,7 @@ from collaboration.expert_pool import (
     ExpertPoolRegistry,
     default_expert_profiles,
 )
-from collaboration.hub_server import CollaborationHubServer, HubStateProvider
+from collaboration.hub_server import CollaborationHubServer, HubStateProvider, ProjectProposalReviewPort
 from collaboration.mcp_tools import CollaborationMCPTools
 from collaboration.models import (
     CloseoutCard,
@@ -62,6 +62,7 @@ __all__ = [
     "MemoryProposalSinkPort",
     "NotificationDecision",
     "NotificationPolicyEngine",
+    "ProjectProposalReviewPort",
     "RoleMemoryProposal",
     "RoleSkillMemoryStore",
     "TaskboardSinkPort",

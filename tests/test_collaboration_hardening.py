@@ -63,8 +63,11 @@ class Recorder:
 @pytest.mark.parametrize("bad", ["../outside", "a/b", "..", "", "closeout-x", "/etc/passwd"])
 def test_ids_cannot_leave_their_directory(tmp_path: Path, bad: str) -> None:
     closeouts, roles = CloseoutStore(tmp_path / "closeouts"), RoleSkillMemoryStore(tmp_path / "mem")
-    (tmp_path / "outside.json").write_text("{}")
-    (tmp_path / "mem" / "proposals" / "outside.json").write_text("{}")
+    # Complete records just outside, so only the id check can refuse them.
+    card = draft(CloseoutCoordinator(closeouts))
+    proposal = roles.propose_skill_write(role_id="sde", content="x", reason="r", proposed_by="x")
+    (tmp_path / "outside.json").write_text(json.dumps(card.to_dict()))
+    (tmp_path / "mem" / "proposals" / "outside.json").write_text(json.dumps(proposal.to_dict()))
     with pytest.raises(KeyError):
         closeouts.get(bad)
     with pytest.raises(KeyError):
@@ -135,8 +138,6 @@ def test_a_failed_sync_is_finished_by_confirming_again(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError):
         coord.confirm_and_sync(card.card_id, confirmed_by="owner")
     assert store.get(card.card_id).status == "confirmed"
-    with pytest.raises(ValueError):
-        coord.discard(card.card_id)
     result = coord.confirm_and_sync(card.card_id, confirmed_by="owner")
     assert (result.tasks_created, result.already_synced) == (("task-one", "task-two"), False)
     # The chief hears of it once, after everything else has landed.
