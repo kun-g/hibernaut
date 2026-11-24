@@ -1,3 +1,4 @@
+from agent_runtime.adapters.memory_fs.expert_mount import ExpertMount, open_role_store
 from agent_runtime.adapters.memory_fs.fs_memory import FileSystemMemoryAdapter
 from agent_runtime.adapters.memory_fs.hub import GovernedMemoryHub
 from agent_runtime.adapters.memory_fs.partitioned import (
@@ -20,6 +21,7 @@ __all__ = [
     "APPROVE_TOOL",
     "MEMORY_TOOLS",
     "BaselineSegments",
+    "ExpertMount",
     "FileSystemMemoryAdapter",
     "GovernedMemoryHub",
     "PartitionBinding",
@@ -30,5 +32,6 @@ __all__ = [
     "check_inbox_id",
     "describe_proposal",
     "directory_key",
+    "open_role_store",
     "write_memory",
 ]

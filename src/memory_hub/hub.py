@@ -86,6 +86,9 @@ class MemoryHub:
     def propose_write(self, proposal: WriteProposal) -> WriteResult:
         return self._gate.propose_write(proposal)
 
+    def queue_proposal(self, proposal: WriteProposal, *, proposal_id: str) -> WriteResult:
+        return self._gate.propose_write(proposal, queue_as=proposal_id)
+
     def approve_proposal(self, proposal_id: str, *, actor: str) -> WriteResult:
         return self._gate.approve_proposal(proposal_id, actor=actor)
 
@@ -135,9 +138,11 @@ class MemoryHub:
             return False
         if not (self._store.root / ".git").exists():
             return False
+        # git add fails as a whole on a directory that is not there; only a deployment with experts has roles/.
+        roles = ["roles"] if any((self._store.root / "roles").glob("*/*")) else []
         try:
             subprocess.run(
-                ["git", "add", "-A", "global", "projects", "shared", "proposals"],
+                ["git", "add", "-A", "global", "projects", "shared", "proposals", *roles],
                 cwd=self._store.root,
                 check=False,
                 capture_output=True,
