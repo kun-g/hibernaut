@@ -35,6 +35,7 @@ from agent_runtime.core.models import Emit, Event, PermissionDecision, SessionRe
 from agent_runtime.engine import AgentWorker, EventHandler
 from tests.empty_guidance import empty_project_guidance
 from tests.fakes import InMemoryPermission
+from tests.review_flow_support import REPORT, ReviewFlowCase
 from tests.test_coder_reviewer import (
     CHANGES_REQUESTED,
     FAKE_CLAUDE,
@@ -265,49 +266,6 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertIn(EVIDENCE, outcome.messages[0])
         self.assertEqual([c["role"] for c in self.calls()], ["sde"])
 
-    async def test_failed_review_stays_pending_and_approval_retries_only_the_review(self):
-        self.set_plan(sde=[dev(FIXED)], reviewer=[{"error": "reviewer crashed"}, PASS])
-        executor = self.executor()
-        outcome = await executor.execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        self.assertIn("review pending", outcome.prompt)
-        self.assertIn("reviewer crashed", outcome.prompt)
-        self.assertNotIn("verdict=pass", outcome.prompt)
-        session = SessionRef(session_id=outcome.session_id or "s", inbox_id="proj:x", correlation_key="task:1",
-                             executor_id="sde", executor_session_id=outcome.executor_session_id,
-                             status="suspended", checkpoint=outcome.session_checkpoint,
-                             pending_request_id=outcome.request_id)
-        approve = event({"approval_request_id": outcome.request_id, "approved": True})
-        resumed = await executor.execute([approve], session, self.caps)
-        assert isinstance(resumed, Emit), resumed
-        self.assertIn("review=pass after 1 round", resumed.messages[0])
-        self.assertEqual([c["role"] for c in self.calls()], ["sde", "reviewer", "reviewer"])
-
-    async def test_declined_retry_delivers_marked_as_unreviewed(self):
-        self.set_plan(sde=[dev(FIXED)], reviewer=[{"error": "reviewer crashed"}])
-        executor = self.executor()
-        outcome = await executor.execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        session = SessionRef(session_id="s", inbox_id="proj:x", executor_id="sde", status="suspended",
-                             checkpoint=outcome.session_checkpoint, pending_request_id=outcome.request_id)
-        declined = await executor.execute(
-            [event({"approval_request_id": outcome.request_id, "approved": False})], session, self.caps
-        )
-        assert isinstance(declined, Emit), declined
-        self.assertIn("review=pending", declined.messages[0])
-        self.assertNotIn("review=pass", declined.messages[0])
-        self.assertEqual(len(self.calls("reviewer")), 1)
-
-    async def test_rounds_exhausted_keep_the_review_pending_with_blocking_items(self):
-        self.set_plan(sde=[dev(BUGGY), dev({"calc.py": "def divide(a, b):\n    return a // b\n"})],
-                      reviewer=[CHANGES_REQUESTED])
-        outcome = await self.executor(max_review_rounds=2).execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        self.assertIn("review pending", outcome.prompt)
-        self.assertIn("changes_requested after 2 round", outcome.prompt)
-        self.assertIn("calc.py:2", outcome.prompt)
-        self.assertEqual([c["role"] for c in self.calls()], ["sde", "reviewer", "sde", "reviewer"])
-
     async def test_needs_input_suspends_and_the_answer_resumes_the_developer_session(self):
         self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?"), dev(FIXED)], reviewer=[PASS])
         executor = self.executor()
@@ -366,6 +324,56 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((call["base_url"], call["auth_token"]), ("http://127.0.0.1:3425", "magpie"))
         self.assertEqual(call["paid_env"], ["ANTHROPIC_AUTH_TOKEN"])
         self.assertEqual(call["argv"][call["argv"].index("--model") + 1], "codex/gpt-6.2-astra")
+
+
+class TestSDEReviewState(ReviewFlowCase):
+    def setUp(self):
+        super().setUp()
+        self.executor._delivery = None
+        self.turns = Mock()
+        self.turns.attach_mock(self.develop, "develop")
+        self.turns.attach_mock(self.reviewer.review, "review")
+
+    def role_order(self):
+        return [name for name, _, _ in self.turns.mock_calls]
+
+    async def decide(self, outcome, approved):
+        session = SessionRef(session_id=outcome.session_id, inbox_id="proj:x", correlation_key="task:1",
+                             executor_id="sde", executor_session_id=outcome.executor_session_id, status="suspended",
+                             checkpoint=outcome.session_checkpoint, pending_request_id=outcome.request_id)
+        return await self.executor.execute(
+            [event({"approval_request_id": outcome.request_id, "approved": approved})], session, self.caps)
+
+    async def test_failed_review_stays_pending_and_approval_retries_only_the_review(self):
+        outcome = await self.run_flow(snapshots=["changed", "changed"], diffs={}, reports=[REPORT],
+                                      reviews=[ReviewAborted("reviewer crashed"), PASS])
+        assert isinstance(outcome, Suspend), outcome
+        self.assertIn("review pending", outcome.prompt)
+        self.assertIn("reviewer crashed", outcome.prompt)
+        self.assertNotIn("verdict=pass", outcome.prompt)
+        resumed = await self.decide(outcome, True)
+        assert isinstance(resumed, Emit), resumed
+        self.assertIn("review=pass after 1 round", resumed.messages[0])
+        self.assertEqual(self.role_order(), ["develop", "review", "review"])
+
+    async def test_declined_retry_delivers_marked_as_unreviewed(self):
+        outcome = await self.run_flow(snapshots=["changed"], diffs={}, reviews=[ReviewAborted("reviewer crashed")])
+        assert isinstance(outcome, Suspend), outcome
+        declined = await self.decide(outcome, False)
+        assert isinstance(declined, Emit), declined
+        self.assertIn("review=pending", declined.messages[0])
+        self.assertNotIn("review=pass", declined.messages[0])
+        self.assertEqual(self.role_order(), ["develop", "review"])
+
+    async def test_rounds_exhausted_keep_the_review_pending_with_blocking_items(self):
+        self.executor._options = SDEOptions(max_review_rounds=2)
+        outcome = await self.run_flow(snapshots=["buggy", "still-buggy"], reviews=[CHANGES_REQUESTED] * 2,
+                                      diffs={("buggy", "still-buggy"): ("+    return a // b", ["calc.py"])})
+        assert isinstance(outcome, Suspend), outcome
+        self.assertIn("review pending", outcome.prompt)
+        self.assertIn("changes_requested after 2 round", outcome.prompt)
+        self.assertIn("calc.py:2", outcome.prompt)
+        self.assertEqual(self.role_order(), ["develop", "review", "develop", "review"])
 
 
 class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
