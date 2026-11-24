@@ -233,6 +233,14 @@ class DriveChainTests(ForwardCase):
 
 
 class TimerTests(unittest.TestCase):
+    def test_missed_intervals_fire_once_and_keep_the_original_phase(self) -> None:
+        timers, inbox = InMemoryTimerStore(), InMemoryInbox()
+        timers.schedule("schedule", "2026-01-01T00:00:03+00:00", {}, 10)
+        scheduler = TimerScheduler(timers=timers, inbox=inbox)
+        self.assertEqual(scheduler.tick("2026-01-01T00:00:39+00:00"), 1)
+        self.assertEqual(scheduler.tick("2026-01-01T00:00:42+00:00"), 0)
+        self.assertEqual(scheduler.tick("2026-01-01T00:00:43+00:00"), 1)
+
     def test_a_named_timer_is_its_own_source(self) -> None:
         timers, inbox = InMemoryTimerStore(), InMemoryInbox()
         timers.schedule("schedule", utc_now_iso(), {"timer_name": "ops"}, 60, inbox_id="proj:x")

@@ -46,6 +46,12 @@
 | `RunContext` | 给可接回执行器的 Run 句柄：`run_dir`（执行器私有状态，如 `state.json`）、`detachable()`（包住可脱离的等待段）、`should_detach()`（阻塞线程工作的检查点）、`detached()` |
 | `RunCapabilities` | 注入单轮 Run 的受控能力集合：`memory`、`timers`、`permissions`、`poll_folded_events()`、`is_interrupted()`、`forward_to_inbox()`（受控转投，§3） |
 
+### 配置定时器的生命周期
+
+配置生效时按 `name` 对账。SQLite 的 `config:<name>` 主键专属配置定时器，白盒工具继续使用独立 ID。新增、重新启用或修改间隔后从生效时刻算一个间隔。其余更新和重启沿用持久化的 `due_at`。删除或停用只撤销后续触发，已经投出的事件按原流程处理。
+
+所有周期定时器错过多个周期只补跑一次，下次对齐原相位的第一个未来间隔。配置定时器在一个事务中推进到期时间、检查自己的未完成事件、按需入队。已有 `pending` 或 `processing` 时直接跳过，重启和热加载中的旧 Run 也算在内。每个配置定时器在目标 Inbox 内沿用固定会话键，复用会话以保留连续记录，避免每轮新建一个 `active` 会话。
+
 ## 3. 外部关联键 `correlation_key`、多执行器粘滞路由与 L3 通道
 
 - **4 级会话解析优先级**（`AgentWorker._resolve_session()`）：`approval_request_id` → 显式 `session_id` → `(inbox_id, correlation_key)` → 新建 `session_id`。

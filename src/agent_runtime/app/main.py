@@ -1048,7 +1048,7 @@ def build_daemon_from_config(
     demo: bool = False,
     gdrive_client: DriveClientProtocol | None = None,
     switchboard: SwitchboardHandle | None = None,
-    # False for a reload, whose daemon may be dropped yet: what Switchboard delivers goes to the one in force.
+    # Only the active daemon owns timer reconciliation and Switchboard delivery.
     attach: bool = True,
     ledger: RunLedger | None = None,
     runner_pilot: RunnerPilotRelay | None = None,
@@ -1614,6 +1614,8 @@ def build_daemon_from_config(
         # Last, so settings refused above leave no listener behind. A reload passes the running hub, whose service goes
         # on; its settings cannot change without a restart.
         daemon.memory_http = open_memory_http(config.memory_hub.http, memory_hub)
+    if attach:
+        daemon.timers.reconcile(config.timers)
     return daemon
 
 
@@ -1824,6 +1826,7 @@ async def serve_configured(
                     replacement.runner.apply(candidate)
                 if replacement.forward_targets is not None:
                     replacement.forward_targets.activate(candidate)
+                replacement.timers.reconcile(candidate.timers)
                 previous = generation
                 # Apply the new caps only after activation succeeds; retired Runs stay counted in shared_limiter.
                 shared_limiter.reconfigure(candidate.runtime.max_concurrency, concurrency_limits(candidate))
@@ -1991,7 +1994,7 @@ def main() -> None:
             else cfg
         )
         daemon = build_daemon_from_config(
-            companion, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot
+            companion, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot, attach=not args.mcp_stdio
         )
         host = cfg.channels.host
         port = cfg.channels.port

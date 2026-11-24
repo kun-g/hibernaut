@@ -291,6 +291,10 @@ class SQLiteDatabase:
                 """
             )
 
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_outstanding ON event_inbox (correlation_key, source) "
+            "WHERE status IN ('pending', 'processing')"
+        )
         outbox_cols = {
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(outbox)").fetchall()

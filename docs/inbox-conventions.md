@@ -48,6 +48,12 @@ system_tools = true             # 可选，默认 false；见「系统 Steward�
 - 可用不带 `role` 的 CLI agent；`checkout_access = "readonly"` 的绑定还可用 `steward`（见下节）。`sde`、`code-reviewer` 依赖项目检出，加载时拒绝。`agents` 省略时指全部 CLI agent，加上本绑定 `default_agent`、`rules` 点名的 steward。
 - 一条绑定自成一个转投范围：可以在本 Inbox 内换 agent 接力，不能与别的绑定互投；写了 `forward_to` 才能转投到列出的项目主 Inbox 或系统 Inbox。
 
+## 定时脚本的 Inbox
+
+重复执行同一脚本可用固定的 `sys:<name>` 和只读工作目录。也可选项目覆盖的 Inbox，项目写了绑定时须命中其中一条。带 `system_tools` 的 Inbox 拒绝作定时目标。`rules = [{ source = "timer:disk-check", agent = "disk-check" }]` 可让脚本和同一 Inbox 的其他来源分别选路。
+
+在 `[[timers]]` 写唯一 `name`、`inbox_id` 和 `interval_seconds`（1 至 2147483647 的整数）。`enabled` 默认 `true`。可选的 `payload` 表只接受 JSON 可表示的数据，整体放在事件的 `payload.data` 下，里面的 `executor`、`agent_id` 等键只是数据。执行文件和参数模板由绑定的 CLI 配置指定，脚本把事件当输入读取。示例见 [`hibernaut.example.toml`](../hibernaut.example.toml)。
+
 ## 全局 Steward 与转投白名单
 
 不属于项目的 `steward` 接个人对话（如飞书单聊）：能答的自己答，要动手的派给对的项目。

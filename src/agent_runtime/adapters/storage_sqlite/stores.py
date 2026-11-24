@@ -5,12 +5,14 @@ import sqlite3
 import time
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
 from agent_runtime.core.models import (
+    CONFIG_TIMER_PREFIX,
     MAX_FORWARD_HOPS,
+    ConfiguredTimer,
     Event,
     EventStatus,
     ForwardSpec,
@@ -341,6 +343,27 @@ class SQLiteTimerAdapter:
     def __init__(self, db: SQLiteDatabase) -> None:
         self._db = db
 
+    def reconcile(self, declarations: Sequence[ConfiguredTimer]) -> None:
+        desired = {timer.timer_id: timer for timer in declarations if timer.enabled}
+        now = datetime.now(timezone.utc)
+        with self._db.transaction() as conn:
+            existing = {row[0] for row in conn.execute(
+                "SELECT timer_id FROM timers WHERE timer_id GLOB ?", (CONFIG_TIMER_PREFIX + "*",),
+            )}
+            conn.executemany("DELETE FROM timers WHERE timer_id = ?", ((key,) for key in existing - desired.keys()))
+            for key, timer in desired.items():
+                conn.execute(
+                    """INSERT INTO timers (timer_id, inbox_id, kind, due_at, payload_json, recurrence_seconds, status)
+                       VALUES (?, ?, 'schedule', ?, ?, ?, 'pending')
+                       ON CONFLICT(timer_id) DO UPDATE SET
+                           inbox_id = excluded.inbox_id, payload_json = excluded.payload_json,
+                           recurrence_seconds = excluded.recurrence_seconds,
+                           due_at = CASE WHEN timers.recurrence_seconds = excluded.recurrence_seconds
+                                         THEN timers.due_at ELSE excluded.due_at END""",
+                    (key, timer.inbox_id, to_utc_iso(now + timedelta(seconds=timer.interval_seconds)),
+                     json.dumps(timer.payload, ensure_ascii=False), timer.interval_seconds),
+                )
+
     def schedule(
         self,
         kind: TimerKind,
@@ -371,6 +394,21 @@ class SQLiteTimerAdapter:
                 ),
             )
         return timer_id
+
+    def fire_configured(self, timer: TimerSpec, event: Event, next_due_at: str) -> bool:
+        with self._db.transaction() as conn:
+            claimed = conn.execute(
+                "UPDATE timers SET due_at = ? WHERE timer_id = ? AND due_at = ? AND status = 'pending'",
+                (next_due_at, timer.timer_id, timer.due_at),
+            )
+            if not claimed.rowcount or conn.execute(
+                "SELECT 1 FROM event_inbox WHERE correlation_key = ? AND source = ? "
+                "AND status IN ('pending', 'processing') LIMIT 1",
+                (event.correlation_key, event.source),
+            ).fetchone():
+                return False
+            _, duplicate = SQLiteInboxAdapter(self._db).append(event)
+            return not duplicate
 
     def fetch_due(self, now_iso: str) -> list[TimerSpec]:
         rows = self._db.fetchall(

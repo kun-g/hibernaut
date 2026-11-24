@@ -291,6 +291,22 @@ def resolve_executor_id(
     return global_default
 
 
+CONFIG_TIMER_PREFIX = "config:"
+
+
+@dataclass(frozen=True, slots=True)
+class ConfiguredTimer:
+    name: str
+    inbox_id: str
+    interval_seconds: int
+    payload: dict[str, Any]
+    enabled: bool
+
+    @property
+    def timer_id(self) -> str:
+        return CONFIG_TIMER_PREFIX + self.name
+
+
 @dataclass(frozen=True, slots=True)
 class TimerSpec:
     inbox_id: str
