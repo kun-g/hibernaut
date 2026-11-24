@@ -8,6 +8,7 @@ root_packages =
     ledger
     dashboard
     memory_hub
+    collaboration
 include_external_packages = True
 
 [importlinter:contract:clean-layers]
@@ -157,3 +158,32 @@ source_modules =
     taskboard
 forbidden_modules =
     memory_hub
+
+[importlinter:contract:collaboration-zero-business-deps]
+name = Collaboration package has zero business dependencies
+type = forbidden
+source_modules =
+    collaboration
+forbidden_modules =
+    agent_runtime
+    switchboard
+    taskboard
+    runner
+    ledger
+    ccpeer
+    dashboard
+    memory_hub
+
+[importlinter:contract:business-packages-no-collaboration]
+name = Business packages must not depend on Collaboration
+type = forbidden
+source_modules =
+    switchboard
+    taskboard
+    runner
+    ledger
+    ccpeer
+    dashboard
+    memory_hub
+forbidden_modules =
+    collaboration

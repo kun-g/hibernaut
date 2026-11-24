@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hibernaut.guokun.ai/schemas/v1/digest_snapshot.schema.json",
+  "title": "DigestSnapshot",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "window_label", "projects", "cost_summary", "pending_proposals", "recent_closeouts"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "window_label": { "type": "string", "minLength": 1 },
+    "headline": { "type": "string" },
+    "projects": { "type": "array" },
+    "cost_summary": {
+      "type": "object",
+      "required": ["total_runs", "failed_runs", "total_cost_usd"],
+      "properties": {
+        "total_runs": { "type": "integer", "minimum": 0 },
+        "failed_runs": { "type": "integer", "minimum": 0 },
+        "total_cost_usd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "pending_proposals": { "type": "array" },
+    "recent_closeouts": { "type": "array" }
+  },
+  "additionalProperties": false
+}

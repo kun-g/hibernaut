@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hibernaut.guokun.ai/schemas/v1/expert_profile.schema.json",
+  "title": "ExpertProfile",
+  "type": "object",
+  "required": ["schema_version", "agent_id", "role_id", "display_name", "executor_id", "skills", "quality_gates", "max_concurrency"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "agent_id": { "type": "string", "minLength": 1 },
+    "role_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]*$" },
+    "display_name": { "type": "string", "minLength": 1 },
+    "executor_id": { "type": "string", "minLength": 1 },
+    "skills": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "quality_gates": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "max_concurrency": { "type": "integer", "minimum": 1 },
+    "allow_direct_channel": { "type": "boolean" },
+    "role_memory_uri": { "type": "string", "pattern": "^role://[a-z0-9][a-z0-9_-]*/" }
+  },
+  "additionalProperties": false
+}
