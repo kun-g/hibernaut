@@ -56,6 +56,8 @@
 - **ccpeer 接收端 vs. Claude Code 会话**：Claude Code 会话是 Orca 终端等处运行的交互式 `claude` 进程，在 `<配置目录>/sessions/` 登记 `messagingSocketPath`；ccpeer 接收端是以某个名字登记成 `standalone` 会话的常驻进程，只收不推理，把对方 `SendMessage(<名字>)` 的回复写进收件箱（`inbox.jsonl`，控制回执在 `control.jsonl`）。消息里的 `from-name`、`from-mode` 是发送方自称，不鉴别身份。
 - **交接方式（`handoff`）：`mcp` vs. `peer`**：Claude Code 角色会话取任务、交结果的通道，按项目配置。`mcp` 由启动器挂的 `hibernaut_handoff` MCP 服务读写 hb 进程所建的轮次目录；`peer` 把任务以 ccpeer 消息发给会话、会话 `SendMessage` 把结果 JSON 发回常驻接收端，hb 按持久化游标读收件箱。`task_id` 标识一次任务（取 Hibernaut `session_id`），`attempt_id` 标识其中一轮（首次开发、返工、跟进各一个），结果必须带上当前轮的两者才被接受。
 - **通审 vs. 增量复核**：SDE 内置评审的两种范围。通审看整份改动，任何问题都能阻断（第 1 轮，或没有上一轮阻断与交付交回可对照时）；增量复核（其余各轮，挂起期间有人跟进也一样）只能阻断上一轮没修好的项和上一轮之后改动引入的新问题，范围外的阻断由程序降级为跟进。
+- **评审候选**：SDE 的 `reviewer` 写成有序列表时列表里的每一个。每个任务第一次评审前按列表取第一个可用的，选定后各轮都用它；它报额度用完才换下一个。`reviewer` 写一个名字就是固定的评审者，不叫候选，不看可用表。
+- **可用表**：外面的程序写、Hibernaut 只读的一份 JSON（`[availability] file`），说哪些执行器现在不该用和为什么；没列到的算可用。与「额度标记」分开：额度标记是 Hibernaut 在评审报额度用完时自己记的，到期失效，两者任一说不可用就不选。
 - **跟进（评审）**：评审 `notes` 里不阻断的意见，含被降级的阻断；交付时列在 PR 正文与 Outbox 消息，不打回开发。与挂起期间人发来的 follow-up（并入需求）不是一回事。
 - **Taskboard（多源任务与 DAG 排期）**：负责归集来自多源的任务（`TaskItem`），维护任务状态与 DAG 先后依赖关系（`TaskDependency`，含环检测）；上游结案后自动解锁下游并经 Switchboard 发送 `work.ready` 事件唤醒 Hibernaut。不直接触碰 Session、Worktree 或执行器。
 - **Runner → Executor → Agent 三层边界**：Runner 是执行工位，Executor 是工位上的驱动，Agent 是用驱动干活的业务主体；**Inbox 绑定的是 Agent**，不是 Executor 或 Runner。

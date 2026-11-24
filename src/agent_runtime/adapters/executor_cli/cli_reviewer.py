@@ -20,12 +20,14 @@ from agent_runtime.adapters.executor_cli.orca import (
     terminal_title,
 )
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout, supervise
+from agent_runtime.adapters.executor_cli.quota import quota_hit
 from agent_runtime.adapters.executor_cli.run_state import TurnSlot
 from agent_runtime.adapters.executor_cli.reviewer import (
     CODE_REVIEWER_ROLE,
     REVIEW_LAUNCH_TOOL,
     REVIEW_SCHEMA,
     ReviewAborted,
+    ReviewQuotaExhausted,
     ReviewRequest,
     plain_review_contract,
     render_review,
@@ -106,7 +108,11 @@ class CLIReviewer:
             # The terminals are closed by now; a review without a verdict still says which ones it ran in.
             if where is None or not where.handles:
                 raise
-            raise ReviewAborted(f"{exc} (Orca terminal: {render_terminals(where.handles, where.sessions)})") from exc
+            text = f"{exc} (Orca terminal: {render_terminals(where.handles, where.sessions)})"
+            if isinstance(exc, ReviewQuotaExhausted):
+                raise ReviewQuotaExhausted(text, reason=exc.reason, changed=exc.changed, terminals=where.handles,
+                                           sessions=where.sessions) from exc
+            raise ReviewAborted(text) from exc
 
     async def _review(
         self, request: ReviewRequest, caps: RunCapabilities, slot: TurnSlot | None, where: _Where | None
@@ -117,6 +123,16 @@ class CLIReviewer:
         saved = (slot.peek(_RETRY_TURN) or slot.peek(_FIRST_TURN)) if slot is not None else None
         recorded = saved.get("before") if saved is not None else None
         before = recorded if isinstance(recorded, str) else await asyncio.to_thread(worktree_fingerprint, request.workdir)
+        try:
+            return await self._judge(request, caps, slot, where, prompt, subject, before)
+        except ReviewQuotaExhausted as exc:
+            exc.changed = await asyncio.to_thread(worktree_fingerprint, request.workdir) != before
+            raise
+
+    async def _judge(
+        self, request: ReviewRequest, caps: RunCapabilities, slot: TurnSlot | None, where: _Where | None, prompt: str,
+        subject: str, before: str,
+    ) -> dict[str, Any]:
         if slot is not None and slot.peek(_RETRY_TURN) is not None:
             # The format retry was running when the process stopped; if it cannot be picked up, start over.
             stdout = await self._picked_up(slot, _RETRY_TURN, request.workdir, caps, where)
@@ -248,10 +264,15 @@ class CLIReviewer:
 
     def _stdout(self, code: int | None, stdout: bytes, stderr: bytes) -> str:
         t = self._template
+        out = stdout.decode("utf-8", "replace")
         if code != 0:
-            detail = stderr.decode("utf-8", "replace").strip()[:_MAX_STDERR_CHARS] or "(no stderr)"
-            raise ReviewAborted(f"{t.name}: '{t.command}' exited with code {code}: {detail}")
-        return stdout.decode("utf-8", "replace")
+            err = stderr.decode("utf-8", "replace")
+            text = f"{t.name}: '{t.command}' exited with code {code}: {err.strip()[:_MAX_STDERR_CHARS] or '(no stderr)'}"
+            reason = quota_hit(t.quota_errors, err, out)
+            if reason is not None:
+                raise ReviewQuotaExhausted(text, reason=reason)
+            raise ReviewAborted(text)
+        return out
 
     def format_review(self, review: Mapping[str, Any]) -> str:
         settings = f"cli={self._template.command}"

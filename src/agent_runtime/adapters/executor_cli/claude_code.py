@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout, supervise
+from agent_runtime.adapters.executor_cli.quota import parse_quota_errors
 from agent_runtime.adapters.executor_cli.role_skills import builtin_skill, parse_skills, render_skills
 
 CLAUDE_CODE = "claude-code"
@@ -30,7 +31,10 @@ _PAID_ENV_KEYS = (
 # subscription token to a gateway the operator did not pick for it. The deployment file may set them explicitly.
 _ROUTING_ENV_KEYS = (*_PAID_ENV_KEYS, "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN")
 _STREAM_LIMIT = 16 * 1024 * 1024
-PROFILE_KEYS = frozenset({"harness", "launcher", "billing", "model", "effort", "timeout_seconds", "env", "skills"})
+# The end of what a launcher printed outside its JSON messages, kept for telling why it failed.
+_MAX_PLAIN_CHARS = 16_000
+PROFILE_KEYS = frozenset({"harness", "launcher", "billing", "model", "effort", "timeout_seconds", "env", "skills",
+                          "quota_errors"})
 
 
 def _empty_env() -> dict[str, str]:
@@ -87,6 +91,8 @@ class ClaudeCodeProfile:
     credential_proxy_url: str = ""
     # Ordered SKILL.md files from the deployment file; empty means the role's built-in skill.
     skills: tuple[Path, ...] = field(default_factory=_no_skills)
+    # Regular expressions; a non-interactive review that exits non-zero and reports a match has no quota left.
+    quota_errors: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         where = f"executors.{self.name}"
@@ -174,6 +180,7 @@ def parse_profile(
         env=_str_env(where, item.get("env", {})),
         credential_proxy_url=credential_proxy_url,
         skills=parse_skills(where, role, item.get("skills"), base_dir or Path.cwd()),
+        quota_errors=parse_quota_errors(where, item.get("quota_errors")),
     )
 
 
@@ -238,7 +245,11 @@ PROBE_PROMPT = "Reply with OK."
 
 
 class ClaudeCodeError(Exception):
-    pass
+    # Of a process that ended: its exit code and what it reported itself, without the conversation.
+    def __init__(self, text: str, *, returncode: int | None = None, output: str = "") -> None:
+        super().__init__(text)
+        self.returncode = returncode
+        self.output = output
 
 
 async def run_claude_code(
@@ -308,10 +319,12 @@ async def _read_stream(
     assert proc.stdout is not None
     initialized = False
     result: dict[str, Any] | None = None
+    plain = ""
     while line := await proc.stdout.readline():
         try:
             parsed: object = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            plain = (plain + line.decode("utf-8", errors="replace"))[-_MAX_PLAIN_CHARS:]
             continue
         if not isinstance(parsed, dict):
             continue
@@ -326,15 +339,21 @@ async def _read_stream(
     stderr = (await stderr_task).decode("utf-8", errors="replace").strip()
     who = f"{profile.harness} (launcher '{profile.launcher.name}')"
     if not initialized:
-        raise ClaudeCodeError(f"{who} exited ({returncode}) before reporting its session: {stderr[-2000:]}")
-    return _checked_result(who, result, returncode, stderr)
+        raise ClaudeCodeError(f"{who} exited ({returncode}) before reporting its session: {stderr[-2000:]}",
+                              returncode=returncode, output=f"{stderr}\n{plain}")
+    return _checked_result(who, result, returncode, stderr, plain)
 
 
-def _checked_result(who: str, result: dict[str, Any] | None, returncode: int | None, stderr: str) -> dict[str, Any]:
+def _checked_result(
+    who: str, result: dict[str, Any] | None, returncode: int | None, stderr: str, plain: str = ""
+) -> dict[str, Any]:
+    own = f"{stderr}\n{plain}"
     if result is None:
-        raise ClaudeCodeError(f"{who} exited ({returncode}) without a result: {stderr[-2000:]}")
+        raise ClaudeCodeError(f"{who} exited ({returncode}) without a result: {stderr[-2000:]}",
+                              returncode=returncode, output=own)
     if result.get("is_error") or result.get("subtype") != "success":
-        raise ClaudeCodeError(f"{who} reported an error: {str(result.get('result', ''))[:2000]}")
+        said = str(result.get("result", ""))
+        raise ClaudeCodeError(f"{who} reported an error: {said[:2000]}", returncode=returncode, output=f"{said}\n{own}")
     return result
 
 

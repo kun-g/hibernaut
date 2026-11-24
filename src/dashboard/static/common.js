@@ -42,7 +42,7 @@ function statusPill(st) {
     processing: "cyan", active: "cyan", in_progress: "cyan", develop: "cyan",
     done: "green", merged: "green", sent: "green", ready: "green", pass: "green", emit: "green", ok: "green", info: "blue",
     pending: "amber", suspended: "amber", suspend: "amber", pr_open: "blue", backlog: "gray", warn: "amber", warning: "amber",
-    review: "purple", review_pending: "purple", needs_input: "amber", user: "blue",
+    review: "purple", review_pending: "purple", no_reviewer: "purple", needs_input: "amber", user: "blue",
     failed: "red", error: "red", critical: "red", cancelled: "gray", dropped: "gray", closed: "gray",
   };
   return `<span class="pill ${map[st] || "gray"}">${esc(st || "-")}</span>`;

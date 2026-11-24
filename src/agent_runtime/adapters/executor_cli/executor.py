@@ -51,14 +51,20 @@ class CLITemplate:
     terminal: Literal["none", "orca"] = "none"
     # Read by the worker pool: inboxes running this executor at once, across all projects; None leaves it unlimited.
     max_concurrency: int | None = None
+    # Regular expressions; a review that exits non-zero and prints a match has no quota left.
+    quota_errors: tuple[str, ...] = ()
 
+
+# The account's answer once the plan's balance is used up (seen on 2026-11-23). Other CLIs have no default: what they
+# print is not known.
+_GROK_QUOTA_ERRORS = (r"status 402 Payment Required\): Grok Build usage balance exhausted",)
 
 CLI_TERMINALS: tuple[Literal["none", "orca"], ...] = ("none", "orca")
 
 DEFAULT_CLI_TEMPLATES: dict[str, CLITemplate] = {
     "claude": CLITemplate(name="claude", command="claude", args=("-p",)),
     "cursor-agent": CLITemplate(name="cursor-agent", command="cursor-agent", args=("-p",)),
-    "grok": CLITemplate(name="grok", command="grok", args=("-p",)),
+    "grok": CLITemplate(name="grok", command="grok", args=("-p",), quota_errors=_GROK_QUOTA_ERRORS),
     "dsh": CLITemplate(name="dsh", command="dsh", args=("-c",)),
 }
 
