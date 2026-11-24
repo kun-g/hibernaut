@@ -19,6 +19,8 @@ from collaboration import (
     CloseoutMemoryDraft,
     CloseoutStore,
     CollaborationHubServer,
+    CollaborationMCPTools,
+    ExpertPoolRegistry,
     RoleSkillMemoryStore,
 )
 
@@ -315,3 +317,58 @@ def test_close_without_start_does_not_hang(tmp_path: Path) -> None:
     closer.start()
     closer.join(timeout=5)
     assert not closer.is_alive()
+
+
+# --- MCP tools: declared and checked arguments ------------------------------------------------------------------
+
+
+def tools(tmp_path: Path) -> CollaborationMCPTools:
+    return CollaborationMCPTools(
+        role_store=RoleSkillMemoryStore(tmp_path / "mem"), expert_pool=ExpertPoolRegistry(),
+        closeout=CloseoutCoordinator(CloseoutStore(tmp_path / "closeouts")),
+    )
+
+
+CARD = {
+    "session_id": "s", "agent_id": "a", "project_key": "hibernaut", "summary": "x",
+    "decisions": [{"key": "k", "title": "t", "choice": "c"}],
+}
+
+
+def test_every_tool_declares_its_arguments(tmp_path: Path) -> None:
+    definitions = tools(tmp_path).tool_definitions()
+    assert [d["name"] for d in definitions] == [
+        "emit_closeout_card", "confirm_closeout_card", "resolve_expert_mount", "propose_role_skill",
+        "route_notification",
+    ]
+    for definition in definitions:
+        schema = definition["inputSchema"]
+        assert schema["type"] == "object" and schema["additionalProperties"] is False
+        assert set(schema["required"]) <= set(schema["properties"])
+
+
+@pytest.mark.parametrize(("name", "arguments"), [
+    ("emit_closeout_card", {k: v for k, v in CARD.items() if k != "summary"}),
+    ("emit_closeout_card", {**CARD, "decisions": "none"}),
+    ("emit_closeout_card", {**CARD, "decisions": [{"key": "k"}]}),
+    ("emit_closeout_card", {**CARD, "follow_up_tasks": "one task"}),
+    ("emit_closeout_card", {**CARD, "memory_proposals": [{"target_uri": "role://sde/skills.md"}]}),
+    ("emit_closeout_card", {**CARD, "surprise": 1}),
+    ("confirm_closeout_card", {"card_id": 7, "confirmed_by": "owner"}),
+    ("confirm_closeout_card", {"card_id": "closeout-000000000000", "confirmed_by": "owner"}),
+    ("resolve_expert_mount", {"role_id": "nobody", "project_key": "hibernaut"}),
+    ("resolve_expert_mount", {"role_id": "architect", "project_key": "hibernaut", "extra_readonly_projects": "workshop"}),
+    ("resolve_expert_mount", {"role_id": "architect", "project_key": "hibernaut", "task_slug": "a/b"}),
+    ("resolve_expert_mount", {"role_id": "architect", "project_key": "hibernaut", "budget_chars": True}),
+    ("resolve_expert_mount", {"role_id": "architect", "project_key": ".."}),
+    ("route_notification", {"kind": "marketing"}),
+    ("route_notification", {"kind": "run_completed", "is_urgent_blocker": "false"}),
+])
+def test_unusable_arguments_are_a_value_error(tmp_path: Path, name: str, arguments: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        tools(tmp_path).call_tool(name, arguments)
+
+
+def test_an_unknown_tool_is_a_key_error(tmp_path: Path) -> None:
+    with pytest.raises(KeyError):
+        tools(tmp_path).call_tool("nope", {})

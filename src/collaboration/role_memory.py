@@ -18,8 +18,8 @@ from collaboration.models import (
     utc_now_iso,
 )
 
-_ROLE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-_PROJECT_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_ROLE_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
+_PROJECT_KEY_RE = re.compile(r"(?!.*\.\.)[A-Za-z0-9._-]*[A-Za-z0-9_-][A-Za-z0-9._-]*")
 _PROPOSAL_ID_RE = re.compile(r"rprop-[0-9a-f]{12}")
 
 

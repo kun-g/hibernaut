@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from collaboration.models import ExpertProfile, MemoryMountPlan
 from collaboration.role_memory import build_four_layer_mount_plan
+
+# One part of an inbox id, so never another separator or path.
+_TASK_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +118,10 @@ class ExpertPoolRegistry:
         )
         scope = f"proj:{project_key}:{profile.role_id}"
         if task_slug:
-            scope = f"{scope}:{task_slug.strip()}"
+            slug = task_slug.strip()
+            if not _TASK_SLUG_RE.fullmatch(slug) or ".." in slug:
+                raise ValueError(f"Invalid task_slug: {task_slug!r}")
+            scope = f"{scope}:{slug}"
         return ExpertDispatchBinding(
             profile=profile,
             mount_plan=mount_plan,

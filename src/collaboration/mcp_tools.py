@@ -1,13 +1,89 @@
 from __future__ import annotations
 
-from typing import Any
+import copy
+from typing import Any, get_args
 
+from collaboration._schema import check
 from collaboration.closeout import CloseoutCoordinator
 from collaboration.digest import DigestAssembler
 from collaboration.expert_pool import ExpertPoolRegistry
-from collaboration.models import CloseoutDecision, CloseoutMemoryDraft
+from collaboration.models import CloseoutDecision, CloseoutMemoryDraft, NotificationKind
 from collaboration.notification_policy import NotificationPolicyEngine
 from collaboration.role_memory import RoleSkillMemoryStore
+
+
+_TEXT: dict[str, Any] = {"type": "string", "minLength": 1}
+_FREE_TEXT: dict[str, Any] = {"type": "string"}
+
+
+def _object(required: dict[str, Any], optional: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {**required, **(optional or {})},
+        "required": list(required),
+        "additionalProperties": False,
+    }
+
+
+def _list(items: dict[str, Any], **limits: int) -> dict[str, Any]:
+    return {"type": "array", "items": items, **limits}
+
+
+_TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "emit_closeout_card",
+        "description": "Emit a draft CloseoutCard after a direct Owner-Expert session (D6-A).",
+        "inputSchema": _object(
+            {
+                "session_id": _TEXT,
+                "agent_id": _TEXT,
+                "project_key": _TEXT,
+                "summary": _TEXT,
+                "decisions": _list(
+                    _object({"key": _TEXT, "title": _TEXT, "choice": _TEXT}, {"rationale": _FREE_TEXT}), minItems=1
+                ),
+            },
+            {
+                "task_id": _TEXT,
+                "follow_up_tasks": _list(_TEXT),
+                "memory_proposals": _list(_object({"target_uri": _TEXT, "content": _TEXT, "reason": _TEXT})),
+            },
+        ),
+    },
+    {
+        "name": "confirm_closeout_card",
+        "description": "Confirm a CloseoutCard by Owner and sync to Chief of Staff, Taskboard, and Memory proposals.",
+        "inputSchema": _object({"card_id": _TEXT, "confirmed_by": _TEXT}),
+    },
+    {
+        "name": "resolve_expert_mount",
+        "description": "Resolve a shared Expert Pool role into a single-project RW + role-skill RO/propose mount plan (D3-B/D7-B).",
+        "inputSchema": _object(
+            {"role_id": _TEXT, "project_key": _TEXT},
+            {
+                "task_slug": _TEXT,
+                "extra_readonly_projects": _list(_TEXT),
+                "budget_chars": {"type": "integer", "minimum": 1},
+            },
+        ),
+    },
+    {
+        "name": "propose_role_skill",
+        "description": "Queue a CAS-protected skill update proposal under roles/<role>/ (D7-B).",
+        "inputSchema": _object(
+            {"role_id": _TEXT, "content": _TEXT, "reason": _TEXT},
+            {"proposed_by": _TEXT, "rel_path": _TEXT, "base_sha256": _TEXT},
+        ),
+    },
+    {
+        "name": "route_notification",
+        "description": "Evaluate D8-B push vs. pull routing for an outbound notification.",
+        "inputSchema": _object(
+            {"kind": {"type": "string", "enum": list(get_args(NotificationKind))}},
+            {"correlation_key": _FREE_TEXT, "is_urgent_blocker": {"type": "boolean"}},
+        ),
+    },
+]
 
 
 class CollaborationMCPTools:
@@ -27,30 +103,20 @@ class CollaborationMCPTools:
         self._digest = digest or DigestAssembler()
 
     def tool_definitions(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "name": "emit_closeout_card",
-                "description": "Emit a draft CloseoutCard after a direct Owner-Expert session (D6-A).",
-            },
-            {
-                "name": "confirm_closeout_card",
-                "description": "Confirm a CloseoutCard by Owner and sync to Chief of Staff, Taskboard, and Memory proposals.",
-            },
-            {
-                "name": "resolve_expert_mount",
-                "description": "Resolve a shared Expert Pool role into a single-project RW + role-skill RO/propose mount plan (D3-B/D7-B).",
-            },
-            {
-                "name": "propose_role_skill",
-                "description": "Queue a CAS-protected skill update proposal under roles/<role>/ (D7-B).",
-            },
-            {
-                "name": "route_notification",
-                "description": "Evaluate D8-B push vs. pull routing for an outbound notification.",
-            },
-        ]
+        return copy.deepcopy(_TOOLS)
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        # KeyError means the tool is unknown; whatever is wrong with a call to a known one is a ValueError.
+        schema = next((t["inputSchema"] for t in _TOOLS if t["name"] == name), None)
+        if schema is None:
+            raise KeyError(f"Unknown collaboration MCP tool: {name}")
+        check(schema, arguments)
+        try:
+            return self._call(name, arguments)
+        except KeyError as exc:
+            raise ValueError(str(exc.args[0]) if exc.args else "not found") from exc
+
+    def _call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "emit_closeout_card":
             decisions = tuple(
                 CloseoutDecision(
