@@ -132,6 +132,19 @@ class ShutdownHarness(unittest.TestCase):
         thread.start()
         return thread, result
 
+    def stop_waiting_on(self, board: Switchboard, component: Any, method: str) -> tuple[threading.Thread, list[bool]]:
+        entered = threading.Event()
+        operation = getattr(component, method)
+
+        def observe(*args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            return operation(*args, **kwargs)
+
+        with mock.patch.object(component, method, side_effect=observe):
+            thread, result = self.stop_in_thread(board)
+            self.assertTrue(entered.wait(5))
+        return thread, result
+
 
 def refused(port: int) -> bool:
     try:
@@ -184,8 +197,7 @@ class DrainTests(ShutdownHarness):
                 board.bus.subscribe("hibernaut", handler)
                 board.worker.start()
                 self.assertTrue(wait_until(lambda seen=seen, n=max_parallel: len(seen) == n))
-                stopper, result = self.stop_in_thread(board)
-                stopper.join(0.3)
+                stopper, result = self.stop_waiting_on(board, board.worker, "join")
                 self.assertTrue(stopper.is_alive())
                 gate.opened.set()
                 stopper.join(5)
@@ -203,8 +215,7 @@ class DrainTests(ShutdownHarness):
             board.store.insert_outbound(text_message(number), board.pipeline._clock())  # pyright: ignore[reportPrivateUsage]
         board.gateway.wake()
         self.assertTrue(gate.entered.wait(5))
-        stopper, result = self.stop_in_thread(board)
-        stopper.join(0.3)
+        stopper, result = self.stop_waiting_on(board, board.gateway, "join")
         self.assertTrue(stopper.is_alive())
         gate.opened.set()
         stopper.join(5)
@@ -218,6 +229,9 @@ class DrainTests(ShutdownHarness):
 
     def test_write_in_flight_finishes_before_the_database_closes(self) -> None:
         board = self.board()
+        # Leave only the open write transaction to drain.
+        self.assertTrue(board.worker.stop())
+        self.assertTrue(board.gateway.stop())
         entered, commit = threading.Event(), threading.Event()
         store = board.store
 
@@ -236,8 +250,7 @@ class DrainTests(ShutdownHarness):
         writer = threading.Thread(target=slow_write, daemon=True)
         writer.start()
         self.assertTrue(entered.wait(5))
-        stopper, result = self.stop_in_thread(board)
-        stopper.join(0.3)
+        stopper, result = self.stop_waiting_on(board, store, "close")
         self.assertTrue(stopper.is_alive())
         commit.set()
         stopper.join(5)
@@ -253,9 +266,8 @@ class DrainTests(ShutdownHarness):
         board.bus.publish(event)
         push = recv_message(ws)
         assert isinstance(push, Push)
-        stopper, result = self.stop_in_thread(board)
+        stopper, result = self.stop_waiting_on(board, board.worker, "join")
         self.assertTrue(wait_until(lambda: refused(board.relay_port)))
-        stopper.join(0.2)
         self.assertTrue(stopper.is_alive())
         ws.send_text(encode_message(Ack(conn_epoch=welcome.conn_epoch, event_id=event.event_id)))
         closed = recv_message(ws)
@@ -306,7 +318,7 @@ class DrainTests(ShutdownHarness):
         with socket.create_connection(("127.0.0.1", board.http.port), timeout=5) as idle:
             # A request line that never ends is not a request yet.
             idle.sendall(b"POST /webh")
-            time.sleep(0.1)
+            self.assertTrue(wait_until(lambda: bool(board.http._server._waiting)))
             started = time.monotonic()
             self.assertTrue(board.stop())
             self.assertLess(time.monotonic() - started, 3)
@@ -318,7 +330,7 @@ class DrainTests(ShutdownHarness):
         headers = github_headers(raw, "ping", "d-9")
         head = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
         with socket.create_connection(("127.0.0.1", board.http.port), timeout=5) as sock:
-            time.sleep(0.1)
+            self.assertTrue(wait_until(lambda: bool(board.http._server._waiting)))
             stopper, result = self.stop_in_thread(board)
             self.assertTrue(wait_until(lambda: refused(board.http.port)))
             sock.sendall(f"POST /webhooks/github HTTP/1.1\r\nHost: x\r\nContent-Length: {len(raw)}\r\n{head}\r\n".encode() + raw)
@@ -338,18 +350,18 @@ class TimeoutTests(ShutdownHarness):
         with self.assertLogs("switchboard", level="WARNING") as logs:
             self.assertFalse(board.stop())
         elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertGreaterEqual(elapsed, board.config.shutdown_timeout_seconds)
         self.assertLess(elapsed, 2.5)
         self.assertEqual({r.levelname for r in logs.records}, {"WARNING"})
         self.assertIn(component, "\n".join(logs.output))
-        self.assertIn("0.2", "\n".join(logs.output))
+        self.assertIn(f"timed out after {board.config.shutdown_timeout_seconds:g}s", "\n".join(logs.output))
         with self.assertRaises(sqlite3.ProgrammingError):
             board.store.count_inbound()
 
     def stuck_delivery(self, **sections: Mapping[str, Any]) -> tuple[Switchboard, Gate]:
         gate = Gate()
-        self.addCleanup(gate.opened.set)
         board = self.board(timeout=0.2, sections=sections)
+        self.addCleanup(gate.opened.set)
 
         def handler(event: CanonicalEvent) -> DeliverStatus:
             gate.pass_through()
@@ -377,8 +389,8 @@ class TimeoutTests(ShutdownHarness):
 
     def test_stuck_outbound_send(self) -> None:
         gate = Gate()
-        self.addCleanup(gate.opened.set)
         board = self.board(timeout=0.2, http_client=GatedHttpClient(gate))
+        self.addCleanup(gate.opened.set)
         board.gateway.deliver(text_message(1))
         self.assertTrue(gate.entered.wait(5))
         self.assert_forced(board, "outbound")
@@ -410,8 +422,7 @@ class TimeoutTests(ShutdownHarness):
         before = set(threading.enumerate())
         with socket.create_connection(("127.0.0.1", board.http.port), timeout=5) as sock:
             sock.sendall(b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
-            self.assertTrue(wait_until(lambda: bool(set(threading.enumerate()) - before)))
-            time.sleep(0.1)
+            self.assertTrue(wait_until(lambda: bool(board.http._server._active)))
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):
                 self.assert_forced(board, "HTTP")
@@ -435,8 +446,8 @@ class TimeoutTests(ShutdownHarness):
     # A board with one dead letter and an MCP call held in its token check.
     def stuck_mcp_call(self, tool: str, arguments: dict[str, str]) -> tuple[Switchboard, Gate, set[threading.Thread]]:
         gate = Gate()
+        board = self.board(timeout=0.05, credentials=GatedCredentials(gate, "mcp"))
         self.addCleanup(gate.opened.set)
-        board = self.board(timeout=0.2, credentials=GatedCredentials(gate, "mcp"))
         dead = ready_event(1, "proj:a")
         # Not due, so the worker leaves it alone.
         later = utc_now() + timedelta(hours=1)
@@ -484,9 +495,9 @@ class TimeoutTests(ShutdownHarness):
                 board, gate, before = self.stuck_mcp_call(tool, arguments)
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
-                    with board.store._lock:  # pyright: ignore[reportPrivateUsage]
-                        with self.assertLogs("switchboard", level="WARNING") as logs:
-                            self.assertFalse(board.stop())
+                    with mock.patch.object(board.store, "close", return_value=False) as close, self.assertLogs("switchboard", level="WARNING") as logs:
+                        self.assertFalse(board.stop())
+                        close.assert_called_once()
                     self.assertIn("SQLite write", "\n".join(logs.output))
                     conn = RecordingConnection(board.store._conn)  # pyright: ignore[reportPrivateUsage]
                     board.store._conn = conn  # type: ignore[assignment]  # pyright: ignore
@@ -671,12 +682,14 @@ class SignalTests(unittest.TestCase):
                 proc, port = self.start(60, ("-c", SIGNALLED_OFF_MAIN))
                 assert proc.stdin is not None
                 if second is not None:
-                    self.hang_request(port)
+                    ws, _ = handshake(f"ws://127.0.0.1:{port}/ws/relay")
+                    self.addCleanup(ws.close)
                 os.write(proc.stdin.fileno(), bytes([first]))
                 if second is None:
                     self.assertEqual(proc.wait(8), 0, self.output())
                     continue
-                self.assertTrue(wait_until(lambda: refused(port)), self.output())
+                self.assertIsInstance(recv_message(ws), Close)
+                self.assertTrue(refused(port))
                 os.write(proc.stdin.fileno(), bytes([second]))
                 self.assertEqual(proc.wait(8), 128 + second, self.output())
 
@@ -684,10 +697,12 @@ class SignalTests(unittest.TestCase):
         for first, second in ((signal.SIGTERM, signal.SIGTERM), (signal.SIGTERM, signal.SIGINT), (signal.SIGINT, signal.SIGTERM)):
             with self.subTest(first=first.name, second=second.name):
                 proc, port = self.start(60)
-                self.hang_request(port)
+                ws, _ = handshake(f"ws://127.0.0.1:{port}/ws/relay")
+                self.addCleanup(ws.close)
                 proc.send_signal(first)
-                self.assertTrue(wait_until(lambda: refused(port)))
-                time.sleep(0.3)
+                # The unacknowledged close frame proves the first signal reached the drain.
+                self.assertIsInstance(recv_message(ws), Close)
+                self.assertTrue(refused(port))
                 self.assertIsNone(proc.poll(), self.output())
                 started = time.monotonic()
                 proc.send_signal(second)

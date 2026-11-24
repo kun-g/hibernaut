@@ -5,6 +5,8 @@ import hashlib
 import http.client
 import json
 import os
+import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -12,12 +14,14 @@ import sys
 import textwrap
 import time
 from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 
+from agent_runtime.adapters import runner_bridge, runner_pilot
 from agent_runtime.adapters.runner_bridge import RunnerExecutorBridge
 from agent_runtime.adapters.runner_pilot import (
     LAUNCH_PERMISSION,
@@ -634,8 +638,27 @@ def test_relay_admits_only_the_pilot_node(tmp_path: Path) -> None:
         assert refusal(RunnerCapabilities.from_dict({**good, **change})) is not None, change
 
 
-def test_waiting_for_the_node_is_bounded_and_can_be_interrupted(tmp_path: Path) -> None:
+def test_waiting_for_the_node_is_bounded_and_can_be_interrupted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        clock = loop.time
+        elapsed = 0.0
+        next_heartbeat = asyncio.Event()
+
+        async def retry(stop: asyncio.Event, seconds: float) -> bool:
+            nonlocal elapsed
+            assert seconds > 0
+            elapsed += seconds
+            if elapsed > heartbeat_at:
+                next_heartbeat.set()
+                return await stop.wait()
+            await asyncio.sleep(0)
+            return stop.is_set()
+
+        # Advance by the actual delay requested by the bridge, keeping other loop deadlines monotonic.
+        heartbeat_at = float("inf")
+        monkeypatch.setattr(loop, "time", lambda: clock() + elapsed)
+        monkeypatch.setattr(runner_bridge, "_set_within", retry)
         relay = _relay(tmp_path)
         await relay.start()
         event = Event(inbox_id=PILOT, source="t", external_id="1", payload={"candidate_commit": COMMIT})
@@ -646,14 +669,15 @@ def test_waiting_for_the_node_is_bounded_and_can_be_interrupted(tmp_path: Path) 
                 runner=relay, inbox_id=PILOT, project_key="hibernaut", timeout_seconds=9.0, **kwargs
             )
 
-        started = time.monotonic()
         outcome = await check(node_wait_seconds=0.6).execute([event], session, _Caps())
         assert isinstance(outcome, Emit) and (outcome.status, outcome.close_session) == ("failed", True)
         assert outcome.telemetry is not None and outcome.telemetry.error_kind == "network"
-        assert 0.5 < time.monotonic() - started < 5
+        assert 0.5 < elapsed <= 0.6
+        heartbeat_at = elapsed + runner_pilot._HEARTBEAT_SECONDS
         run = asyncio.create_task(check().execute([event], session, _Caps()))
-        await asyncio.sleep(0.8)
-        assert not run.done()  # by default it waits longer than the node's heartbeat
+        run.add_done_callback(lambda _: next_heartbeat.set())
+        await next_heartbeat.wait()
+        assert elapsed > heartbeat_at and not run.done()
         started = time.monotonic()
         run.cancel()
         with pytest.raises(asyncio.CancelledError) as cancelled:
@@ -710,22 +734,69 @@ class Deployment:
         draft.write_text(text)
         draft.replace(self.config)
 
-    def reload(self, *, enabled: bool, expect: str = "[config] Reloaded") -> None:
+    def reload(self, *, enabled: bool, extra: str = "", expect: str = "[config] Reloaded") -> None:
         seen = self.hb_log.read_text().count(expect)
-        self.write(enabled=enabled)
+        self.write(enabled=enabled, extra=extra)
         self.until(lambda: self.hb_log.read_text().count(expect) > seen)
 
-    def start_hb(self) -> None:
+    def start_hb(self, *, fast_retry: bool = False) -> None:
+        entry = ("-m", "agent_runtime.app.main")
+        if fast_retry:
+            entry = ("-c", "from agent_runtime.adapters import runner_bridge; runner_bridge._NODE_POLL_SECONDS = 0.02; "
+                           "from agent_runtime.app.main import main; main()")
         with self.hb_log.open("ab") as stream:
             self.hb = subprocess.Popen(
-                [sys.executable, "-m", "agent_runtime.app.main", "--config", str(self.config),
+                [sys.executable, *entry, "--config", str(self.config),
                  "--config-poll-interval", "0.05", "--outbox-interval", "0.05"],
                 cwd=self.root, env={**os.environ, "PYTHONPATH": str(SRC)}, stdout=stream, stderr=stream,
             )
-        self.until(lambda: self._post({"inbox_id": "warmup", "external_id": "0", "payload": {}}) is not None)
+        self.until(self.http_ready)
 
-    def start_runner(self) -> None:
-        self.runner = start_service(self.runner_config, self.runner_log)
+    def http_ready(self) -> bool:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+        try:
+            conn.request("POST", "/readiness-probe")
+            return conn.getresponse().status == 404
+        except ConnectionRefusedError:
+            return False
+        finally:
+            conn.close()
+
+    def start_runner(self, *, fast_retry: bool = False) -> None:
+        entry = ("-m", "runner.service")
+        if fast_retry:
+            entry = ("-c", "from functools import partial; from runner import service; "
+                           "service.RunnerRelayAgent = partial(service.RunnerRelayAgent, reconnect_delays=(0.02,)); "
+                           "raise SystemExit(service.main())")
+        self.runner = start_service(self.runner_config, self.runner_log, entry=entry)
+
+    def start_gated_runner(self, monkeypatch: pytest.MonkeyPatch, *, fast_retry: bool = False) -> Path:
+        gate = self.root / "hold-check"
+        real_git = shutil.which("git")
+        assert real_git is not None
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        shim = bin_dir / "git"
+        shim.write_text(
+            "#!/bin/sh\nfor arg do\n"
+            f'  if [ "$arg" = cat-file ] && [ -p {shlex.quote(str(gate))} ]; then\n'
+            f"    {{ printf '%s\\n' \"$PPID\" > {shlex.quote(str(gate.with_suffix('.ready')))}; read -r go; }} < {shlex.quote(str(gate))}\n"
+            "    break\n  fi\ndone\n"
+            f'exec {shlex.quote(real_git)} "$@"\n'
+        )
+        shim.chmod(0o755)
+        with monkeypatch.context() as env:
+            env.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+            self.start_runner(fast_retry=fast_retry)
+        return gate
+
+    def force_stop_hb(self) -> None:
+        assert self.hb is not None
+        self.hb.terminate()
+        self.until(lambda: "Stopping: waiting for runs in progress" in self.hb_log.read_text())
+        self.hb.terminate()
+        assert self.hb.wait(timeout=20) == 0, self.logs()
+        self.hb = None
 
     def stop_runner(self) -> int:
         assert self.runner is not None
@@ -743,13 +814,21 @@ class Deployment:
                     proc.kill()
                     proc.wait()
 
-    def until(self, check: Callable[[], Any], timeout: float = 25.0) -> Any:
+    def until(self, check: Callable[[], Any], timeout: float = 25.0, *, interval: float = 0.05) -> Any:
         deadline = time.monotonic() + timeout
         while not (value := check()):
             assert self.hb is None or self.hb.poll() is None, self.logs()
             assert time.monotonic() < deadline, self.logs()
-            time.sleep(0.05)
+            time.sleep(interval)
         return value
+
+    def gated_worker(self, ready: Path) -> int:
+        # The Git shim identifies the exact process that requested the blocked object read.
+        pid = int(self.until(lambda: ready.is_file() and ready.read_text().strip(), interval=0.01))
+        parent, command = subprocess.check_output(["ps", "-ww", "-p", str(pid), "-o", "ppid=", "-o", "command="],
+                                                  text=True).strip().split(None, 1)
+        assert self.runner and int(parent) == self.runner.pid and "protocol_check.py" in command
+        return pid
 
     def logs(self) -> str:
         return "\n".join(p.read_text() for p in (self.hb_log, self.runner_log) if p.exists())
@@ -780,15 +859,19 @@ class Deployment:
         return str(data["event_id"])
 
     def rows(self, sql: str, *params: Any, db: str = "hb.db") -> list[sqlite3.Row]:
-        with sqlite3.connect(self.root / db, timeout=5) as conn:
+        with closing(sqlite3.connect(self.root / db, timeout=5)) as conn:
             conn.row_factory = sqlite3.Row
             return conn.execute(sql, params).fetchall()
 
     def status(self, event_id: str) -> str:
         return str(self.rows("SELECT status FROM event_inbox WHERE event_id = ?", event_id)[0]["status"])
 
-    def finished(self, *event_ids: str) -> None:
-        self.until(lambda: all(self.status(e) == "done" for e in event_ids))
+    def finished(self, *event_ids: str, timeout: float = 25.0) -> None:
+        with closing(sqlite3.connect(self.root / "hb.db", timeout=5)) as db:
+            def all_done() -> bool:
+                return all(db.execute("SELECT status FROM event_inbox WHERE event_id = ?", (e,)).fetchone() == ("done",)
+                           for e in event_ids)
+            self.until(all_done, timeout=timeout, interval=0.01)
 
     def outbox(self, inbox: str) -> list[str]:
         return [r["content"] for r in self.rows("SELECT content FROM outbox WHERE inbox_id = ? ORDER BY seq", inbox)]
@@ -824,9 +907,9 @@ class Deployment:
     def check(self, inbox: str = PILOT, **payload: Any) -> str:
         return self.post(inbox, candidate_commit=self.commit, **payload)
 
-    def assert_original_path(self, inbox: str) -> None:
+    def assert_original_path(self, inbox: str, *, key: str | None = None) -> None:
         before = len(self.outbox(inbox))
-        self.finished(self.post(inbox))
+        self.finished(self.post(inbox, key=key))
         assert self.outbox(inbox)[before:] == [f"original path: t{self.seq}"]
         assert (self.runs(inbox)[-1]["executor_id"], self.runs(inbox)[-1]["runner_id"]) == ("cli", "local")
 
@@ -841,6 +924,20 @@ def pilot(tmp_path: Path) -> Iterator[Deployment]:
         leaked = [p.name for p in (deployment.hb_log, deployment.runner_log)
                   if p.exists() and (deployment.token in p.read_text() or "synthetic-service-token" in p.read_text())]
         assert leaked == []
+
+
+@contextmanager
+def hold_protocol_check(gate: Path) -> Iterator[Path]:
+    ready = gate.with_suffix(".ready")
+    ready.unlink(missing_ok=True)
+    os.mkfifo(gate)
+    # The runner publishes ready after opening its read end. RDWR also lets cleanup release a killed reader.
+    with os.fdopen(os.open(gate, os.O_RDWR), "wb", buffering=0) as pipe:
+        try:
+            yield ready
+        finally:
+            gate.unlink()
+            pipe.write(b"resume\n")
 
 
 def _runner_run(deployment: Deployment, run: sqlite3.Row) -> Path:
@@ -913,26 +1010,24 @@ def test_a_new_event_interrupts_the_check_and_leaves_no_partial_result(pilot: De
     pilot.assert_original_path(OTHER)
 
 
-def test_a_forced_stop_ends_the_worker_process_and_the_next_start_finishes_the_task(pilot: Deployment) -> None:
+def test_a_forced_stop_ends_the_worker_process_and_the_next_start_finishes_the_task(
+    pilot: Deployment, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pilot.write(enabled=True)
-    pilot.start_hb()
-    pilot.start_runner()
-    held = pilot.check(key=KEY, hold_seconds=20)
-    worker = pilot.worker()
-    assert pilot.hb is not None
-    pilot.hb.send_signal(signal.SIGTERM)
-    time.sleep(0.5)
-    pilot.hb.send_signal(signal.SIGTERM)
-    assert pilot.hb.wait(timeout=20) == 0, pilot.logs()
-    assert not alive(worker)
-    assert (pilot.status(held), pilot.outbox(PILOT)) == ("pending", [])
-    (run,) = pilot.runs()
-    assert (run["outcome_kind"], run["runner_id"]) == ("interrupted", RUNNER_ID)
-    assert _runner_run(pilot, run).is_file()
-    pilot.hb = None
+    pilot.start_hb(fast_retry=True)
+    gate = pilot.start_gated_runner(monkeypatch, fast_retry=True)
+    with hold_protocol_check(gate) as entered:
+        held = pilot.check(key=KEY)
+        worker = pilot.gated_worker(entered)
+        pilot.force_stop_hb()
+        assert not alive(worker)
+        assert (pilot.status(held), pilot.outbox(PILOT)) == ("pending", [])
+        (run,) = pilot.runs()
+        assert (run["outcome_kind"], run["runner_id"]) == ("interrupted", RUNNER_ID)
+        assert _runner_run(pilot, run).is_file()
     # Same port, same token; the Runner reconnects on its own.
-    pilot.start_hb()
-    pilot.until(lambda: pilot.status(held) == "done", timeout=60)
+    pilot.start_hb(fast_retry=True)
+    pilot.finished(held, timeout=60)
     assert len(pilot.outbox(PILOT)) == 1 and pilot.runs()[-1]["emit_status"] == "done"
 
 
@@ -956,34 +1051,36 @@ def test_stopping_the_runner_service_fails_the_task_and_frees_everything(pilot: 
     assert pilot.runs()[-1]["emit_status"] == "done"
 
 
-def test_turning_the_route_off_drains_it_and_restores_the_original_path(pilot: Deployment) -> None:
+def test_turning_the_route_off_drains_it_and_restores_the_original_path(
+    pilot: Deployment, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pilot.write(enabled=False)
-    pilot.start_hb()
-    pilot.start_runner()
+    pilot.start_hb(fast_retry=True)
+    gate = pilot.start_gated_runner(monkeypatch, fast_retry=True)
     assert not pilot.relay_open()
-    pilot.assert_original_path(PILOT)  # off: the pilot inbox is an ordinary inbox
+    ordinary_key = "github:fixture/test#9000"
+    pilot.assert_original_path(PILOT, key=ordinary_key)  # off: the pilot inbox is an ordinary inbox
 
     pilot.reload(enabled=True)
     assert pilot.relay_open()
     pilot.finished(pilot.check())
-    in_flight = pilot.check(key=KEY, hold_seconds=3)
-    worker = pilot.worker()
-    pilot.reload(enabled=False)
-    # The Run in flight keeps its Relay until it has ended, on its own terms.
-    assert alive(worker) and pilot.relay_open()
+    with hold_protocol_check(gate) as entered:
+        in_flight = pilot.check(key=KEY)
+        worker = pilot.gated_worker(entered)
+        pilot.reload(enabled=False)
+        # The Run in flight keeps its Relay until it has ended, on its own terms.
+        assert alive(worker) and pilot.relay_open()
     pilot.finished(in_flight)
     assert recomputed_manifest(pilot.runner_repo, pilot.commit) in pilot.outbox(PILOT)[-1]
     pilot.until(lambda: not pilot.relay_open())
     assert pilot.runs()[-1]["runner_id"] == RUNNER_ID
     pilot.assert_original_path(PILOT)
     # A session of the pilot must not keep pointing its correlation key at the closed route.
-    before = len(pilot.outbox(PILOT))
-    pilot.finished(pilot.post(PILOT, key=KEY))
-    assert pilot.outbox(PILOT)[before:] == [f"original path: t{pilot.seq}"]
-    # Leftover work addressed to the check ends with a notice instead of running elsewhere.
+    pilot.assert_original_path(PILOT, key=KEY)
+    # Leftover work addressed to the check ends with a notice. An existing ordinary task can then continue.
     pilot.finished(pilot.check(executor_id=PROTOCOL_CHECK_EXECUTOR_ID))
     assert "试点路由未对本 Inbox 开放" in pilot.outbox(PILOT)[-1]
-    pilot.assert_original_path(PILOT)
+    pilot.assert_original_path(PILOT, key=ordinary_key)
 
     pilot.reload(enabled=True)
     assert pilot.runner is not None and pilot.runner.poll() is None
@@ -1001,14 +1098,9 @@ def test_interrupted_work_left_by_a_rollback_is_not_run_elsewhere(pilot: Deploym
     pilot.start_runner()
     held = pilot.check(key=KEY, hold_seconds=60)
     worker = pilot.worker()
-    assert pilot.hb is not None
-    pilot.hb.terminate()
-    time.sleep(0.5)
-    pilot.hb.terminate()
-    pilot.hb.wait(timeout=20)
+    pilot.force_stop_hb()
     assert not alive(worker)
     assert pilot.stop_runner() == 0
-    pilot.hb = None
     pilot.write(enabled=False)
     pilot.start_hb()
     pilot.finished(held)
@@ -1044,9 +1136,9 @@ def test_the_route_cannot_be_changed_while_open_or_opened_on_a_taken_port(pilot:
         pilot.start_hb()
         pilot.reload(enabled=True, expect="Cannot activate settings")
         pilot.assert_original_path(PILOT)
-    pilot.write(enabled=True, extra="timeout_seconds = 60\n")
-    pilot.until(pilot.relay_open)
-    pilot.write(enabled=True, extra="timeout_seconds = 61\n")
-    pilot.until(lambda: "changes need enabled = false first" in pilot.hb_log.read_text())
+    # The relay can already be listening while its generation is still being activated.
+    pilot.reload(enabled=True, extra="timeout_seconds = 60\n")
+    assert pilot.relay_open()
+    pilot.reload(enabled=True, extra="timeout_seconds = 61\n", expect="changes need enabled = false first")
     assert pilot.relay_open()
     pilot.assert_original_path(OTHER)

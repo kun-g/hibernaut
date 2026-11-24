@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import dataclasses
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+from contextlib import contextmanager
+from functools import cache
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -38,15 +44,18 @@ from runner.worktree import CommandOutput, CreatedWorktree, GitWorktreeBackend, 
 
 PY = sys.executable
 
-# Leader writes "<leader_pid> <grandchild_pid>" to the path in argv[1]; the grandchild ignores SIGTERM.
+# Publish both PIDs only once the grandchild ignores TERM. The cancellation matrix covers descendants
+# that do and don't keep the leader's output pipes open.
 _SPAWN_SCRIPT = (
-    "import os, subprocess, sys, time\n"
-    "child = subprocess.Popen([sys.executable, '-c', "
-    "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'])\n"
-    "time.sleep(0.2)\n"
-    "open(sys.argv[1] + '.tmp', 'w').write(f'{os.getpid()} {child.pid}')\n"
-    "os.replace(sys.argv[1] + '.tmp', sys.argv[1])\n"
-    "time.sleep(60)\n"
+    "import os, signal, sys\n"
+    "leader = os.getpid()\n"
+    "if os.fork() == 0:\n"
+    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "    if '--hold-pipes' not in sys.argv: os.close(1); os.close(2)\n"
+    "    with open(sys.argv[1] + '.tmp', 'w') as f: f.write(f'{leader} {os.getpid()}')\n"
+    "    os.replace(sys.argv[1] + '.tmp', sys.argv[1])\n"
+    "signal.alarm(60)\n"
+    "signal.pause()\n"
 )
 
 
@@ -54,18 +63,31 @@ def _git(*args: str, cwd: Path) -> str:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
 
 
-def _init_repo(repo: Path) -> None:
-    repo.mkdir(parents=True, exist_ok=True)
+@cache
+def _seed_repos() -> tuple[Path, Path]:
+    tmp = tempfile.TemporaryDirectory(prefix="runner_seed_")
+    atexit.register(tmp.cleanup)
+    repo, bare = Path(tmp.name) / "repo", Path(tmp.name) / "remote.git"
+    repo.mkdir()
     _git("init", "-b", "main", cwd=repo)
     _git("config", "user.email", "test@example.com", cwd=repo)
     _git("config", "user.name", "Test", cwd=repo)
     (repo / "README.md").write_text("hello\n", encoding="utf-8")
     _git("add", "README.md", cwd=repo)
-    _git("commit", "-m", "init", cwd=repo)
-    bare = repo.parent / f"{repo.name}-remote.git"
-    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    _git("-c", "maintenance.auto=false", "commit", "-m", "init", cwd=repo)
+    _git("init", "--bare", str(bare), cwd=repo)
     _git("remote", "add", "origin", str(bare), cwd=repo)
-    _git("push", "-u", "origin", "main", cwd=repo)
+    _git("-c", "maintenance.auto=false", "push", "-u", "origin", "main", cwd=repo)
+    return repo, bare
+
+
+def _init_repo(repo: Path) -> None:
+    seed, origin = _seed_repos()
+    bare = repo.with_name(f"{repo.name}-remote.git")
+    # Mutations, including pushes to origin and the registration of linked worktrees, belong to one test.
+    shutil.copytree(seed, repo, symlinks=True)
+    shutil.copytree(origin, bare, symlinks=True)
+    _git("remote", "set-url", "origin", str(bare), cwd=repo)
 
 
 def _config(tmp_path: Path, repo: Path, runner_id: str = "runner-safety", max_concurrent: int = 4) -> RunnerConfig:
@@ -171,23 +193,45 @@ def _kill_quietly(*pids: int) -> None:
             pass
 
 
-def test_cancelled_run_reaps_process_group_and_keeps_workspace_busy_until_reaped(tmp_path: Path) -> None:
+@pytest.mark.parametrize("hold_pipes", [False, True], ids=["detached-output", "inherited-output"])
+def test_cancelled_run_reaps_process_group_and_keeps_workspace_busy_until_reaped(
+    tmp_path: Path, hold_pipes: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
-    daemon = RunnerDaemon(_config(tmp_path, repo), drivers=_drivers())
+    drivers = _drivers()
+    if hold_pipes:
+        spawn = drivers["spawn"]
+        drivers["spawn"] = dataclasses.replace(spawn, args=(*spawn.args, "--hold-pipes"))
+    daemon = RunnerDaemon(_config(tmp_path, repo), drivers=drivers)
     pidfile = tmp_path / "pids-cancel"
     pids: list[int] = []
+    reaping, release = asyncio.Event(), asyncio.Event()
+    terminate = supervisor_module.terminate_process_group
+
+    async def controlled_reap(proc, *, grace_seconds):
+        if proc.pid in pids:
+            reaping.set()
+            await release.wait()
+            grace_seconds = 0.05
+        await terminate(proc, grace_seconds=grace_seconds)
+
+    monkeypatch.setattr(supervisor_module, "terminate_process_group", controlled_reap)
 
     async def _scenario() -> None:
         task = asyncio.create_task(daemon.run(_req("run_cancel_1", executor_id="spawn", prompt=str(pidfile)), caller_id="hibernaut"))
-        pids.extend(await _wait_pids(pidfile))
-
-        # While run_cancel_1 owns the worktree, a second run_id for the same workspace must not start a second writer.
-        busy = await daemon.run(_req("run_cancel_2", executor_id="cwd"), caller_id="hibernaut")
-        assert busy.status == "refused"
-        assert busy.error_summary is not None and "workspace_busy" in busy.error_summary
-
-        task.cancel()
+        try:
+            pids.extend(await _wait_pids(pidfile))
+            # The claim covers both the running CLI and cleanup of its descendants.
+            busy = await daemon.run(_req("run_cancel_2", executor_id="cwd"), caller_id="hibernaut")
+            assert busy.status == "refused" and "workspace_busy" in (busy.error_summary or "")
+            task.cancel()
+            await asyncio.wait_for(reaping.wait(), 5)
+            assert _alive(pids[1])
+            busy = await daemon.run(_req("run_during_reap", executor_id="cwd"), caller_id="hibernaut")
+            assert busy.status == "refused" and "workspace_busy" in (busy.error_summary or "")
+        finally:
+            release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
 
@@ -471,13 +515,39 @@ def test_interrupt_retries_until_run_is_registered(tmp_path: Path) -> None:
         daemon.close()
 
 
-# Appends one line per execution to the path in argv[1], then reports success after a short delay.
-_COUNT_SCRIPT = (
-    "import json, sys, time\n"
-    "open(sys.argv[1], 'a').write('x\\n')\n"
-    "time.sleep(1.0)\n"
-    "print(json.dumps({'outcome': 'emit', 'message': 'ok'}))\n"
-)
+# Publish the count after opening the optional gate, so the test can immediately release the child.
+_COUNT_SCRIPT = """\
+import json, sys
+from pathlib import Path
+counter = Path(sys.argv[1])
+gate = counter.with_suffix('.gate')
+reader = gate.open('rb', buffering=0) if gate.exists() else None
+with counter.open('a') as out:
+    out.write('x\\n')
+if reader is not None:
+    with reader:
+        reader.read(1)
+print(json.dumps({'outcome': 'emit', 'message': 'ok'}))
+"""
+
+
+@contextmanager
+def _hold_count(counter: Path):
+    gate = counter.with_suffix(".gate")
+    os.mkfifo(gate)
+    # RDWR keeps entering and releasing nonblocking even if the child fails to start.
+    with os.fdopen(os.open(gate, os.O_RDWR), "wb", buffering=0) as writer:
+        try:
+            yield
+        finally:
+            gate.unlink()
+            writer.write(b"1")
+
+
+async def _count_started(counter: Path) -> None:
+    async with asyncio.timeout(10):
+        while not counter.exists():
+            await asyncio.sleep(0.01)
 
 
 def _count_drivers() -> dict[str, TemplateCLIDriver]:
@@ -518,17 +588,17 @@ def test_agent_accepts_duplicate_submit_of_inflight_run_when_slots_full(tmp_path
         await asyncio.wait_for(ready.wait(), 5.0)
         submit = {"type": "run.submit", "conn_epoch": 1, "caller_id": "hibernaut", "request": req.to_dict()}
 
-        await send_json(conn["w"], submit, mask=False)
-        first = await asyncio.wait_for(frames.get(), 5.0)
-        assert first["type"] == "run.accepted" and first["accepted"] is True
-        while not counter.exists():
-            await asyncio.sleep(0.02)
-        assert daemon.capabilities_sync().slots.available == 0
+        with _hold_count(counter):
+            await send_json(conn["w"], submit, mask=False)
+            first = await asyncio.wait_for(frames.get(), 5.0)
+            assert first["type"] == "run.accepted" and first["accepted"] is True
+            await _count_started(counter)
+            assert daemon.capabilities_sync().slots.available == 0
 
-        await send_json(conn["w"], submit, mask=False)
-        second = await asyncio.wait_for(frames.get(), 5.0)
-        assert second["type"] == "run.accepted"
-        assert second["accepted"] is True, f"in-flight run_id rejected: {second.get('reason')}"
+            await send_json(conn["w"], submit, mask=False)
+            second = await asyncio.wait_for(frames.get(), 5.0)
+            assert second["type"] == "run.accepted"
+            assert second["accepted"] is True, f"in-flight run_id rejected: {second.get('reason')}"
 
         completed = [await asyncio.wait_for(frames.get(), 10.0) for _ in range(2)]
         assert [f["type"] for f in completed] == ["run.completed", "run.completed"]
@@ -612,15 +682,16 @@ def test_hub_overlapping_waiters_on_one_run_id_share_one_submission(tmp_path: Pa
         await agent.start()
         await agent.wait_connected()
 
-        impatient = asyncio.create_task(asyncio.wait_for(hub.run(req), 0.4))
-        await asyncio.sleep(0.1)
-        patient = asyncio.create_task(hub.run(req))
-        await asyncio.sleep(0.1)
-        rec = hub.registry.get("share-1")
-        assert rec is not None and rec.reserved_slots == 1, "the second waiter reserved another slot"
-
-        with pytest.raises(asyncio.TimeoutError):
-            await impatient
+        with _hold_count(counter):
+            impatient = asyncio.create_task(hub.run(req))
+            await _count_started(counter)
+            patient = asyncio.create_task(hub.run(req))
+            # Let the second waiter enter hub.run before cancelling the first one's wait.
+            await asyncio.sleep(0)
+            rec = hub.registry.get("share-1")
+            assert rec is not None and rec.reserved_slots == 1, "the second waiter reserved another slot"
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(impatient, timeout=0)
         got = await asyncio.wait_for(patient, 10.0)
         assert got.status == "succeeded"
         assert counter.read_text(encoding="utf-8") == "x\n"
@@ -640,9 +711,12 @@ def test_worktree_commands_do_not_block_the_event_loop(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
 
+    creating, ticked = threading.Event(), threading.Event()
+
     class _SlowBackend(GitWorktreeBackend):
         def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> CreatedWorktree:
-            time.sleep(1.0)  # a slow `orca worktree create` / `git worktree add`
+            creating.set()
+            assert ticked.wait(5), "no event-loop tick while a worktree was being created"
             return super().create(primary_checkout=primary_checkout, workdir=workdir, branch=branch, base_ref=base_ref)
 
     cfg = _config(tmp_path, repo)
@@ -657,12 +731,13 @@ def test_worktree_commands_do_not_block_the_event_loop(tmp_path: Path) -> None:
             last = time.monotonic()
             while not stop.is_set():
                 await asyncio.sleep(0.02)
+                if creating.is_set():
+                    ticked.set()
                 now = time.monotonic()
                 gaps.append(now - last)
                 last = now
 
         ticker = asyncio.create_task(_ticker())
-        await asyncio.sleep(0.1)
         res = await daemon.run(_req("run_slow_create", executor_id="cwd", work_key="gh#11"), caller_id="hibernaut")
         stop.set()
         await ticker
@@ -675,18 +750,24 @@ def test_worktree_commands_do_not_block_the_event_loop(tmp_path: Path) -> None:
         daemon.close()
 
 
-def test_concurrent_resolves_with_same_hint_get_distinct_worktrees(tmp_path: Path) -> None:
-    # Resolves now run in worker threads, so two work_keys can allocate names while the other is still creating.
+@pytest.mark.parametrize("hold_first", [False, True], ids=["concurrent", "name-reserved"])
+def test_concurrent_resolves_with_same_hint_get_distinct_worktrees(tmp_path: Path, hold_first: bool) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
+    second_created = threading.Event()
 
-    class _SlowBackend(GitWorktreeBackend):
+    class _HeldReservation(GitWorktreeBackend):
         def create(self, *, primary_checkout: Path, workdir: Path, branch: str, base_ref: str) -> CreatedWorktree:
-            time.sleep(0.5)
-            return super().create(primary_checkout=primary_checkout, workdir=workdir, branch=branch, base_ref=base_ref)
+            # The second work key must reserve a distinct name before the first directory even exists.
+            if workdir.name == "hb-same-hint":
+                assert second_created.wait(5), "the second key did not get past the first reservation"
+            created = super().create(primary_checkout=primary_checkout, workdir=workdir, branch=branch, base_ref=base_ref)
+            second_created.set()
+            return created
 
     cfg = _config(tmp_path, repo)
-    mgr = WorktreeManager(db_path=cfg.state_dir / "runner_workspaces.db", backend=_SlowBackend())
+    backend = _HeldReservation() if hold_first else GitWorktreeBackend()
+    mgr = WorktreeManager(db_path=cfg.state_dir / "runner_workspaces.db", backend=backend)
     daemon = RunnerDaemon(cfg, drivers=_drivers(), worktree_manager=mgr)
 
     def _with_hint(run_id: str, work_key: str) -> RunRequest:

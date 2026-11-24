@@ -448,13 +448,14 @@ class _OpenMCP(BaseHTTPRequestHandler):
 @contextmanager
 def serve(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
     try:
         yield f"http://127.0.0.1:{server.server_address[1]}"
     finally:
         server.shutdown()
         server.server_close()
+        thread.join()
 
 
 class SmokeTests(unittest.TestCase):

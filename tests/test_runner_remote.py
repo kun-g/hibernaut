@@ -140,7 +140,7 @@ def test_anything_else_is_refused_by_the_node(workdir: Path, tool: str, args: di
 
 
 def test_the_node_refuses_before_hibernaut_is_asked(tmp_path: Path) -> None:
-    node = Node(tmp_path)
+    node = Node(tmp_path, real_worktree=True)
     node.daemon = RunnerDaemon(
         node.config, drivers={"claude": agent_driver("claude", str(_fake_claude(tmp_path / "gated", node.log)))},
         tool_guard=workspace_read_refusal,
@@ -417,7 +417,7 @@ def test_the_two_relays_do_not_share_a_token(tmp_path: Path) -> None:
 
 
 def test_readonly_only_makes_every_run_readonly(tmp_path: Path) -> None:
-    node = Node(tmp_path)
+    node = Node(tmp_path, real_worktree=True)
     outcome = execute(bridge_to(node.client, readonly=True), [event(plan(("Bash", {"command": "ls"})))], session(), Caps(Policy("allow")))
     assert outcome.messages == ("all done",)
     (start,) = node.entries("start")

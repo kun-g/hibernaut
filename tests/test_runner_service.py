@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import io
 import json
 import logging
 import os
@@ -12,9 +13,12 @@ import sys
 import time
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+from runner import protocol_check
 
 from runner.check_driver import CHECK_PROGRAM, ProtocolCheckDriver
 from runner.daemon import RunnerDaemon
@@ -56,7 +60,9 @@ def _check(repo: Path, request: str | bytes, **env: str) -> subprocess.Completed
 # --- the fixed check program
 
 
-def test_report_names_the_commit_and_recomputes_with_git_and_sha256_alone(tmp_path: Path) -> None:
+def test_report_names_the_commit_and_recomputes_with_git_and_sha256_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     repo = tmp_path / "repo"
     head = protocol_repo(repo)
     proc = _check(repo, CheckRequest(head).to_json())
@@ -74,7 +80,13 @@ def test_report_names_the_commit_and_recomputes_with_git_and_sha256_alone(tmp_pa
     assert subprocess.check_output(["sh", "-c", shell], cwd=repo, text=True).split()[0] == report["manifest_sha256"]
     # Deterministic, and independent of the worktree's files and of the hold.
     (repo / PROTOCOL_FILES[0]).write_text("tampered", encoding="utf-8")
-    assert _check(repo, CheckRequest(head, hold_seconds=1).to_json()).stdout == proc.stdout
+    delays = []
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(protocol_check, "time", SimpleNamespace(sleep=delays.append))
+    with io.TextIOWrapper(io.BytesIO(CheckRequest(head, hold_seconds=1).to_json().encode())) as stdin:
+        monkeypatch.setattr(sys, "stdin", stdin)
+        assert protocol_check.main() == 0
+    assert delays == [1] and capsys.readouterr().out == proc.stdout
 
 
 def test_this_checkout_passes_the_check() -> None:
@@ -135,7 +147,9 @@ def test_other_files_in_the_protocol_directory_are_not_part_of_the_check(tmp_pat
     assert (after["files"], after["manifest_sha256"]) == (before["files"], before["manifest_sha256"])
 
 
-def test_only_the_request_format_and_a_commit_of_this_repository_are_accepted(tmp_path: Path) -> None:
+def test_only_the_request_format_and_a_commit_of_this_repository_are_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     repo = tmp_path / "repo"
     head = protocol_repo(repo)
     git("tag", "-a", "v1", "-m", "tag", cwd=repo)
@@ -148,10 +162,14 @@ def test_only_the_request_format_and_a_commit_of_this_repository_are_accepted(tm
         *(json.dumps({**base, "hold_seconds": h}) for h in (-1, 61, 1.5, True, "1")),
         json.dumps({**base, "schema": "other"}), json.dumps(base) + " " * 2000,
     ]
+    monkeypatch.chdir(repo)
     for request in bad:
-        proc = _check(repo, request)
-        assert (proc.returncode, proc.stdout) == (1, ""), request
-        assert proc.stderr.startswith("protocol check failed:"), request
+        with io.TextIOWrapper(io.BytesIO(request.encode())) as stdin:
+            monkeypatch.setattr(sys, "stdin", stdin)
+            assert protocol_check.main() == 1, request
+        out = capsys.readouterr()
+        assert out.out == "", request
+        assert out.err.startswith("protocol check failed:"), request
 
 
 def test_replace_refs_cannot_swap_the_checked_content(tmp_path: Path) -> None:
@@ -214,6 +232,11 @@ def test_driver_command_line_is_fixed_and_ignores_everything_but_the_prompt() ->
 
 
 @pytest.fixture
+def config_file(tmp_path: Path) -> Path:
+    return runner_toml(tmp_path / "runner.toml", repo=tmp_path / "repo", port=8800, token_file=tmp_path / "relay.token")
+
+
+@pytest.fixture
 def service(tmp_path: Path) -> tuple[Path, int, str]:
     repo = tmp_path / "repo"
     protocol_repo(repo)
@@ -223,11 +246,11 @@ def service(tmp_path: Path) -> tuple[Path, int, str]:
     return runner_toml(tmp_path / "runner.toml", repo=repo, port=port, token_file=token_file), port, token
 
 
-def test_service_config_accepts_the_pilot_shape(service: tuple[Path, int, str]) -> None:
-    cfg = load_service_config(service[0])
+def test_service_config_accepts_the_pilot_shape(config_file: Path) -> None:
+    cfg = load_service_config(config_file)
     assert (cfg.runner.max_concurrent, cfg.runner.readonly_only) == (1, True)
-    assert cfg.relay_url == f"ws://127.0.0.1:{service[1]}/ws/runner"
-    assert cfg.runner.state_dir == service[0].parent.resolve() / "state"
+    assert cfg.relay_url == "ws://127.0.0.1:8800/ws/runner"
+    assert cfg.runner.state_dir == config_file.parent.resolve() / "state"
 
 
 @pytest.mark.parametrize(
@@ -249,13 +272,12 @@ def test_service_config_accepts_the_pilot_shape(service: tuple[Path, int, str]) 
         ("[relay]", "[relay]\nextra = 1"),
     ],
 )
-def test_service_config_refuses_anything_wider_than_the_pilot(service: tuple[Path, int, str], old: str, new: str) -> None:
-    path = service[0]
-    text = path.read_text(encoding="utf-8")
+def test_service_config_refuses_anything_wider_than_the_pilot(config_file: Path, old: str, new: str) -> None:
+    text = config_file.read_text(encoding="utf-8")
     assert old in text
-    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    config_file.write_text(text.replace(old, new, 1), encoding="utf-8")
     with pytest.raises(ValueError):
-        load_service_config(path)
+        load_service_config(config_file)
 
 
 def test_deploy_examples_match_the_service() -> None:

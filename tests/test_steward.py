@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agent_runtime.adapters.executor_cli import (
     CLITemplate,
@@ -55,11 +55,12 @@ from agent_runtime.core.models import (
 )
 from agent_runtime.engine.forwarding import carried_spec
 from agent_runtime.engine.worker import AgentWorker
+from tests.async_deadline import expire_when_ready
 from tests.fakes import InMemoryOutbox, InMemoryPermission, RecordingChannel
 from tests.test_coder_reviewer import fake_command, git, make_repo
 from tests.test_sde_executor import make_base_repo
 from tests.test_terminal_processes import alive, until
-from tests.test_visible_roles import FakeOrcaTerminals
+from tests.test_visible_roles import FakeOrcaTerminals, build_terminal_daemon
 
 MAIN = "proj:x"
 SDE = "proj:x:sde"
@@ -145,19 +146,20 @@ class StewardCase(unittest.IsolatedAsyncioTestCase):
     async def run_steward(self, *events: Event, session: SessionRef | None = None) -> Any:
         return await self.executor().execute(list(events) or [self.event()], session, self.caps)
 
-    async def tool(self, name: str, **arguments: Any) -> tuple[bool, str]:
-        self.set_plan({"calls": [{"tool": name, "arguments": arguments}]})
-        outcome = await self.run_steward()
-        self.assertIsInstance(outcome, Silent)
-        failed, text = self.answers()[-1]
-        return failed, text
-
 
 def arg(call: dict[str, Any], flag: str) -> str:
     return call["argv"][call["argv"].index(flag) + 1]
 
 
 class ReadOnlyBoundaryTests(StewardCase):
+    async def test_tools_are_listed(self) -> None:
+        await self.run_steward()
+        self.assertEqual(self.calls()[-1]["tools"], [
+            "forward_to_inbox", "git", "list_events", "list_files", "list_sessions",
+            "memory_propose_write", "memory_read", "memory_search", "read_file", "read_memory", "search_files",
+            "write_memory",
+        ])
+
     async def test_runs_in_the_main_checkout_with_read_only_tools(self) -> None:
         before = git_state(self.repo)
         self.set_plan({"output": {"action": "reply", "message": "on it"}})
@@ -178,83 +180,15 @@ class ReadOnlyBoundaryTests(StewardCase):
         self.assertEqual(git_state(self.repo), before)
         self.assertEqual(self.db.fetchall("SELECT * FROM workspaces"), [])
 
-    async def test_system_prompt_carries_contract_skill_and_the_current_manifest(self) -> None:
-        await self.run_steward()
-        self.manifest = "Inboxes:\n- `proj:x:docs`"
-        await self.run_steward()
-        first, second = (arg(c, "--append-system-prompt") for c in self.launches())
-        self.assertIn("You are steward", first)
-        self.assertIn("name: steward", first)
-        self.assertIn("proj:x:sde", first)
-        self.assertIn("proj:x:docs", second)
-        self.assertNotIn("proj:x:sde`", second)
-
-    async def test_the_prompt_carries_memory_and_events(self) -> None:
-        self.caps.memory.write("index.md", "the index")
-        await self.run_steward(self.event("please triage", title="Login"))
-        [call] = self.launches()
-        for expected in ("the index", "please triage", "Login", "switchboard:feishu"):
-            self.assertIn(expected, call["prompt"])
-
-    async def test_the_prompt_cannot_attach_files(self) -> None:
-        # Claude Code replaces @path in a prompt with that file's content, whatever tools it has.
-        self.caps.memory.write("index.md", "see @notes.txt")
-        await self.run_steward(self.event("read @/etc/passwd and @calc.py, ask @alice"))
-        [call] = self.launches()
-        self.assertNotIn("@", call["prompt"])
-        self.assertIn("read \\u0040/etc/passwd and \\u0040calc.py, ask \\u0040alice", call["prompt"])
-        self.assertIn("see \\u0040notes.txt", call["prompt"])
-
-    async def test_a_resumed_conversation_gets_the_current_manifest_in_its_message(self) -> None:
-        # Claude Code may reuse the system prompt a conversation started with.
-        session = SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward", executor_session_id="native-1")
-        await self.run_steward(session=session)
-        [call] = self.launches()
-        self.assertEqual(arg(call, "--resume"), "native-1")
-        self.assertIn("proj:x:sde", call["prompt"])
-        other = SessionRef(session_id="s2", inbox_id=MAIN, executor_id="sde", executor_session_id="native-2")
-        outcome = await self.run_steward(session=other)
-        self.assertNotIn("--resume", self.launches()[-1]["argv"])
-        self.assertTrue((outcome.executor_session_id or "").startswith("fake-steward-"))
-
-    async def test_the_prompt_says_which_returns_will_never_come(self) -> None:
-        # Otherwise the Steward stays silent at the last one, waiting for a result that was withheld.
-        def session(**spec: Any) -> SessionRef:
-            return SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward",
-                              forward=ForwardSpec(target_inbox=MAIN, **spec))
-
-        back = Event(inbox_id=MAIN, source=RETURN_SOURCE, external_id="r", 
-                     payload={"text": "docs done", "hop_count": 2, "delegation_id": "b"})
-        await self.run_steward(back, session=session(pending_returns=("b", "c"), cancelled_returns=("a",)))
-        self.assertIn("1 will not come back", self.launches()[-1]["prompt"])
-        self.assertIn("Still awaited: 1", self.launches()[-1]["prompt"])
-        await self.run_steward(back, session=session(pending_returns=("b",), cancelled_returns=("a",)))
-        self.assertIn("Still awaited: 0", self.launches()[-1]["prompt"])
-        await self.run_steward(back, session=session(pending_returns=("b",)))
-        self.assertNotIn("awaited", self.launches()[-1]["prompt"])
-
-    async def test_launch_passes_the_permission_gate(self) -> None:
-        self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("block", "closed today")})
+    async def test_tool_refusal_reaches_the_steward_through_its_cli(self) -> None:
+        self.caps.permissions = Mock(wraps=InMemoryPermission({"git_read": PermissionDecision("block", "private history")}))
+        self.set_plan({"calls": [{"tool": "git", "arguments": {"args": ["status"]}}]})
         outcome = await self.run_steward()
-        assert isinstance(outcome, Emit)
-        self.assertEqual(outcome.status, "refused")
-        self.assertIn("closed today", outcome.messages[0])
-        self.assertEqual(self.calls(), [])
-
-    async def test_failures_are_reported_as_failed(self) -> None:
-        outcome = await self.executor({}).execute([self.event()], None, self.caps)
-        assert isinstance(outcome, Emit)
-        self.assertEqual(outcome.status, "failed")
-        self.set_plan({"error": "overloaded"})
-        outcome = await self.run_steward()
-        assert isinstance(outcome, Emit)
-        self.assertEqual(outcome.status, "failed")
-        self.assertIn("overloaded", outcome.messages[0])
-        self.set_plan({"output": {"action": "dance"}})
-        outcome = await self.run_steward()
-        assert isinstance(outcome, Emit)
-        self.assertEqual(outcome.status, "failed")
-
+        self.assertIsInstance(outcome, Silent)
+        [(failed, text)] = self.answers()
+        self.assertTrue(failed)
+        self.assertIn("private history", text)
+        self.assertEqual([c.args[0] for c in self.caps.permissions.check.call_args_list], ["steward.launch", "git_read"])
 
 def git_state(repo: Path) -> tuple[str, str, str]:
     def out(*args: str) -> str:
@@ -263,14 +197,23 @@ def git_state(repo: Path) -> tuple[str, str, str]:
     return out("status", "--porcelain"), out("rev-parse", "HEAD"), out("worktree", "list")
 
 
-class ToolTests(StewardCase):
-    async def test_tools_are_listed(self) -> None:
-        await self.run_steward()
-        self.assertEqual(self.calls()[-1]["tools"], [
-            "forward_to_inbox", "git", "list_events", "list_files", "list_sessions",
-            "memory_propose_write", "memory_read", "memory_search", "read_file", "read_memory", "search_files",
-            "write_memory",
-        ])
+class ToolTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.repo = make_repo(self.root)
+        db = SQLiteDatabase(":memory:")
+        self.addCleanup(db.close)
+        self.sessions = SQLiteSessionStoreAdapter(db)
+        self.inbox = SQLiteInboxAdapter(db)
+        self.caps = Caps(self.root)
+        self.tools = steward_tools.StewardTools(
+            caps=self.caps, checkout=self.repo, inbox_id=MAIN, sessions=self.sessions,
+            events=self.inbox, in_project=lambda inbox_id: inbox_id.startswith("proj:x"),
+        )
+
+    async def tool(self, name: str, **arguments: Any) -> tuple[bool, str]:
+        text, failed = await self.tools.call(name, arguments)
+        return failed, text
 
     async def test_forward(self) -> None:
         failed, text = await self.tool(
@@ -438,7 +381,7 @@ class ToolTests(StewardCase):
             self.assertTrue(failed, path)
             self.assertIn("private", text)
             self.assertNotIn("needle", text)
-        self.assertIn(("steward.launch", "allow"), [(name, "allow") for name, _ in seen])
+        self.assertEqual(seen, [("read_file", {"path": "secrets/key.txt"})] * 3)
         self.assertEqual((await self.tool("read_file", path="open.txt"))[1], "1\tneedle in the open\n")
         # A search returns file content too, so each file it found is asked for as a read.
         _, text = await self.tool("search_files", pattern="needle")
@@ -701,7 +644,45 @@ class SuspendCase(StewardCase):
         })
 
 
-class SuspendTests(SuspendCase):
+class ScriptedStewardCase(SuspendCase):
+    def setUp(self) -> None:
+        super().setUp()
+        terminal = Mock(spec=OrcaCommandTerminal)
+        terminal.run.side_effect = self.reply
+        self.terminal = terminal
+        self.records: list[dict[str, Any]] = []
+
+    def set_plan(self, *steps: dict[str, Any]) -> None:
+        self.steps = iter(steps)
+
+    def calls(self) -> list[dict[str, Any]]:
+        return self.records
+
+    def launches(self) -> list[dict[str, Any]]:
+        return self.records
+
+    async def reply(self, *, argv: list[str], stdin: str, workdir: Path, **_: Any) -> orca.TerminalRun:
+        self.records.append({"argv": argv, "prompt": stdin, "cwd": str(workdir)})
+        step = next(self.steps, {})
+        if calls := step.get("calls"):
+            spec = json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]["hibernaut_steward"]
+            reader, writer = await asyncio.open_unix_connection(spec["args"][-1])
+            try:
+                for call in calls:
+                    writer.write((json.dumps({"op": "call", "name": call["tool"], "arguments": call["arguments"]}) + "\n").encode())
+                    await writer.drain()
+                    self.assertFalse(json.loads(await reader.readline())["error"])
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        result = {"type": "result", "session_id": "fake-steward-session", "subtype": "success",
+                  "structured_output": step.get("output", {"action": "silent", "message": ""})}
+        if "error" in step:
+            result.update(subtype="error", is_error=True, result=step["error"])
+        return orca.TerminalRun(handle="terminal", stdout=json.dumps(result).encode(), stderr=b"", exit_code=0)
+
+
+class SuspendTests(ScriptedStewardCase):
     async def test_a_deferred_launch_waits_and_then_runs_the_original_event(self) -> None:
         self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("defer", "ask")})
         outcome = await self.run_steward(self.event("triage this"))
@@ -758,7 +739,7 @@ class SuspendTests(SuspendCase):
                     final = await executor.execute([self.decision(asked, True)], self.suspended(asked), self.caps)
                     self.assertIsInstance(final, Silent)
                     self.assertIn("triage this", self.launches()[-1]["prompt"])
-                    self.log.unlink()
+                    self.records.clear()
 
     async def test_a_request_from_before_the_arguments_were_kept_is_asked_again(self) -> None:
         self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("defer", "ask")})
@@ -832,6 +813,85 @@ class SuspendTests(SuspendCase):
         self.assertIsInstance(final, Silent)
         self.assertEqual(len(self.caps.forwards), 1)
         self.assertIn("also update the docs", self.launches()[-1]["prompt"])
+
+
+class PromptTests(ScriptedStewardCase):
+    async def test_system_prompt_carries_contract_skill_and_the_current_manifest(self) -> None:
+        await self.run_steward()
+        self.manifest = "Inboxes:\n- `proj:x:docs`"
+        await self.run_steward()
+        first, second = (arg(c, "--append-system-prompt") for c in self.launches())
+        self.assertIn("You are steward", first)
+        self.assertIn("name: steward", first)
+        self.assertIn("proj:x:sde", first)
+        self.assertIn("proj:x:docs", second)
+        self.assertNotIn("proj:x:sde`", second)
+
+    async def test_the_prompt_carries_memory_and_events(self) -> None:
+        self.caps.memory.write("index.md", "the index")
+        await self.run_steward(self.event("please triage", title="Login"))
+        [call] = self.launches()
+        for expected in ("the index", "please triage", "Login", "switchboard:feishu"):
+            self.assertIn(expected, call["prompt"])
+
+    async def test_the_prompt_cannot_attach_files(self) -> None:
+        # Claude Code replaces @path in a prompt with that file's content, whatever tools it has.
+        self.caps.memory.write("index.md", "see @notes.txt")
+        await self.run_steward(self.event("read @/etc/passwd and @calc.py, ask @alice"))
+        [call] = self.launches()
+        self.assertNotIn("@", call["prompt"])
+        self.assertIn("read \\u0040/etc/passwd and \\u0040calc.py, ask \\u0040alice", call["prompt"])
+        self.assertIn("see \\u0040notes.txt", call["prompt"])
+
+    async def test_a_resumed_conversation_gets_the_current_manifest_in_its_message(self) -> None:
+        # Claude Code may reuse the system prompt a conversation started with.
+        session = SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward", executor_session_id="native-1")
+        await self.run_steward(session=session)
+        [call] = self.launches()
+        self.assertEqual(arg(call, "--resume"), "native-1")
+        self.assertIn("proj:x:sde", call["prompt"])
+        other = SessionRef(session_id="s2", inbox_id=MAIN, executor_id="sde", executor_session_id="native-2")
+        outcome = await self.run_steward(session=other)
+        self.assertNotIn("--resume", self.launches()[-1]["argv"])
+        self.assertTrue((outcome.executor_session_id or "").startswith("fake-steward-"))
+
+    async def test_the_prompt_says_which_returns_will_never_come(self) -> None:
+        # Otherwise the Steward stays silent at the last one, waiting for a result that was withheld.
+        def session(**spec: Any) -> SessionRef:
+            return SessionRef(session_id="s1", inbox_id=MAIN, executor_id="steward",
+                              forward=ForwardSpec(target_inbox=MAIN, **spec))
+
+        back = Event(inbox_id=MAIN, source=RETURN_SOURCE, external_id="r",
+                     payload={"text": "docs done", "hop_count": 2, "delegation_id": "b"})
+        await self.run_steward(back, session=session(pending_returns=("b", "c"), cancelled_returns=("a",)))
+        self.assertIn("1 will not come back", self.launches()[-1]["prompt"])
+        self.assertIn("Still awaited: 1", self.launches()[-1]["prompt"])
+        await self.run_steward(back, session=session(pending_returns=("b",), cancelled_returns=("a",)))
+        self.assertIn("Still awaited: 0", self.launches()[-1]["prompt"])
+        await self.run_steward(back, session=session(pending_returns=("b",)))
+        self.assertNotIn("awaited", self.launches()[-1]["prompt"])
+
+    async def test_launch_passes_the_permission_gate(self) -> None:
+        self.caps.permissions = InMemoryPermission({"steward.launch": PermissionDecision("block", "closed today")})
+        outcome = await self.run_steward()
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "refused")
+        self.assertIn("closed today", outcome.messages[0])
+        self.assertEqual(self.calls(), [])
+
+    async def test_failures_are_reported_as_failed(self) -> None:
+        outcome = await self.executor({}).execute([self.event()], None, self.caps)
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "failed")
+        self.set_plan({"error": "overloaded"})
+        outcome = await self.run_steward()
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("overloaded", outcome.messages[0])
+        self.set_plan({"output": {"action": "dance"}})
+        outcome = await self.run_steward()
+        assert isinstance(outcome, Emit)
+        self.assertEqual(outcome.status, "failed")
 
 
 class TerminalTests(SuspendCase):
@@ -968,7 +1028,10 @@ class TerminalTests(SuspendCase):
         self.set_plan({"pidfile": str(pids)})
         executor = self.executor()
         executor._profile = replace(executor._profile, timeout_seconds=6.0)  # pyright: ignore[reportPrivateUsage]
-        outcome = await executor.execute([self.event()], None, self.caps)
+        outcome = await expire_when_ready(
+            executor.execute([self.event()], None, self.caps), 6.0,
+            lambda: pids.exists() and len(pids.read_text().split()) == 2,
+        )
         assert isinstance(outcome, Emit)
         self.assertEqual(outcome.status, "failed")
         self.assertIn("timed out after 6s", outcome.messages[0])
@@ -1278,29 +1341,17 @@ agents = ["sde"]
 """
 
 
-class DaemonTests(unittest.IsolatedAsyncioTestCase):
+class DaemonCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        origin = make_base_repo(self.root)
         self.repo = self.root / "checkout"
-        git(self.root, "clone", "-q", str(origin), str(self.repo))
-        git(self.repo, "config", "user.email", "t@example.invalid")
-        git(self.repo, "config", "user.name", "t")
-        self.log = self.root / "calls.jsonl"
-        self.plan = self.root / "plan.json"
-        self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan)}))
-        self.orca = FakeOrcaTerminals(self.root)
-        self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
         self.channel = RecordingChannel()
-
-    async def asyncTearDown(self) -> None:
-        await self.orca.close_all()
 
     def raw(self) -> dict[str, Any]:
         return tomllib.loads(CONFIG.format(root=self.root, repo=self.repo, command=fake_command(self.root)))
 
     async def run_daemon(self, *events: tuple[str, str | None, dict[str, Any]]) -> Any:
-        daemon = build_daemon_from_config(parse_config(self.raw()), channel=self.channel)
+        daemon = build_terminal_daemon(parse_config(self.raw()), self.root, channel=self.channel)
         self.addCleanup(daemon.db.close)
         stop = asyncio.Event()
         daemon.pool.bind(asyncio.get_running_loop())
@@ -1312,6 +1363,23 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         stop.set()
         await pool
         return daemon
+
+
+class DaemonTests(DaemonCase):
+    def setUp(self) -> None:
+        super().setUp()
+        origin = make_base_repo(self.root)
+        git(self.root, "clone", "-q", str(origin), str(self.repo))
+        git(self.repo, "config", "user.email", "t@example.invalid")
+        git(self.repo, "config", "user.name", "t")
+        self.log = self.root / "calls.jsonl"
+        self.plan = self.root / "plan.json"
+        self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan)}))
+        self.orca = FakeOrcaTerminals(self.root)
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
+
+    async def asyncTearDown(self) -> None:
+        await self.orca.close_all()
 
     def launches(self) -> list[dict[str, Any]]:
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
@@ -1380,14 +1448,36 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((forwarded.payload["trace_id"], forwarded.payload["parent_event_id"]),
                          ("trace-1", asked.event_id))
 
+
+class DaemonReturnTests(DaemonCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo.mkdir()
+        self.steps = iter(())
+        self.roles = []
+        self.answers = []
+
+        async def steward(executor, native, prompt, caps, tools):
+            self.roles.append("steward")
+            step = next(self.steps)
+            for call in step.get("calls", []):
+                self.answers.append(await tools.call(call["tool"], call["arguments"]))
+            return {"session_id": "test-steward", "structured_output": step.get("output", {"action": "silent"})}
+
+        async def developer(executor, events, session, caps, run):
+            self.roles.append("sde")
+            return Emit(messages=("implemented",))
+
+        self.enterContext(patch.object(StewardExecutor, "_converse", new=steward))
+        self.enterContext(patch.object(SDEExecutor, "_execute", new=developer))
+
     async def test_a_deferred_return_waits_for_its_own_approval(self) -> None:
-        self.set_plan(
+        self.steps = iter(
             [
                 {"calls": [{"tool": "forward_to_inbox", "arguments": {
                     "target_inbox": SDE, "text": "do it", "return_to": MAIN}}]},
                 {"output": {"action": "reply", "message": "all done"}},
             ],
-            [{"write": {"calc.py": "x = 1\n"}}],
         )
         check = AutoModePermissionAdapter.check
 
@@ -1411,15 +1501,14 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             await daemon.pool.wait_until_idle(60)
             stop.set()
             await pool
-        self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde", "steward"])
+        self.assertEqual(self.roles, ["steward", "sde", "steward"])
         answers = [(m.inbox_id, m.content) for m in daemon.outbox.fetch_pending(limit=50) if m.metadata["kind"] == "emit"]
         self.assertEqual(answers, [(MAIN, "all done")])
 
     async def test_a_withheld_result_ends_the_stewards_wait(self) -> None:
-        self.set_plan(
+        self.steps = iter(
             [{"calls": [{"tool": "forward_to_inbox", "arguments": {
                 "target_inbox": SDE, "text": "do it", "return_to": MAIN}}]}],
-            [{"write": {"calc.py": "x = 1\n"}}],
         )
         check = AutoModePermissionAdapter.check
 
@@ -1442,7 +1531,7 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
             await daemon.pool.wait_until_idle(60)
             stop.set()
             await pool
-        self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde"])
+        self.assertEqual(self.roles, ["steward", "sde"])
         sent = {m.metadata["kind"]: m for m in daemon.outbox.fetch_pending(limit=50)}
         self.assertEqual(sorted(sent), ["approval_request", "return_withheld"])
         notice = sent["return_withheld"]
@@ -1453,9 +1542,8 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(steward.forward.pending_returns, ())
 
     async def test_direct_forward_answers_from_the_child(self) -> None:
-        self.set_plan(
+        self.steps = iter(
             [{"calls": [{"tool": "forward_to_inbox", "arguments": {"target_inbox": SDE, "text": "do it"}}]}],
-            [{"write": {"calc.py": "x = 1\n"}}],
         )
         daemon = await self.run_daemon((MAIN, "feishu:1", {"text": "x", "reply_channel": "feishu"}))
         messages = [m for m in daemon.outbox.fetch_pending(limit=50) if m.metadata["kind"] == "emit"]
@@ -1464,18 +1552,17 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_targets_the_config_does_not_cover_are_refused(self) -> None:
         targets = ["proj:x:docs", "proj:y", "proj:x:sde:a/b", "proj:x:sde:.."]
-        self.set_plan([{"calls": [
+        self.steps = iter([{"calls": [
             {"tool": "forward_to_inbox", "arguments": {"target_inbox": t, "text": "x"}} for t in targets
         ] + [{"tool": "forward_to_inbox", "arguments": {"target_inbox": SDE, "text": "x", "target_agent": "steward"}}]}])
         daemon = await self.run_daemon((MAIN, "feishu:1", {"text": "x"}))
-        answers = [a for c in map(json.loads, self.log.read_text().splitlines()) for a in c.get("answers", [])]
-        self.assertEqual([failed for failed, _ in answers], [True] * 5)
+        self.assertEqual([failed for _, failed in self.answers], [True] * 5)
         self.assertEqual(len(daemon.inbox.list_events()), 1)
 
     async def test_agent_outside_the_whitelist_is_refused_end_to_end(self) -> None:
         daemon = await self.run_daemon((MAIN, "feishu:1", {"text": "x", "agent_id": "sde"}))
         self.assertEqual([e.status for e in daemon.inbox.list_events()], ["failed"])
-        self.assertFalse(self.log.exists())
+        self.assertEqual(self.roles, [])
         self.assertEqual([m.metadata["kind"] for m in daemon.outbox.fetch_pending(limit=5)], ["agent_refused"])
 
 

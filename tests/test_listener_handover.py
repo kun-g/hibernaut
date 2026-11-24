@@ -183,7 +183,7 @@ class ConfiguredDaemonHandoverTests(unittest.IsolatedAsyncioTestCase):
             return conn.getresponse().status
         except ConnectionRefusedError:
             return None
-        except (ConnectionResetError, http.client.RemoteDisconnected) as exc:
+        except (ConnectionResetError, BrokenPipeError, http.client.RemoteDisconnected) as exc:
             # Queued on the old listener just as the reload closed it.
             return repr(exc)
         finally:

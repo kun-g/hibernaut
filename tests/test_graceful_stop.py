@@ -102,6 +102,9 @@ class GatedDaemonCase(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             return conn.execute(sql, params).fetchall()
 
+    def wait_for_drain(self, proc):
+        self.wait_for(lambda: "Stopping: waiting for runs in progress" in self.log_path.read_text(), proc)
+
     def runs(self):
         if not self.run_log.exists():
             return []
@@ -131,7 +134,7 @@ class TestStopWaitsForRunsWithIngressUp(GatedDaemonCase):
         proc = self.daemon()
         blocked_id = self.start_blocked_run(proc)
         proc.send_signal(signal.SIGTERM)
-        time.sleep(0.3)
+        self.wait_for_drain(proc)
         self.assertIsNone(proc.poll())
 
         # (a) Ingress accepts and stores the event; nothing runs it in this process.
@@ -144,7 +147,6 @@ class TestStopWaitsForRunsWithIngressUp(GatedDaemonCase):
         with contextlib.closing(SQLiteDatabase(self.db_path)) as db:
             SQLiteOutboxAdapter(db).enqueue(OTHER, "notice during drain")
         self.wait_for(lambda: self.outbox(OTHER) == [("notice during drain", "sent")], proc)
-        time.sleep(0.3)
         self.assertEqual(self.event_status(other["event_id"]), "pending")
         self.assertNotIn("other-1", self.runs())
         self.assertEqual(self.event_status(blocked_id), "processing")
@@ -170,7 +172,7 @@ class TestStopWaitsForRunsWithIngressUp(GatedDaemonCase):
         proc = self.daemon()
         blocked_id = self.start_blocked_run(proc)
         proc.send_signal(signal.SIGTERM)
-        time.sleep(0.3)
+        self.wait_for_drain(proc)
         self.assertEqual(self.post(OTHER, "other-1")[0], 202)
         self.assertIsNone(proc.poll())
 
@@ -214,10 +216,9 @@ class TestUpdateWaitsForDrain(GatedDaemonCase):
         self.git(origin, "commit", "-qam", "release")
         self.wait_for(lambda: "Draining daemon" in self.log_path.read_text(), proc)
 
-        time.sleep(0.5)
+        self.wait_for_drain(proc)
         status, during = self.post(OTHER, "during-drain")
         self.assertEqual(status, 202)
-        time.sleep(0.3)
         self.assertEqual(self.event_status(during["event_id"]), "pending")
         self.assertEqual(self.event_status(blocked_id), "processing")
         self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), old_head)
@@ -258,7 +259,7 @@ class TestUpdateWaitsForDrain(GatedDaemonCase):
                            "--config", str(self.config), "--outbox-interval", "0.02"], cwd=self.root)
         blocked_id = self.start_blocked_run(proc)
         proc.send_signal(signal.SIGHUP)
-        time.sleep(0.5)
+        self.wait_for_drain(proc)
         self.assertIsNone(proc.poll())
 
         self.gate.touch()
@@ -319,6 +320,14 @@ class TestDaemonRunDrains(unittest.IsolatedAsyncioTestCase):
         self.workdir = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.stop = asyncio.Event()
         self.force = asyncio.Event()
+        self.drained = asyncio.Event()
+        drain = self.daemon.pool.drain
+
+        def observe_drain():
+            drain()
+            self.drained.set()
+
+        self.daemon.pool.drain = observe_drain
         self.serving = asyncio.create_task(self.daemon.run(
             stop_event=self.stop, force_stop_event=self.force, webhook_host="127.0.0.1", webhook_port=self.port,
             timer_interval_seconds=0.05, outbox_interval_seconds=0.02,
@@ -354,12 +363,11 @@ class TestDaemonRunDrains(unittest.IsolatedAsyncioTestCase):
     async def test_stop_waits_for_the_run_and_keeps_ingress_and_delivery(self):
         blocked_id = await self.start_blocked()
         self.stop.set()
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(self.drained.wait(), 10)
         status, other = await self.post(OTHER, "other-1")
         self.assertEqual(status, 202)
         self.daemon.outbox.enqueue(OTHER, "notice")
         await self.wait_for(lambda: self.outbox(OTHER) == [("notice", "sent")])
-        await asyncio.sleep(0.2)
         self.assertFalse(self.serving.done())
         self.assertEqual(self.status(other["event_id"]), "pending")
         self.assertNotIn("other-1", self.executor.started)
@@ -373,7 +381,7 @@ class TestDaemonRunDrains(unittest.IsolatedAsyncioTestCase):
     async def test_force_stop_cancels_the_run_and_leaves_it_pending(self):
         blocked_id = await self.start_blocked()
         self.stop.set()
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(self.drained.wait(), 10)
         self.assertFalse(self.serving.done())
         self.force.set()
         await asyncio.wait_for(self.serving, timeout=5)
@@ -387,7 +395,7 @@ class TestDrainUnderInterruptPolicy(TestDaemonRunDrains):
     async def test_an_event_for_the_draining_inbox_does_not_interrupt_its_run(self):
         blocked_id = await self.start_blocked()
         self.stop.set()
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(self.drained.wait(), 10)
         status, follow_up = await self.post(BLOCKED, "follow-up")
         self.assertEqual(status, 202)
         await asyncio.sleep(0.3)

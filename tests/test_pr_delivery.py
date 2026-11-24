@@ -9,11 +9,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from agent_runtime.adapters.delivery import (
     MERGE_TOOL,
     OPEN_PR_TOOL,
     DeliveryConfig,
+    DeliveryRecord,
     DeliveryRequest,
     PRDelivery,
     bump_version,
@@ -22,6 +24,7 @@ from agent_runtime.adapters.delivery import (
 )
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteDeliveryStore
 from agent_runtime.core.models import DeliveryOutcome, Event, PermissionDecision
+from tests import fake_gh
 from tests.fakes import InMemoryPermission
 
 FAKE_GH = Path(__file__).with_name("fake_gh.py")
@@ -172,6 +175,13 @@ def _repoint_origin(repo: Path, old_bare: Path, new_bare: Path) -> None:
     cfg.write_text(cfg.read_text(encoding="utf-8").replace(str(old_bare), str(new_bare)), encoding="utf-8")
 
 
+class FixtureDelivery(PRDelivery):
+    def _run(self, argv, cwd, *, timeout=300.0):
+        if argv[0] == self.config.gh_command:
+            return fake_gh.run(argv, cwd=cwd, env=self._env)
+        return super()._run(argv, cwd, timeout=timeout)
+
+
 class DeliveryCase(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -180,10 +190,7 @@ class DeliveryCase(unittest.TestCase):
         self._tmpl_seed = tmpl_seed
         self._main_moved = False
         self.bare = self.root / "remote.git"
-        self.seed = self.root / "seed"
         shutil.copytree(tmpl_bare, self.bare)
-        shutil.copytree(tmpl_seed, self.seed)
-        _repoint_origin(self.seed, tmpl_bare, self.bare)
         self.state_file = self.root / "gh-state.json"
         self.state_file.write_text(json.dumps({"bare": str(self.bare)}))
         gh = self.root / "gh"
@@ -200,6 +207,10 @@ class DeliveryCase(unittest.TestCase):
         self.store = SQLiteDeliveryStore(self.db)
         self.env = {**os.environ, "FAKE_GH_STATE": str(self.state_file), "GH_TOKEN": "leak", "GITHUB_TOKEN": "leak"}
         self.sleeps: list[float] = []
+
+    @functools.cached_property
+    def seed(self):
+        return self.clone("seed", None)
 
     def _bare_unchanged(self) -> bool:
         if self._main_moved:
@@ -240,9 +251,9 @@ class DeliveryCase(unittest.TestCase):
         git(self.seed, "push", "-q", "origin", "main")
         self._main_moved = True
 
-    def delivery(self, sleep=None, **overrides):
-        return PRDelivery(dataclasses.replace(self.config, **overrides), self.store, env=self.env,
-                          sleep=sleep or self.sleeps.append)
+    def delivery(self, sleep=None, *, launch_gh=False, **overrides):
+        cls = PRDelivery if launch_gh else FixtureDelivery
+        return cls(dataclasses.replace(self.config, **overrides), self.store, env=self.env, sleep=sleep or self.sleeps.append)
 
     def request(self, workdir, kind="feature", review="pass", work_key=None, title="divide rejects zero", issue=""):
         return DeliveryRequest(work_key=work_key or f"task:{workdir.name}", workdir=workdir, title=title,
@@ -263,11 +274,41 @@ class DeliveryCase(unittest.TestCase):
         return out
 
 
+def rendered_body(*, issue="", repo="", link="refs", followups=(), summary="s", evidence="e"):
+    config = DeliveryConfig(repo=repo, issue_link=link, version_file=VERSION_FILE)
+    request = DeliveryRequest(work_key="task:1", workdir=Path("repo"), title="t", summary=summary,
+                              test_evidence=evidence, change_kind="fix", rationale="r", review="pass",
+                              followups=followups, issue=issue)
+    record = DeliveryRecord(state="pr_open", head_sha="a" * 40, base_sha="b" * 40, version="0.4.1",
+                            base_version="0.4.0", bump="patch", checks=[{"command": "pytest", "exit_code": 0}])
+    return PRDelivery(config, Mock(spec_set=SQLiteDeliveryStore), env={})._body(request, record)
+
+
+class TestPullRequestBody(unittest.TestCase):
+    def test_pr_body_opens_with_the_source_issue_line_for_each_issue_link(self):
+        cases = {
+            ("closes", "o/r#7"): "Closes #7\n\n## Summary",
+            ("refs", "o/r#7"): "Refs #7\n\n## Summary",
+            ("closes", "other/lib#12"): "Closes other/lib#12\n\n## Summary",
+            ("refs", "Other/Lib#12"): "Refs Other/Lib#12\n\n## Summary",
+            ("closes", "O/R#3"): "Closes #3\n\n## Summary",
+            ("none", "o/r#7"): "## Summary",
+            ("closes", ""): "## Summary",
+        }
+        for (link, issue), start in cases.items():
+            with self.subTest(link=link, issue=issue):
+                body = rendered_body(issue=issue, repo="o/r", link=link)
+                self.assertTrue(body.startswith(start), body[:80])
+
+    def test_without_a_configured_repo_the_issue_is_written_in_full(self):
+        self.assertTrue(rendered_body(issue="o/r#7", link="closes").startswith("Closes o/r#7\n\n## Summary"))
+
+
 class TestOpenPullRequest(DeliveryCase):
     def test_merges_latest_main_sets_version_runs_checks_pushes_and_creates_the_pr(self):
         wt = self.task("task-a", {"calc.py": "def divide(a, b):\n    return a / b\n"})
         self.push_main({"README.md": "docs\n"})
-        rec = self.delivery().deliver(self.request(wt), permissions=InMemoryPermission())
+        rec = self.delivery(launch_gh=True).deliver(self.request(wt), permissions=InMemoryPermission())
         self.assertEqual(rec.problem, "")
         self.assertEqual(rec.state, "pr_open")
         self.assertEqual((rec.base_version, rec.bump, rec.version), ("0.4.0", "minor", "0.5.0"))
@@ -302,32 +343,6 @@ class TestOpenPullRequest(DeliveryCase):
         self.assertEqual(self.gh_state()["prs"][0]["edits"], 1)
         self.assertEqual(self.check_log.read_text(), "ran\n")
         self.assertEqual(second.attempts, 2)
-
-    def test_pr_body_opens_with_the_source_issue_line_for_each_issue_link(self):
-        cases = {
-            ("closes", "o/r#7"): "Closes #7\n\n## Summary",
-            ("refs", "o/r#7"): "Refs #7\n\n## Summary",
-            ("closes", "other/lib#12"): "Closes other/lib#12\n\n## Summary",
-            ("refs", "Other/Lib#12"): "Refs Other/Lib#12\n\n## Summary",
-            ("closes", "O/R#3"): "Closes #3\n\n## Summary",
-            ("none", "o/r#7"): "## Summary",
-            ("closes", ""): "## Summary",
-        }
-        for (link, issue), start in cases.items():
-            with self.subTest(link=link, issue=issue):
-                name = f"task-{link}-{issue.replace('/', '-').replace('#', '-') or 'plain'}".lower()
-                wt = self.task(name, {"calc.py": "x = 1\n"})
-                rec = self.delivery(issue_link=link).deliver(self.request(wt, issue=issue),
-                                                             permissions=InMemoryPermission())
-                self.assertEqual(rec.problem, "")
-                pr = next(p for p in self.gh_state()["prs"] if p["head"] == f"hb/{name}")
-                self.assertTrue(pr["body"].startswith(start), pr["body"][:80])
-
-    def test_without_a_configured_repo_the_issue_is_written_in_full(self):
-        wt = self.task("task-a", {"calc.py": "x = 1\n"})
-        self.delivery(repo="", issue_link="closes").deliver(self.request(wt, issue="o/r#7"),
-                                                            permissions=InMemoryPermission())
-        self.assertTrue(self.gh_state()["prs"][0]["body"].startswith("Closes o/r#7\n\n## Summary"))
 
     def test_a_reused_pr_keeps_the_issue_line_when_its_body_is_updated(self):
         wt = self.task("task-a", {"calc.py": "x = 1\n"})
@@ -438,6 +453,63 @@ class TestOpenPullRequest(DeliveryCase):
         self.assertEqual(rec.handback, {})
 
 
+class TestMergePolicy(unittest.TestCase):
+    url = "https://github.example/o/r/pull/1"
+
+    def setUp(self):
+        self.config = DeliveryConfig(repo="o/r", open_pr=True, auto_merge=True)
+        self.delivery = PRDelivery(self.config, Mock(), env={})
+        self.request = DeliveryRequest(work_key="task:1", workdir=Path("repo"), title="t", summary="s", test_evidence="e",
+                                       change_kind="fix", rationale="r", review="pass")
+        self.record = DeliveryRecord(state="pr_open", head_sha="a" * 40, pr_number=1, pr_url=self.url)
+        self.gh = self.enterContext(patch.object(self.delivery, "_gh", side_effect=AssertionError("unexpected gh call")))
+
+    def merge(self, review="pass", permissions=None):
+        self.delivery._merge(dataclasses.replace(self.request, review=review), self.record,
+                             permissions or InMemoryPermission(), frozenset(), lambda: False)
+        return self.delivery.outcome(self.record)
+
+    def test_merge_needs_a_passing_independent_review(self):
+        for review in ("off", "pending"):
+            with self.subTest(review):
+                self.record.notes.clear()
+                self.merge(review)
+                self.assertEqual(self.record.state, "pr_open")
+                self.assertIn(f"needs a passing independent review (review={review})", self.record.notes[0])
+        self.gh.assert_not_called()
+
+    def failed_ci(self):
+        self.gh.side_effect = None
+        self.gh.return_value = subprocess.CompletedProcess([], 1, '[{"name":"gates","state":"FAILURE","bucket":"fail"}]', "")
+        outcome = self.merge()
+        self.assertEqual([call.args[1:3] for call in self.gh.call_args_list], [("pr", "checks")])
+        return outcome
+
+    def test_failed_ci_does_not_merge(self):
+        self.failed_ci()
+        self.assertEqual((self.record.state, self.record.problem), ("pr_open", ""))
+        self.assertIn("not merged: CI failed (gates)", self.record.notes)
+
+    def test_outcome_names_why_an_authorized_merge_did_not_happen(self):
+        self.assertEqual(self.merge("pending"), DeliveryOutcome(
+            state="pr_open", pr_url=self.url, auto_merge=True, hold="review",
+            hold_detail="merging needs a passing independent review (review=pending)"))
+        outcome = self.failed_ci()
+        self.assertEqual((outcome.state, outcome.auto_merge, outcome.hold, outcome.hold_detail, outcome.pr_url),
+                         ("pr_open", True, "ci", "CI failed (gates)", self.url))
+        self.record = dataclasses.replace(self.record, merge_hold="", merge_hold_detail="", notes=[])
+        block = InMemoryPermission({MERGE_TOOL: PermissionDecision("block", "no merges today")})
+        outcome = self.merge(permissions=block)
+        self.assertEqual((outcome.state, outcome.hold, outcome.hold_detail),
+                         ("pr_open", "other", "delivery.merge blocked: no merges today"))
+
+    def test_outcome_has_no_hold_when_merging_is_not_authorized_or_done(self):
+        manual = PRDelivery(dataclasses.replace(self.config, auto_merge=False), Mock(), env={})
+        self.assertEqual(manual.outcome(self.record), DeliveryOutcome(state="pr_open", pr_url=self.url, auto_merge=False))
+        merged = dataclasses.replace(self.record, state="merged")
+        self.assertEqual(self.delivery.outcome(merged), DeliveryOutcome(state="merged", pr_url=self.url, auto_merge=True))
+
+
 class TestMerge(DeliveryCase):
     def merging(self, **overrides):
         return self.delivery(auto_merge=True, **overrides)
@@ -468,64 +540,21 @@ class TestMerge(DeliveryCase):
 
     def test_merge_is_a_separate_grant(self):
         wt = self.task("task-a", {"calc.py": "x = 1\n"})
-        rec = self.delivery(auto_merge=False).deliver(self.request(wt), permissions=InMemoryPermission())
-        self.assertEqual(rec.state, "pr_open")
+        request = self.request(wt)
+        opened = self.delivery(auto_merge=False).deliver(request, permissions=InMemoryPermission())
+        self.assertEqual(opened.state, "pr_open")
         self.assertEqual(self.gh_calls("merge"), [])
+        delivery = self.merging()
         defer = InMemoryPermission({MERGE_TOOL: PermissionDecision("defer", "merge needs a person")})
-        rec = self.merging().deliver(self.request(wt), permissions=defer)
+        rec = delivery.record(request.work_key)
+        delivery._merge(request, rec, defer, frozenset(), lambda: False)
         self.assertEqual((rec.state, rec.approval), ("pr_open", MERGE_TOOL))
         self.assertEqual(self.gh_calls("merge"), [])
-        rec = self.merging().deliver(self.request(wt), permissions=defer, approved=frozenset({MERGE_TOOL}))
+        rec = delivery.record(request.work_key)
+        delivery._merge(request, rec, defer, frozenset({MERGE_TOOL}), lambda: False)
         self.assertEqual(rec.state, "merged")
-
-    def test_merge_needs_a_passing_independent_review(self):
-        for review in ("off", "pending"):
-            wt = self.task(f"task-{review}", {"calc.py": f"x = '{review}'\n"})
-            rec = self.merging().deliver(self.request(wt, review=review), permissions=InMemoryPermission())
-            with self.subTest(review):
-                self.assertEqual(rec.state, "pr_open")
-                self.assertIn(f"needs a passing independent review (review={review})", rec.notes[0])
-        self.assertEqual(self.gh_calls("merge"), [])
-
-    def test_failed_ci_does_not_merge(self):
-        wt = self.task("task-a", {"calc.py": "x = 1\n"})
-        self.set_gh(checks=[{"name": "gates", "state": "FAILURE", "bucket": "fail"}])
-        rec = self.merging().deliver(self.request(wt), permissions=InMemoryPermission())
-        self.assertEqual((rec.state, rec.problem), ("pr_open", ""))
-        self.assertIn("not merged: CI failed (gates)", rec.notes)
-        self.assertEqual(self.gh_calls("merge"), [])
-
-    def test_outcome_names_why_an_authorized_merge_did_not_happen(self):
-        url = "https://github.example/o/r/pull/1"
-        wt = self.task("task-r", {"calc.py": "x = 'r'\n"})
-        rec = self.merging().deliver(self.request(wt, review="pending"), permissions=InMemoryPermission())
-        self.assertEqual(self.merging().outcome(rec), DeliveryOutcome(
-            state="pr_open", pr_url=url, auto_merge=True, hold="review",
-            hold_detail="merging needs a passing independent review (review=pending)"))
-
-        wt = self.task("task-c", {"calc.py": "x = 'c'\n"})
-        self.set_gh(checks=[{"name": "gates", "state": "FAILURE", "bucket": "fail"}])
-        rec = self.merging().deliver(self.request(wt), permissions=InMemoryPermission())
-        outcome = self.merging().outcome(rec)
-        self.assertEqual((outcome.state, outcome.auto_merge, outcome.hold, outcome.hold_detail),
-                         ("pr_open", True, "ci", "CI failed (gates)"))
-        self.assertTrue(outcome.pr_url.startswith("https://github.example/o/r/pull/"))
-
-        wt = self.task("task-b", {"calc.py": "x = 'b'\n"})
-        self.set_gh(checks=[{"name": "gates", "state": "SUCCESS", "bucket": "pass"}])
-        block = InMemoryPermission({MERGE_TOOL: PermissionDecision("block", "no merges today")})
-        outcome = self.merging().outcome(self.merging().deliver(self.request(wt), permissions=block))
-        self.assertEqual((outcome.state, outcome.hold, outcome.hold_detail),
-                         ("pr_open", "other", "delivery.merge blocked: no merges today"))
-
-    def test_outcome_has_no_hold_when_merging_is_not_authorized_or_done(self):
-        wt = self.task("task-a", {"calc.py": "x = 1\n"})
-        rec = self.delivery(auto_merge=False).deliver(self.request(wt), permissions=InMemoryPermission())
-        self.assertEqual(self.delivery(auto_merge=False).outcome(rec), DeliveryOutcome(
-            state="pr_open", pr_url="https://github.example/o/r/pull/1", auto_merge=False))
-        rec = self.merging().deliver(self.request(wt), permissions=InMemoryPermission())
-        self.assertEqual(self.merging().outcome(rec), DeliveryOutcome(
-            state="merged", pr_url="https://github.example/o/r/pull/1", auto_merge=True))
+        (merge,) = self.gh_calls("merge")
+        self.assertEqual(merge[merge.index("--match-head-commit") + 1], opened.head_sha)
 
     def test_ci_timeout_is_recoverable(self):
         wt = self.task("task-a", {"calc.py": "x = 1\n"})
@@ -541,58 +570,83 @@ class TestMerge(DeliveryCase):
     def test_concurrent_prs_from_the_same_base_end_with_distinct_versions(self):
         a = self.task("task-a", {"calc.py": "a = 1\n"})
         b = self.task("task-b", {"other.py": "b = 1\n"})
-        ra = self.delivery().deliver(self.request(a, kind="feature"), permissions=InMemoryPermission())
-        rb = self.delivery().deliver(self.request(b, kind="fix"), permissions=InMemoryPermission())
-        self.assertEqual((ra.version, rb.version), ("0.5.0", "0.4.1"))
-        merged_a = self.merging().deliver(self.request(a, kind="feature"), permissions=InMemoryPermission())
-        self.assertEqual(merged_a.state, "merged")
-        merged_b = self.merging().deliver(self.request(b, kind="fix"), permissions=InMemoryPermission())
-        self.assertEqual((merged_b.state, merged_b.problem), ("merged", ""))
-        self.assertEqual((merged_b.base_version, merged_b.version, merged_b.pr_number), ("0.5.0", "0.5.1", rb.pr_number))
-        self.assertIn("version recomputed from 0.5.0", "\n".join(merged_b.history))
+        qa, qb = self.request(a, kind="feature"), self.request(b, kind="fix")
+        permissions = InMemoryPermission()
+        ra = self.delivery().deliver(qa, permissions=permissions)
+        rb = self.delivery().deliver(qb, permissions=permissions)
+        self.assertEqual((ra.state, rb.state, ra.version, rb.version), ("pr_open", "pr_open", "0.5.0", "0.4.1"))
+        number = rb.pr_number
+        self.merging()._merge(qa, ra, permissions, frozenset(), lambda: False)
+        self.assertEqual(ra.state, "merged")
+        self.merging()._merge(qb, rb, permissions, frozenset(), lambda: False)
+        self.assertEqual((rb.state, rb.problem), ("merged", ""))
+        self.assertEqual((rb.base_version, rb.version, rb.pr_number), ("0.5.0", "0.5.1", number))
+        self.assertIn("version recomputed from 0.5.0", "\n".join(rb.history))
         self.assertIn('"0.5.1"', self.main_file())
         self.assertEqual(self.main_file("other.py"), "b = 1")
         self.assertEqual(self.gh_state()["prs"][1]["title"], "Pkg 0.5.1: divide rejects zero")
 
+    def waiting_for_ci(self):
+        a = self.task("task-a", {VERSION_FILE: '"""pkg"""\n__version__ = "0.5.0"\n', "calc.py": "a = 1\n"})
+        b = self.task("task-b", {VERSION_FILE: '"""pkg"""\n__version__ = "0.4.1"\n', "other.py": "b = 1\n"})
+        gh = self.delivery()._gh
+
+        def open_pr(wt, branch):
+            git(wt, "push", "-q", "origin", branch)
+            return gh(wt, "pr", "create", "--base", "main", "--head", branch, "--title", "Release", "--body", "").stdout.strip()
+
+        a_number = open_pr(a, "hb/task-a").rsplit("/", 1)[1]
+        a_head = git(a, "rev-parse", "HEAD")
+        b_url = open_pr(b, "hb/task-b")
+        head = git(b, "rev-parse", "HEAD")
+        record = DeliveryRecord(state="pr_open", branch="hb/task-b", change_kind="fix", bump="patch", version="0.4.1",
+                                base_sha=git(b, "rev-parse", "origin/main"), base_version="0.4.0", pr_url=b_url,
+                                pr_number=int(b_url.rsplit("/", 1)[1]), head_sha=head, checked_sha=head,
+                                pushed_sha=head, verified_sha=head)
+
+        def merge_a():
+            gh(a, "pr", "merge", a_number, "--squash", "--match-head-commit", a_head)
+
+        return self.request(b, kind="fix"), record, merge_a
+
     def test_main_version_moving_between_ci_and_merge_recomputes_before_merging(self):
-        a = self.task("task-a", {"calc.py": "a = 1\n"})
-        b = self.task("task-b", {"other.py": "b = 1\n"})
-        self.delivery().deliver(self.request(a), permissions=InMemoryPermission())
-        merged_a: list[object] = []
+        request, rb, merge_a = self.waiting_for_ci()
+        seen_heads = []
 
-        def merge_a_while_b_waits(_seconds):
-            if not merged_a:
-                merged_a.append(self.merging().deliver(self.request(a), permissions=InMemoryPermission()))
+        def passed(req, record, cwd, is_interrupted):
+            seen_heads.append(record.head_sha)
+            if len(seen_heads) == 1:
+                merge_a()  # The old head passed CI just before the base changed.
+            return "passed"
 
-        pending = [{"name": "gates", "state": "IN_PROGRESS", "bucket": "pending"}]
-        self.set_gh(checks_sequence=[pending])
-        rb = self.merging(sleep=merge_a_while_b_waits).deliver(self.request(b, kind="fix"),
-                                                             permissions=InMemoryPermission())
-        self.assertEqual(merged_a[0].state, "merged")  # type: ignore[attr-defined]
+        delivery = self.merging()
+        with patch.object(delivery, "_wait_for_ci", side_effect=passed):
+            delivery._merge(request, rb, InMemoryPermission(), frozenset(), lambda: False)
+        self.assertEqual(len(seen_heads), 2)
+        self.assertNotEqual(seen_heads[0], seen_heads[1])
+        self.assertEqual(seen_heads[1], rb.head_sha)
+        self.assertEqual(self.gh_state()["prs"][0]["state"], "MERGED")
         self.assertEqual((rb.state, rb.problem, rb.version), ("merged", "", "0.5.1"))
         self.assertIn('"0.5.1"', self.main_file())
         self.assertEqual(rb.merge_sha, git(self.bare, "rev-parse", "main"))
+        self.assertFalse(any("while waiting for CI" in item for item in rb.history), rb.history)
 
     def test_a_pr_that_conflicts_while_waiting_for_ci_is_prepared_again_without_waiting_for_the_timeout(self):
-        a = self.task("task-a", {"calc.py": "a = 1\n"})
-        b = self.task("task-b", {"other.py": "b = 1\n"})
-        self.delivery().deliver(self.request(a), permissions=InMemoryPermission())
-        merged_a: list[object] = []
-        waits: list[float] = []
+        request, rb, merge_a = self.waiting_for_ci()
 
         def merge_a_while_b_waits(seconds):
-            waits.append(seconds)
-            if not merged_a:
-                merged_a.append(self.merging().deliver(self.request(a), permissions=InMemoryPermission()))
+            self.sleeps.append(seconds)
+            if len(self.sleeps) == 1:
+                merge_a()
 
         pending = [{"name": "gates", "state": "IN_PROGRESS", "bucket": "pending"}]
         # Both PRs set the version: once a merges, b conflicts and GitHub reports no checks for it.
         self.set_gh(checks_sequence=[pending], dirty_blocks_ci=True)
-        rb = self.merging(sleep=merge_a_while_b_waits, ci_timeout_seconds=600).deliver(
-            self.request(b, kind="fix"), permissions=InMemoryPermission())
-        self.assertEqual(merged_a[0].state, "merged")  # type: ignore[attr-defined]
+        delivery = self.merging(sleep=merge_a_while_b_waits, ci_timeout_seconds=600)
+        delivery._merge(request, rb, InMemoryPermission(), frozenset(), lambda: False)
+        self.assertEqual(self.gh_state()["prs"][0]["state"], "MERGED")
         self.assertEqual((rb.state, rb.problem, rb.version), ("merged", "", "0.5.1"))
-        self.assertEqual(len(waits), 1)
+        self.assertEqual(len(self.sleeps), 1)
         self.assertIn("PR #2 conflicts with origin/main while waiting for CI; merging origin/main again",
                       rb.history)
         self.assertIn('"0.5.1"', self.main_file())

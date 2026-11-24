@@ -31,9 +31,7 @@ TOKEN_ENV = "HIBERNAUT_RUNNER_TOKEN"
 
 def raw_config(tmp_path: Path, runner: dict[str, Any] | None, **sections: Any) -> dict[str, Any]:
     repo = tmp_path / "repo"
-    if not repo.exists():
-        _init_repo(repo)
-    command = install_gated_cli(tmp_path / "bin")
+    command = tmp_path / "bin" / "claude"
     raw: dict[str, Any] = {
         "runtime": {
             "db_path": str(tmp_path / "hb.db"), "memory_root": str(tmp_path / "memory"), "max_concurrency": 2,
@@ -56,6 +54,14 @@ def raw_config(tmp_path: Path, runner: dict[str, Any] | None, **sections: Any) -
     if runner is not None:
         raw["runner"] = runner
     return raw
+
+
+def runnable_config(tmp_path: Path, runner: dict[str, Any] | None) -> dict[str, Any]:
+    repo = tmp_path / "repo"
+    if not repo.exists():
+        _init_repo(repo)
+    install_gated_cli(tmp_path / "bin")
+    return raw_config(tmp_path, runner)
 
 
 def in_process(**kw: Any) -> dict[str, Any]:
@@ -174,7 +180,7 @@ def test_allowed_and_blocked_tools_extend_the_default_policy(tmp_path: Path) -> 
 
 
 def test_in_process_runner_executes_a_run_through_the_worker(tmp_path: Path) -> None:
-    daemon = build_daemon_from_config(parse_config(raw_config(tmp_path, in_process())))
+    daemon = build_daemon_from_config(parse_config(runnable_config(tmp_path, in_process())))
 
     async def scenario() -> None:
         async with running(daemon) as sent:
@@ -190,7 +196,7 @@ def test_in_process_runner_executes_a_run_through_the_worker(tmp_path: Path) -> 
 
 
 def test_in_process_deferred_call_suspends_until_the_approval_arrives(tmp_path: Path) -> None:
-    daemon = build_daemon_from_config(parse_config(raw_config(tmp_path, in_process(allow_tools=[]))))
+    daemon = build_daemon_from_config(parse_config(runnable_config(tmp_path, in_process(allow_tools=[]))))
 
     async def scenario() -> None:
         async with running(daemon) as sent:
@@ -284,7 +290,7 @@ def test_relay_that_cannot_listen_fails_the_start(tmp_path: Path, monkeypatch: p
 
 
 def test_a_forced_stop_ends_the_run_before_the_runner_closes(tmp_path: Path) -> None:
-    daemon = build_daemon_from_config(parse_config(raw_config(tmp_path, in_process())))
+    daemon = build_daemon_from_config(parse_config(runnable_config(tmp_path, in_process())))
 
     async def scenario() -> None:
         stop, force = asyncio.Event(), asyncio.Event()
@@ -347,7 +353,7 @@ def test_reload_keeps_the_runner_and_gives_it_the_new_settings(tmp_path: Path, m
     monkeypatch.setattr(main_module, "build_daemon_from_config", record)
     monkeypatch.setattr(f"{__name__}.build_daemon_from_config", record)
     stderr = io.StringIO()
-    raw = raw_config(tmp_path, in_process())
+    raw = runnable_config(tmp_path, in_process())
 
     async def scenario() -> None:
         async with serving(tmp_path, raw, stderr) as write:
@@ -474,7 +480,7 @@ def test_handle_start_and_stop_are_idempotent(tmp_path: Path) -> None:
 
 
 def test_session_of_the_runner_is_not_resumed_by_the_local_executor_once_the_runner_is_off(tmp_path: Path) -> None:
-    daemon = build_daemon_from_config(parse_config(raw_config(tmp_path, in_process())))
+    daemon = build_daemon_from_config(parse_config(runnable_config(tmp_path, in_process())))
 
     async def run_once(target: AlwaysOnDaemon, external_id: str) -> None:
         async with running(target) as sent:
@@ -482,14 +488,14 @@ def test_session_of_the_runner_is_not_resumed_by_the_local_executor_once_the_run
             await until(lambda: [m for m in sent if "all done" in m.content])
 
     asyncio.run(run_once(daemon, "e1"))
-    later = build_daemon_from_config(parse_config(raw_config(tmp_path, None)))
+    later = build_daemon_from_config(parse_config(runnable_config(tmp_path, None)))
     asyncio.run(run_once(later, "e2"))
     assert len(entries(tmp_path, "start")) == 2
     assert "--resume" not in entries(tmp_path, "start")[1]["argv"]
 
 
 def test_event_without_a_session_runs_and_is_resumed_in_its_own_worktree(tmp_path: Path) -> None:
-    daemon = build_daemon_from_config(parse_config(raw_config(tmp_path, in_process(allow_tools=[]))))
+    daemon = build_daemon_from_config(parse_config(runnable_config(tmp_path, in_process(allow_tools=[]))))
 
     async def scenario() -> None:
         async with running(daemon) as sent:

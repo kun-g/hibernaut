@@ -15,7 +15,7 @@ from runner.registry import NoEligibleRunnerError, WorkspaceAffinityStore
 from runner.supervisor import ProcessSupervisor
 from runner.transport.relay_hub import RunnerConnectionLostError, RunnerRelayHub
 from runner.transport.ws_protocol import WSConnectionClosed, WSProtocolError, client_handshake, recv_json, send_json
-from tests.test_runner_safety import PY, _config, _count_drivers, _init_repo, _req
+from tests.test_runner_safety import PY, _config, _count_drivers, _count_started, _hold_count, _init_repo, _req
 
 _ENV_SCRIPT = "import json, os; print(json.dumps({'env': dict(os.environ)}))"
 
@@ -322,6 +322,7 @@ def test_rejected_first_claim_on_a_multi_slot_node_does_not_split_the_workspace(
 import threading  # noqa: E402
 
 from runner.protocol import InterruptRequest, InterruptResult, ReclaimRequest, ReclaimResult, RunResult  # noqa: E402
+from runner.transport import relay_client  # noqa: E402
 from runner.transport.relay_client import RunnerRelayAgent  # noqa: E402
 
 
@@ -380,14 +381,15 @@ def test_daemon_checks_caller_and_workspace_before_reusing_a_run_id(tmp_path: Pa
     other_workspace = dataclasses.replace(original, owner_scope="proj:b", work_key="gh#2")
 
     async def scenario() -> None:
-        running = asyncio.create_task(daemon.run(original, caller_id="hibernaut"))
-        await asyncio.sleep(0.3)
-        # In flight: another workspace (or another caller) may not join this run.
-        joined = await daemon.run(other_workspace, caller_id="hibernaut")
-        assert (joined.status, joined.error_kind) == ("refused", "permission_denied")
-        assert "run_id" in (joined.error_summary or "")
-        stranger = await daemon.run(original, caller_id="workshop")
-        assert (stranger.status, stranger.error_kind) == ("refused", "permission_denied")
+        with _hold_count(counter):
+            running = asyncio.create_task(daemon.run(original, caller_id="hibernaut"))
+            await _count_started(counter)
+            # In flight: another workspace (or another caller) may not join this run.
+            joined = await daemon.run(other_workspace, caller_id="hibernaut")
+            assert (joined.status, joined.error_kind) == ("refused", "permission_denied")
+            assert "run_id" in (joined.error_summary or "")
+            stranger = await daemon.run(original, caller_id="workshop")
+            assert (stranger.status, stranger.error_kind) == ("refused", "permission_denied")
         done = await running
         assert done.status == "succeeded"
         # Finished: same rules, and the original caller still gets the original result.
@@ -420,12 +422,13 @@ def test_hub_refuses_a_run_id_reused_for_another_request(tmp_path: Path) -> None
         await agent.start()
         await agent.wait_connected()
         try:
-            running = asyncio.create_task(hub.run(original))
-            await asyncio.sleep(0.2)
-            with pytest.raises(RunIdConflictError):
-                await asyncio.wait_for(hub.run(conflicting), 2.0)
-            with pytest.raises(RunIdConflictError):
-                await asyncio.wait_for(hub.run(original, caller_id="workshop"), 2.0)
+            with _hold_count(counter):
+                running = asyncio.create_task(hub.run(original))
+                await _count_started(counter)
+                with pytest.raises(RunIdConflictError):
+                    await asyncio.wait_for(hub.run(conflicting), 2.0)
+                with pytest.raises(RunIdConflictError):
+                    await asyncio.wait_for(hub.run(original, caller_id="workshop"), 2.0)
             done = await asyncio.wait_for(running, 15.0)
             with pytest.raises(RunIdConflictError):
                 await asyncio.wait_for(hub.run(conflicting), 2.0)
@@ -609,13 +612,11 @@ def test_readonly_run_removes_its_detached_worktree_when_it_ends(tmp_path: Path)
 
 # ---- review round 12 ----------------------------------------------------------------------------------------------
 
-import os  # noqa: E402
-import signal  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
 
 from runner.config import NamespacePolicy  # noqa: E402
 from runner.transport.in_process import InProcessRunnerClient  # noqa: E402
-from tests.test_runner_safety import _alive, _drivers  # noqa: E402
+from tests.test_runner_safety import _drivers  # noqa: E402
 
 
 def _cwd_drivers() -> dict[str, TemplateCLIDriver]:
@@ -700,6 +701,24 @@ def test_reconnecting_node_reports_a_workspace_it_was_still_creating(tmp_path: P
         return original_resolve(**kwargs)
 
     monkeypatch.setattr(daemon_a.worktrees, "resolve", slow_resolve)
+    announced = []
+    ready_keys = daemon_a.worktrees.list_ready_work_keys
+
+    def advertised_keys():
+        rows = ready_keys()
+        announced.append([row["work_key"] for row in rows])
+        return rows
+
+    monkeypatch.setattr(daemon_a.worktrees, "list_ready_work_keys", advertised_keys)
+    draining = asyncio.Event()
+    cancel_and_wait = relay_client._cancel_and_wait
+
+    async def observe_disconnect(tasks):
+        if tasks:
+            draining.set()
+        await cancel_and_wait(tasks)
+
+    monkeypatch.setattr(relay_client, "_cancel_and_wait", observe_disconnect)
     counter = tmp_path / "count"
 
     def bound() -> str | None:
@@ -708,9 +727,10 @@ def test_reconnecting_node_reports_a_workspace_it_was_still_creating(tmp_path: P
     async def scenario() -> None:
         host, port = await hub.start("127.0.0.1", 0)
         url = f"ws://{host}:{port}/ws/runner"
-        agent_a = RunnerRelayAgent(daemon=daemon_a, hub_url=url, token="tok")
+        agent_a = RunnerRelayAgent(daemon=daemon_a, hub_url=url, token="tok", reconnect_delays=(0.01,))
         await agent_a.start()
         await agent_a.wait_connected()
+        epoch = agent_a.conn_epoch
         agent_b = RunnerRelayAgent(daemon=daemon_b, hub_url=url, token="tok")
         await agent_b.start()
         await agent_b.wait_connected()
@@ -721,13 +741,12 @@ def test_reconnecting_node_reports_a_workspace_it_was_still_creating(tmp_path: P
             hub._drop_connection(hub._conns["a-1"], "network drop")  # pyright: ignore[reportPrivateUsage]
             with pytest.raises(RunnerConnectionLostError):
                 await asyncio.wait_for(first, 5.0)
-            await asyncio.sleep(1.0)
-            # a-1 is still creating gh#5: a hello now must not erase the claim, or the next write goes to b-1.
-            assert bound() == "a-1"
+            await asyncio.wait_for(draining.wait(), 5)
+            assert announced == [[]] and bound() == "a-1"
             go.set()
-            await asyncio.sleep(0.5)
             await agent_a.wait_connected(10.0)
-            assert bound() == "a-1"
+            assert agent_a.conn_epoch > epoch
+            assert announced == [[], ["gh#5"]] and bound() == "a-1"
             second = await asyncio.wait_for(
                 hub.run(_req("run_after_drop", executor_id="count", prompt=str(counter), work_key="gh#5")), 15.0
             )
@@ -760,11 +779,12 @@ def test_daemon_refuses_a_run_id_reused_with_different_execution_fields(tmp_path
     changed = dataclasses.replace(original, **change)
 
     async def scenario() -> None:
-        running = asyncio.create_task(daemon.run(original, caller_id="hibernaut"))
-        await asyncio.sleep(0.3)
-        joined = await daemon.run(changed, caller_id="hibernaut")
-        assert (joined.status, joined.error_kind) == ("refused", "permission_denied")
-        assert "run_id" in (joined.error_summary or "")
+        with _hold_count(counter):
+            running = asyncio.create_task(daemon.run(original, caller_id="hibernaut"))
+            await _count_started(counter)
+            joined = await daemon.run(changed, caller_id="hibernaut")
+            assert (joined.status, joined.error_kind) == ("refused", "permission_denied")
+            assert "run_id" in (joined.error_summary or "")
         done = await running
         assert done.status == "succeeded"
         again = await daemon.run(changed, caller_id="hibernaut")
@@ -796,11 +816,12 @@ def test_hub_refuses_a_run_id_reused_with_a_different_prompt_or_interactive(tmp_
         await agent.start()
         await agent.wait_connected()
         try:
-            running = asyncio.create_task(hub.run(original))
-            await asyncio.sleep(0.2)
-            for variant in variants:
-                with pytest.raises(RunIdConflictError):
-                    await asyncio.wait_for(hub.run(variant), 2.0)
+            with _hold_count(counter):
+                running = asyncio.create_task(hub.run(original))
+                await _count_started(counter)
+                for variant in variants:
+                    with pytest.raises(RunIdConflictError):
+                        await asyncio.wait_for(hub.run(variant), 2.0)
             done = await asyncio.wait_for(running, 15.0)
             for variant in variants:
                 with pytest.raises(RunIdConflictError):
@@ -824,12 +845,13 @@ def test_run_refused_as_workspace_busy_runs_when_retried_after_the_workspace_fre
     counter = tmp_path / "count"
 
     async def scenario() -> None:
-        holder = asyncio.create_task(daemon.run(_req("run_holder", executor_id="count", prompt=str(counter)), caller_id="hibernaut"))
-        await asyncio.sleep(0.3)
-        retried = _req("run_retried", executor_id="count", prompt=str(counter))
-        busy = await daemon.run(retried, caller_id="hibernaut")
-        assert (busy.error_summary or "").startswith("workspace_busy")
-        assert not daemon.knows_run(retried.run_id)
+        with _hold_count(counter):
+            holder = asyncio.create_task(daemon.run(_req("run_holder", executor_id="count", prompt=str(counter)), caller_id="hibernaut"))
+            await _count_started(counter)
+            retried = _req("run_retried", executor_id="count", prompt=str(counter))
+            busy = await daemon.run(retried, caller_id="hibernaut")
+            assert (busy.error_summary or "").startswith("workspace_busy")
+            assert not daemon.knows_run(retried.run_id)
         assert (await holder).status == "succeeded"
         again = await daemon.run(retried, caller_id="hibernaut")
         assert again.status == "succeeded", again.error_summary
@@ -858,10 +880,11 @@ def test_another_caller_cannot_interrupt_or_read_a_run_in_process(tmp_path: Path
     req = _req("run_owned", executor_id="count", prompt=str(counter))
 
     async def scenario() -> None:
-        running = asyncio.create_task(owner.run(req))
-        await asyncio.sleep(0.3)
-        res = await stranger.interrupt(InterruptRequest(run_id=req.run_id, reason="user_cancel"))
-        assert (res.accepted, res.state) == (False, "not_found")
+        with _hold_count(counter):
+            running = asyncio.create_task(owner.run(req))
+            await _count_started(counter)
+            res = await stranger.interrupt(InterruptRequest(run_id=req.run_id, reason="user_cancel"))
+            assert (res.accepted, res.state) == (False, "not_found")
         done = await running
         assert done.status == "succeeded"
         assert daemon.query_run(req.run_id, caller_id="workshop") is None
@@ -888,10 +911,11 @@ def test_another_caller_cannot_interrupt_or_read_a_run_through_the_relay(tmp_pat
         await agent.start()
         await agent.wait_connected()
         try:
-            running = asyncio.create_task(hub.run(req, caller_id="hibernaut"))
-            await asyncio.sleep(0.4)
-            res = await hub.interrupt(InterruptRequest(run_id=req.run_id, reason="user_cancel"), caller_id="workshop")
-            assert (res.accepted, res.state) == (False, "not_found")
+            with _hold_count(counter):
+                running = asyncio.create_task(hub.run(req, caller_id="hibernaut"))
+                await _count_started(counter)
+                res = await hub.interrupt(InterruptRequest(run_id=req.run_id, reason="user_cancel"), caller_id="workshop")
+                assert (res.accepted, res.state) == (False, "not_found")
             done = await asyncio.wait_for(running, 15.0)
             assert done.status == "succeeded"
             assert await hub.query_run("s-1", req.run_id, caller_id="workshop") is None
@@ -907,19 +931,23 @@ def test_another_caller_cannot_interrupt_or_read_a_run_through_the_relay(tmp_pat
         affinity.close()
 
 
-def test_no_process_is_left_when_the_run_log_cannot_be_opened(tmp_path: Path) -> None:
+def test_no_process_is_left_when_the_run_log_cannot_be_opened(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     logs = tmp_path / "logs"
     now = datetime.now(timezone.utc)
     for day in (now, now + timedelta(days=1)):
         (logs / day.strftime("%Y-%m-%d") / "run_nolog.log").mkdir(parents=True)  # opening it for writing fails
-    pid_file = tmp_path / "pid"
     supervisor = ProcessSupervisor(runner_id="r", logs_dir=logs)
+
+    async def unexpected_spawn(*args, **kwargs):
+        pytest.fail("the supervisor started a child before it could open the run log")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_spawn)
 
     async def scenario() -> None:
         with pytest.raises(OSError):
             await supervisor.execute(
                 run_id="run_nolog",
-                argv=[PY, "-c", "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(30)", str(pid_file)],
+                argv=[PY, "-c", "pass"],
                 cwd=tmp_path,
                 env={"PATH": "/usr/bin:/bin"},
                 stdin_text=None,
@@ -928,15 +956,8 @@ def test_no_process_is_left_when_the_run_log_cannot_be_opened(tmp_path: Path) ->
                 cancel_event=asyncio.Event(),
                 grace_seconds=0.5,
             )
-        await asyncio.sleep(1.0)
 
     asyncio.run(scenario())
-    if pid_file.exists():
-        pid = int(pid_file.read_text())
-        alive = _alive(pid)
-        if alive:
-            os.kill(pid, signal.SIGKILL)
-        assert not alive, "the CLI kept running after the run failed"
 
 
 def test_output_line_longer_than_the_stream_limit_is_read_in_full(tmp_path: Path) -> None:

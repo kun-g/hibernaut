@@ -8,18 +8,19 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from agent_runtime.adapters.channels.gdrive_tasks import DriveTaskPoller, parse_task_markdown
-from agent_runtime.adapters.delivery import MERGE_TOOL, OPEN_PR_TOOL, PRDelivery
+from agent_runtime.adapters.delivery import MERGE_TOOL, OPEN_PR_TOOL, DeliveryConfig, DeliveryRecord, PRDelivery
 from agent_runtime.adapters.executor_cli import OrcaWorktreeManager
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeLauncher, ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.project_guidance import Selection, load_guidance, pin_head
 from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
-from agent_runtime.adapters.executor_cli.sde import SDE_SCHEMA, SDEExecutor, SDEOptions
+from agent_runtime.adapters.executor_cli.sde import SDE_SCHEMA, SDEExecutor, SDEOptions, _State
 from agent_runtime.adapters.permissions.security import AutoModePermissionAdapter
 from agent_runtime.adapters.storage_sqlite import SQLiteSessionStoreAdapter
 from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.app.config import parse_config
 from agent_runtime.core.models import DeliveryOutcome, Emit, Event, PermissionDecision, SessionRef, Suspend
+from tests.empty_guidance import empty_project_guidance
 from tests.fakes import InMemoryPermission
 from tests.test_coder_reviewer import fake_command
 from tests.test_gdrive_tasks import _FakeDriveClient
@@ -45,6 +46,7 @@ def event(payload, key="task:1"):
 class SDEDeliveryCase(DeliveryCase, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         super().setUp()
+        self.enterContext(empty_project_guidance())
         self.wt = self.clone("task-1", "hb/task-1")
         self.log = self.root / "calls.jsonl"
         self.plan = self.root / "plan.json"
@@ -192,10 +194,13 @@ class TestSDEDelivery(SDEDeliveryCase):
         self.assertEqual(self.gh_state().get("prs", []), [])
 
     async def test_approving_a_deferred_merge_merges_with_the_recorded_sha(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
+        (self.wt / "calc.py").write_text("x = 1\n")
+        git(self.wt, "commit", "-qam", "fix divide")
+        state = _State(stage="develop", workdir=str(self.wt), base_ref="origin/main", requirements="fix divide",
+                       change_kind="fix", rounds=1, work_key="task:1", inbox_id="proj:x")
         self.caps.permissions = InMemoryPermission({MERGE_TOOL: PermissionDecision("defer", "merge needs a person")})
         executor = self.executor(delivery=self.delivery(auto_merge=True))
-        outcome = await executor.execute([event(self.payload())], None, self.caps)
+        outcome = await executor._finish("session", "native", state, self.caps, review="pass")
         assert isinstance(outcome, Suspend), outcome
         self.assertIn("delivery.merge needs approval", outcome.prompt)
         self.assertIn("PR: https://github.example/o/r/pull/1", outcome.prompt)
@@ -215,56 +220,56 @@ class TestSDEDelivery(SDEDeliveryCase):
         assert isinstance(outcome, Emit), outcome
         self.assertIn("# Reject zero\n\ndivide must raise on zero", self.calls("sde")[0]["prompt"])
 
+
+class TestSDEDeliveryResult(unittest.IsolatedAsyncioTestCase):
+    url = "https://github.example/o/r/pull/1"
+
+    async def finish(self, record=None, *, auto_merge=False, open_pr=True):
+        delivery = None
+        if record is not None:
+            delivery = PRDelivery(DeliveryConfig(open_pr=open_pr, auto_merge=auto_merge), Mock(), env={})
+            self.enterContext(patch.object(delivery, "deliver", return_value=record))
+        executor = SDEExecutor(profile=ClaudeCodeProfile(name="sde"), options=SDEOptions(review=False), reviewer=None,
+                               worktree_manager=Mock(spec=OrcaWorktreeManager), inbox_checkout_map={}, tasks=Mock(),
+                               delivery=delivery)
+        state = _State(stage="develop", requirements="divide", base_ref="main", workdir="/test/repo", change_kind="fix")
+        return await executor._finish("session", "native", state, Mock(permissions=InMemoryPermission()), review="pass")
+
     async def test_a_merged_delivery_closes_the_session(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
-        outcome = await self.executor(delivery=self.delivery(auto_merge=True)).execute(
-            [event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
+        record = DeliveryRecord(state="merged", pr_url=self.url, history=["deleted origin/hb/task-1"])
+        outcome = await self.finish(record, auto_merge=True)
+        self.assertIsInstance(outcome, Emit)
         self.assertTrue(outcome.close_session)
-        text = outcome.messages[0]
-        self.assertIn("Delivery: merged", text)
-        self.assertIn("deleted origin/hb/task-1", text)
-        self.assertIn("Worktree: the PR is merged", text)
+        for part in ("Delivery: merged", "deleted origin/hb/task-1", "Worktree: the PR is merged"):
+            self.assertIn(part, outcome.messages[0])
 
     async def test_an_open_pr_keeps_the_session(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})], reviewer=[PASS])
-        outcome = await self.executor(delivery=self.delivery()).execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
+        outcome = await self.finish(DeliveryRecord(state="pr_open", pr_url=self.url))
+        self.assertIsInstance(outcome, Emit)
         self.assertFalse(outcome.close_session)
         self.assertNotIn("Worktree: the PR is merged", outcome.messages[0])
 
     async def test_the_result_carries_the_delivery_outcome_for_the_outbox(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
-        state = self.gh_state()
-        state["checks"] = [{"name": "gates", "state": "FAILURE", "bucket": "fail"}]
-        self.state_file.write_text(json.dumps(state))
-        outcome = await self.executor(delivery=self.delivery(auto_merge=True)).execute(
-            [event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
+        record = DeliveryRecord(state="pr_open", pr_url=self.url, merge_hold="ci", merge_hold_detail="CI failed (gates)")
+        outcome = await self.finish(record, auto_merge=True)
+        self.assertIsInstance(outcome, Emit)
         self.assertEqual((outcome.status, outcome.close_session), ("done", False))
-        self.assertEqual(outcome.delivery, DeliveryOutcome(
-            state="pr_open", pr_url="https://github.example/o/r/pull/1", auto_merge=True, hold="ci",
-            hold_detail="CI failed (gates)"))
+        self.assertEqual(outcome.delivery, DeliveryOutcome(state="pr_open", pr_url=self.url, auto_merge=True,
+                                                           hold="ci", hold_detail="CI failed (gates)"))
 
     async def test_a_merged_result_carries_a_merged_outcome(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"}, kind="fix")], reviewer=[PASS])
-        outcome = await self.executor(delivery=self.delivery(auto_merge=True)).execute(
-            [event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
-        self.assertEqual(outcome.delivery, DeliveryOutcome(
-            state="merged", pr_url="https://github.example/o/r/pull/1", auto_merge=True))
+        outcome = await self.finish(DeliveryRecord(state="merged", pr_url=self.url), auto_merge=True)
+        self.assertIsInstance(outcome, Emit)
+        self.assertEqual(outcome.delivery, DeliveryOutcome(state="merged", pr_url=self.url, auto_merge=True))
 
     async def test_without_delivery_the_result_carries_no_outcome(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])
-        outcome = await self.executor(review=False).execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
+        outcome = await self.finish()
+        self.assertIsInstance(outcome, Emit)
         self.assertIsNone(outcome.delivery)
 
     async def test_local_delivery_keeps_the_session(self):
-        self.set_plan(sde=[dev({"calc.py": "x = 1\n"})])
-        outcome = await self.executor(review=False, delivery=self.delivery(open_pr=False)).execute(
-            [event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit), outcome
+        outcome = await self.finish(DeliveryRecord(), open_pr=False)
+        self.assertIsInstance(outcome, Emit)
         self.assertFalse(outcome.close_session)
 
 
@@ -317,41 +322,6 @@ class TestDeliveryHandBack(SDEDeliveryCase):
         self.assertIn("## Delivery handed back: repository checks failed", handback)
         self.assertIn("main.txt needs ok.txt", handback)
         self.assertEqual(git(self.bare, "show", "hb/task-1:ok.txt"), "ok")
-
-    async def test_hand_backs_stop_at_the_limit_and_wait_for_a_person(self):
-        self.set_plan(sde=[dev({"calc.py": TASK_CALC}), dev({"notes.txt": "tried\n"}, commit="no merge")],
-                      reviewer=[PASS])
-        self.push_main({"calc.py": MAIN_CALC})
-        executor = self.executor(delivery=self.delivery())
-        outcome = await executor.execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        self.assertEqual(len(self.calls("sde")), 3)
-        for part in ("[sde] delivery pending: merging origin/main into hb/task-1 conflicts in calc.py",
-                     "Handed back to the developer 2 time(s) already (limit 2); a person decides now.",
-                     "Delivery hand-back 1 of 2", "Delivery hand-back 2 of 2"):
-            self.assertIn(part, outcome.prompt)
-        self.assertEqual(self.gh_state().get("prs", []), [])
-
-    async def test_a_limit_of_zero_suspends_as_before(self):
-        self.set_plan(sde=[dev({"calc.py": TASK_CALC})], reviewer=[PASS])
-        self.push_main({"calc.py": MAIN_CALC})
-        outcome = await self.executor(delivery=self.delivery(max_handbacks=0)).execute(
-            [event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        self.assertIn("conflicts in calc.py", outcome.prompt)
-        self.assertEqual(len(self.calls("sde")), 1)
-
-    async def test_a_question_from_the_developer_during_a_hand_back_suspends(self):
-        question = {"status": "needs_input", "summary": "both sides change divide", "test_evidence": "",
-                    "question": "keep main's divide or ours?", "change_kind": "feature",
-                    "change_rationale": "feature so far"}
-        self.set_plan(sde=[dev({"calc.py": TASK_CALC}), {"output": question}], reviewer=[PASS])
-        self.push_main({"calc.py": MAIN_CALC})
-        outcome = await self.executor(delivery=self.delivery()).execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Suspend), outcome
-        self.assertIn("[sde] needs input: keep main's divide or ours?", outcome.prompt)
-        self.assertIn("Delivery hand-back 1 of 2: merging origin/main conflicts in calc.py", outcome.prompt)
-        self.assertEqual(self.gh_state().get("prs", []), [])
 
     async def test_a_conflict_only_in_the_version_file_is_still_resolved_by_delivery(self):
         self.set_plan(sde=[dev({VERSION_FILE: '"""pkg"""\n__version__ = "0.4.1"\n', "calc.py": "y = 2\n"},

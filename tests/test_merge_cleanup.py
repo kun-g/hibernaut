@@ -1,5 +1,5 @@
+import json
 import os
-import subprocess
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
@@ -47,20 +47,29 @@ class TestRemoteBranchDeletion(DeliveryCase):
         self.assertIn("deleted origin/hb/task-a", "\n".join(rec.render()))
         self.assertNotIn("--delete-branch", self.gh_calls("merge")[0])
 
+    def published_task(self):
+        # The task was pushed and the hosting service now reports it merged. Each case owns the real remote ref.
+        branch = "hb/task-a"
+        head = git(self.bare, "rev-parse", "main")
+        git(self.bare, "branch", branch, head)
+        req = self.request(self.seed, work_key="task:task-a")
+        rec = DeliveryRecord(state="pr_open", branch=branch, head_sha=head, pushed_sha=head, verified_sha=head)
+        self.store.save(req.work_key, rec.to_dict())
+        pr = {"head": branch, "number": 1, "url": "https://github.example/o/r/pull/1", "state": "MERGED",
+              "merged_head": head, "merge_sha": head}
+        self.state_file.write_text(json.dumps({**self.gh_state(), "prs": [pr]}))
+        return req
+
     def test_delete_branch_off_keeps_the_remote_branch(self):
-        wt = self.task("task-a", {"calc.py": "x = 1\n"})
-        rec = self.merging(delete_branch=False).deliver(self.request(wt), permissions=InMemoryPermission())
+        rec = self.merging(delete_branch=False).deliver(self.published_task(), permissions=InMemoryPermission())
         self.assertEqual(rec.state, "merged")
         self.assertEqual(self.remote_head("hb/task-a"), rec.head_sha)
         self.assertNotIn("deleted origin/hb/task-a", "\n".join(rec.render()))
 
     def test_a_branch_already_gone_counts_as_deleted(self):
-        wt = self.task("task-a", {"calc.py": "x = 1\n"})
-        rec = self.delivery().deliver(self.request(wt), permissions=InMemoryPermission())
-        subprocess.run([str(self.root / "gh"), "pr", "merge", "1", "--squash", "--match-head-commit", rec.head_sha],
-                       env=self.env, check=True, capture_output=True)
+        req = self.published_task()
         git(self.bare, "branch", "-D", "hb/task-a")
-        again = self.delivery().deliver(self.request(wt), permissions=InMemoryPermission())
+        again = self.delivery().deliver(req, permissions=InMemoryPermission())
         self.assertEqual((again.state, again.problem, again.notes), ("merged", "", []))
         self.assertIn("origin/hb/task-a was already deleted", "\n".join(again.render()))
 
@@ -69,8 +78,7 @@ class TestRemoteBranchDeletion(DeliveryCase):
         hook.write_text(f'#!/bin/sh\nwhile read old new ref; do [ "$new" = "{ZERO}" ] && '
                         '{ echo "deletion refused by policy" >&2; exit 1; }; done\nexit 0\n')
         hook.chmod(0o755)
-        wt = self.task("task-a", {"calc.py": "x = 1\n"})
-        rec = self.merging().deliver(self.request(wt), permissions=InMemoryPermission())
+        rec = self.merging().deliver(self.published_task(), permissions=InMemoryPermission())
         self.assertEqual((rec.state, rec.problem), ("merged", ""))
         self.assertEqual(self.remote_head("hb/task-a"), rec.head_sha)
         text = "\n".join(rec.render())
@@ -78,20 +86,12 @@ class TestRemoteBranchDeletion(DeliveryCase):
         self.assertIn("deletion refused by policy", text)
 
     def test_a_branch_that_moved_after_the_merge_is_kept(self):
-        wt = self.task("task-a", {"calc.py": "x = 1\n"})
-        rec = self.delivery().deliver(self.request(wt), permissions=InMemoryPermission())
-        subprocess.run([str(self.root / "gh"), "pr", "merge", "1", "--squash", "--match-head-commit", rec.head_sha],
-                       env=self.env, check=True, capture_output=True)
-        other = self.clone("other", None)
-        git(other, "fetch", "-q", "origin", "hb/task-a")
-        git(other, "checkout", "-qb", "hb/task-a", "FETCH_HEAD")
-        (other / "late.py").write_text("late = 1\n")
-        git(other, "add", "-A")
-        git(other, "commit", "-qm", "late")
-        git(other, "push", "-q", "origin", "hb/task-a")
-        again = self.delivery().deliver(self.request(wt), permissions=InMemoryPermission())
+        req = self.published_task()
+        git(self.seed, "commit", "-q", "--allow-empty", "-m", "late")
+        git(self.seed, "push", "-q", "origin", "HEAD:refs/heads/hb/task-a")
+        again = self.delivery().deliver(req, permissions=InMemoryPermission())
         self.assertEqual(again.state, "merged")
-        self.assertEqual(self.remote_head("hb/task-a"), git(other, "rev-parse", "HEAD"))
+        self.assertEqual(self.remote_head("hb/task-a"), git(self.seed, "rev-parse", "HEAD"))
         self.assertIn("branch kept: origin/hb/task-a is at", "\n".join(again.notes))
 
     def test_unmerged_or_local_delivery_keeps_the_branch(self):
@@ -118,9 +118,7 @@ class TestRemoteBranchDeletion(DeliveryCase):
 
 class TestReclaimDeletesTheMergedBranch(ReclaimCase, unittest.TestCase):
     def merged_and_pruned(self):
-        head = self.commit()
-        git(self.wt, "push", "-q", "origin", "hb/task-9")
-        merge = self.squash_merge()
+        head, merge = self.squashed_task()
         self.merged_pr(head, merge)
         return head
 
@@ -292,9 +290,7 @@ class TestMergedTaskReclaimEndToEnd(ReclaimCase, unittest.IsolatedAsyncioTestCas
         self.cfg = parse_delivery("d", {"open_pr": True, "auto_merge": True}, repo="o/r")
 
     def merged_record(self):
-        head = self.commit()
-        git(self.wt, "push", "-q", "origin", "hb/task-9")
-        merge = self.squash_merge()
+        head, merge = self.squashed_task()
         self.merged_pr(head, merge)
         self.deliveries.save("task:9", DeliveryRecord(state="merged", branch="hb/task-9", pushed_sha=head,
                                                       verified_sha=head, merge_sha=merge).to_dict())

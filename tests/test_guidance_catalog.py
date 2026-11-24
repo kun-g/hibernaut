@@ -19,13 +19,14 @@ from agent_runtime.adapters.executor_cli.project_guidance import (
     matches,
     pin_head,
 )
-from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor
+from agent_runtime.adapters.executor_cli.reviewer import CoderReviewerExecutor, ReviewRequest, review_inputs, review_prompt
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor, SDEOptions
 from agent_runtime.adapters.storage_sqlite import SQLiteDatabase, SQLiteSessionStoreAdapter
 from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.core.models import Emit, Event, SessionRef, Suspend
 from tests.fakes import InMemoryPermission
+from tests.review_flow_support import DONE, ReviewFlowCase
 from tests.test_coder_reviewer import fake_command, git
 
 GENERAL = "# rules\nGENERAL-RULE: run `make check` before committing.\nDetailed rules: guidance.toml.\n"
@@ -57,7 +58,6 @@ BODIES = ("VERSIONING-BODY", "TESTING-BODY", "ISSUES-BODY")
 EVIDENCE = "red: test_zero FAILED\ngreen: 1 passed"
 PASS = {"verdict": "pass", "summary": "ok", "blocking": []}
 VERSION_BUMP = {"VERSION": "1.1.0\n", "src/pkg/__init__.py": "__version__ = '1.1.0'\n"}
-NEW_TEST = {"tests/test_calc.py": "def test_divide_rejects_zero():\n    pass\n"}
 CITES_VERSIONING = {
     "verdict": "changes_requested",
     "summary": "version bumped in one place only",
@@ -224,9 +224,15 @@ class _Harness(unittest.IsolatedAsyncioTestCase):
         self.caps.is_interrupted.return_value = False
         self.caps.memory.load_baseline.return_value = {}
         self.launcher = ClaudeCodeLauncher(name="fake", command=fake_command(self.root))
-        self.repo = make_project(self.root)
-        git(self.repo, "checkout", "-qb", "hb/task-1")
+        # The reviewer only returns scripted text here. Guidance pins and changed paths still come from Git.
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.reviewer.worktree_fingerprint", return_value="head:tree"))
+        self.repo = self.task_repo()
         self.start = head(self.repo)
+
+    def task_repo(self):
+        repo = make_project(self.root)
+        git(repo, "checkout", "-qb", "hb/task-1")
+        return repo
 
     def set_plan(self, sde=(), reviewer=()):
         for name in ("sde", "reviewer"):
@@ -240,6 +246,11 @@ class _Harness(unittest.IsolatedAsyncioTestCase):
     def reviewer(self):
         return CoderReviewerExecutor(profile=ClaudeCodeProfile(name="coder-reviewer", launcher=self.launcher),
                                      workspaces=self.workspaces, tasks=self.tasks)
+
+    async def independent_prompt(self, payload):
+        request = self.reviewer()._review_input([event(payload, correlation_key="review:task:1")], None)
+        diff, guidance = await review_inputs(request)
+        return review_prompt(request, guidance, diff)
 
     def sde(self, review=True):
         return SDEExecutor(
@@ -279,29 +290,35 @@ class TestDevelopmentAndBuiltInReview(_Harness):
         self.assertEqual((record.guidance_commit, record.workdir, record.activities, record.tags),
                          (self.start, str(self.repo), ("versioning",), ("tests",)))
 
+    async def guidance_prompts(self, paths, **extra):
+        executor = self.sde()
+        events = [event(self.payload(**extra))]
+        state = await executor._new_state(events, events, None)
+        developer = await executor._first_prompt(state, self.caps)
+        pin, selection = executor._guidance_inputs(state)
+        request = ReviewRequest(workdir=self.repo, requirements=state.requirements, test_evidence=EVIDENCE,
+                                base_ref=state.base_ref, pin=pin, selection=selection)
+        with patch("agent_runtime.adapters.executor_cli.reviewer._collect_diff", return_value=("diff", paths)):
+            diff, guidance = await review_inputs(request)
+        return developer, review_prompt(request, guidance, diff)
+
     async def test_pure_test_task_selects_by_issue_label(self):
-        self.set_plan(sde=[dev(NEW_TEST)], reviewer=[PASS])
-        await self.run_sde(labels=[{"name": "tests"}, {"name": "good first issue"}])
-        dev_call, review_call = self.calls()
-        self.assertEqual(bodies(dev_call["prompt"]), {"TESTING-BODY"})
-        self.assertIn('Selected because: tag "tests"', dev_call["prompt"])
-        self.assertEqual(bodies(section(review_call["prompt"])), {"TESTING-BODY"})
+        developer, reviewer = await self.guidance_prompts(["tests/test_calc.py"], labels=[{"name": "tests"}, {"name": "good first issue"}])
+        self.assertEqual(bodies(developer), {"TESTING-BODY"})
+        self.assertEqual(bodies(section(reviewer)), {"TESTING-BODY"})
 
     async def test_diff_adds_guidance_the_developer_was_not_given(self):
-        self.set_plan(sde=[dev({**NEW_TEST, "VERSION": "2.0.0\n"})], reviewer=[PASS])
-        await self.run_sde(tags=["tests"])
-        dev_call, review_call = self.calls()
-        self.assertEqual(bodies(dev_call["prompt"]), {"TESTING-BODY"})
-        self.assertEqual(bodies(section(review_call["prompt"])), {"TESTING-BODY", "VERSIONING-BODY"})
-        self.assertIn("Selected because: diff touches VERSION", review_call["prompt"])
+        developer, reviewer = await self.guidance_prompts(["tests/test_calc.py", "VERSION"], tags=["tests"])
+        self.assertEqual(bodies(developer), {"TESTING-BODY"})
+        self.assertEqual(bodies(section(reviewer)), {"TESTING-BODY", "VERSIONING-BODY"})
+        self.assertIn("Selected because: diff touches VERSION", reviewer)
 
     async def test_unmatched_task_gets_general_rules_and_catalog_only(self):
-        self.set_plan(sde=[dev({"calc.py": "def divide(a, b):\n    return a / b\n"})], reviewer=[PASS])
-        await self.run_sde()
-        for call in self.calls():
-            self.assertIn("GENERAL-RULE", call["prompt"])
-            self.assertIn("- docs/testing.md: Writing tests", call["prompt"])
-            self.assertEqual(bodies(section(call["prompt"])), set())
+        prompts = await self.guidance_prompts(["calc.py"])
+        for prompt in prompts:
+            self.assertIn("GENERAL-RULE", prompt)
+            self.assertIn("- docs/testing.md: Writing tests", prompt)
+            self.assertEqual(bodies(section(prompt)), set())
 
     async def test_committed_and_uncommitted_guidance_edits_never_change_the_pinned_version(self):
         # Uncommitted guidance in the worktree when the task starts is not part of the task's guidance.
@@ -336,23 +353,6 @@ class TestDevelopmentAndBuiltInReview(_Harness):
             self.assertIn(f"Source: {self.start}:AGENTS.md", guidance)
             self.assertIn(f"Pinned to commit {self.start}", guidance)
 
-    async def test_rework_round_resends_cited_guidance_once_with_its_clause(self):
-        # Pure test task; the diff touches VERSION, the reviewer cites the versioning document.
-        self.set_plan(sde=[dev({**NEW_TEST, "VERSION": "2.0.0\n"}), dev(), dev(VERSION_BUMP)],
-                      reviewer=[CITES_VERSIONING, CITES_VERSIONING, PASS])
-        outcome = await self.run_sde(tags=["tests"])
-        self.assertIn("review=pass after 3 round(s)", outcome.messages[0])
-        first, fix1, fix2 = self.calls("sde")
-        self.assertEqual(bodies(first["prompt"]), {"TESTING-BODY"})
-        self.assertIn("Guidance: docs/versioning.md", fix1["prompt"])
-        self.assertIn('Clause: "bump VERSION and src/pkg/__init__.py in the same commit"', fix1["prompt"])
-        self.assertIn("VERSIONING-BODY", fix1["prompt"])
-        self.assertIn(f"Source: {self.start}:docs/versioning.md", fix1["prompt"])
-        self.assertIn("Selected because: cited by blocking item 1", fix1["prompt"])
-        # The developer session already holds it: the next round cites it again without resending the body.
-        self.assertIn("Guidance: docs/versioning.md", fix2["prompt"])
-        self.assertNotIn("VERSIONING-BODY", fix2["prompt"])
-
     async def test_resumed_review_retry_keeps_the_pinned_commit(self):
         self.set_plan(sde=[dev(VERSION_BUMP)], reviewer=[{"error": "reviewer crashed"}, PASS])
         executor = self.sde()
@@ -371,18 +371,44 @@ class TestDevelopmentAndBuiltInReview(_Harness):
         self.assertIn(f"Source: {self.start}:docs/versioning.md", last)
 
     async def test_a_later_task_on_the_same_work_key_reuses_the_recorded_commit(self):
-        self.set_plan(sde=[dev(VERSION_BUMP, commit="bump")], reviewer=[PASS])
-        await self.run_sde(review=False, activities=["versioning"])
+        executor = self.sde(review=False)
+        first_events = [event(self.payload(activities=["versioning"]))]
+        await executor._new_state(first_events, first_events, None)
         (self.repo / "docs/versioning.md").write_text("LATER-VERSIONING\n")
         git(self.repo, "commit", "-qam", "later guidance")
-        self.set_plan(sde=[dev()])
-        await self.run_sde(review=False, activities=["release"])
-        second = self.calls("sde")[-1]["prompt"]
+        next_events = [event(self.payload(activities=["release"]))]
+        state = await executor._new_state(next_events, next_events, None)
+        second = await executor._first_prompt(state, self.caps)
         self.assertIn("VERSIONING-BODY", second)
         self.assertNotIn("LATER-VERSIONING", second)
         record = self.tasks.get("task:1")
         assert record is not None
         self.assertEqual((record.guidance_commit, record.activities), (self.start, ("release",)))
+
+
+class TestCitedGuidance(ReviewFlowCase):
+    async def test_rework_round_resends_cited_guidance_once_with_its_clause(self):
+        repo = make_project(Path(self.enterContext(tempfile.TemporaryDirectory())))
+        pin = pin_head(repo, origin="task start")
+        self.state.workdir = str(repo)
+        self.state.project = {**pin.to_dict(), "tags": ["tests"]}
+        self.executor._delivery = None
+        self.caps.memory.load_baseline.return_value = {}
+        first = await self.executor._first_prompt(self.state, self.caps)
+        outcome = await self.run_flow(snapshots=["changed", "fix1", "fix2"],
+                                      diffs={("changed", "fix1"): ("", []), ("fix1", "fix2"): ("bump", list(VERSION_BUMP))},
+                                      reviews=[CITES_VERSIONING, CITES_VERSIONING, PASS], deliveries=[DONE], prompt=first)
+        self.assertIn("review=pass after 3 round(s)", outcome.messages[0])
+        first, fix1, fix2 = (c.args[3] for c in self.develop.await_args_list)
+        self.assertEqual(bodies(first), {"TESTING-BODY"})
+        self.assertIn("Guidance: docs/versioning.md", fix1)
+        self.assertIn('Clause: "bump VERSION and src/pkg/__init__.py in the same commit"', fix1)
+        self.assertIn("VERSIONING-BODY", fix1)
+        self.assertIn(f"Source: {pin.commit}:docs/versioning.md", fix1)
+        self.assertIn("Selected because: cited by blocking item 1", fix1)
+        # The developer session already holds it: the next round cites it again without resending the body.
+        self.assertIn("Guidance: docs/versioning.md", fix2)
+        self.assertNotIn("VERSIONING-BODY", fix2)
 
 
 class TestIndependentReview(_Harness):
@@ -416,29 +442,25 @@ class TestIndependentReview(_Harness):
         (self.repo / "VERSION").write_text("9.9.9\n")
         git(self.repo, "commit", "-qam", "change under review rewrites the rules")
         (self.repo / "docs/versioning.md").write_text("RELAXED-UNCOMMITTED\n")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo)))
+        prompt = await self.independent_prompt(self.review_payload(explicit_workdir=str(self.repo)))
         base = subprocess.run(["git", "merge-base", "main", "HEAD"], cwd=self.repo, capture_output=True,
                               text=True, check=True).stdout.strip()
         self.assertEqual(base, self.start)
-        self.assertIn(f"Pinned to commit {base} (merge base of main and HEAD", call["prompt"])
-        self.assertIn(f"Source: {base}:AGENTS.md", call["prompt"])
-        # Verifiable: the quoted body is exactly what `git show <base>:AGENTS.md` prints.
+        self.assertIn(f"Pinned to commit {base} (merge base of main and HEAD", prompt)
+        self.assertIn(f"Source: {base}:AGENTS.md", prompt)
         shown = subprocess.run(["git", "show", f"{base}:AGENTS.md"], cwd=self.repo, capture_output=True,
                                text=True, check=True).stdout.strip()
-        self.assertIn(f"----- begin AGENTS.md -----\n{shown}\n----- end AGENTS.md -----", call["prompt"])
-        self.assertIn("GENERAL-RULE", section(call["prompt"]))
-        self.assertNotIn("RELAXED", section(call["prompt"]))
-        self.assertEqual(bodies(section(call["prompt"])), {"VERSIONING-BODY"})
-        self.assertIn("Selected because: diff touches VERSION", call["prompt"])
+        self.assertIn(f"----- begin AGENTS.md -----\n{shown}\n----- end AGENTS.md -----", prompt)
+        self.assertIn("GENERAL-RULE", section(prompt))
+        self.assertNotIn("RELAXED", section(prompt))
+        self.assertEqual(bodies(section(prompt)), {"VERSIONING-BODY"})
+        self.assertIn("Selected because: diff touches VERSION", prompt)
 
     async def test_independent_review_takes_its_own_activities_and_labels(self):
         (self.repo / "calc.py").write_text("def divide(a, b):\n    return a / b\n")
         git(self.repo, "commit", "-qam", "divide")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo),
-                                                        labels=["issue"]))
-        self.assertEqual(bodies(section(call["prompt"])), {"ISSUES-BODY"})
+        prompt = await self.independent_prompt(self.review_payload(explicit_workdir=str(self.repo), labels=["issue"]))
+        self.assertEqual(bodies(section(prompt)), {"ISSUES-BODY"})
 
     async def test_blocking_item_citing_guidance_needs_a_clause(self):
         bad = json.loads(json.dumps(CITES_VERSIONING))
@@ -451,66 +473,67 @@ class TestIndependentReview(_Harness):
 
 
 class TestNonAsciiDiffPaths(_Harness):
-    review_payload = TestIndependentReview.review_payload
-    review = TestIndependentReview.review
 
     # git quotes non-ASCII paths ("\\347\\211\\210...") unless asked for raw output; matching must see real names.
     CN_DOC = "docs/规范/版本.md"
     CN_BODY = "CN-VERSION-BODY: 改版本时同步更新 版本/当前.txt。"
 
-    def setUp(self):
-        super().setUp()
-        git(self.repo, "checkout", "-q", "main")
-        (self.repo / "docs/规范").mkdir(parents=True)
-        (self.repo / self.CN_DOC).write_text(self.CN_BODY + "\n", encoding="utf-8")
-        (self.repo / "版本").mkdir()
-        (self.repo / "版本/当前.txt").write_text("1.0.0\n", encoding="utf-8")
-        catalog = (self.repo / "guidance.toml").read_text(encoding="utf-8") + (
-            '\n[[docs]]\npath = "docs/规范/版本.md"\nsummary = "中文版本规范"\n'
-            'paths = ["版本/*.txt", "docs/规范/版本.md"]\n'
-        )
-        (self.repo / "guidance.toml").write_text(catalog, encoding="utf-8")
-        git(self.repo, "add", "-A")
-        git(self.repo, "commit", "-qm", "中文规范")
-        git(self.repo, "checkout", "-qb", "hb/task-cn")
-        self.base = head(self.repo)
-        quoted = subprocess.run(["git", "ls-files", "版本"], cwd=self.repo, capture_output=True,
-                                text=True, check=True).stdout
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        repo = make_project(Path(cls.enterClassContext(tempfile.TemporaryDirectory())))
+        (repo / "docs/规范").mkdir(parents=True)
+        (repo / cls.CN_DOC).write_text(cls.CN_BODY + "\n", encoding="utf-8")
+        (repo / "版本").mkdir()
+        (repo / "版本/当前.txt").write_text("1.0.0\n", encoding="utf-8")
+        with (repo / "guidance.toml").open("a", encoding="utf-8") as catalog:
+            catalog.write('\n[[docs]]\npath = "docs/规范/版本.md"\nsummary = "中文版本规范"\n'
+                          'paths = ["版本/*.txt", "docs/规范/版本.md"]\n')
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "中文规范")
+        git(repo, "checkout", "-qb", "hb/task-cn")
+        cls.template = repo
+
+    def task_repo(self):
+        repo = shutil.copytree(self.template, self.root / "proj")
         # Precondition: this git quotes the path, so the regression is real on this machine.
+        quoted = subprocess.run(["git", "ls-files", "版本"], cwd=repo, capture_output=True, text=True, check=True).stdout
         self.assertIn('"', quoted)
+        return repo
 
     def assert_cn_selected(self, call, touched):
         guidance = section(call["prompt"])
         self.assertIn(f"Selected because: diff touches {touched}", guidance)
         self.assertIn(f"### Selected guidance: {self.CN_DOC}", guidance)
-        self.assertIn(f"Source: {self.base}:{self.CN_DOC}", guidance)
+        self.assertIn(f"Source: {self.start}:{self.CN_DOC}", guidance)
         self.assertIn(self.CN_BODY, guidance)
+
+    async def explicit_review(self):
+        prompt = await self.independent_prompt({"executor_id": "coder-reviewer", "text": "the task", "base_ref": "main",
+                                                "explicit_workdir": str(self.repo)})
+        return {"prompt": prompt}
 
     async def test_tracked_chinese_paths_select_their_guidance(self):
         (self.repo / "版本/当前.txt").write_text("1.1.0\n", encoding="utf-8")
         git(self.repo, "commit", "-qam", "bump")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo)))
+        call = await self.explicit_review()
         self.assert_cn_selected(call, "版本/当前.txt")
 
     async def test_tracked_edit_of_the_chinese_guidance_document_selects_its_pinned_body(self):
         (self.repo / self.CN_DOC).write_text("RELAXED-CN\n", encoding="utf-8")
         git(self.repo, "commit", "-qam", "relax")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo)))
+        call = await self.explicit_review()
         self.assert_cn_selected(call, self.CN_DOC)
         self.assertNotIn("RELAXED-CN", section(call["prompt"]))
 
     async def test_uncommitted_chinese_edit_selects_its_guidance(self):
         (self.repo / "版本/当前.txt").write_text("2.0.0\n", encoding="utf-8")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo)))
+        call = await self.explicit_review()
         self.assert_cn_selected(call, "版本/当前.txt")
 
     async def test_untracked_chinese_file_selects_its_guidance(self):
         (self.repo / "版本/新增说明.txt").write_text("new\n", encoding="utf-8")
-        self.set_plan(reviewer=[PASS])
-        _, call = await self.review(self.review_payload(explicit_workdir=str(self.repo)))
+        call = await self.explicit_review()
         self.assert_cn_selected(call, "版本/新增说明.txt")
 
     async def test_sde_built_in_review_matches_chinese_paths(self):

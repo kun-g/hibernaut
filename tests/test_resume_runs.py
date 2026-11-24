@@ -604,9 +604,15 @@ class TestSDEResumesAfterRestart(PeerCase):
 
     async def stop_when(self, worker: AgentWorker, runs: SQLiteOpenRunStore, phase: str) -> None:
         running = asyncio.create_task(worker.process_inbox(INBOX))
-        await until(lambda: (s := self.saved_state(runs)) and s["phase"] == phase and s["turn"] and s["turn"]["sent"],
-                    what=f"the {phase} turn")
-        await asyncio.sleep(0.1)
+        def sent_handle():
+            state = self.saved_state(runs)
+            if state and state["phase"] == phase and state["turn"] and state["turn"]["sent"]:
+                return state["turn"]["handle"]
+            return None
+
+        handle = await until(sent_handle, what=f"the {phase} turn")
+        peer = self.orca.terminals[handle]["session"]
+        await asyncio.to_thread(peer.wait_received, 1)
         worker.detach()
         self.assertEqual(await asyncio.wait_for(running, 5), [])
 

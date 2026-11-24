@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
@@ -8,7 +9,9 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+from functools import cache
 from pathlib import Path
 
 from runner.protocol_check import PROTOCOL_FILES
@@ -24,16 +27,24 @@ def git(*args: str, cwd: Path) -> str:
     ).stdout.strip()
 
 
-def protocol_repo(repo: Path) -> str:
-    # A repository holding this checkout's five protocol files; returns the commit.
-    repo.mkdir(parents=True)
+@cache
+def _protocol_seed() -> tuple[Path, str]:
+    tmp = tempfile.TemporaryDirectory(prefix="runner_protocol_seed_")
+    atexit.register(tmp.cleanup)
+    repo = Path(tmp.name)
     git("init", "-q", "-b", "main", cwd=repo)
     git("config", "user.email", "test@example.com", cwd=repo)
     git("config", "user.name", "Test", cwd=repo)
     for path in PROTOCOL_FILES:
         (repo / path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / path, repo / path)
-    return commit(repo, "protocol files")
+    return repo, commit(repo, "protocol files")
+
+
+def protocol_repo(repo: Path) -> str:
+    seed, head = _protocol_seed()
+    shutil.copytree(seed, repo, symlinks=True)
+    return head
 
 
 def commit(repo: Path, message: str) -> str:
@@ -78,17 +89,19 @@ def runner_toml(path: Path, *, repo: Path, port: int, token_file: Path, runner_i
     return path
 
 
-def start_service(config: Path, log: Path) -> subprocess.Popen[bytes]:
+def start_service(config: Path, log: Path, *, entry: tuple[str, ...] = ("-m", "runner.service")) -> subprocess.Popen[bytes]:
+    # A restarted service appends to the same log. Wait for the new process to publish its own ready line.
+    previous = log.stat().st_size if log.exists() else 0
     with log.open("ab") as stream:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "runner.service", "--config", str(config)],
+            [sys.executable, *entry, "--config", str(config)],
             cwd=config.parent,
             env={**os.environ, "PYTHONPATH": str(SRC), "GH_TOKEN": "synthetic-service-token"},
             stdout=stream,
             stderr=stream,
         )
     deadline = time.monotonic() + 20
-    while " serving " not in log.read_text(encoding="utf-8"):
+    while b" serving " not in log.read_bytes()[previous:]:
         assert proc.poll() is None and time.monotonic() < deadline, log.read_text(encoding="utf-8")
         time.sleep(0.05)
     return proc

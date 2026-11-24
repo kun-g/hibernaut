@@ -24,7 +24,9 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     child_env,
     harness_args,
 )
+from agent_runtime.adapters.executor_cli.project_guidance import GuidancePin
 from agent_runtime.adapters.executor_cli.reviewer import (
+    ReviewRequest,
     CoderReviewerExecutor,
     worktree_fingerprint,
 )
@@ -230,10 +232,9 @@ class TestReviewerProfile(unittest.TestCase):
             daemon.close()
 
 
-class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
+class ReviewerCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.repo = make_repo(self.root)
         self.log = self.root / "calls.jsonl"
         self.env = self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log)}))
         self.db = SQLiteDatabase(":memory:")
@@ -261,6 +262,12 @@ class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
             **extra,
         }
 
+
+class TestCoderReviewerExecutor(ReviewerCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = make_repo(self.root)
+
     async def test_pass_review_sends_all_three_inputs_with_configured_settings(self):
         outcome = await self.executor().execute([event(self.payload())], None, self.caps)
         self.assertIsInstance(outcome, Emit)
@@ -276,6 +283,97 @@ class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(Path(call["cwd"]).resolve(), self.repo.resolve())
         for evidence in ("divide must reject zero", "pytest: 3 passed", "+    return a / b", "notes.txt"):
             self.assertIn(evidence, call["prompt"])
+
+    async def test_review_that_changes_the_worktree_is_discarded(self):
+        before = worktree_fingerprint(self.repo)
+        with patch.dict(os.environ, {"FAKE_TOUCH": str(self.repo / "calc.py")}):
+            outcome = await self.executor().execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit)
+        self.assertIn("working tree", outcome.messages[0])
+        self.assertIn("findings discarded", outcome.messages[0])
+        self.assertNotEqual(worktree_fingerprint(self.repo), before)
+
+    async def test_fingerprint_tracks_untracked_edits_and_leaves_the_real_index_alone(self):
+        def staged():
+            return subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=self.repo,
+                                  capture_output=True, text=True, check=True).stdout
+
+        before = worktree_fingerprint(self.repo)
+        self.assertEqual(worktree_fingerprint(self.repo), before)
+        self.assertEqual(staged(), "")
+        (self.repo / "notes.txt").write_text("changed\n")
+        self.assertNotEqual(worktree_fingerprint(self.repo), before)
+        self.assertEqual(staged(), "")
+
+    async def test_fingerprint_sees_a_same_size_edit_whose_stat_still_matches_the_index(self):
+        # Regression: the scratch index got a fresh timestamp, so git trusted a stale stat entry for a
+        # same-size edit with the same mtime and two fingerprints of one working tree could disagree.
+        git(self.repo, "config", "core.trustctime", "false")
+        calc = self.repo / "calc.py"
+        old = time.time_ns() - 60_000_000_000
+        os.utime(calc, ns=(old, old))
+        git(self.repo, "add", "calc.py")
+        before = worktree_fingerprint(self.repo)
+        calc.write_text(calc.read_text().replace("return a / b", "return b / a"))
+        os.utime(calc, ns=(old, old))
+        self.assertNotEqual(worktree_fingerprint(self.repo), before)
+
+    async def test_review_of_finds_the_developer_workspace_and_never_creates_one(self):
+        outcome = await self.executor().execute(
+            [event({"executor_id": "coder-reviewer", "text": "t", "review_of": "dev:1", "base_ref": "main"},
+                   correlation_key="review:dev:1")],
+            None, self.caps,
+        )
+        assert isinstance(outcome, Emit)
+        self.assertIn("no ready workspace for 'dev:1'", outcome.messages[0])
+        self.workspaces.reserve_creating(work_key="dev:1", repo_checkout=str(self.repo), workdir=str(self.repo), branch="feature")
+        self.workspaces.mark_ready("dev:1", workdir=str(self.repo), branch="feature")
+        outcome = await self.executor().execute(
+            [event({"executor_id": "coder-reviewer", "text": "t", "review_of": "dev:1", "base_ref": "main"})],
+            None, self.caps,
+        )
+        assert isinstance(outcome, Emit)
+        self.assertIn("verdict=pass", outcome.messages[0])
+
+    async def test_missing_requirements_or_changes_are_rejected_before_launch(self):
+        outcome = await self.executor().execute([event(self.payload(text=""))], None, self.caps)
+        assert isinstance(outcome, Emit)
+        self.assertIn("task requirements", outcome.messages[0])
+        outcome = await self.executor().execute([event(self.payload(base_ref="missing"))], None, self.caps)
+        assert isinstance(outcome, Emit)
+        self.assertIn("cannot find a merge base with missing", outcome.messages[0])
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "notes")
+        outcome = await self.executor().execute([event(self.payload(base_ref="feature"))], None, self.caps)
+        assert isinstance(outcome, Emit)
+        self.assertIn("no changes between feature", outcome.messages[0])
+        self.assertEqual(self.calls(), [])
+
+    async def test_contradictory_verdict_is_rejected(self):
+        bad = {"verdict": "pass", "summary": "s", "blocking": CHANGES_REQUESTED["blocking"]}
+        with patch.dict(os.environ, {"FAKE_REVIEW": json.dumps(bad)}):
+            outcome = await self.executor().execute([event(self.payload())], None, self.caps)
+        assert isinstance(outcome, Emit)
+        self.assertIn("contradicts 1 blocking item", outcome.messages[0])
+
+    async def test_permission_gate_runs_before_launch(self):
+        self.caps.permissions = InMemoryPermission(
+            {"code_reviewer.launch": PermissionDecision(action="defer", reason="approve review")}
+        )
+        outcome = await self.executor().execute([event(self.payload())], None, self.caps)
+        self.assertIsInstance(outcome, Suspend)
+        self.assertEqual(self.calls(), [])
+
+
+class TestReviewerLauncher(ReviewerCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.root
+        request = ReviewRequest(workdir=self.repo, requirements="divide", test_evidence="pytest: 3 passed", base_ref="main",
+                                pin=GuidancePin(str(self.repo), "commit", "test"))
+        self.enterContext(patch.object(CoderReviewerExecutor, "_review_input", return_value=request))
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.reviewer.review_inputs", return_value=("diff", "")))
+        self.enterContext(patch("agent_runtime.adapters.executor_cli.reviewer.worktree_fingerprint", return_value="head:tree"))
 
     async def test_changes_requested_lists_location_trigger_and_impact(self):
         with patch.dict(os.environ, {"FAKE_REVIEW": json.dumps(CHANGES_REQUESTED)}):
@@ -397,86 +495,6 @@ class TestCoderReviewerExecutor(unittest.IsolatedAsyncioTestCase):
             outcome = await self.executor().execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Emit)
         self.assertIn("configured model 'claude-opus-5-5' but Claude Code selected 'claude-haiku-5-5'", outcome.messages[0])
-
-    async def test_review_that_changes_the_worktree_is_discarded(self):
-        before = worktree_fingerprint(self.repo)
-        with patch.dict(os.environ, {"FAKE_TOUCH": str(self.repo / "calc.py")}):
-            outcome = await self.executor().execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit)
-        self.assertIn("working tree", outcome.messages[0])
-        self.assertIn("findings discarded", outcome.messages[0])
-        self.assertNotEqual(worktree_fingerprint(self.repo), before)
-
-    async def test_fingerprint_tracks_untracked_edits_and_leaves_the_real_index_alone(self):
-        def staged():
-            return subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=self.repo,
-                                  capture_output=True, text=True, check=True).stdout
-
-        before = worktree_fingerprint(self.repo)
-        self.assertEqual(worktree_fingerprint(self.repo), before)
-        self.assertEqual(staged(), "")
-        (self.repo / "notes.txt").write_text("changed\n")
-        self.assertNotEqual(worktree_fingerprint(self.repo), before)
-        self.assertEqual(staged(), "")
-
-    async def test_fingerprint_sees_a_same_size_edit_whose_stat_still_matches_the_index(self):
-        # Regression: the scratch index got a fresh timestamp, so git trusted a stale stat entry for a
-        # same-size edit with the same mtime and two fingerprints of one working tree could disagree.
-        git(self.repo, "config", "core.trustctime", "false")
-        calc = self.repo / "calc.py"
-        old = time.time_ns() - 60_000_000_000
-        os.utime(calc, ns=(old, old))
-        git(self.repo, "add", "calc.py")
-        before = worktree_fingerprint(self.repo)
-        calc.write_text(calc.read_text().replace("return a / b", "return b / a"))
-        os.utime(calc, ns=(old, old))
-        self.assertNotEqual(worktree_fingerprint(self.repo), before)
-
-    async def test_review_of_finds_the_developer_workspace_and_never_creates_one(self):
-        outcome = await self.executor().execute(
-            [event({"executor_id": "coder-reviewer", "text": "t", "review_of": "dev:1", "base_ref": "main"},
-                   correlation_key="review:dev:1")],
-            None, self.caps,
-        )
-        assert isinstance(outcome, Emit)
-        self.assertIn("no ready workspace for 'dev:1'", outcome.messages[0])
-        self.workspaces.reserve_creating(work_key="dev:1", repo_checkout=str(self.repo), workdir=str(self.repo), branch="feature")
-        self.workspaces.mark_ready("dev:1", workdir=str(self.repo), branch="feature")
-        outcome = await self.executor().execute(
-            [event({"executor_id": "coder-reviewer", "text": "t", "review_of": "dev:1", "base_ref": "main"})],
-            None, self.caps,
-        )
-        assert isinstance(outcome, Emit)
-        self.assertIn("verdict=pass", outcome.messages[0])
-
-    async def test_missing_requirements_or_changes_are_rejected_before_launch(self):
-        outcome = await self.executor().execute([event(self.payload(text=""))], None, self.caps)
-        assert isinstance(outcome, Emit)
-        self.assertIn("task requirements", outcome.messages[0])
-        outcome = await self.executor().execute([event(self.payload(base_ref="missing"))], None, self.caps)
-        assert isinstance(outcome, Emit)
-        self.assertIn("cannot find a merge base with missing", outcome.messages[0])
-        git(self.repo, "add", "-A")
-        git(self.repo, "commit", "-qm", "notes")
-        outcome = await self.executor().execute([event(self.payload(base_ref="feature"))], None, self.caps)
-        assert isinstance(outcome, Emit)
-        self.assertIn("no changes between feature", outcome.messages[0])
-        self.assertEqual(self.calls(), [])
-
-    async def test_contradictory_verdict_is_rejected(self):
-        bad = {"verdict": "pass", "summary": "s", "blocking": CHANGES_REQUESTED["blocking"]}
-        with patch.dict(os.environ, {"FAKE_REVIEW": json.dumps(bad)}):
-            outcome = await self.executor().execute([event(self.payload())], None, self.caps)
-        assert isinstance(outcome, Emit)
-        self.assertIn("contradicts 1 blocking item", outcome.messages[0])
-
-    async def test_permission_gate_runs_before_launch(self):
-        self.caps.permissions = InMemoryPermission(
-            {"code_reviewer.launch": PermissionDecision(action="defer", reason="approve review")}
-        )
-        outcome = await self.executor().execute([event(self.payload())], None, self.caps)
-        self.assertIsInstance(outcome, Suspend)
-        self.assertEqual(self.calls(), [])
 
 
 class TestDispatchAndHotReload(unittest.TestCase):

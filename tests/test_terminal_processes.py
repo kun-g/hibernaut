@@ -320,6 +320,8 @@ from pathlib import Path
 from agent_runtime.adapters.executor_cli import claude_gate, cli_terminal
 
 start, window, root = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+# The FIFO and the injected signal identify the stop window, including on the first poll after launch.
+cli_terminal.POLL_SECONDS = claude_gate._POLL_SECONDS = 0.005
 argv = ["/bin/sh", "-c", f'sleep 60 & echo "$$ $!" > "{root / "started"}"; wait']
 if start == "once":
     # cli_terminal.py kills a one-off gate after its own grace, so the gate must spend none on a probe that ignores TERM.
@@ -557,18 +559,39 @@ class TestCLIGroupSignals(unittest.TestCase):
         self.assertTrue(is_running())
 
     def test_the_rest_of_the_group_has_the_grace_to_end_after_its_leader_ended(self):
-        # The leader is gone with the first SIGTERM; its child ends by itself, only later. The child sleeps in short
-        # steps: a long sleep begun after the signal would outlive it, and a signal just before `wait` would be missed.
-        done = self.root / "done"
-        proc, child = self.popen(
-            f"sh -c 'trap \"sleep 0.2; echo cleaned > {done}; exit\" TERM; echo $$ > \"$READY\"; "
-            "while :; do sleep 0.05; done' & wait")
+        # Block SIGTERM before reporting ready so even a signal arriving before sigwait stays pending.
+        # The child finishes cleanup once the supervisor observes it outliving the leader.
+        ready = self.root / "ready"
+        finish = ready.with_suffix(".finish")
+        os.mkfifo(finish)
+        writer = self.enterContext(os.fdopen(os.open(finish, os.O_RDWR), "w", buffering=1))
+        program = self.root / "child.py"
+        program.write_text(
+            "import os, signal\n"
+            "from pathlib import Path\n"
+            "ready = Path(os.environ['READY'])\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
+            "ready.write_text(str(os.getpid()))\n"
+            "signal.sigwait({signal.SIGTERM})\n"
+            "with ready.with_suffix('.finish').open() as gate: gate.readline()\n"
+            "ready.with_suffix('.done').write_text('cleaned')\n"
+        )
+        proc, child = self.popen(f'"{sys.executable}" -I "{program}" & wait')
         self.addCleanup(lambda: alive(int(child)) and os.kill(int(child), signal.SIGKILL))
-        started = time.monotonic()
-        cli_terminal.end_group(proc, grace=30)
-        self.assertLess(time.monotonic() - started, 20)
+        group_running = cli_terminal._group_running
+
+        def observe(pgid):
+            live = group_running(pgid)
+            if live and cli_terminal.exited(pgid, 0):
+                writer.write("finish\n")
+            return live
+
+        with patch.object(cli_terminal, "_group_running", new=observe):
+            started = time.monotonic()
+            cli_terminal.end_group(proc, grace=30)
+            self.assertLess(time.monotonic() - started, 20)
         self.assertEqual(proc.returncode, -signal.SIGTERM)
-        self.assertEqual(done.read_text() if done.exists() else "killed", "cleaned\n")
+        self.assertEqual(ready.with_suffix(".done").read_text(), "cleaned")
         self.assert_never_after_reaping()
 
 

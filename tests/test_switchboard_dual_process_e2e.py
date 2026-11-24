@@ -122,6 +122,7 @@ class DualProcessEndToEndTests(unittest.TestCase):
         self.sb_db = self.root / "switchboard.db"
         self.hb_db = self.root / "hibernaut.db"
         self.gate = self.root / "gate.open"
+        self.outbox_clock = self.root / "outbox-clock"
 
         sb_config = self.root / "switchboard.toml"
         sb_config.write_text(
@@ -137,7 +138,7 @@ path = "{self.sb_db}"
 default_scope = "{SCOPE}"
 
 [delivery]
-retry_backoff_seconds = [0.2, 0.2, 0.2, 0.2, 0.2]
+retry_backoff_seconds = [0.05, 0.05, 0.05, 0.05, 0.05]
 
 [outbound]
 # A closed loopback port: replies are recorded in outbound_messages but never reach GitHub.
@@ -193,6 +194,7 @@ consumer_id = "{CONSUMER}"
                 SWITCHBOARD_RELAY_TOKEN=RELAY_TOKEN,
                 SWITCHBOARD_MCP_TOKEN=MCP_TOKEN,
                 HB_E2E_GATE=str(self.gate),
+                HB_E2E_OUTBOX_CLOCK=str(self.outbox_clock),
             ),
             self.root,
         )
@@ -283,8 +285,15 @@ consumer_id = "{CONSUMER}"
         self.assertEqual(self.hibernaut.stop(), 0, self.hibernaut.logs())
         first = self.post_message("off-1", "first while offline")
         second = self.post_message("off-2", "second while offline")
-        # Give the delivery worker several retry periods (0.2s) to prove nothing is attempted while offline.
-        time.sleep(1.5)
+        # Observe the offline head of the queue being deferred on successive delivery rounds.
+        def next_retry():
+            [(due,)] = query(self.sb_db, "SELECT next_retry_at FROM delivery_log WHERE event_id = ? AND consumer_id = ?",
+                             (first, CONSUMER))
+            return due
+
+        for _ in range(3):
+            due = next_retry()
+            self.wait(lambda: next_retry() > due, "offline delivery deferred again")
         self.assertEqual(self.delivery(first), ("pending", 0))
         self.assertEqual(self.delivery(second), ("pending", 0))
 
@@ -305,6 +314,9 @@ consumer_id = "{CONSUMER}"
         self.wait(lambda: any(b == "echo: second while offline" for _, b in self.reports()), "backlog reported")
 
     def test_switchboard_restart_is_ridden_out_by_outbox_backoff(self) -> None:
+        tick = self.outbox_clock.with_suffix(".tmp")
+        tick.write_text("2030-01-01T00:00:00.000000+00:00")
+        tick.replace(self.outbox_clock)
         event_id = self.post_message("gate-1", "gate: report after the switchboard restarts")
         self.wait(lambda: self.delivery(event_id) == ("acked", 1), "gated event acked")
 
@@ -313,10 +325,13 @@ consumer_id = "{CONSUMER}"
         self.wait(lambda: any(attempts >= 1 for _, _, attempts, _ in self.hb_outbox()), "first failed upload")
         (_, status, attempts, next_retry_at), = self.hb_outbox()
         self.assertEqual((status, attempts), ("pending", 1))
-        self.assertIsNotNone(next_retry_at)
+        self.assertEqual(next_retry_at, "2030-01-01T00:00:05.000000+00:00")
 
         self.start_switchboard()
-        # First backoff step is 5s; allow for it plus the dispatcher's polling interval.
+        self.assertEqual(self.hb_outbox()[0][1:], ("pending", 1, next_retry_at))
+        assert next_retry_at is not None
+        tick.write_text(next_retry_at)
+        tick.replace(self.outbox_clock)
         self.wait(lambda: self.hb_outbox()[0][1] == "sent", "outbox sent after backoff", timeout=20.0)
         (_, status, attempts, next_retry_at), = self.hb_outbox()
         self.assertEqual((status, attempts, next_retry_at), ("sent", 1, None))
