@@ -1048,6 +1048,8 @@ def build_daemon_from_config(
     demo: bool = False,
     gdrive_client: DriveClientProtocol | None = None,
     switchboard: SwitchboardHandle | None = None,
+    # False for a reload, whose daemon may be dropped yet: what Switchboard delivers goes to the one in force.
+    attach: bool = True,
     ledger: RunLedger | None = None,
     runner_pilot: RunnerPilotRelay | None = None,
     runner: RunnerHandle | None = None,
@@ -1605,7 +1607,7 @@ def build_daemon_from_config(
             failed_folder_id=config.gdrive.failed_folder_id or None,
         )
 
-    if switchboard is not None:
+    if switchboard is not None and attach:
         attach_switchboard(daemon, switchboard, config.switchboard.consumer_id)
 
     if opened_hub:
@@ -1787,30 +1789,49 @@ async def serve_configured(
                         memory_hub=daemon.memory_hub,
                         forward_targets=daemon.forward_targets,
                         reloads=reloads,
+                        attach=False,
                     )
                     handler = replacement.http_handler()
                     if address != (config.channels.host, config.channels.port):
                         next_server = WebhookHTTPServer(address, handler)
                 except (OSError, ValueError, OverflowError) as exc:
-                    refuse(f"Cannot activate settings ({type(exc).__name__}); keeping current settings.")
+                    if reloads.on_disk(version):
+                        refuse(f"Cannot activate settings ({type(exc).__name__}); keeping current settings.")
+                    if next_pilot is not None and next_pilot is not runner_pilot:
+                        await next_pilot.stop()
+                    continue
+                finally:
+                    # Building it applies the candidate's to the shared hub, but the current settings are in force still.
                     if daemon.memory_hub is not None:
                         daemon.memory_hub.is_projectless = projectless_inboxes(config)
+
+                # Stop the old services first so two dispatchers never send the same Outbox row.
+                await generation.stop_services()
+                # An editor knows no lock. Nothing is awaited from here until the version is settled.
+                if not reloads.on_disk(version):
+                    print(f"[config] {path} changed again before it was in force; reading it again.",
+                          file=sys.stderr, flush=True)
+                    generation.start_services(tasks, outbox_interval_seconds=outbox_interval_seconds, halt=stop)
+                    if next_server is not None:
+                        next_server.server_close()
                     if next_pilot is not None and next_pilot is not runner_pilot:
                         await next_pilot.stop()
                     continue
 
+                if daemon.memory_hub is not None:
+                    daemon.memory_hub.is_projectless = projectless_inboxes(candidate)
                 if replacement.runner is not None:
                     replacement.runner.apply(candidate)
                 if replacement.forward_targets is not None:
                     replacement.forward_targets.activate(candidate)
                 previous = generation
-                # Stop the old services first so two dispatchers never send the same Outbox row.
-                await previous.stop_services()
                 # Apply the new caps only after activation succeeds; retired Runs stay counted in shared_limiter.
                 shared_limiter.reconfigure(candidate.runtime.max_concurrency, concurrency_limits(candidate))
                 generation = _Generation.start(replacement, tasks, outbox_interval_seconds=outbox_interval_seconds,
                                                halt=stop)
                 generations = [g for g in generations if g.runs is not None and not g.runs.done()] + [generation]
+                if switchboard is not None:
+                    attach_switchboard(replacement, switchboard, candidate.switchboard.consumer_id)
                 # From here every wake reaching the old pool, from its in-flight requests or released leases,
                 # is forwarded to the new one.
                 previous.retire_pool(wake_current)
@@ -1820,16 +1841,18 @@ async def serve_configured(
                         [g.runs for g in generations if g is not generation and g.runs is not None],
                     )))
                 runner_pilot = next_pilot
+                replaced_listener: tuple[WebhookHTTPServer, threading.Thread] | None = None
                 if next_server is None:
                     server.RequestHandlerClass = handler
                 else:
-                    next_thread = _serve_in_thread(next_server)
-                    # Accepted requests finish against the old adapters before the old listener closes.
-                    await _close_server(server, server_thread)
-                    server, server_thread = next_server, next_thread
+                    replaced_listener = server, server_thread
+                    server, server_thread = next_server, _serve_in_thread(next_server)
                 daemon, config = replacement, candidate
-                print(f"[config] Reloaded {path}", file=sys.stderr, flush=True)
                 reloads.settle(version)
+                if replaced_listener is not None:
+                    # Accepted requests finish against the old adapters before the old listener closes.
+                    await _close_server(*replaced_listener)
+                print(f"[config] Reloaded {path}", file=sys.stderr, flush=True)
         finally:
             reloads.watch(None)
             await changes.aclose()
@@ -1875,6 +1898,14 @@ class _Generation:
             daemon.run_services(services_stop, outbox_interval_seconds=outbox_interval_seconds, halt=halt)
         )
         return cls(daemon, services, services_stop, pool_stop, runs)
+
+    def start_services(
+        self, tasks: asyncio.TaskGroup, *, outbox_interval_seconds: float, halt: asyncio.Event | None = None
+    ) -> None:
+        self.services_stop = asyncio.Event()
+        self.services = tasks.create_task(
+            self.daemon.run_services(self.services_stop, outbox_interval_seconds=outbox_interval_seconds, halt=halt)
+        )
 
     async def stop_services(self) -> None:
         self.services_stop.set()

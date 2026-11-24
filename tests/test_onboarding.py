@@ -736,6 +736,8 @@ class ReloadStatusTests(unittest.TestCase):
 
 class ConfigChangesTests(unittest.IsolatedAsyncioTestCase):
     # A person's editor takes no part in the locks: it may write while a version is being parsed.
+    dropped = 0
+
     async def race(self, *writes: str) -> tuple[list[int], list[str | None]]:
         # What is used, and the errors that were settled.
         path = Path(self.enterContext(tempfile.TemporaryDirectory()), "h.toml")
@@ -755,9 +757,17 @@ class ConfigChangesTests(unittest.IsolatedAsyncioTestCase):
         async def collect() -> None:
             async for config in config_module.config_changes(path, stop, interval=0.01, reloads=reloads):
                 found.append(config.runtime.max_concurrency)
+                if found.count(found[-1]) > self.dropped:
+                    reloads.settle(reloads.latest)
 
-        with (patch.object(config_module, "parse_config", parse),
-              patch.object(reloads, "settle", lambda *args: errors.append(args[-1] if args else None))):
+        settle = reloads.settle
+
+        def settling(version: str, error: str | None = None) -> None:
+            if error is not None:
+                errors.append(error)
+            settle(version, error)
+
+        with patch.object(config_module, "parse_config", parse), patch.object(reloads, "settle", settling):
             task = asyncio.create_task(collect())
             for _ in range(500):
                 await asyncio.sleep(0.01)
@@ -781,6 +791,11 @@ class ConfigChangesTests(unittest.IsolatedAsyncioTestCase):
         # "nonsense" parses as TOML and is refused by parse_config, after the file was put right.
         found, errors = await self.race('[runtime]\nnew_event_policy = "nonsense"\n', "[runtime]\nmax_concurrency = 3\n")
         self.assertEqual((found, errors), ([3], []))
+
+    async def test_c5_one_that_was_dropped_is_taken_up_again_if_it_is_still_there(self) -> None:
+        # Dropped because the file had changed, which is back as it was by the next look.
+        self.dropped = 1
+        self.assertEqual(await self.race(), ([1, 1], []))
 
     async def test_c5_changed_and_changed_back_it_is_used(self) -> None:
         found, errors = await self.race("[runtime]\nmax_concurrency = 2\n", "[runtime]\nmax_concurrency = 1\n")

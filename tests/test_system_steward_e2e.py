@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import socket
@@ -20,8 +21,11 @@ from unittest.mock import patch
 
 from agent_runtime.adapters.channels.channels import webhook_request_handler
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter
-from agent_runtime.app.config import load_config, parse_config
-from agent_runtime.app.main import build_daemon_from_config, serve_configured
+from agent_runtime.app import config as config_module
+from agent_runtime.app import main as main_module
+from agent_runtime.app.config import HibernautConfig, load_config, parse_config
+from agent_runtime.app.main import ForwardTargets, build_daemon_from_config, serve_configured
+from agent_runtime.app.reload import ReloadFailed, ReloadStatus
 from agent_runtime.core.models import FORWARD_SOURCE, RETURN_SOURCE, Event
 from agent_runtime.engine.handler import EventHandler, RemoteRefused
 from tests.fakes import RecordingChannel
@@ -381,21 +385,43 @@ class EndToEndTests(ServedCase):
         self.assertEqual(self.path.read_text(), edited)
 
 
-    async def race(self, target: str, theirs: str) -> str:
-        # Somebody saves the file while the version the tool wrote is on its way into force.
+    async def race(self, owner: Any, name: str, theirs: str) -> None:
+        # Somebody saves the file while the version the tool wrote is on its way into force: that one never is.
         await self.serve()
-        real = getattr(sys.modules[target.rpartition(".")[0]], target.rpartition(".")[2])
+        real = getattr(owner, name)
         raced: list[bool] = []
+        used: list[str] = []
+        settled: list[str] = []
 
-        def racing(*args: Any, **kwargs: Any) -> Any:
+        def write() -> None:
             if not raced and "计算器" in self.path.read_text():
                 raced.append(True)
                 self.path.write_text(theirs)
+
+        def racing(*args: Any, **kwargs: Any) -> Any:
+            write()
             return real(*args, **kwargs)
 
+        async def racing_async(*args: Any, **kwargs: Any) -> Any:
+            found = await real(*args, **kwargs)
+            write()
+            return found
+
+        activate, settle = ForwardTargets.activate, ReloadStatus.settle
+
+        def activating(targets: ForwardTargets, config: HibernautConfig) -> None:
+            used.append(config.projects["a"].description)
+            activate(targets, config)
+
+        def settling(status: ReloadStatus, version: str, error: str | None = None) -> None:
+            settled.append(version)
+            settle(status, version, error)
+
         self.set_plan([{"calls": [forward(OPS, "补上")]},
-                       {"calls": [tool("complete_project", name="a", description="计算器")], **reply("没补成")}])
-        with patch(target, racing):
+                       {"calls": [tool("complete_project", name="a", description="计算器")], **reply("没补成")},
+                       reply("还在")])
+        with (patch.object(owner, name, racing_async if asyncio.iscoroutinefunction(real) else racing),
+              patch.object(ForwardTargets, "activate", activating), patch.object(ReloadStatus, "settle", settling)):
             await self.message("补上")
             await self.wait_for(lambda: any("没补成" in r for r in self.replies()), "the answer")
         self.assertEqual(raced, [True])
@@ -403,16 +429,76 @@ class EndToEndTests(ServedCase):
         self.assertTrue(failed, said)
         self.assertIn("changed by somebody else", said)
         self.assertEqual(self.path.read_text(), theirs)
-        return said
+        self.assertNotIn("计算器", used)
+        written = self.before.replace("[projects.a]\n", '[projects.a]\ndescription = "计算器"\n')
+        self.assertNotIn(hashlib.sha256(written.encode()).hexdigest(), settled)
+        # What ran before still does, its services and its listener included.
+        await self.message("在吗")
+        await self.wait_for(lambda: any("还在" in r for r in self.replies()), "the next answer")
+
+    def mine(self) -> str:
+        return self.text().replace("[projects.a]\n", "[projects.a]\n# mine\n")
 
     async def test_c5_an_edit_while_the_new_version_is_parsed_wins_and_is_told(self) -> None:
-        await self.race("agent_runtime.app.config.parse_config", self.text().replace("[projects.a]\n", "[projects.a]\n# mine\n"))
+        await self.race(config_module, "parse_config", self.mine())
 
     async def test_c5_an_edit_that_is_not_valid_is_told_as_well(self) -> None:
-        await self.race("agent_runtime.app.config.parse_config", "not = [valid\n")
+        await self.race(config_module, "parse_config", "not = [valid\n")
 
-    async def test_c5_an_edit_while_the_new_version_is_activated_is_told(self) -> None:
-        await self.race("agent_runtime.app.main.build_daemon_from_config", "not = [valid\n")
+    async def test_c5_an_edit_while_the_new_version_is_built_keeps_it_out_of_force(self) -> None:
+        await self.race(main_module, "build_daemon_from_config", "not = [valid\n")
+
+    async def test_c5_an_edit_while_the_relay_is_opened_keeps_it_out_of_force(self) -> None:
+        await self.race(main_module, "next_runner_pilot", self.mine())
+
+    async def test_c5_an_edit_while_the_old_services_end_keeps_it_out_of_force(self) -> None:
+        await self.race(main_module._Generation, "stop_services", "not = [valid\n")
+
+    async def test_c5_a_valid_edit_while_the_old_services_end_is_what_comes_into_force(self) -> None:
+        await self.race(main_module._Generation, "stop_services", self.mine().replace(
+            "# mine\n", 'description = "mine"\n'))
+        await self.wait_for(lambda: self.daemon.reloads.latest == hashlib.sha256(self.path.read_bytes()).hexdigest(), "it")
+        await asyncio.to_thread(self.daemon.reloads.wait, self.path.read_bytes(), 10)
+
+    async def test_c5_a_version_that_cannot_be_activated_leaves_the_chat_with_the_one_in_force(self) -> None:
+        await self.serve()
+        await self.wait_for(lambda: self.daemon.reloads.path, "the start")
+        with socket.socket() as taken:
+            taken.bind(("127.0.0.1", 0))
+            taken.listen()
+            self.path.write_text(self.before.replace(f"port = {self.port}", f"port = {taken.getsockname()[1]}"))
+            with self.assertRaisesRegex(ReloadFailed, "Cannot activate"):
+                await asyncio.to_thread(self.daemon.reloads.wait, self.path.read_bytes(), 20)
+        self.set_plan([reply("还在")])
+        await self.message("在吗")
+        await self.wait_for(lambda: any("还在" in r for r in self.replies()), "the answer")
+
+    async def test_c5_a_version_that_is_dropped_leaves_the_listener_and_the_next_one_alone(self) -> None:
+        # A new port, taken back while the old services end; then set again.
+        await self.serve()
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            moved = sock.getsockname()[1]
+        wanted = self.before.replace(f"port = {self.port}", f"port = {moved}")
+        real, raced = main_module._Generation.stop_services, list[bool]()
+
+        async def racing(generation: Any) -> None:
+            await real(generation)
+            if not raced:
+                raced.append(True)
+                self.path.write_text(self.before)
+
+        def listens(port: int) -> bool:
+            with socket.socket() as probe:
+                return probe.connect_ex(("127.0.0.1", port)) == 0
+
+        with patch.object(main_module._Generation, "stop_services", racing):
+            self.path.write_text(wanted)
+            await self.wait_for(lambda: raced, "the race")
+            await asyncio.sleep(0.3)
+            self.assertEqual((listens(self.port), listens(moved)), (True, False))
+            self.path.write_text(wanted)
+            await self.wait_for(lambda: listens(moved) and not listens(self.port), "the new port")
 
 
 class BoundaryTests(ServedCase):

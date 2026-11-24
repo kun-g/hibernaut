@@ -25,6 +25,17 @@ class ReloadStatus:
     def _digest(contents: bytes) -> str:
         return hashlib.sha256(contents).hexdigest()
 
+    def on_disk(self, version: str) -> bool:
+        path = self.path
+        try:
+            return path is not None and self._digest(path.read_bytes()) == version
+        except OSError:
+            return False
+
+    def settled(self, version: str) -> bool:
+        with self._changed:
+            return self._settled == version
+
     def watch(self, path: Path | None) -> None:
         with self._changed:
             self._watched = path.resolve() if path is not None else None

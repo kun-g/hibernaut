@@ -1023,6 +1023,9 @@ async def config_changes(
                 reloads.settle(version, f"invalid configuration ({error})")
             continue
         yield config
+        if reloads is not None and not reloads.settled(version):
+            # Dropped, as the file had changed again. It may be back as it was.
+            previous = None
 
 
 def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> HibernautConfig:
