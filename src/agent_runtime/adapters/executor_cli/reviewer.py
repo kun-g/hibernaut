@@ -22,6 +22,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner, TerminalUnavailable, terminal_title
 from agent_runtime.adapters.executor_cli.peer import PEER_TOOLS, DeveloperPeerResolver, PeerLookup
 from agent_runtime.adapters.executor_cli.process import join_text, last_text, relayed_work_key, target_events
+from agent_runtime.adapters.executor_cli.quota import quota_hit
 from agent_runtime.adapters.executor_cli.review_scope import BASES, INTRODUCED, UNFIXED, ReviewScope
 from agent_runtime.adapters.executor_cli.run_state import TurnSlot
 from agent_runtime.adapters.executor_cli.project_guidance import (
@@ -179,6 +180,20 @@ judge on what you can verify and say so.
 
 class ReviewAborted(Exception):
     pass
+
+
+class ReviewQuotaExhausted(ReviewAborted):
+    # The reviewer has no quota left. The text is what any other failure of that run would say; reason is the line
+    # that named the quota, changed says the worktree is not what the review started from.
+    def __init__(
+        self, text: str, *, reason: str, changed: bool = False, terminals: Sequence[str] = (),
+        sessions: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(text)
+        self.reason = reason
+        self.changed = changed
+        self.terminals = tuple(terminals)
+        self.sessions = dict(sessions or {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,16 +366,24 @@ class CoderReviewerExecutor:
                                       f"Hibernaut session {peer.hibernaut_session_id})"
                                       if peer is not None else f"none ({request.peer.reason})")
         else:
-            result = await run_claude_code(
-                p,
-                cwd=request.workdir,
-                prompt=review_prompt(request, guidance, evidence),
-                permission_mode="dontAsk",
-                role_args=(*_ROLE_ARGS, "--append-system-prompt", system),
-                env=env,
-                is_interrupted=caps.is_interrupted,
-                poll_interval=self._interrupt_poll_interval,
-            )
+            try:
+                result = await run_claude_code(
+                    p,
+                    cwd=request.workdir,
+                    prompt=review_prompt(request, guidance, evidence),
+                    permission_mode="dontAsk",
+                    role_args=(*_ROLE_ARGS, "--append-system-prompt", system),
+                    env=env,
+                    is_interrupted=caps.is_interrupted,
+                    poll_interval=self._interrupt_poll_interval,
+                )
+            except ClaudeCodeError as exc:
+                # An interactive session reports no exit code, so only this kind of run can tell.
+                reason = quota_hit(p.quota_errors, exc.output) if exc.returncode else None
+                if reason is None:
+                    raise
+                changed = await asyncio.to_thread(worktree_fingerprint, request.workdir) != before
+                raise ReviewQuotaExhausted(str(exc), reason=reason, changed=changed) from exc
             raw = result.get("structured_output")
         after = await asyncio.to_thread(worktree_fingerprint, request.workdir)
         if after != before:

@@ -110,6 +110,9 @@ reviewer = "code-reviewer"      # review = true 时必填有效值：role = "cod
 # reviewer = "grok-reviewer"    # 用 [executors.grok-reviewer] 模板非交互评审：prompt 末尾要求只输出一个 JSON 结论，格式错重试一次；模板写 terminal = "orca" 时在 Orca 终端里可旁观。
 #                               # 只读保证较弱：CLI 的工具不受限制，只靠评审前后比对 worktree 指纹，改动了就作废结论并挂起为 review pending。
 #                               # 省略 reviewer 且没有名为 code-reviewer 的执行器时，回退用旧名 coder-reviewer 的评审角色执行器。
+# reviewer = ["grok-reviewer", "gpt-reviewer"]   # 或写评审候选的有序列表：每个任务第一次评审前按 [availability] 的可用表取第一个可用的，
+#                               # 之后各轮、重启、挂起恢复都用它；它报额度用完（quota_errors）才换下一个并重跑这一轮，全不可用则挂起等人。
+#                               # 每项规则同单个名字，不能重复；写代码的和评审的别用同一家模型，由这里的列表自己避开。
 max_review_rounds = 3           # 第 2 轮起只做增量复核（上一轮没修好的项、之后改动引入的新问题），其余降为跟进；超过轮数仍未通过则保持待处理（Suspend），批准再修一轮，拒绝则标注未评审交付
 interactive = true              # 开发对话在交互终端里续接（存活终端或 --resume）；缺后端则挂起并说明原因，批准重试；false 走非交互
 # 可选：同上，省略时用内置 "builtin:sde"（测试先行）。各角色只读自己这一节的 skills，SDE 内置评审用评审者那一节的。
@@ -154,7 +157,18 @@ terminal = "orca"               # 仅作评审者（SDE reviewer = "grok"）时�
 command = "grok"
 args = ["-p", "{prompt}", "--permission-mode", "plan", "--json-schema", "{review_schema}"]
 timeout_seconds = 900.0
+# 可选：额度用完的报错（正则列表，区分大小写，在 stderr 与 stdout 里找）。评审非零退出且命中才算；别的失败照旧等人。
+# 命中后这个执行器在 quota_cooldown_seconds 内不被任何任务选中。[executors.<id>] 的 CLI 与 Claude Code 驱动都可写（后者只对
+# interactive = false 的评审有效：交互会话没有退出码），用它的 agent 沿用。内置 grok 模板（没写 [executors.grok] 时）自带这一条，别家没有默认值，按见过的原文写。
+quota_errors = ['status 402 Payment Required\): Grok Build usage balance exhausted']
 # terminal = "orca"             # 可选：在任务 worktree 的 Orca 终端里跑，人可旁观（见 [executors.grok]）
+
+# 可选：可用表，由外面的程序按余量和策略写，Hibernaut 只读，用来选评审候选（reviewer 写成列表时）。格式：
+# {"version": 1, "generated_at": "...", "executors": {"grok-reviewer": {"available": false, "reason": "剩余 8%，低于 15%"}}}
+# 没列到的算可用；文件缺失或读不懂时全部算可用并记一条日志；不看 generated_at 判过期，沿用旧判断是写的一方的事。
+# [availability]
+# file = "~/.config/hibernaut/availability.json"   # 支持 ~，相对路径以本文件所在目录为准；不写则全部可用
+# quota_cooldown_seconds = 3600   # 报额度用完的执行器多久内不选，默认 60 分钟；记在数据库里，重启仍在
 
 [executors.dsh]
 command = "dsh"

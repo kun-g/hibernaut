@@ -27,6 +27,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
 from agent_runtime.adapters.executor_cli.executor import CLI_TERMINALS, DEFAULT_CLI_TEMPLATES, CLITemplate
 from agent_runtime.adapters.executor_cli.orca import registered_checkout
 from agent_runtime.adapters.executor_cli.peer_handoff import PeerHandoffConfig
+from agent_runtime.adapters.executor_cli.quota import parse_quota_errors
 from agent_runtime.adapters.executor_cli.reviewer import CODE_REVIEWER_ROLE
 from agent_runtime.adapters.executor_cli.role_skills import ROLE_ALIASES, canonical_role
 from agent_runtime.adapters.executor_cli.sde import SDE_OPTION_KEYS, SDE_ROLE, SDEOptions
@@ -307,8 +308,21 @@ def _sde_options(name: str, item: dict[str, Any]) -> SDEOptions:
     rounds = item.get("max_review_rounds", defaults.max_review_rounds)
     if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
         raise ValueError(f"{where}: max_review_rounds must be a positive integer")
-    reviewer = str(item.get("reviewer", defaults.reviewer)).strip()
+    reviewer = _reviewer_option(where, item.get("reviewer", defaults.reviewer))
     return SDEOptions(review=review, reviewer=reviewer, max_review_rounds=rounds)
+
+
+def _reviewer_option(where: str, raw: object) -> str | tuple[str, ...]:
+    if isinstance(raw, str):
+        return raw.strip()
+    listed = cast(list[object], raw) if isinstance(raw, list) else []
+    names = tuple(n.strip() for n in listed if isinstance(n, str))
+    if not names or len(names) != len(listed):
+        raise ValueError(f"{where}: reviewer must be an executor name or a non-empty list of them")
+    for n, name in enumerate(names):
+        if name in names[:n]:
+            raise ValueError(f"{where}: reviewer '{name}' is listed twice")
+    return names
 
 
 def _resolve_reviewer(
@@ -316,26 +330,53 @@ def _resolve_reviewer(
 ) -> SDEOptions:
     # A reviewer is a code-reviewer role executor or any CLI template, built-in ones included.
     templates = {**DEFAULT_CLI_TEMPLATES, **executors}
-    target = opts.reviewer
-    if not explicit and target not in roles and target not in templates:
+    reviewer = opts.reviewer
+    if not explicit and reviewer not in roles and reviewer not in templates:
         legacy = roles.get(_LEGACY_REVIEWER)
         if legacy is not None and legacy.role == CODE_REVIEWER_ROLE:
             # Deployments from before the rename keep working without naming their reviewer.
-            target = _LEGACY_REVIEWER
-    resolved = SDEOptions(review=opts.review, reviewer=target, max_review_rounds=opts.max_review_rounds)
+            reviewer = _LEGACY_REVIEWER
+    resolved = SDEOptions(review=opts.review, reviewer=reviewer, max_review_rounds=opts.max_review_rounds)
     if not opts.review:
         return resolved
     choices = sorted({n for n, r in roles.items() if r.role == CODE_REVIEWER_ROLE} | set(templates))
     hint = f"choose a {CODE_REVIEWER_ROLE} executor or a CLI executor ({', '.join(choices)}) or set review = false"
-    where = f"executors.{name}: reviewer '{target}'"
-    if target == name:
-        raise ValueError(f"{where} is this executor itself; {hint}")
-    role = roles.get(target)
-    if role is not None and role.role != CODE_REVIEWER_ROLE:
-        raise ValueError(f"{where} has role '{role.role}', which cannot review; {hint}")
-    if role is None and target not in templates:
-        raise ValueError(f"{where} is not a declared executor; {hint}")
+    for target in resolved.candidates:
+        where = f"executors.{name}: reviewer '{target}'"
+        if target == name:
+            raise ValueError(f"{where} is this executor itself; {hint}")
+        role = roles.get(target)
+        if role is not None and role.role != CODE_REVIEWER_ROLE:
+            raise ValueError(f"{where} has role '{role.role}', which cannot review; {hint}")
+        if role is None and target not in templates:
+            raise ValueError(f"{where} is not a declared executor; {hint}")
     return resolved
+
+
+@dataclass(frozen=True, slots=True)
+class AvailabilityConfig:
+    # The availability table another program writes; "" leaves every review candidate available.
+    file: str = ""
+    # How long a reviewer that ran out of quota is not chosen.
+    quota_cooldown_seconds: float = 3600.0
+
+
+def parse_availability(raw: Any, *, base_dir: Path | None = None) -> AvailabilityConfig:
+    defaults = AvailabilityConfig()
+    if raw is None:
+        return defaults
+    if not isinstance(raw, dict):
+        raise ValueError("[availability] must be a table")
+    section = cast(dict[str, Any], raw)
+    unknown = sorted(set(section) - {"file", "quota_cooldown_seconds"})
+    if unknown:
+        raise ValueError(f"availability: {', '.join(unknown)} not supported")
+    path = _optional_text("availability", section, "file")
+    cooldown = section.get("quota_cooldown_seconds", defaults.quota_cooldown_seconds)
+    if isinstance(cooldown, bool) or not isinstance(cooldown, (int, float)) or not 0 < cooldown < math.inf:
+        raise ValueError("availability.quota_cooldown_seconds must be a positive number")
+    return AvailabilityConfig(file=_resolve_path(path, base_dir) if path else "",
+                              quota_cooldown_seconds=float(cooldown))
 
 
 @dataclass(frozen=True, slots=True)
@@ -500,6 +541,7 @@ class HibernautConfig:
     memory_hub: MemoryHubLinkConfig = field(default_factory=MemoryHubLinkConfig)
     runner_pilot: RunnerPilotConfig = field(default_factory=RunnerPilotConfig)
     onboarding: OnboardingConfig = field(default_factory=OnboardingConfig)
+    availability: AvailabilityConfig = field(default_factory=AvailabilityConfig)
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
     timers: tuple[ConfiguredTimer, ...] = ()
@@ -1176,6 +1218,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             orca_agent=orca_agent,
             terminal=cli_terminal,
             max_concurrency=_max_concurrency(f"executors.{name}", item),
+            quota_errors=parse_quota_errors(f"executors.{name}", item.get("quota_errors")),
         )
 
     agents: dict[str, AgentConfig] = {
@@ -1355,6 +1398,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         memory_hub=parse_memory_hub(raw.get("memory_hub"), base_dir=base_dir),
         runner_pilot=parse_runner_pilot(raw.get("runner_pilot"), base_dir=base_dir),
         onboarding=parse_onboarding(raw.get("onboarding")),
+        availability=parse_availability(raw.get("availability"), base_dir=base_dir),
         config_dir=str(base_dir) if base_dir is not None else "",
     )
     _validate_runner_pilot(config)

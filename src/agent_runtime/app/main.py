@@ -56,6 +56,7 @@ from agent_runtime.adapters.executor_cli.orca import (
     default_transcript_roots,
 )
 from agent_runtime.adapters.executor_cli.steward import GlobalScope
+from agent_runtime.adapters.executor_cli.reviewer_pool import ReviewerPool, SwitchNotice
 from agent_runtime.adapters.executor_cli.reclaim_sweep import (
     DEFAULT_SWEEP_INTERVAL_SECONDS,
     SweepTarget,
@@ -90,6 +91,7 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteInboxAdapter,
     SQLiteLeaseLockAdapter,
     SQLiteOutboxAdapter,
+    SQLiteReviewerStore,
     SQLiteSessionStoreAdapter,
     SQLiteTimerAdapter,
     SQLiteTaskMetadataStore,
@@ -1178,6 +1180,9 @@ def build_daemon_from_config(
         def _notify(inbox_id: str, text: str) -> None:
             daemon.outbox.enqueue(inbox_id, text, metadata={"kind": "peer_notice"})
 
+        def _reviewer_switched(notice: SwitchNotice, text: str) -> None:
+            daemon.outbox.enqueue(notice.inbox_id, text, metadata=dict(notice.metadata))
+
         # Projects with handoff = "peer" share one runner; the receiver's inbox and cursor live outside any Run.
         peer_runner = OrcaVisibleRunner(
             bindings=terminal_bindings, notify=_notify,
@@ -1194,6 +1199,7 @@ def build_daemon_from_config(
         tasks = SQLiteTaskMetadataStore(daemon.db)
 
         deliveries = SQLiteDeliveryStore(daemon.db)
+        reviewer_store = SQLiteReviewerStore(daemon.db)
         usage = SQLiteWorkUsage(daemon.db)
 
         def _steward(
@@ -1304,9 +1310,17 @@ def build_daemon_from_config(
                 built[name] = SDEExecutor(
                     profile=role.profile,
                     options=role.sde,
-                    reviewer=reviewer_for(role.sde.reviewer) if role.sde.review else None,
-                    # An independently dispatched review always comes from a code-reviewer executor.
-                    peer_reviewer=role.sde.reviewer if role.sde.reviewer in reviewers else next(iter(reviewers), None),
+                    # A list has no reviewer of its own: the pool chooses one per task.
+                    reviewer=(reviewer_for(role.sde.reviewer)
+                              if role.sde.review and isinstance(role.sde.reviewer, str) else None),
+                    pool=ReviewerPool(
+                        configured=role.sde.reviewer, lookup=reviewer_for, store=reviewer_store, owner=name,
+                        table=config.availability.file,
+                        cooldown_seconds=config.availability.quota_cooldown_seconds, notify=_reviewer_switched,
+                    ) if role.sde.review else None,
+                    # An independently dispatched review always comes from a code-reviewer executor: the first one
+                    # the role names, else the first one declared.
+                    peer_reviewer=next((n for n in (*role.sde.candidates, *reviewers) if n in reviewers), None),
                     worktree_manager=wt_mgr,
                     inbox_checkout_map=inbox_checkout_map,
                     terminal=terminal(role),
