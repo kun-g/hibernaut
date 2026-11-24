@@ -46,6 +46,7 @@ from agent_runtime.app.projects import (
     validate_project_rules,
     validate_workdir_bindings,
 )
+from agent_runtime.app.reload import ReloadStatus
 from agent_runtime.core.models import InboxRoute, NewEventPolicy
 from memory_hub import BaselineBudgetConfig, KnowledgeMountConfig, MemoryHubConfig
 from memory_hub.models import AccessRole
@@ -88,6 +89,12 @@ class ChannelsConfig:
 
 TerminalBackend = Literal["orca", "none"]
 TERMINAL_BACKENDS: tuple[TerminalBackend, ...] = ("orca", "none")
+@dataclass(frozen=True, slots=True)
+class OnboardingConfig:
+    # Lower-cased GitHub owners in whose repositories the system tools may create the trigger label.
+    label_owners: tuple[str, ...] = ()
+
+
 Handoff = Literal["mcp", "peer"]
 HANDOFFS: tuple[Handoff, ...] = ("mcp", "peer")
 
@@ -490,6 +497,7 @@ class HibernautConfig:
     runner: RunnerLinkConfig = field(default_factory=RunnerLinkConfig)
     memory_hub: MemoryHubLinkConfig = field(default_factory=MemoryHubLinkConfig)
     runner_pilot: RunnerPilotConfig = field(default_factory=RunnerPilotConfig)
+    onboarding: OnboardingConfig = field(default_factory=OnboardingConfig)
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
 
@@ -654,6 +662,18 @@ def parse_runner_pilot(raw: Any, *, base_dir: Path | None = None) -> RunnerPilot
     )
 
 
+_OWNER_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+def parse_onboarding(raw: Any) -> OnboardingConfig:
+    section = _Table(raw if raw is not None else {}, "onboarding", frozenset({"label_owners"}))
+    owners = tuple(dict.fromkeys(owner.lower() for owner in section.names("label_owners", ())))
+    for owner in owners:
+        if not _OWNER_RE.fullmatch(owner):
+            raise ValueError(f"onboarding.label_owners: {owner!r} is not a GitHub owner")
+    return OnboardingConfig(label_owners=owners)
+
+
 def _validate_runner_pilot(config: HibernautConfig) -> None:
     pilot = config.runner_pilot
     if not pilot.enabled:
@@ -811,7 +831,7 @@ _MEMORY_ROLES: tuple[AccessRole, ...] = ("readonly", "propose", "admin")
 
 
 class _Table:
-    # One table of the [memory_hub] section: typed reads that name the offending key.
+    # One table of a section: typed reads that name the offending key.
     def __init__(self, raw: Any, where: str, keys: frozenset[str] | None = None) -> None:
         if not isinstance(raw, dict):
             raise ValueError(f"[{where}] must be a table")
@@ -950,7 +970,9 @@ async def config_changes(
     path: Path,
     stop: asyncio.Event,
     interval: float = 1.0,
+    reloads: ReloadStatus | None = None,
 ) -> AsyncIterator[HibernautConfig]:
+    # What is yielded is settled in `reloads` by whoever activates it.
     previous: bytes | None = None
     missing = False
     while not stop.is_set():
@@ -974,6 +996,8 @@ async def config_changes(
         if contents == previous:
             continue
         previous = contents
+        if reloads is not None:
+            reloads.seen(contents)
         try:
             raw = tomllib.loads(contents.decode("utf-8"))
             if not raw:
@@ -987,6 +1011,8 @@ async def config_changes(
                 file=sys.stderr,
                 flush=True,
             )
+            if reloads is not None:
+                reloads.settle(f"invalid configuration ({type(exc).__name__}{detail})")
             continue
         yield config
 
@@ -1274,6 +1300,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         runner=parse_runner_link(raw.get("runner"), agents=agents, templates=executors, base_dir=base_dir),
         memory_hub=parse_memory_hub(raw.get("memory_hub"), base_dir=base_dir),
         runner_pilot=parse_runner_pilot(raw.get("runner_pilot"), base_dir=base_dir),
+        onboarding=parse_onboarding(raw.get("onboarding")),
         config_dir=str(base_dir) if base_dir is not None else "",
     )
     _validate_runner_pilot(config)

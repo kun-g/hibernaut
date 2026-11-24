@@ -13,6 +13,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 多 Agent 选路 | Agent（角色、Skill、模型、权限边界）与底层执行器（claude / cursor-agent / grok / dsh 等 CLI、Claude Code 启动器）分开配置；Inbox 与 Agent 多对多绑定，按事件指定、会话、Inbox 规则、Inbox 默认、项目与全局默认五级选择；事件指定的 Agent 不在 Inbox 白名单里就明确拒绝 |
 | Steward 与转投 | 项目前台 `steward`：在主检出（或 `workdir`）的 Orca 终端里一次性只读运行，跑完即关，没有 Orca 终端就挂起等人批准重试，不作 daemon 子进程；自己答复或用 `forward_to_inbox` 转投给别的 Agent（同项目、最多主动转投 3 次、回投不计、逐次过权限门禁）；单步活由接手的 Agent 直接回复来源，多步活的结果回投给 Steward 汇总 |
 | 全局 Steward | 同一个 `steward` 角色绑到不属于项目的 Inbox（如 `user:main`）：能答的自己答，新活按绑定的 `forward_to` 转投到列出的项目主 Inbox，由项目自己的规则选 Agent；同一个聊天派出的每件活各有会话与 worktree，补充用 `continues` 回到原来那件 |
+| 系统 Steward | 绑在 `sys:ops`（写了 `system_tools = true`）的 `steward`：由全局 Steward 转交，接入新项目（克隆、登记 Orca、建标签、写项目段与 Steward 绑定、加进全局 Steward 的 `forward_to`）、检查各项目缺什么、补上缺的；改动直接写进 `hibernaut.toml` 并热加载，留备份，热加载不成功就恢复。没有 Shell，不改执行器、权限、交付检查、凭据和自己的绑定。需求见 [`docs/requirements/system-steward.md`](docs/requirements/system-steward.md) |
 | SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `agent_id = "sde"`（Drive 任务 frontmatter 写 `agent_id: sde`，旧键 `executor_id: sde` 仍可用），项目或 Inbox 也可设为默认 Agent；GitHub Issue 以 `# 标题` + 正文为需求、标题为 PR 标题 |
 | 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok，模板写 `terminal = "orca"` 可在 Orca 终端里旁观评审，命令结束、结果读回后立即关闭该终端，且不让 Orca 登记并续接这次会话，评审记录留终端句柄与 CLI 会话 ID）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested`；SDE 内置评审第 1 轮通审，第 2 轮起只做增量复核：只有上一轮没修好的项和之后改动引入的新问题能打回，其余由程序降为跟进，交付时列在 PR 正文「跟进」小节和完成消息里 |
 | PR 交付 | SDE 完成后由 Hibernaut 合入主干、按改动类型定版本号、跑检查、推分支、开 PR，可选在评审通过且 CI 绿后自动合并；合入主干冲突（版本号以外）或合入后检查失败时交回同一开发会话解决，已通过评审且只解了冲突的（逐块核对解法只由两侧内容组成）直接重跑检查续交付，另有改动的只评审开发者自己的增量（不含主干带进来的改动），超过次数上限才挂起等人；合并后删除源分支并结案；与任务来源无关 |
@@ -76,7 +77,8 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 | 配置段 | 管什么 |
 | :--- | :--- |
 | `[runtime]` | 数据库与记忆目录、全局并发上限 `max_concurrency`、新事件策略（`defer` / `fold` / `interrupt`）、全局默认 Agent（`default_agent`，旧键 `default_executor`）；`ledger_db_path` 是执行账本的独立数据库（默认 `db_path` 同目录的 `ledger.db`，运行日志在它旁边的 `logs/runs/`） |
-| `[[runtime.inbox_bindings]]` | 不属于项目的 Inbox（`sys:*` / `user:*`）：键同项目绑定，另须写启动目录 `workdir`，可选 `checkout_access`（`readwrite` / `readonly`）；可写目录只能给一个 Inbox，不能是项目检出或 Steward 的 `workdir`。可用 CLI agent；`checkout_access = "readonly"` 的绑定还可用 `steward`，可选 `forward_to` 列出它能转投的项目主 Inbox。规范见 [`docs/inbox-conventions.md`](docs/inbox-conventions.md) |
+| `[[runtime.inbox_bindings]]` | 不属于项目的 Inbox（`sys:*` / `user:*`）：键同项目绑定，另须写启动目录 `workdir`，可选 `checkout_access`（`readwrite` / `readonly`）；可写目录只能给一个 Inbox，不能是项目检出或 Steward 的 `workdir`。可用 CLI agent；`checkout_access = "readonly"` 的绑定还可用 `steward`，可选 `forward_to` 列出它能转投的项目主 Inbox 或系统 Inbox；`system_tools = true` 把只读的单个精确 `sys:<name>` 变成系统 Inbox。规范见 [`docs/inbox-conventions.md`](docs/inbox-conventions.md) |
+| `[onboarding]` | 系统 Steward 接入项目：`label_owners` 列出可以在其仓库上建标签的 GitHub owner，默认空 = 不建，列为待人做 |
 | `[channels]` | HTTP 端口、MCP 的密钥环境变量名；`outbox_dir` 设置后每条 Outbox 消息另存为该目录下一个带任务上下文的 Markdown 文件；配置了 `auto_merge` 却停在 PR 未合并时，状态为「待合并」并写明 PR 链接与未合并原因 |
 | `[executors.<id>]` | 底层驱动：CLI 模板（写 `command`），或供 Agent 引用的 Claude Code 启动器与计费（都不写）。旧写法仍可用：写 `role` 或 `command` 即同时是同名 Agent。可选 `max_concurrency` 限制同时跑该执行器的 Inbox 数（跨项目、跨引用它的 Agent 合计；只限某个 Agent 就写在 `[agents.<id>]`） |
 | `[agents.<id>]` | Agent：`executor` 指向驱动，`role` 为 `sde` / `code-reviewer` / `steward`，另有 `model`、`effort`、`skills`、`description`，可选 `max_concurrency` 只限这个 Agent（不影响共用同一驱动的别的 Agent）。SDE 的 `review`、`reviewer` 决定评审开关和评审者；`steward` 有 `checkout_access = "readonly"`（唯一取值）、可选 `workdir`（工作目录，未写用项目检出）与 `branch`（每次运行前核对该目录的分支，不一致则挂起，不切换） |
@@ -136,6 +138,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 | [`docs/observability-ledger-design.md`](docs/observability-ledger-design.md) | 执行账本（Observability / Ledger）设计基线：定位与边界、双层数据契约、错误分类与分流、日志与计费、重放与 Memory 闸门；接线见架构文档 §11 |
 | [`docs/runner.md`](docs/runner.md) | Runner 执行面设计（v1.0 定稿）：`RunnerPort` 协议与双模传输、多节点注册与亲和、worktree 三道保险、CLI 驱动与看门狗；交互蓝图 [`docs/runner_blueprint.html`](docs/runner_blueprint.html) |
 | [`docs/glossary.md`](docs/glossary.md) | 术语表（术语以它为准） |
+| [`docs/requirements/system-steward.md`](docs/requirements/system-steward.md) | 系统 Steward 的需求（R/C 编号） |
 | [`AGENTS.md`](AGENTS.md) | 开发规范与提交门禁 |
 | [`docs/dispatch/`](docs/dispatch) | 派单模板：SDE 任务（`/events`、Drive）、独立评审 |
 | [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md) | Drive 队列凭据代理的安装与维护 |

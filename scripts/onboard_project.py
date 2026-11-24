@@ -1,19 +1,18 @@
 """Onboard a GitHub repository as a Hibernaut project fed by the Switchboard webhook.
 
-    python3 scripts/onboard_project.py kun-g/new-tool [--config hibernaut.toml] [--dry-run]
+    python3 scripts/onboard_project.py owner/new-tool [--config hibernaut.toml] [--dry-run]
 
-Clones the repository next to the Hibernaut checkout when missing, creates the trigger label, and appends a
-[projects.<name>] table to hibernaut.toml (hot-reloaded by the running daemon). Re-running is safe.
+Clones the repository next to the Hibernaut checkout when missing, registers it in Orca, creates the trigger label, and
+adds a [projects.<name>] table with its Steward to hibernaut.toml (hot-reloaded by the running daemon), whose previous
+version stays beside it as a backup. The system Steward does the same through its onboard_project tool. Re-running is
+safe.
 """
 
 from __future__ import annotations
 
 import argparse
-import re
-import subprocess
 import sys
-import tomllib
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,16 +20,17 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from agent_runtime.app.config import parse_config  # noqa: E402
-
-_REPO = re.compile(r"^(?P<owner>[A-Za-z0-9-]+)/(?P<name>[A-Za-z0-9._-]+)$")
-_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-
-Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
-
-
-def _run(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(list(args), capture_output=True, text=True, check=False)
+from agent_runtime.app.onboarding import (  # noqa: E402
+    DEFAULT_LABEL,
+    OnboardError,
+    Onboarding,
+    Request,
+    Runner,
+    description_text,
+    project_name,
+    run_command,
+    split_repo,
+)
 
 
 @dataclass
@@ -41,102 +41,46 @@ class Plan:
     checkout: Path
     label: str
     auto_merge: bool
-    steps: list[str] = field(default_factory=list)
+    steps: list[str] = field(default_factory=list[str])
+    by_hand: list[str] = field(default_factory=list[str])
+    backup: Path | None = None
 
 
-def project_block(plan: Plan) -> str:
-    return f"""
-[projects.{plan.name}]
-# Onboarded by scripts/onboard_project.py: issues labelled "{plan.label}" arrive through the Switchboard webhook.
-inbox_id = ["proj:{plan.name}", "proj:{plan.name}:.+"]
-repo = "{plan.repo}"
-checkout = "{plan.checkout}"
-worktree_backend = "orca"
-executor = "sde"
-
-[projects.{plan.name}.delivery]
-open_pr = true
-auto_merge = {"true" if plan.auto_merge else "false"}
-"""
-
-
-def ensure_checkout(plan: Plan, run: Runner, dry_run: bool) -> None:
-    if (plan.checkout / ".git").exists():
-        origin = run(["git", "-C", str(plan.checkout), "remote", "get-url", "origin"]).stdout.strip().lower()
-        if plan.repo.lower() not in origin:
-            raise SystemExit(f"{plan.checkout} exists but its origin is {origin or 'unset'}, not {plan.repo}")
-        plan.steps.append(f"checkout: {plan.checkout} (existing)")
-        return
-    if plan.checkout.exists() and any(plan.checkout.iterdir()):
-        raise SystemExit(f"{plan.checkout} exists and is not a git checkout")
-    if not dry_run:
-        done = run(["gh", "repo", "clone", plan.repo, str(plan.checkout)])
-        if done.returncode != 0:
-            raise SystemExit(f"gh repo clone {plan.repo} failed: {done.stderr.strip()}")
-    plan.steps.append(f"checkout: {plan.checkout} (cloned)")
-
-
-def ensure_label(plan: Plan, run: Runner, dry_run: bool) -> None:
-    exists = run(["gh", "api", f"repos/{plan.repo}/labels/{plan.label}", "--silent"]).returncode == 0
-    if exists:
-        plan.steps.append(f"label: {plan.label} (existing)")
-        return
-    if not dry_run:
-        done = run(
-            ["gh", "label", "create", plan.label, "-R", plan.repo, "--color", "5319E7",
-             "--description", "交给 Hibernaut 处理（经 Switchboard Webhook 入站）"]
-        )
-        if done.returncode != 0:
-            raise SystemExit(f"creating label {plan.label} on {plan.repo} failed: {done.stderr.strip()}")
-    plan.steps.append(f"label: {plan.label} (created)")
-
-
-def ensure_project(plan: Plan, dry_run: bool) -> None:
-    text = plan.config.read_text(encoding="utf-8")
-    existing = tomllib.loads(text).get("projects", {})
-    for name, item in existing.items():
-        if name == plan.name or str(item.get("repo", "")).lower() == plan.repo.lower():
-            plan.steps.append(f"hibernaut.toml: [projects.{name}] already serves {item.get('repo')}")
-            return
-    updated = text.rstrip("\n") + "\n" + project_block(plan)
-    # Validate the whole file first: the running daemon would otherwise keep its old settings and only log.
-    parse_config(tomllib.loads(updated), base_dir=plan.config.parent)
-    if not dry_run:
-        tmp = plan.config.with_name(plan.config.name + ".onboard.tmp")
-        tmp.write_text(updated, encoding="utf-8")
-        tmp.replace(plan.config)
-    plan.steps.append(f"hibernaut.toml: [projects.{plan.name}] added")
-
-
-def onboard(argv: Sequence[str] | None = None, *, run: Runner = _run) -> Plan:
-    parser = argparse.ArgumentParser(prog="onboard_project", description=__doc__.splitlines()[0])
+def onboard(argv: Sequence[str] | None = None, *, run: Runner = run_command) -> Plan:
+    parser = argparse.ArgumentParser(prog="onboard_project", description=(__doc__ or "").splitlines()[0])
     parser.add_argument("repo", help="owner/name on GitHub")
     parser.add_argument("--config", default="hibernaut.toml")
     parser.add_argument("--name", help="project name and inbox suffix (default: lower-cased repository name)")
+    parser.add_argument("--description", help="one sentence saying what the project is")
     parser.add_argument("--checkout", help="default: next to the Hibernaut checkout, <config dir>/../<name>")
     parser.add_argument(
-        "--label", default="hibernaut", help="repository label to create (match Switchboard [github] require_label)",
+        "--label", default=DEFAULT_LABEL,
+        help="repository label to create (match Switchboard [github] require_label)",
     )
     parser.add_argument("--auto-merge", action="store_true", help="merge after review and CI pass")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
-    match = _REPO.match(args.repo)
-    if match is None:
-        parser.error(f"repo must be owner/name, got {args.repo!r}")
-    name = (args.name or match.group("name")).lower()
-    if not _NAME.match(name):
-        # The Switchboard owner route maps a repo to proj:<lower-cased repo name>, so the inbox must match it.
-        parser.error(f"project name {name!r} must be lower-case letters, digits, '-' or '_'; pass --name")
+    try:
+        split_repo(args.repo)
+        name = project_name(args.name.lower() if args.name else None, args.repo)
+        description = description_text(args.description, args.repo)
+    except OnboardError as exc:
+        parser.error(str(exc))
     config = Path(args.config).resolve()
-    checkout = Path(args.checkout).expanduser().resolve() if args.checkout else config.parent.parent / name
+    # Nobody to wait for a reload here: the whole file is checked before it is written, and the daemon logs the rest.
+    onboarding = Onboarding(config, run=run, write=lambda file, before, after: file.replace(before, after),
+                            label_owners=lambda _config: None, steward_optional=True, dry_run=args.dry_run)
+    checkout = Path(args.checkout).expanduser().resolve() if args.checkout else onboarding.default_checkout(name)
     plan = Plan(args.repo, name, config, checkout, args.label, args.auto_merge)
-
-    if run(["gh", "api", f"repos/{plan.repo}", "--silent"]).returncode != 0:
-        raise SystemExit(f"{plan.repo} is not reachable with gh")
-    ensure_checkout(plan, run, args.dry_run)
-    ensure_label(plan, run, args.dry_run)
-    ensure_project(plan, args.dry_run)
+    try:
+        report = onboarding.onboard(Request(
+            repo=plan.repo, name=name, checkout=checkout, description=description, label=plan.label,
+            auto_merge=plan.auto_merge,
+        ))
+    except OnboardError as exc:
+        raise SystemExit(str(exc)) from exc
+    plan.steps, plan.by_hand, plan.backup = report.done, report.by_hand, report.backup
     return plan
 
 
@@ -144,16 +88,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     plan = onboard(argv)
     for step in plan.steps:
         print(f"[onboard] {step}")
-    owner = plan.repo.split("/")[0]
-    if plan.name != plan.repo.split("/")[1].lower():
-        print(
-            f'[onboard] --name differs from the repository name: add "{plan.repo.lower()}" = "proj:{plan.name}" '
-            "to Switchboard [routing.github_repos], the owner route would send it to another inbox."
-        )
-    print(
-        f"[onboard] Switchboard routes {plan.repo} to proj:{plan.name} when [routing.github_owners] has "
-        f'"{owner.lower()}" = "proj:{{repo}}" and comments when [outbound] github_app_owners lists {owner.lower()}.'
-    )
+    for step in plan.by_hand:
+        print(f"[onboard] left to you: {step}")
+    if plan.backup is not None:
+        print(f"[onboard] undo: cp {plan.backup} {plan.config}")
     print(f'[onboard] Label an issue "{plan.label}" in {plan.repo} to hand it to Hibernaut.')
     return 0
 

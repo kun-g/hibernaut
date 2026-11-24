@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from typing import Any, Never, assert_never, cast
+from typing import Any, Literal, Never, assert_never, cast
 
 from agent_runtime.core.models import (
     FORWARD_SOURCE,
@@ -29,6 +29,8 @@ from agent_runtime.core.models import (
 from agent_runtime.core.ports import PermissionPort, SessionStorePort
 
 _AGENT_SOURCES = (FORWARD_SOURCE, RETURN_SOURCE)
+# Who put an event here: a person in their own one-to-one chat, or somebody on this host.
+EventOrigin = Literal["chat", "operator"]
 # Which project documents the task needs travels with it; everything else the receiver learns from the text.
 _INHERITED_KEYS = ("activities", "base_ref")
 
@@ -544,6 +546,7 @@ class ForwardStage:
     approval: Callable[[str], bool]
     # Events of an inbox that are pending or in progress.
     queued: Callable[[str], Sequence[Event]] = lambda _inbox_id: ()
+    origin: Callable[[Event], EventOrigin | None] = lambda _event: None
     staged: list[Event] = field(default_factory=list[Event])
 
     def reset(self) -> None:
@@ -574,9 +577,12 @@ class ForwardStage:
             raise ForwardRefused(
                 f"this work was already forwarded {hops} hop(s) (limit {MAX_FORWARD_HOPS}); answer it here instead"
             )
-        # Only from a scope outside every project, and only to the main inboxes its binding lists.
+        # Only from a scope outside every project, and only to the inboxes its binding lists.
         crossing = self._crosses(target)
         binding_route = self._check_inbox("target_inbox", target, crossing)
+        if binding_route is not None and binding_route.system and not self.from_person():
+            raise ForwardRefused(f"'{target}' takes only what a person asks for in this turn, in their own chat or on "
+                                 "this host; ask them")
         relayed = target == self.inbox_id
         agent = _text(target_agent)
         if crossing and agent is not None:
@@ -664,6 +670,13 @@ class ForwardStage:
                 dropped.append((evt, str(exc)))
         return dropped
 
+    def from_person(self) -> bool:
+        events = self.events()
+        saved = self.session.forward
+        return any(self.origin(evt) is not None for evt in events) or (
+            saved is not None and saved.from_person and any(map(is_approval, events))
+        )
+
     def _crosses(self, target: str) -> bool:
         if self.routes is None:
             return False
@@ -717,6 +730,8 @@ class ForwardStage:
         if self.routes is None:
             return None
         here, there = self.routes(self.inbox_id), self.routes(inbox_id)
+        if here is not None and here.system:
+            raise ForwardRefused(f"'{self.inbox_id}' passes no work on; answer it here")
         if here is None or there is None or (there.project != here.project and not other_project):
             listed = f", nor one of {', '.join(here.forward_to)}" if here is not None and here.forward_to else ""
             raise ForwardRefused(f"{name} '{inbox_id}' is not an inbox of this project{listed}")

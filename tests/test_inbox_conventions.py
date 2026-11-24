@@ -47,10 +47,18 @@ class TestConventionsDocument(unittest.TestCase):
 class TestExampleConfig(unittest.TestCase):
     def test_the_example_loads_with_a_workdir_binding_and_an_agent_limit(self):
         config = load_config(ROOT / "hibernaut.example.toml")
-        bound = config.runtime.workdir_binding("sys:hb-ops")
+        bound = config.runtime.workdir_binding("sys:patrol")
         assert bound is not None
-        self.assertEqual((bound.binding.default_agent, bound.readonly), ("ops", False))
+        self.assertEqual((bound.binding.default_agent, bound.readonly, bound.system_tools), ("patrol", False, False))
         self.assertIsNotNone(config.agents["sde"].max_concurrency)
+
+    def test_the_example_binds_the_system_steward_and_sends_the_chat_s_steward_to_it(self):
+        config = load_config(ROOT / "hibernaut.example.toml")
+        system, chat = (config.runtime.workdir_binding(i) for i in ("sys:ops", "user:main"))
+        assert system is not None and chat is not None
+        self.assertEqual((system.binding.default_agent, system.readonly, system.system_tools), ("ops", True, True))
+        self.assertIn("sys:ops", chat.forward_to)
+        self.assertEqual(config.onboarding.label_owners, ())
 
 
 if __name__ == "__main__":

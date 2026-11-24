@@ -188,6 +188,8 @@ class ForwardSpec:
     owed_failures: tuple[str, ...] = ()
     # Set only on the session that keeps a refused return; the result stays there after the decision.
     held: HeldReturn | None = None
+    # The suspended Run was one a person had asked for, so what they approve of it still is.
+    from_person: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,8 +229,10 @@ class InboxRoute:
     project: str
     binding: InboxBinding | None = None
     has_bindings: bool = False
-    # Main inboxes of projects that work may be forwarded to from this inbox, which belongs to no project.
+    # What work may be forwarded to from this inbox, which belongs to no project: main inboxes and system inboxes.
     forward_to: tuple[str, ...] = ()
+    # A system inbox: it takes work from a person only (see AgentWorker and ForwardStage), and passes none on.
+    system: bool = False
 
 
 class AgentNotAllowed(ValueError):
