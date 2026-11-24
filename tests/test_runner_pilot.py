@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 import pytest
 
+from agent_runtime.adapters import runner_bridge, runner_pilot
 from agent_runtime.adapters.runner_bridge import RunnerExecutorBridge
 from agent_runtime.adapters.runner_pilot import (
     LAUNCH_PERMISSION,
@@ -637,8 +638,27 @@ def test_relay_admits_only_the_pilot_node(tmp_path: Path) -> None:
         assert refusal(RunnerCapabilities.from_dict({**good, **change})) is not None, change
 
 
-def test_waiting_for_the_node_is_bounded_and_can_be_interrupted(tmp_path: Path) -> None:
+def test_waiting_for_the_node_is_bounded_and_can_be_interrupted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        clock = loop.time
+        elapsed = 0.0
+        next_heartbeat = asyncio.Event()
+
+        async def retry(stop: asyncio.Event, seconds: float) -> bool:
+            nonlocal elapsed
+            assert seconds > 0
+            elapsed += seconds
+            if elapsed > heartbeat_at:
+                next_heartbeat.set()
+                return await stop.wait()
+            await asyncio.sleep(0)
+            return stop.is_set()
+
+        # Advance by the actual delay requested by the bridge, keeping other loop deadlines monotonic.
+        heartbeat_at = float("inf")
+        monkeypatch.setattr(loop, "time", lambda: clock() + elapsed)
+        monkeypatch.setattr(runner_bridge, "_set_within", retry)
         relay = _relay(tmp_path)
         await relay.start()
         event = Event(inbox_id=PILOT, source="t", external_id="1", payload={"candidate_commit": COMMIT})
@@ -649,14 +669,15 @@ def test_waiting_for_the_node_is_bounded_and_can_be_interrupted(tmp_path: Path) 
                 runner=relay, inbox_id=PILOT, project_key="hibernaut", timeout_seconds=9.0, **kwargs
             )
 
-        started = time.monotonic()
         outcome = await check(node_wait_seconds=0.6).execute([event], session, _Caps())
         assert isinstance(outcome, Emit) and (outcome.status, outcome.close_session) == ("failed", True)
         assert outcome.telemetry is not None and outcome.telemetry.error_kind == "network"
-        assert 0.5 < time.monotonic() - started < 5
+        assert 0.5 < elapsed <= 0.6
+        heartbeat_at = elapsed + runner_pilot._HEARTBEAT_SECONDS
         run = asyncio.create_task(check().execute([event], session, _Caps()))
-        await asyncio.sleep(0.8)
-        assert not run.done()  # by default it waits longer than the node's heartbeat
+        run.add_done_callback(lambda _: next_heartbeat.set())
+        await next_heartbeat.wait()
+        assert elapsed > heartbeat_at and not run.done()
         started = time.monotonic()
         run.cancel()
         with pytest.raises(asyncio.CancelledError) as cancelled:

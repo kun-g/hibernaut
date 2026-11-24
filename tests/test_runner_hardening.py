@@ -322,6 +322,7 @@ def test_rejected_first_claim_on_a_multi_slot_node_does_not_split_the_workspace(
 import threading  # noqa: E402
 
 from runner.protocol import InterruptRequest, InterruptResult, ReclaimRequest, ReclaimResult, RunResult  # noqa: E402
+from runner.transport import relay_client  # noqa: E402
 from runner.transport.relay_client import RunnerRelayAgent  # noqa: E402
 
 
@@ -700,6 +701,24 @@ def test_reconnecting_node_reports_a_workspace_it_was_still_creating(tmp_path: P
         return original_resolve(**kwargs)
 
     monkeypatch.setattr(daemon_a.worktrees, "resolve", slow_resolve)
+    announced = []
+    ready_keys = daemon_a.worktrees.list_ready_work_keys
+
+    def advertised_keys():
+        rows = ready_keys()
+        announced.append([row["work_key"] for row in rows])
+        return rows
+
+    monkeypatch.setattr(daemon_a.worktrees, "list_ready_work_keys", advertised_keys)
+    draining = asyncio.Event()
+    cancel_and_wait = relay_client._cancel_and_wait
+
+    async def observe_disconnect(tasks):
+        if tasks:
+            draining.set()
+        await cancel_and_wait(tasks)
+
+    monkeypatch.setattr(relay_client, "_cancel_and_wait", observe_disconnect)
     counter = tmp_path / "count"
 
     def bound() -> str | None:
@@ -708,9 +727,10 @@ def test_reconnecting_node_reports_a_workspace_it_was_still_creating(tmp_path: P
     async def scenario() -> None:
         host, port = await hub.start("127.0.0.1", 0)
         url = f"ws://{host}:{port}/ws/runner"
-        agent_a = RunnerRelayAgent(daemon=daemon_a, hub_url=url, token="tok")
+        agent_a = RunnerRelayAgent(daemon=daemon_a, hub_url=url, token="tok", reconnect_delays=(0.01,))
         await agent_a.start()
         await agent_a.wait_connected()
+        epoch = agent_a.conn_epoch
         agent_b = RunnerRelayAgent(daemon=daemon_b, hub_url=url, token="tok")
         await agent_b.start()
         await agent_b.wait_connected()
@@ -721,13 +741,12 @@ def test_reconnecting_node_reports_a_workspace_it_was_still_creating(tmp_path: P
             hub._drop_connection(hub._conns["a-1"], "network drop")  # pyright: ignore[reportPrivateUsage]
             with pytest.raises(RunnerConnectionLostError):
                 await asyncio.wait_for(first, 5.0)
-            await asyncio.sleep(1.0)
-            # a-1 is still creating gh#5: a hello now must not erase the claim, or the next write goes to b-1.
-            assert bound() == "a-1"
+            await asyncio.wait_for(draining.wait(), 5)
+            assert announced == [[]] and bound() == "a-1"
             go.set()
-            await asyncio.sleep(0.5)
             await agent_a.wait_connected(10.0)
-            assert bound() == "a-1"
+            assert agent_a.conn_epoch > epoch
+            assert announced == [[], ["gh#5"]] and bound() == "a-1"
             second = await asyncio.wait_for(
                 hub.run(_req("run_after_drop", executor_id="count", prompt=str(counter), work_key="gh#5")), 15.0
             )
