@@ -229,6 +229,24 @@ def harness_args(
     ]
 
 
+def with_mcp_server(
+    role_args: Sequence[str], name: str, server: Mapping[str, Any], tools: Sequence[str]
+) -> list[str]:
+    # Adds the server to the one --mcp-config value and its tools to the allowed ones.
+    args = list(role_args)
+    allowed = [f"mcp__{name}__{tool}" for tool in tools]
+    if "--allowedTools" in args:
+        i = args.index("--allowedTools") + 1
+        args[i] = ",".join((args[i], *allowed))
+    else:
+        args += ["--allowedTools", ",".join(allowed)]
+    if "--mcp-config" not in args:
+        args += ["--mcp-config", json.dumps({"mcpServers": {}})]
+    i = args.index("--mcp-config") + 1
+    args[i] = json.dumps({"mcpServers": {**json.loads(args[i])["mcpServers"], name: dict(server)}})
+    return args
+
+
 def interactive_args(profile: ClaudeCodeProfile, *, permission_mode: str, role_args: Sequence[str]) -> list[str]:
     # The same settings as harness_args, for a conversation a person can watch and answer.
     return [

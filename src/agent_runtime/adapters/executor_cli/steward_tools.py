@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from agent_runtime.adapters.executor_cli import memory_mcp
 from agent_runtime.adapters.executor_cli.steward_git import (
     GIT_COMMANDS,
     ToolError,
@@ -22,20 +23,17 @@ from agent_runtime.adapters.executor_cli.steward_git import (
     plan_git,
     run_git,
 )
+from agent_runtime.adapters.executor_cli.tool_socket import MAX_SOCKET_PATH, clip, line_server, request_of
 from agent_runtime.adapters.memory_fs import call_memory_tool, write_memory
 from agent_runtime.core.models import Event, ForwardRefused, SessionStatus
 from agent_runtime.core.ports import RunCapabilities, SessionStorePort
 
 _STATUSES: tuple[SessionStatus, ...] = ("active", "suspended", "archived", "closed")
 _MAX_LIST = 100
-_MAX_TEXT = 100_000
 _SNIPPET = 500
 _MAX_LINES = 2000
 _MAX_MATCHES = 200
 _MAX_FILE = 10 * 1024 * 1024
-# Longest Unix socket path every supported system accepts (macOS allows 104 bytes).
-_MAX_SOCKET_PATH = 100
-_STREAM_LIMIT = 4 * 1024 * 1024
 
 
 class EventLister(Protocol):
@@ -114,10 +112,6 @@ def _search(checkout: Path, pattern: str, pathspec: str) -> list[tuple[str, str,
 
 def _shown_path(path: str) -> str:
     return path if path.isprintable() else json.dumps(path, ensure_ascii=False)
-
-
-def _clip(text: str) -> str:
-    return text if len(text) <= _MAX_TEXT else f"{text[:_MAX_TEXT]}\n[{len(text) - _MAX_TEXT} more characters cut]"
 
 
 def _required(arguments: dict[str, Any], key: str) -> str:
@@ -259,17 +253,7 @@ class StewardTools:
              "description": f"Replace a file of {memory}. reported.md is appended to instead; instructions.md "
                             "waits for a person's approval.",
              "inputSchema": _schema(("path", "content"), path=_TEXT, content=_TEXT)},
-            {"name": "memory_search",
-             "description": f"Full-text search over {whose} and the shared "
-                            "memory, and with include_kb the read-only knowledge mounts.",
-             "inputSchema": _schema(
-                 ("query",), query=_TEXT, top_k={"type": "integer"}, include_shared=_FLAG, include_kb=_FLAG,
-                 include_archived=_FLAG,
-             )},
-            {"name": "memory_read",
-             "description": f"Read a memory document or one Markdown section of it. uri: a path of {memory}, "
-                            "or a proj://, shared://, global:// or kb:// URI from memory_search.",
-             "inputSchema": _schema(("uri",), uri=_TEXT, heading=_TEXT, max_bytes={"type": "integer"})},
+            *memory_mcp.tool_definitions(memory=memory, whose=whose, uris="proj://, shared://, global:// or kb://"),
             {"name": "memory_propose_write",
              "description": f"Governed write to {memory if projectless else 'project memory'}: notes/ and progress/ apply at once (near-duplicates are "
                             "refused unless supersedes or force_new is given), instructions.md and shared:// wait for "
@@ -326,7 +310,7 @@ class StewardTools:
             return "arguments must be an object", True
         self.calls += 1
         try:
-            return _clip(await handler(cast(dict[str, Any], arguments))), False
+            return clip(await handler(cast(dict[str, Any], arguments))), False
         except (ToolError, OSError, ValueError) as exc:
             return str(exc), True
 
@@ -514,44 +498,18 @@ class StewardTools:
     async def serve(self) -> AsyncGenerator[str]:
         # A socket in a fresh 0700 directory, gone with the run: only processes of this user can reach it.
         base = tempfile.gettempdir()
-        if len(os.fsencode(base)) > _MAX_SOCKET_PATH - 24:
+        if len(os.fsencode(base)) > MAX_SOCKET_PATH - 24:
             base = "/tmp"
         with tempfile.TemporaryDirectory(prefix="hb-steward-", dir=base) as tmp:
             path = os.path.join(tmp, "s")
-            connections: set[asyncio.Task[None]] = set()
-
-            async def connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-                task = asyncio.current_task()
-                assert task is not None
-                connections.add(cast(asyncio.Task[None], task))
-                try:
-                    while line := await reader.readline():
-                        writer.write((json.dumps(await self._answer(line), ensure_ascii=False) + "\n").encode("utf-8"))
-                        await writer.drain()
-                except (ConnectionError, ValueError):
-                    pass
-                finally:
-                    connections.discard(cast(asyncio.Task[None], task))
-                    writer.close()
-
-            server = await asyncio.start_unix_server(connected, path, limit=_STREAM_LIMIT)
-            try:
+            # No tool call outlives the run: a late forward would miss the batch the worker queues.
+            async with line_server(path, self._answer):
                 yield path
-            finally:
-                # No tool call outlives the run: a late forward would miss the batch the worker queues.
-                server.close()
-                for task in list(connections):
-                    task.cancel()
-                await asyncio.gather(*connections, return_exceptions=True)
 
     async def _answer(self, line: bytes) -> dict[str, Any]:
-        try:
-            request: object = json.loads(line)
-        except ValueError:
-            request = None
-        if not isinstance(request, dict):
+        item = request_of(line)
+        if item is None:
             return {"text": "malformed request", "error": True}
-        item = cast(dict[str, Any], request)
         if item.get("op") == "tools":
             return {"tools": self.definitions(projectless=self.projectless, system=self.system is not None)}
         text, error = await self.call(item.get("name"), item.get("arguments"))

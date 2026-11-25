@@ -201,6 +201,13 @@ CREATE TABLE IF NOT EXISTS reviewer_choices (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (session_id, executor_id)
 );
+
+-- Sessions that may read project memory over the runtime's socket, by the token their agents hold.
+CREATE TABLE IF NOT EXISTS memory_grants (
+    session_id TEXT PRIMARY KEY,
+    token TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
 """
 
 

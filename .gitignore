@@ -28,6 +28,8 @@ outbox/
 /attachments/
 # Open Run state for restart resume (runs_root sits next to the database); untracked files block auto-update
 /runs/
+# Socket of the memory tools of SDE sessions (next to the database too)
+/.hibernaut-memory/
 .env
 .env.*
 

@@ -1,5 +1,6 @@
 from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
 from agent_runtime.adapters.storage_sqlite.deliveries import SQLiteDeliveryStore
+from agent_runtime.adapters.storage_sqlite.memory_grants import SQLiteMemoryGrantStore
 from agent_runtime.adapters.storage_sqlite.open_runs import SQLiteOpenRunStore
 from agent_runtime.adapters.storage_sqlite.reviewers import QuotaMark, ReviewerChoice, SQLiteReviewerStore
 from agent_runtime.adapters.storage_sqlite.stores import (
@@ -26,6 +27,7 @@ __all__ = [
     "SQLiteDeliveryStore",
     "SQLiteInboxAdapter",
     "SQLiteLeaseLockAdapter",
+    "SQLiteMemoryGrantStore",
     "SQLiteOpenRunStore",
     "SQLiteOutboxAdapter",
     "SQLiteReviewerStore",

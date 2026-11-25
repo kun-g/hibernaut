@@ -553,7 +553,10 @@ def verdict_pass(session: FakeClaude, msg: Incoming) -> None:
                                    "verdict": "pass", "summary": "zero is rejected", "blocking": []}))
 
 
-class TestSDEResumesAfterRestart(PeerCase):
+class SDERestartCase(PeerCase):
+    # What each process hands its SDE on top of the rest.
+    sde_extra: dict = {}
+
     def setUp(self):
         super().setUp()
         self.repo = Path(os.path.realpath(make_base_repo(self.root)))
@@ -572,7 +575,7 @@ class TestSDEResumesAfterRestart(PeerCase):
                           options=SDEOptions(), reviewer=reviewer,
                           worktree_manager=OrcaWorktreeManager(workspace_store=workspaces, session_store=sessions,
                                                                backend="git"),
-                          inbox_checkout_map={}, tasks=SQLiteTaskMetadataStore(db), terminal=runner)
+                          inbox_checkout_map={}, tasks=SQLiteTaskMetadataStore(db), terminal=runner, **self.sde_extra)
         memory = Mock()
         memory.load_baseline.return_value = {}
         runs = SQLiteOpenRunStore(db, self.runs_root)
@@ -622,6 +625,8 @@ class TestSDEResumesAfterRestart(PeerCase):
     def event_status(self, db: SQLiteDatabase, evt: Event) -> str:
         return db.fetchone("SELECT status FROM event_inbox WHERE event_id = ?", (evt.event_id,))["status"]
 
+
+class TestSDEResumesAfterRestart(SDERestartCase):
     async def test_a_stop_during_development_resumes_into_review_without_sending_the_task_again(self):
         self.orca.scripts += [[None], [verdict_pass]]
         evt = self.submit()
