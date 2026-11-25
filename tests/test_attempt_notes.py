@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import unittest
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
@@ -24,6 +25,7 @@ from agent_runtime.adapters.executor_cli.attempt_notes import (
     AttemptResult,
     note_path,
 )
+from agent_runtime.adapters.delivery import MERGE_TOOL
 from agent_runtime.adapters.executor_cli import CommandResult
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor
 from agent_runtime.adapters.memory_fs import GovernedMemoryHub, WorkspacePartitionRegistry
@@ -38,7 +40,7 @@ from agent_runtime.adapters.storage_sqlite import (
 )
 from agent_runtime.app.config import parse_config
 from agent_runtime.app.main import build_daemon_from_config
-from agent_runtime.core.models import Emit, Event, RunDetached, SessionRef, Suspend
+from agent_runtime.core.models import Emit, Event, PermissionDecision, RunDetached, SessionRef, Suspend
 from agent_runtime.engine.attempts import ATTEMPT_NOTES_KEY, attempt_goal, check_goal
 from agent_runtime.engine.handler import EventHandler
 from agent_runtime.engine.worker import AgentWorker
@@ -174,7 +176,7 @@ def test_without_a_goal_nothing_is_recorded(notes: Notes) -> None:
     notes.notes.progress("s1", "tried")
     notes.notes.finish("s1", AttemptResult(MERGED))
     notes.notes.session_closed("s1")
-    notes.notes.settle("task:1", ALPHA, Mock(side_effect=AssertionError("nothing to ask for")), Path("/nowhere"))
+    notes.notes.settle("task:1", ALPHA, Mock(side_effect=AssertionError("nothing to ask for")))
     assert not notes.path().parent.exists()
     assert "attempts" not in "".join(p.read_text() for p in notes.hub.project_dir("alpha").glob("*.md"))
 
@@ -286,10 +288,11 @@ def test_a_refused_write_and_a_broken_database_are_logged(
     assert attempts.begin("s1", ALPHA, (evt, GOAL), "t") == GOAL
     attempts.located("s1", "task:1", "/nowhere")
     attempts.progress("s1", "x")
+    attempts.delivered("s1", "https://x/pull/1", "0" * 40)
     attempts.finish("s1", AttemptResult(NO_CHANGE))
     attempts.session_closed("s1")
-    attempts.settle("task:1", ALPHA, list, Path("/nowhere"))
-    assert caplog.text.count("database is locked") >= 6
+    attempts.settle("task:1", ALPHA, list)
+    assert caplog.text.count("database is locked") >= 7
 
 
 def test_a_task_writes_its_own_projects_memory_and_no_other(notes: Notes) -> None:
@@ -356,7 +359,9 @@ class OwnMergeCase(SweepCase):
         done = work() if work is not None else None
         self.notes.notes.progress(session, f"summary of {session}")
         if result is not None:
-            self.notes.notes.finish(session, result)
+            # A PR is always at a pushed head: what lies there, unless the delivery names another one.
+            pushed = result.head or (git(self.wt, "rev-parse", "HEAD") if result.pr_url else "")
+            self.notes.notes.finish(session, replace(result, head=pushed))
         return done
 
     def merged(self, head: str, merge: str = "", url: str = "https://x/pull/3") -> None:
@@ -423,15 +428,77 @@ class TestOnlyItsOwnMergeCounts(OwnMergeCase, unittest.TestCase):
         self.assertIn("https://x/pull/4", self.notes.text())
 
     def test_a_failed_or_closed_attempt_with_commits_follows_its_merge(self) -> None:
-        self.attempt("s1", AttemptResult(FAILED), lambda: self.commit("x = 1\n"))
+        head = self.attempt("s1", AttemptResult(FAILED), lambda: self.commit("x = 1\n"))
+        self.merged(head)
+        self.settle()
         self.notes.begin("s2")
         self.notes.notes.located("s2", "task:9", str(self.wt))
         head = self.commit("x = 2\n")
         self.notes.notes.session_closed("s2")
-        self.assertEqual(self.entries(), ["停止 · title of s2", "失败 · title of s1"])
+        self.assertEqual(self.entries(), ["停止 · title of s2", "已合并 · title of s1"])
         self.merged(head)
         self.settle()
-        self.assertEqual(sorted(self.entries()), ["已合并 · title of s1", "已合并 · title of s2"])
+        self.assertEqual(self.entries(), ["已合并 · title of s2", "已合并 · title of s1"])
+
+    def test_a_later_attempts_merge_on_top_of_earlier_commits_is_not_the_earlier_ones(self) -> None:
+        self.attempt("s1", AttemptResult(FAILED), lambda: self.commit("x = 1\n"))
+        self.attempt("s2", AttemptResult(UNMERGED), lambda: self.commit("x = 2\n"))
+        self.notes.begin("s3")
+        self.notes.notes.located("s3", "task:9", str(self.wt))
+        self.commit("x = 3\n")
+        self.notes.notes.session_closed("s3")
+        head = self.attempt("s4", AttemptResult(UNMERGED), lambda: self.commit("x = 4\n"))
+        self.merged(head)
+        self.settle()
+        self.assertEqual(self.entries(), ["已合并 · title of s4", "停止 · title of s3", "没合并 · title of s2",
+                                          "失败 · title of s1"])
+        self.assertEqual(self.notes.text().count("https://x/pull/3"), 1)
+
+    def test_commits_of_a_task_without_the_field_on_top_are_not_the_attempts_merge(self) -> None:
+        self.attempt("s1", AttemptResult(FAILED), lambda: self.commit("x = 1\n"))
+        self.merged(self.commit("x = 2\n"))
+        self.settle()
+        self.assertEqual(self.entries(), ["失败 · title of s1"])
+
+    def test_a_replay_without_commits_is_not_given_the_merge_of_what_came_between(self) -> None:
+        for between in ("s2", ""):
+            with self.subTest(between or "a task without the field"):
+                first = f"first{between}"
+                self.attempt(first, AttemptResult(FAILED), lambda: self.commit(f"x = '{first}'\n"))
+                later = self.commit(f"y = '{first}'\n")
+                old = AttemptResult(MERGED, pr_url="https://x/pull/7", head=later)
+                if between:
+                    self.notes.begin(between)
+                    self.notes.notes.located(between, "task:9", str(self.wt))
+                    later = self.commit(f"z = '{first}'\n")
+                    old = AttemptResult(MERGED, pr_url="https://x/pull/7", head=later)
+                    self.notes.notes.progress(between, "more")
+                    self.notes.notes.finish(between, old)
+                self.attempt(first, old)
+                self.assertEqual(self.entries()[0], f"没有改动 · title of {first}")
+
+    def test_an_attempt_resumed_after_a_later_one_merged_is_not_given_that_merge(self) -> None:
+        # Suspended meanwhile, so it does not begin again.
+        self.attempt("s1", None, lambda: self.commit("x = 1\n"))
+        head = self.attempt("s2", None, lambda: self.commit("x = 2\n"))
+        merged = AttemptResult(MERGED, pr_url="https://x/pull/7", head=head)
+        self.notes.notes.finish("s2", merged)
+        self.notes.notes.finish("s1", merged)
+        self.assertEqual(self.entries(), ["没合并 · title of s1", "已合并 · title of s2"])
+
+    def test_a_task_closed_while_its_delivery_waits_follows_its_own_pr(self) -> None:
+        self.attempt("s1", None, lambda: self.commit("x = 1\n"))
+        # The PR's head has the delivery's own commit (the version) on top.
+        self.notes.notes.delivered("s1", "https://x/pull/3", self.commit("version\n"))
+        # A delivery that only knows the PR of other work leaves no trace.
+        head = git(self.wt, "rev-parse", "HEAD")
+        self.attempt("s2", None)
+        self.notes.notes.delivered("s2", "https://x/pull/3", head)
+        self.notes.notes.session_closed("s1")
+        self.notes.notes.session_closed("s2")
+        self.merged(head)
+        self.settle()
+        self.assertEqual(self.entries(), ["已合并 · title of s1", "停止 · title of s2"])
 
     def test_a_task_of_another_project_with_the_same_key_is_left_alone(self) -> None:
         head, merge = self.attempt("s1", AttemptResult(UNMERGED, pr_url="https://x/pull/3"), self.squashed_task, inbox=BETA)
@@ -478,14 +545,15 @@ class TestOnlyItsOwnMergeCounts(OwnMergeCase, unittest.TestCase):
         self.settle()
         self.assertEqual(self.entries()[:2], ["没合并 · title of s5", "没合并 · title of s4"])
         # The delivery's own commits on top (the version, the base) are still this attempt's delivery.
-        ours = self.attempt("s6", None, lambda: self.commit("y = 4\n"))
+        self.attempt("s6", None, lambda: self.commit("y = 4\n"))
         self.notes.notes.finish("s6", AttemptResult(MERGED, pr_url="https://x/pull/6", head=self.commit("version\n")))
-        self.assertTrue(ours)
         self.assertEqual(self.entries()[0], "已合并 · title of s6")
 
     def test_a_follow_up_without_commits_keeps_the_attempts_own_work(self) -> None:
-        head = self.attempt("s1", AttemptResult(UNMERGED, pr_url="https://x/pull/3"), lambda: self.commit("y = 2\n"))
-        self.commit("version\n")
+        self.attempt("s1", None, lambda: self.commit("y = 2\n"))
+        # The delivery's own commit lies on top when the attempt ends, so it does not count as somebody else's work.
+        head = self.commit("version\n")
+        self.notes.notes.finish("s1", AttemptResult(UNMERGED, pr_url="https://x/pull/3", head=head))
         self.notes.notes.begin("s1", ALPHA, None, "again")
         self.notes.notes.located("s1", "task:9", str(self.wt))
         self.notes.notes.progress("s1", "nothing to add")
@@ -745,6 +813,18 @@ class TestDelivered(SDEDeliveryCase):
         assert isinstance(outcome, Emit), outcome
         self.assertEqual(self.kept.entries(project="x"), ["没合并 · Reject zero divisors"])
         self.assertIn("https://github.example/o/r/pull/1", self.kept.text("x"))
+
+    async def test_a_pr_whose_delivery_waits_for_a_person_is_known_to_the_record(self) -> None:
+        self.set_plan(sde=[delivered_dev({"calc.py": "x = 1\n"})], reviewer=[PASS])
+        self.caps.permissions = Mock()
+        self.caps.permissions.check.side_effect = lambda tool, args: PermissionDecision(
+            action="defer" if tool == MERGE_TOOL else "allow", reason="ask first")
+        outcome = await self.executor(True, self.delivery(auto_merge=True)).execute(
+            [event(self.payload(attempt_notes=GOAL))], None, self.caps)
+        assert isinstance(outcome, Suspend), outcome
+        self.kept.notes.session_closed(str(outcome.session_id))
+        self.assertEqual(self.kept.entries(project="x"), ["停止 · Reject zero divisors"])
+        self.assertIn("- PR: https://github.example/o/r/pull/1", self.kept.text("x"))
 
     async def test_later_attempts_are_not_given_the_merge_of_the_first(self) -> None:
         async def run(title: str, step: Any) -> None:

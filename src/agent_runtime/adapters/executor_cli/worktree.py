@@ -105,7 +105,7 @@ class OrcaWorktreeManager:
         usage: Callable[[str], list[str]] | None = None,
         primary_inbox_id: str | None = None,
         isolate_inboxes: bool = False,
-        settle: Callable[[str, str, Callable[[], Sequence[MergedPR]], Path], None] | None = None,
+        settle: Callable[[str, str, Callable[[], Sequence[MergedPR]]], None] | None = None,
     ) -> None:
         # isolate_inboxes: the project serves several inboxes from one checkout, so each (inbox, work_key) writes
         # only in its own managed hb-* worktree. The primary inbox keeps the bare work_key, as before isolation.
@@ -116,8 +116,8 @@ class OrcaWorktreeManager:
         self._store = workspace_store
         # Reports who else still needs a task's worktree (reviewers, queued events, an unfinished delivery).
         self._usage = usage
-        # Told of a workspace, its inbox, how to find out which PRs of its branch were merged, and its checkout: in every
-        # sweep, and before it goes.
+        # Told of a workspace, its inbox, and how to find out which PRs of its branch were merged: in every sweep, and
+        # before it goes.
         self._settle = settle
         self._session_store = session_store
         self._reclaim_stale_after_seconds = reclaim_stale_after_seconds
@@ -512,7 +512,7 @@ class OrcaWorktreeManager:
     def settle(self, record: WorkspaceRecord) -> None:
         owner = record.inbox_id or self._primary_inbox_id
         if self._settle is not None and owner is not None:
-            self._settle(record.work_key, owner, lambda: self._merged_prs(record), Path(record.repo_checkout))
+            self._settle(record.work_key, owner, lambda: self._merged_prs(record))
 
     def _merged_prs(self, record: WorkspaceRecord) -> list[MergedPR]:
         workdir = Path(record.workdir)

@@ -76,10 +76,13 @@ class AttemptNotes:
         try:
             row = self._store.latest(session_id)
             if row is not None:
+                row = replace(row, work_key=work_key, workdir=workdir)
                 # What lies there when the attempt begins is not its own. One begun again before it ended (a restart) has
-                # its commits there already.
-                seen = row.seen_head if row.seen_head and not row.result else _head(workdir)
-                self._store.save(replace(row, work_key=work_key, workdir=workdir, seen_head=seen))
+                # its commits there already; after its end, whatever moved HEAD since is somebody else's work.
+                head = _head(workdir)
+                if not row.seen_head or (row.result and head != row.seen_head):
+                    row = replace(row, seen_head=head, dev_head="")
+                self._store.save(row)
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the workspace of its attempt is not recorded", session_id)
 
@@ -94,13 +97,24 @@ class AttemptNotes:
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the progress of its attempt is not recorded", session_id)
 
+    def delivered(self, session_id: str, pr_url: str, head: str) -> None:
+        # The PR of a delivery that may yet wait for a person: closed meanwhile, the attempt still has its PR.
+        try:
+            row = self._store.latest(session_id)
+            if row is None or row.result == MERGED or not pr_url or pr_url == row.pr_url:
+                return
+            if self._own(row, pr_url, head):
+                self._store.save(replace(row, pr_url=pr_url, written=False))
+        except Exception:  # noqa: BLE001
+            _log.exception("session %s: the PR of its attempt is not recorded", session_id)
+
     def finish(self, session_id: str, ended: AttemptResult) -> None:
         try:
             row = self._store.latest(session_id)
             if row is not None:
                 if ended.result in (FAILED, STOPPED) and not row.dev_head:
                     row = _with_commits(row)
-                self._record(row, _judged(row, ended))
+                self._record(_at_end(row), self._judged(row, ended))
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the end of its attempt is not in the project memory", session_id)
 
@@ -109,25 +123,51 @@ class AttemptNotes:
         try:
             row = self._store.latest(session_id)
             if row is not None and not row.result:
-                self._record(row if row.dev_head else _with_commits(row), AttemptResult(STOPPED, detail="会话被关闭"))
+                row = row if row.dev_head else _with_commits(row)
+                self._record(_at_end(row), AttemptResult(STOPPED, detail="会话被关闭"))
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the end of its attempt is not in the project memory", session_id)
 
-    def settle(self, work_key: str, inbox_id: str, merged: Callable[[], Sequence[MergedPR]], checkout: Path) -> None:
+    def settle(self, work_key: str, inbox_id: str, merged: Callable[[], Sequence[MergedPR]]) -> None:
         # What a person merged after the task had ended. A workspace and its branch may serve one attempt after another,
-        # and its key may come up in another project, so only the attempts of its inbox count, each only for a PR of its
-        # own commits. merged() asks GitHub, and only while such an attempt waits for the answer.
+        # and its key may come up in another project, so only the attempts of its inbox count, each only for its own PR:
+        # the one it had, or one whose head is its last commit. A head that merely contains that is a later attempt's.
+        # merged() asks GitHub, and only while such an attempt waits for the answer.
         try:
             waiting = [r for r in self._store.by_work_key(work_key) if r.inbox_id == inbox_id
                        and r.result in (UNMERGED, FAILED, STOPPED) and (r.dev_head or r.pr_url)]
             prs = merged() if waiting else ()
             for row in reversed(waiting):
                 own = next((p for p in prs if (p.url and p.url == row.pr_url)
-                            or _contains(checkout, p.head, row.dev_head)), None)
+                            or (p.head and p.head == row.dev_head)), None)
                 if own is not None:
                     self._record(row, AttemptResult(MERGED, pr_url=own.url))
         except Exception:  # noqa: BLE001
             _log.exception("%s: its merge is not in the project memory", work_key)
+
+    def _own(self, row: AttemptRow, pr_url: str, head: str) -> bool:
+        # Whether a PR the delivery named, pushed at head, is this attempt's: a delivery record belongs to the work_key,
+        # so it may be that of another attempt. The delivery's own commits may lie on top, another attempt's not.
+        if pr_url and pr_url == row.pr_url:
+            return True
+        here = Path(row.workdir)
+        return _contains(here, head, row.dev_head) and not any(
+            _contains(here, head, other.dev_head) and _contains(here, other.dev_head, row.dev_head)
+            for other in self._store.by_work_key(row.work_key)
+            if other.inbox_id == row.inbox_id and other.dev_head != row.dev_head
+        )
+
+    def _judged(self, row: AttemptRow, ended: AttemptResult) -> AttemptResult:
+        # Not judged when the worktree's HEAD could not be read.
+        if ended.result not in (MERGED, UNMERGED) or not row.seen_head:
+            return ended
+        if not row.dev_head and not row.pr_url:
+            return replace(ended, result=NO_CHANGE, pr_url="", detail="这次没有新提交")
+        if ended.pr_url and not self._own(row, ended.pr_url, ended.head):
+            if ended.result == MERGED:
+                ended = replace(ended, result=UNMERGED, detail=f"已合并的 {ended.pr_url} 不是这次的提交")
+            return replace(ended, pr_url="")
+        return ended
 
     def _record(self, row: AttemptRow, ended: AttemptResult) -> None:
         # Merged is final: what the same task does afterwards (a replay, a follow-up) does not take it back.
@@ -145,18 +185,9 @@ class AttemptNotes:
         self._store.mark_written(row)
 
 
-def _judged(row: AttemptRow, ended: AttemptResult) -> AttemptResult:
-    # A delivery record belongs to the work_key, so what it names may be the PR of an earlier attempt. Not judged when
-    # the worktree's HEAD could not be read.
-    if ended.result not in (MERGED, UNMERGED) or not row.seen_head:
-        return ended
-    if not row.dev_head:
-        return replace(ended, result=NO_CHANGE, pr_url="", detail="这次没有新提交")
-    if ended.pr_url and ended.head and not _contains(Path(row.workdir), ended.head, row.dev_head):
-        if ended.result == MERGED:
-            ended = replace(ended, result=UNMERGED, detail=f"已合并的 {ended.pr_url} 不含这次的提交")
-        return replace(ended, pr_url="")
-    return ended
+def _at_end(row: AttemptRow) -> AttemptRow:
+    # With what the delivery put on top (the version, the base).
+    return replace(row, seen_head=_head(row.workdir) or row.seen_head)
 
 
 def _with_commits(row: AttemptRow) -> AttemptRow:

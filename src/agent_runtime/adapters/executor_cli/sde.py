@@ -1223,6 +1223,8 @@ class SDEExecutor:
             is_interrupted=caps.is_interrupted,
             should_detach=progress.run.should_detach if progress is not None else _stays,
         )
+        if self._attempts is not None:
+            await asyncio.to_thread(self._attempts.delivered, session_id, record.pr_url, record.pushed_sha)
         if record.problem:
             limit = self._delivery.config.max_handbacks
             if record.handback and state.handbacks < limit:
