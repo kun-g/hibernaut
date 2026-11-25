@@ -229,6 +229,8 @@
 
 提交前与 `.github/workflows/ci.yml` 强制执行：`lint-imports`、`pytest -n auto --dist worksteal -v`（串行 `pytest -v` 只用于排查并行相关的失败）、`pyright`（strict，覆盖 `agent_runtime/core`、`agent_runtime/engine`、`switchboard`、`ccpeer`、`taskboard`、`runner`、`ledger`、`dashboard` 与 `collaboration`）。PR 上由 `scripts/select_tests.py` 按 Python AST 反向依赖图与资源映射仅跑受影响测试（加 `full-ci` 标签或合入 `main` 时跑全量兜底）。
 
+全局与系统 Steward 的路由测试在终端接口处直接启动模拟 CLI，覆盖实际工作目录、提示、MCP 子进程和权限判定。需要观察 Orca 终端创建、账号不符或中断后子进程退出的用例使用真实 shell 包装进程。
+
 术语定义以 [`docs/glossary.md`](glossary.md) 为唯一基准，本文不再重复定义。以下是术语在当前实现中的落地约束：
 
 - **Inbox / `inbox_id`**：经项目的 `inbox_id` 规则（字符串为精确 ID；数组每项为整串匹配的正则）解析到至多一个项目；多个 inbox 可属同一项目，但各自持有 worktree。

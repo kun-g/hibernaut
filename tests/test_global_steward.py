@@ -23,6 +23,7 @@ from agent_runtime.app.main import build_daemon_from_config, serve_configured
 from agent_runtime.core.models import FORWARD_SOURCE, RETURN_SOURCE, Event, PermissionDecision, SessionRef
 from agent_runtime.engine import OutboxDispatcher
 from tests.fakes import RecordingChannel
+from tests.steward_terminal import steward_cli_terminal
 from tests.switchboard_support import Harness, make_harness, post
 from tests.test_coder_reviewer import fake_command, git
 from tests.test_sde_executor import make_base_repo
@@ -418,7 +419,13 @@ class RunTests(AshCase):
         self.assertEqual([e.status for e in self.events("switchboard:feishu")], ["pending"])
 
 
-class ForwardRuleTests(AshCase):
+class RoutingCase(AshCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.enterContext(steward_cli_terminal(self.root))
+
+
+class ForwardRuleTests(RoutingCase):
     async def test_only_listed_main_inboxes_take_work(self) -> None:
         targets = ["proj:c", "proj:a:sde", "proj:b:sde", "user:two", "sys:ops", "proj:none"]
         self.set_plan([{"calls": [*(forward(t, "x") for t in targets),
@@ -494,7 +501,7 @@ class ForwardRuleTests(AshCase):
                              [False, False, False, False, True, True, True])
 
 
-class ChatCase(AshCase):
+class ChatCase(RoutingCase):
     # Messages come in and answers go out through a real Switchboard, with Feishu's API faked.
     def setUp(self) -> None:
         super().setUp()
@@ -615,7 +622,7 @@ class EndToEndTests(ChatCase):
         self.assertEqual(card["json"]["receive_id"], "oc_approvals")
 
 
-class ReloadTests(AshCase):
+class ReloadTests(RoutingCase):
     async def wait_for(self, check: Callable[[], bool], what: str) -> None:
         deadline = time.monotonic() + 30
         while not check():

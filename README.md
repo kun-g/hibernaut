@@ -176,6 +176,8 @@ schemas/runner/v1/  # Runner 协议（capabilities、run_request、run_result、
 schemas/v1/         # 执行账本的 AuditRecord / RunRecord（ADR-0001）、Memory Hub 与协作（收口卡、专家、简报）的 JSON Schema（Draft 2020-12）
 ```
 
+Steward 路由测试在配置的工作目录启动模拟 CLI，通过 MCP 调用工具。要验证终端启动、账号检查和进程清理，见 [`test_terminal_processes.py`](tests/test_terminal_processes.py)。
+
 提交前三道门禁必须全绿：
 
 ```bash

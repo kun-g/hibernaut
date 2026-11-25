@@ -29,6 +29,7 @@ from agent_runtime.app.reload import ReloadFailed, ReloadStatus
 from agent_runtime.core.models import FORWARD_SOURCE, RETURN_SOURCE, Event
 from agent_runtime.engine.handler import EventHandler, RemoteRefused
 from tests.fakes import RecordingChannel
+from tests.steward_terminal import steward_cli_terminal
 from tests.switchboard_support import Harness, make_harness, post
 from tests.test_coder_reviewer import fake_command, git
 from tests.test_global_steward import forward, reply
@@ -200,6 +201,7 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
         }))
         self.orca = FakeOrcaTerminals(self.root)
         self.enterContext(poll_test_terminals(self.root))
+        self.enterContext(steward_cli_terminal(self.root))
         # Drain serving runs before removing the terminals they still await.
         self.addAsyncCleanup(self.orca.close_all)
         self.enterContext(patch("agent_runtime.adapters.executor_cli.orca._orca", new=self.orca))
