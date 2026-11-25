@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 import threading
 import unittest
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -23,12 +24,13 @@ from agent_runtime.adapters.executor_cli.attempt_notes import (
     UNMERGED,
     AttemptNotes,
     AttemptResult,
+    MergedPR,
     note_path,
 )
 from agent_runtime.adapters.delivery import MERGE_TOOL
 from agent_runtime.adapters.executor_cli import CommandResult
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor
-from agent_runtime.adapters.memory_fs import GovernedMemoryHub, WorkspacePartitionRegistry
+from agent_runtime.adapters.memory_fs import GovernedMemoryHub, PartitionedMemoryAdapter, WorkspacePartitionRegistry
 from agent_runtime.adapters.storage_sqlite import (
     SQLiteAttemptStore,
     SQLiteDatabase,
@@ -53,7 +55,7 @@ from tests.test_resume_runs import INBOX, SDERestartCase, committed, verdict_pas
 from tests.test_sde_delivery import SDEDeliveryCase
 from tests.test_sde_delivery import dev as delivered_dev
 from tests.test_sde_executor import FIXED, PASS, dev, event
-from tests.test_sde_memory import ALPHA, BETA, MemoryCase
+from tests.test_sde_memory import ALPHA, BETA, MemoryCase, ungranted
 
 GOAL = "test-speed"
 NOTE = f"notes/attempts/{GOAL}.md"
@@ -312,6 +314,215 @@ def test_a_task_writes_its_own_projects_memory_and_no_other(notes: Notes) -> Non
     # The same session id under another inbox is still the project its event came in for.
     notes.run("s1", AttemptResult(FAILED), inbox=BETA, event_id="other")
     assert notes.entries() == ["没有改动 · title of s1"]
+
+
+# --- two processes at once ---------------------------------------------------------------------------------------
+
+
+PR = "https://x/pull/3"
+
+
+class Race:
+    # A sweep of another process, with its own connection and hub, lands between two steps of this one's writes.
+    def __init__(self, root: Path, notes: Notes) -> None:
+        self.notes = notes
+        self.elsewhere = Notes(root)
+
+    def unmerged(self) -> None:
+        # Ended with its PR open, and at work again (a follow-up).
+        self.notes.begin()
+        self.notes.notes.located("s1", "task:9", "/nowhere")
+        self.notes.notes.progress("s1", "one")
+        self.notes.notes.finish("s1", AttemptResult(UNMERGED, detail="open", pr_url=PR, summary="one"))
+
+    def merge(self) -> None:
+        self.elsewhere.notes.settle("task:9", ALPHA, lambda: [MergedPR(url=PR, head="")])
+
+    def after_read(self, meanwhile: Callable[[], None], work: Callable[[], None]) -> None:
+        read = self.notes.store.latest
+
+        def latest(session_id: str) -> Any:
+            row = read(session_id)
+            meanwhile()
+            return row
+
+        with patch.object(self.notes.store, "latest", latest):
+            work()
+
+    def row(self) -> Any:
+        return self.elsewhere.db.fetchone("SELECT * FROM attempt_notes")
+
+    def assert_merged(self) -> None:
+        row = self.row()
+        assert (row["result"], row["pr_url"], row["written"]) == (MERGED, PR, 1)
+        assert self.notes.entries() == ["已合并 · title of s1"]
+
+
+@pytest.fixture
+def race(tmp_path: Path, notes: Notes) -> Iterator[Race]:
+    opened = Race(tmp_path, notes)
+    yield opened
+    opened.elsewhere.close()
+
+
+WRITERS: dict[str, Callable[[AttemptNotes], None]] = {
+    "located": lambda n: n.located("s1", "task:9", "/elsewhere"),
+    "progress": lambda n: n.progress("s1", "two"),
+    "delivered": lambda n: n.delivered("s1", "https://x/pull/4", "c" * 40),
+    "unmerged": lambda n: n.finish("s1", AttemptResult(UNMERGED, detail="still open", pr_url=PR, summary="two")),
+    "failed": lambda n: n.finish("s1", AttemptResult(FAILED, detail="crashed")),
+    "no change": lambda n: n.finish("s1", AttemptResult(NO_CHANGE, summary="two")),
+    "closed": lambda n: n.session_closed("s1"),
+}
+
+
+@pytest.mark.parametrize("writer", WRITERS)
+def test_a_merge_recorded_after_the_row_was_read_stays(race: Race, writer: str) -> None:
+    race.unmerged()
+    with race.notes.db.transaction() as conn:
+        # Its own commit, so that the second PR counts as its own too.
+        conn.execute("UPDATE attempt_notes SET dev_head = ?", ("c" * 40,))
+    race.after_read(race.merge, lambda: WRITERS[writer](race.notes.notes))
+    race.assert_merged()
+    # What ends later knows it too.
+    race.notes.notes.finish("s1", AttemptResult(UNMERGED, summary="three"))
+    race.assert_merged()
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_a_merge_recorded_while_an_older_result_is_on_its_way_into_the_file_stays(race: Race, late: bool) -> None:
+    race.unmerged()
+    rewrite, held = PartitionedMemoryAdapter.rewrite_note, [True]
+
+    def slow(adapter: Any, *args: Any, **options: Any) -> None:
+        if held.pop() if held else False:
+            if late:
+                rewrite(adapter, *args, **options)
+            race.merge()
+            if late:
+                return
+        rewrite(adapter, *args, **options)
+
+    with patch.object(PartitionedMemoryAdapter, "rewrite_note", slow):
+        race.notes.notes.finish("s1", AttemptResult(UNMERGED, detail="still open", pr_url=PR, summary="two"))
+    assert not held
+    race.assert_merged()
+
+
+@pytest.mark.parametrize("merge_first", [False, True])
+@pytest.mark.parametrize("writer", ["progress", "delivered", "unmerged"])
+def test_two_updates_of_one_row_never_overlap(race: Race, writer: str, merge_first: bool) -> None:
+    race.unmerged()
+    with race.notes.db.transaction() as conn:
+        conn.execute("UPDATE attempt_notes SET dev_head = ?", ("c" * 40,))
+
+    def merge(notes: AttemptNotes) -> None:
+        notes.settle("task:9", ALPHA, lambda: [MergedPR(url=PR, head="c" * 40)])
+
+    first, second = (merge, WRITERS[writer]) if merge_first else (WRITERS[writer], merge)
+    ours, theirs = race.notes.store.update, race.elsewhere.store.update
+    begun, inside, overlapped = threading.Event(), threading.Event(), list[bool]()
+    other = threading.Thread(target=lambda: second(race.elsewhere.notes))
+
+    def entered(attempt: str, change: Any) -> Any:
+        def noted(row: Any) -> Any:
+            inside.set()
+            return change(row)
+        return theirs(attempt, noted)
+
+    def held(attempt: str, change: Any) -> Any:
+        def slow(row: Any) -> Any:
+            # The row is read and not yet written: the other connection starts its own update now.
+            other.start()
+            assert begun.wait(5)
+            overlapped.append(inside.wait(0.05))
+            return change(row)
+        with patch.object(race.notes.store, "update", ours):
+            return ours(attempt, slow)
+
+    race.elsewhere.db._conn.set_trace_callback(lambda sql: begun.set() if sql.startswith("BEGIN") else None)
+    with patch.object(race.elsewhere.store, "update", entered), patch.object(race.notes.store, "update", held):
+        first(race.notes.notes)
+        other.join(10)
+    assert not other.is_alive()
+    assert overlapped == [False]
+    # Progress and a PR change the row of an unmerged attempt without writing its record.
+    race.notes.notes.finish("s1", AttemptResult(UNMERGED, summary="three"))
+    row = race.row()
+    assert (row["result"], row["written"]) == (MERGED, 1)
+    assert race.notes.entries() == ["已合并 · title of s1"]
+
+
+@pytest.mark.parametrize("failing", [False, True])
+@pytest.mark.parametrize("marked_last", [False, True])
+def test_a_merge_recorded_between_reading_the_row_and_writing_the_file_stays(
+    race: Race, marked_last: bool, failing: bool
+) -> None:
+    race.unmerged()
+    write, mark, update = race.notes.hub.propose_write, race.notes.store.mark_written, race.elsewhere.store.update
+    committed = threading.Event()
+    sweep = threading.Thread(target=race.merge)
+
+    def merging(attempt: str, change: Any) -> Any:
+        row = update(attempt, change)
+        committed.set()
+        return row
+
+    def propose(proposal: Any) -> Any:
+        # Under the lock, with the row read: the sweep commits its merge and then waits for the lock to write it.
+        sweep.start()
+        assert committed.wait(5)
+        assert "没合并" in proposal.content
+        return write(proposal)
+
+    def marking(row: Any) -> None:
+        if marked_last:
+            sweep.join(10)
+        mark(row)
+
+    broken: Any = patch.object(race.elsewhere.hub, "propose_write", side_effect=OSError("disk full")) if failing \
+        else contextlib.nullcontext()
+    with broken, patch.object(race.elsewhere.store, "update", merging), \
+            patch.object(race.notes.hub, "propose_write", propose), patch.object(race.notes.store, "mark_written", marking):
+        race.notes.notes.finish("s1", AttemptResult(UNMERGED, detail="still open", pr_url=PR, summary="two"))
+        sweep.join(10)
+    assert not sweep.is_alive() and committed.is_set()
+    if failing:
+        # What the file does not say yet must not count as written, or no end would make up for it.
+        assert (race.row()["result"], race.row()["written"]) == (MERGED, 0)
+    else:
+        race.assert_merged()
+    for ended in (AttemptResult(UNMERGED, pr_url=PR, summary="three"), AttemptResult(FAILED, detail="crashed")):
+        race.notes.notes.finish("s1", ended)
+        race.assert_merged()
+
+
+def test_a_sweep_that_asked_before_the_attempt_went_on_takes_nothing_back(race: Race) -> None:
+    race.unmerged()
+
+    def merged() -> list[MergedPR]:
+        race.notes.notes.finish("s1", AttemptResult(MERGED, pr_url="https://x/pull/4", summary="two"))
+        return [MergedPR(url=PR, head="")]
+
+    race.elsewhere.notes.settle("task:9", ALPHA, merged)
+    row = race.row()
+    assert (row["result"], row["pr_url"], row["summary"]) == (MERGED, "https://x/pull/4", "two")
+    assert "https://x/pull/4" in race.notes.text() and "> two" in race.notes.text()
+
+
+@pytest.mark.parametrize("writer", ["located", "progress"])
+def test_what_says_the_same_stays_marked_as_written(race: Race, writer: str) -> None:
+    race.unmerged()
+    with race.notes.db.transaction() as conn:
+        conn.execute("UPDATE attempt_notes SET written = 0")
+
+    def written() -> None:
+        race.elsewhere.notes.finish("s1", AttemptResult(UNMERGED, detail="open", pr_url=PR, summary="one"))
+        assert race.row()["written"] == 1
+
+    work = {**WRITERS, "progress": lambda n: n.progress("s1", "one")}[writer]
+    race.after_read(written, lambda: work(race.notes.notes))
+    assert race.row()["written"] == 1
 
 
 # --- ends that no Run sees ---------------------------------------------------------------------------------------
@@ -785,6 +996,17 @@ class TestFirstPrompt(SDENotesCase):
         await self.prompt()
         self.access = None
         self.assertNotIn("memory_read", await self.prompt())
+
+    async def test_a_session_that_cannot_be_granted_the_tools_is_not_told_of_the_record(self) -> None:
+        self.index("- [Tried](notes/tried.md)\n")
+        await self.prompt(text="one")
+        granted = await self.prompt(text="two")
+        self.assertIn("## Earlier attempts", granted)
+        with ungranted(self.world.db):
+            denied = await self.prompt(text="two")
+        self.assertNotIn("memory_read", denied)
+        self.assertNotIn("## Earlier attempts", denied)
+        self.assertEqual(self.recorded()[0], "没有改动 · Faster tests")
 
 
 class TestDelivered(SDEDeliveryCase):

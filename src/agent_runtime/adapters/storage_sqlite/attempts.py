@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import Any
 
 from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
@@ -69,16 +70,30 @@ class SQLiteAttemptStore:
         return [_row(r) for r in self._db.fetchall(
             f"{_SELECT} WHERE work_key = ? ORDER BY begun_at DESC, rowid DESC", (work_key,))]
 
-    def save(self, row: AttemptRow) -> None:
+    def get(self, attempt_id: str) -> AttemptRow:
+        row = self._db.fetchone(f"{_SELECT} WHERE attempt_id = ?", (attempt_id,))
+        if row is None:
+            raise LookupError(f"no attempt {attempt_id}")
+        return _row(row)
+
+    def update(self, attempt_id: str, change: Callable[[AttemptRow], AttemptRow]) -> AttemptRow:
+        # change gets the row as it is now, whatever the caller read before: the transaction has the write lock (BEGIN
+        # IMMEDIATE) before it reads, so no other connection writes in between. They wait meanwhile: no git in it.
+        # What is written stays so as long as the row says the same.
         with self._db.transaction() as conn:
-            conn.execute(
-                "UPDATE attempt_notes SET work_key = ?, workdir = ?, seen_head = ?, dev_head = ?, summary = ?, result = ?, "
-                "detail = ?, pr_url = ?, written = ? WHERE attempt_id = ?",
-                (row.work_key, row.workdir, row.seen_head, row.dev_head, *row.said(), row.written, row.attempt_id),
-            )
+            row = self.get(attempt_id)
+            now = change(row)
+            now = replace(now, written=row.written and now.said() == row.said())
+            if now != row:
+                conn.execute(
+                    "UPDATE attempt_notes SET work_key = ?, workdir = ?, seen_head = ?, dev_head = ?, summary = ?, "
+                    "result = ?, detail = ?, pr_url = ?, written = ? WHERE attempt_id = ?",
+                    (now.work_key, now.workdir, now.seen_head, now.dev_head, *now.said(), now.written, attempt_id),
+                )
+        return now
 
     def mark_written(self, row: AttemptRow) -> None:
-        # Unless it changed meanwhile.
+        # row: as the file says it. Compared in the same statement: one that changed meanwhile is still to be written.
         with self._db.transaction() as conn:
             conn.execute(
                 "UPDATE attempt_notes SET written = 1 "

@@ -445,6 +445,19 @@ def test_the_memory_server_goes_beside_the_handoffs(tmp_path: Path) -> None:
     assert servers(peer) == {SERVER: server} and set(PERMITTED) <= set(peer[1].split(","))
 
 
+@contextlib.contextmanager
+def ungranted(db: SQLiteDatabase) -> Iterator[None]:
+    # No session gets a token: the write of every grant fails.
+    with db.transaction() as conn:
+        conn.execute("CREATE TRIGGER no_grants BEFORE INSERT ON memory_grants BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END")
+        conn.execute("DELETE FROM memory_grants")
+    try:
+        yield
+    finally:
+        with db.transaction() as conn:
+            conn.execute("DROP TRIGGER no_grants")
+
+
 class MemoryCase(VisibleCase):
     def setUp(self) -> None:
         super().setUp()
@@ -594,6 +607,52 @@ class TestFirstPrompt(MemoryCase):
         for text in ("", " \n"):
             self.index(text)
             self.assertEqual(await self.prompt(self.world.access), await self.prompt(None))
+
+    async def test_a_session_that_cannot_be_granted_the_tools_is_not_told_to_call_them(self) -> None:
+        self.index("- [Tried](notes/tried.md): what was tried\n")
+        plain, granted = await self.prompt(None), await self.prompt(self.world.access)
+        self.assertIn("memory_read", granted)
+        with ungranted(self.world.db), self.assertLogs(level="ERROR") as logged:
+            denied = await self.prompt(self.world.access)
+        self.assertEqual(denied, plain)
+        self.assertNotIn("memory_read", denied)
+        self.assertIn("starts without the memory tools", "".join(logged.output))
+        self.assertEqual(await self.prompt(self.world.access), granted)
+
+    async def test_in_a_terminal_too_and_the_task_is_delivered(self) -> None:
+        self.index("- [Tried](notes/tried.md): what was tried\n")
+        self.set_plan(sde=[{**dev(FIXED), **READ}], reviewer=[PASS])
+        with ungranted(self.world.db):
+            outcome = await self.sde(terminal=self.runner).execute([self.task()], self.session(), self.caps)
+        assert isinstance(outcome, Emit), outcome
+        self.assertIn("[sde] delivered (review=pass", outcome.messages[0])
+        self.assertEqual(outcome.status, "done")
+        [call] = [c for c in self.calls("sde", "interactive") if "turn" in c]
+        self.assertNotIn("memory_read", call["prompt"])
+        self.assertIn("notes/tried.md", call["prompt"])
+        [answer] = self.answers()
+        self.assertIsNone(answer["memory"])
+
+    async def test_it_depends_on_the_launch_not_on_when_the_prompt_was_written(self) -> None:
+        self.index("- [Tried](notes/tried.md): what was tried\n")
+        for denied_at_first in (False, True):
+            with self.subTest(denied_at_first=denied_at_first):
+                self.log.unlink(missing_ok=True)
+                self.set_plan(sde=[dev(FIXED)])
+                permissions, self.caps.permissions = self.caps.permissions, Mock()
+                self.caps.permissions.check.return_value = PermissionDecision(action="defer", reason="ask first")
+                with ungranted(self.world.db) if denied_at_first else contextlib.nullcontext():
+                    asked = await self.sde(review=False).execute([self.task()], self.session(), self.caps)
+                self.caps.permissions = permissions
+                assert isinstance(asked, Suspend), asked
+                waiting = self.session(status="suspended", pending_request_id=asked.request_id,
+                                       checkpoint=asked.session_checkpoint)
+                approval = event({"approval_request_id": asked.request_id, "approved": True}, inbox_id=ALPHA)
+                with contextlib.nullcontext() if denied_at_first else ungranted(self.world.db):
+                    await self.sde(review=False).execute([approval], waiting, self.caps)
+                [call] = self.calls("sde")
+                self.assertEqual("memory_read" in call["prompt"], denied_at_first)
+                self.assertEqual("--mcp-config" in call["argv"], denied_at_first)
 
 
 class TestPeerHandoff(SDERestartCase):
