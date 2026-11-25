@@ -222,6 +222,9 @@ CREATE TABLE IF NOT EXISTS attempt_notes (
     result TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
     pr_url TEXT NOT NULL DEFAULT '',
+    workdir TEXT NOT NULL DEFAULT '',
+    seen_head TEXT NOT NULL DEFAULT '',
+    dev_head TEXT NOT NULL DEFAULT '',
     written INTEGER NOT NULL DEFAULT 0,
     begun_at TEXT NOT NULL
 );

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, cast
 
+from agent_runtime.adapters.executor_cli.attempt_notes import MergedPR
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore, WorkspaceRecord
 from agent_runtime.core.ports import OutboxPort, SessionStorePort
 
@@ -104,7 +105,7 @@ class OrcaWorktreeManager:
         usage: Callable[[str], list[str]] | None = None,
         primary_inbox_id: str | None = None,
         isolate_inboxes: bool = False,
-        settle: Callable[[str, Callable[[], str | None]], None] | None = None,
+        settle: Callable[[str, str, Callable[[], Sequence[MergedPR]], Path], None] | None = None,
     ) -> None:
         # isolate_inboxes: the project serves several inboxes from one checkout, so each (inbox, work_key) writes
         # only in its own managed hb-* worktree. The primary inbox keeps the bare work_key, as before isolation.
@@ -115,7 +116,8 @@ class OrcaWorktreeManager:
         self._store = workspace_store
         # Reports who else still needs a task's worktree (reviewers, queued events, an unfinished delivery).
         self._usage = usage
-        # Told of a workspace that may have been merged, with how to find out (the merged PR's URL), before it goes.
+        # Told of a workspace, its inbox, how to find out which PRs of its branch were merged, and its checkout: in every
+        # sweep, and before it goes.
         self._settle = settle
         self._session_store = session_store
         self._reclaim_stale_after_seconds = reclaim_stale_after_seconds
@@ -508,30 +510,29 @@ class OrcaWorktreeManager:
         return self._in_use(sessions_key, owner, record.work_key)
 
     def settle(self, record: WorkspaceRecord) -> None:
-        if self._settle is not None:
-            self._settle(record.work_key, lambda: self._merged_url(record))
+        owner = record.inbox_id or self._primary_inbox_id
+        if self._settle is not None and owner is not None:
+            self._settle(record.work_key, owner, lambda: self._merged_prs(record), Path(record.repo_checkout))
 
-    def _merged_url(self, record: WorkspaceRecord) -> str | None:
-        merged = self._merged_prs_at_head(record)
-        return str(merged[0].get("url") or "") if merged else None
+    def _merged_prs(self, record: WorkspaceRecord) -> list[MergedPR]:
+        workdir = Path(record.workdir)
+        cwd = workdir if workdir.is_dir() else Path(record.repo_checkout)
+        return [MergedPR(url=str(pr.get("url") or ""), head=str(pr.get("headRefOid") or ""))
+                for pr in self._pr_list(record.branch, "merged", "url,headRefOid", cwd) or ()]
 
     def merged_at_head(self, record: WorkspaceRecord) -> bool | None:
         # Whether GitHub reports a merged PR for the branch whose head is the worktree's HEAD, so the work in this
         # worktree is what was merged. None when it cannot be told (no worktree, git or gh failed).
-        merged = self._merged_prs_at_head(record)
-        return bool(merged) if merged is not None else None
-
-    def _merged_prs_at_head(self, record: WorkspaceRecord) -> list[dict[str, object]] | None:
         workdir = Path(record.workdir)
         if not workdir.is_dir():
             return None
         head = self._runner(["git", "rev-parse", "HEAD"], workdir)
         if head.returncode != 0 or not head.stdout.strip():
             return None
-        merged = self._pr_list(record.branch, "merged", "number,headRefOid,url", workdir)
+        merged = self._pr_list(record.branch, "merged", "number,headRefOid", workdir)
         if merged is None:
             return None
-        return [pr for pr in merged if pr.get("headRefOid") == head.stdout.strip()]
+        return any(pr.get("headRefOid") == head.stdout.strip() for pr in merged)
 
     def _in_use(self, work_key: str, owner: str | None, storage_key: str) -> str | None:
         # Gate 0: no active or suspended session, child included, still references work_key.

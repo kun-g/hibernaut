@@ -8,7 +8,7 @@ from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
 from agent_runtime.core.models import Event, utc_now_iso
 
 _COLUMNS = ("attempt_id", "inbox_id", "goal", "external_id", "title", "session_id", "work_key", "summary", "result",
-            "detail", "pr_url", "written")
+            "detail", "pr_url", "workdir", "seen_head", "dev_head", "written")
 _SELECT = f"SELECT {', '.join(_COLUMNS)} FROM attempt_notes"
 
 
@@ -26,8 +26,16 @@ class AttemptRow:
     result: str = ""
     detail: str = ""
     pr_url: str = ""
+    workdir: str = ""
+    # The worktree's HEAD when last looked at: at the begin, and after each developer turn.
+    seen_head: str = ""
+    # The HEAD the attempt's own last commits made; empty while it has committed nothing.
+    dev_head: str = ""
     # Whether the project memory says what this row says.
     written: bool = False
+
+    def said(self) -> tuple[str, ...]:
+        return self.summary, self.result, self.detail, self.pr_url
 
 
 def attempt_id(event: Event) -> str:
@@ -61,16 +69,12 @@ class SQLiteAttemptStore:
         return [_row(r) for r in self._db.fetchall(
             f"{_SELECT} WHERE work_key = ? ORDER BY begun_at DESC, rowid DESC", (work_key,))]
 
-    def locate(self, attempt: str, work_key: str) -> None:
-        with self._db.transaction() as conn:
-            conn.execute("UPDATE attempt_notes SET work_key = ? WHERE attempt_id = ?", (work_key, attempt))
-
     def save(self, row: AttemptRow) -> None:
-        # What the note is to say; written again once it does.
         with self._db.transaction() as conn:
             conn.execute(
-                "UPDATE attempt_notes SET summary = ?, result = ?, detail = ?, pr_url = ?, written = 0 WHERE attempt_id = ?",
-                (row.summary, row.result, row.detail, row.pr_url, row.attempt_id),
+                "UPDATE attempt_notes SET work_key = ?, workdir = ?, seen_head = ?, dev_head = ?, summary = ?, result = ?, "
+                "detail = ?, pr_url = ?, written = ? WHERE attempt_id = ?",
+                (row.work_key, row.workdir, row.seen_head, row.dev_head, *row.said(), row.written, row.attempt_id),
             )
 
     def mark_written(self, row: AttemptRow) -> None:
@@ -79,7 +83,7 @@ class SQLiteAttemptStore:
             conn.execute(
                 "UPDATE attempt_notes SET written = 1 "
                 "WHERE attempt_id = ? AND summary = ? AND result = ? AND detail = ? AND pr_url = ?",
-                (row.attempt_id, row.summary, row.result, row.detail, row.pr_url),
+                (row.attempt_id, *row.said()),
             )
 
 

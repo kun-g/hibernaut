@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
+import subprocess
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 from agent_runtime.adapters.memory_fs import PartitionedMemoryAdapter
 from agent_runtime.adapters.storage_sqlite import AttemptRow, SQLiteAttemptStore
@@ -28,6 +30,14 @@ class AttemptResult:
     pr_url: str = ""
     # Empty: what the developer last reported.
     summary: str = ""
+    # The head the delivery pushed, which says whose commits its PR has.
+    head: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class MergedPR:
+    url: str
+    head: str
 
 
 def note_path(goal: str) -> str:
@@ -62,28 +72,35 @@ class AttemptNotes:
             _log.exception("%s could not be read", note_path(goal))
         return False
 
-    def located(self, session_id: str, work_key: str) -> None:
+    def located(self, session_id: str, work_key: str, workdir: str) -> None:
         try:
             row = self._store.latest(session_id)
             if row is not None:
-                self._store.locate(row.attempt_id, work_key)
+                # What lies there when the attempt begins is not its own. One begun again before it ended (a restart) has
+                # its commits there already.
+                seen = row.seen_head if row.seen_head and not row.result else _head(workdir)
+                self._store.save(replace(row, work_key=work_key, workdir=workdir, seen_head=seen))
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the workspace of its attempt is not recorded", session_id)
 
     def progress(self, session_id: str, summary: str) -> None:
-        # Kept for an end that comes without a summary, such as a failure or a closed session.
+        # After each developer turn: its commits, and a summary kept for an end that comes without one, such as a
+        # failure or a closed session.
         try:
             row = self._store.latest(session_id)
-            if row is not None and summary and summary != row.summary and row.result != MERGED:
-                self._store.save(replace(row, summary=summary))
+            if row is not None and row.result != MERGED:
+                now = replace(_with_commits(row), summary=summary or row.summary)
+                self._store.save(replace(now, written=row.written and now.summary == row.summary))
         except Exception:  # noqa: BLE001
-            _log.exception("session %s: the summary of its attempt is not recorded", session_id)
+            _log.exception("session %s: the progress of its attempt is not recorded", session_id)
 
     def finish(self, session_id: str, ended: AttemptResult) -> None:
         try:
             row = self._store.latest(session_id)
             if row is not None:
-                self._record(row, ended)
+                if ended.result in (FAILED, STOPPED) and not row.dev_head:
+                    row = _with_commits(row)
+                self._record(row, _judged(row, ended))
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the end of its attempt is not in the project memory", session_id)
 
@@ -92,23 +109,23 @@ class AttemptNotes:
         try:
             row = self._store.latest(session_id)
             if row is not None and not row.result:
-                self._record(row, AttemptResult(STOPPED, detail="会话被关闭"))
+                self._record(row if row.dev_head else _with_commits(row), AttemptResult(STOPPED, detail="会话被关闭"))
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the end of its attempt is not in the project memory", session_id)
 
-    def settle(self, work_key: str, merged: Callable[[], str | None]) -> None:
-        # What a person merged after the task had ended. merged() asks GitHub: the PR's URL, None when not merged. It is
-        # only asked while a record waits for the answer.
+    def settle(self, work_key: str, inbox_id: str, merged: Callable[[], Sequence[MergedPR]], checkout: Path) -> None:
+        # What a person merged after the task had ended. A workspace and its branch may serve one attempt after another,
+        # and its key may come up in another project, so only the attempts of its inbox count, each only for a PR of its
+        # own commits. merged() asks GitHub, and only while such an attempt waits for the answer.
         try:
-            rows = self._store.by_work_key(work_key)
-            waiting = [r for n, r in enumerate(rows) if r.result == UNMERGED or (n == 0 and r.result in (FAILED, STOPPED))]
-            if not waiting:
-                return
-            url = merged()
-            if url is None:
-                return
+            waiting = [r for r in self._store.by_work_key(work_key) if r.inbox_id == inbox_id
+                       and r.result in (UNMERGED, FAILED, STOPPED) and (r.dev_head or r.pr_url)]
+            prs = merged() if waiting else ()
             for row in reversed(waiting):
-                self._record(row, AttemptResult(MERGED, pr_url=row.pr_url or url))
+                own = next((p for p in prs if (p.url and p.url == row.pr_url)
+                            or _contains(checkout, p.head, row.dev_head)), None)
+                if own is not None:
+                    self._record(row, AttemptResult(MERGED, pr_url=own.url))
         except Exception:  # noqa: BLE001
             _log.exception("%s: its merge is not in the project memory", work_key)
 
@@ -117,15 +134,56 @@ class AttemptNotes:
         if row.result != MERGED or ended.result == MERGED:
             now = replace(row, result=ended.result, detail=ended.detail, pr_url=ended.pr_url or row.pr_url,
                           summary=ended.summary or row.summary)
-            if now != row:
-                row = replace(now, written=False)
-                self._store.save(row)
+            now = replace(now, written=now.written and now.said() == row.said())
+            self._store.save(now)
+            row = now
         if row.written:
             return
         # Read and written in one go, so records written at the same moment are all kept.
         self._memory_for(row.inbox_id).rewrite_note(
             note_path(row.goal), lambda text, limit: _with_record(text, limit, row), rationale=_title(row.goal))
         self._store.mark_written(row)
+
+
+def _judged(row: AttemptRow, ended: AttemptResult) -> AttemptResult:
+    # A delivery record belongs to the work_key, so what it names may be the PR of an earlier attempt. Not judged when
+    # the worktree's HEAD could not be read.
+    if ended.result not in (MERGED, UNMERGED) or not row.seen_head:
+        return ended
+    if not row.dev_head:
+        return replace(ended, result=NO_CHANGE, pr_url="", detail="这次没有新提交")
+    if ended.pr_url and ended.head and not _contains(Path(row.workdir), ended.head, row.dev_head):
+        if ended.result == MERGED:
+            ended = replace(ended, result=UNMERGED, detail=f"已合并的 {ended.pr_url} 不含这次的提交")
+        return replace(ended, pr_url="")
+    return ended
+
+
+def _with_commits(row: AttemptRow) -> AttemptRow:
+    head = _head(row.workdir)
+    if not row.seen_head or not head or head == row.seen_head:
+        return row
+    return replace(row, seen_head=head, dev_head=head)
+
+
+def _git(cwd: str | Path, *args: str) -> subprocess.CompletedProcess[str] | None:
+    if not str(cwd) or not Path(cwd).is_dir():
+        return None
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=30, check=False)
+
+
+def _head(workdir: str) -> str:
+    proc = _git(workdir, "rev-parse", "HEAD") if workdir else None
+    return proc.stdout.strip() if proc is not None and proc.returncode == 0 else ""
+
+
+def _contains(cwd: Path, head: str, commit: str) -> bool:
+    if not head or not commit:
+        return False
+    if head == commit:
+        return True
+    proc = _git(cwd, "merge-base", "--is-ancestor", commit, head)
+    return proc is not None and proc.returncode == 0
 
 
 def _title(goal: str) -> str:

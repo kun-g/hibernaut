@@ -24,6 +24,7 @@ from agent_runtime.adapters.executor_cli.attempt_notes import (
     AttemptResult,
     note_path,
 )
+from agent_runtime.adapters.executor_cli import CommandResult
 from agent_runtime.adapters.executor_cli.sde import SDEExecutor
 from agent_runtime.adapters.memory_fs import GovernedMemoryHub, WorkspacePartitionRegistry
 from agent_runtime.adapters.storage_sqlite import (
@@ -44,6 +45,7 @@ from agent_runtime.engine.worker import AgentWorker
 from memory_hub import MemoryHubConfig
 from tests.fakes import InMemoryPermission
 from tests.test_gdrive_tasks import _FakeDriveClient
+from tests.test_pr_delivery import git
 from tests.test_reclaim_sweep import SweepCase
 from tests.test_resume_runs import INBOX, SDERestartCase, committed, verdict_pass
 from tests.test_sde_delivery import SDEDeliveryCase
@@ -168,11 +170,11 @@ def test_a_new_task_in_the_same_session_is_another_record(notes: Notes) -> None:
 
 def test_without_a_goal_nothing_is_recorded(notes: Notes) -> None:
     assert notes.notes.begin("s1", ALPHA, None, "a task") is None
-    notes.notes.located("s1", "task:1")
+    notes.notes.located("s1", "task:1", "/nowhere")
     notes.notes.progress("s1", "tried")
     notes.notes.finish("s1", AttemptResult(MERGED))
     notes.notes.session_closed("s1")
-    notes.notes.settle("task:1", lambda: "https://x/pull/1")
+    notes.notes.settle("task:1", ALPHA, Mock(side_effect=AssertionError("nothing to ask for")), Path("/nowhere"))
     assert not notes.path().parent.exists()
     assert "attempts" not in "".join(p.read_text() for p in notes.hub.project_dir("alpha").glob("*.md"))
 
@@ -282,11 +284,11 @@ def test_a_refused_write_and_a_broken_database_are_logged(
     attempts = AttemptNotes(store=broken, memory_for=notes.registry.memory_for)
     evt = Event(inbox_id=ALPHA, source="test", external_id="e", payload={})
     assert attempts.begin("s1", ALPHA, (evt, GOAL), "t") == GOAL
-    attempts.located("s1", "task:1")
+    attempts.located("s1", "task:1", "/nowhere")
     attempts.progress("s1", "x")
     attempts.finish("s1", AttemptResult(NO_CHANGE))
     attempts.session_closed("s1")
-    attempts.settle("task:1", lambda: "")
+    attempts.settle("task:1", ALPHA, list, Path("/nowhere"))
     assert caplog.text.count("database is locked") >= 6
 
 
@@ -329,59 +331,174 @@ def test_a_session_closed_before_any_result_is_stopped(notes: Notes) -> None:
     assert "> half done" in notes.text()
 
 
-def test_a_later_merge_updates_the_record(notes: Notes) -> None:
-    for session, result in (("s1", AttemptResult(UNMERGED, pr_url="https://x/pull/1")), ("s2", AttemptResult(UNMERGED)),
-                            ("s3", AttemptResult(NO_CHANGE))):
-        notes.begin(session)
-        notes.notes.located(session, f"task:{session}")
-        notes.notes.finish(session, result)
-    asked = Mock(return_value=None)
-    notes.notes.settle("task:s1", asked)
-    assert notes.entries()[-1] == "没合并 · title of s1"
-    notes.notes.settle("task:s1", lambda: "")
-    notes.notes.settle("task:s2", lambda: "https://x/pull/2")
-    for key in ("task:s1", "task:s2", "task:s3", "task:none", ""):
-        notes.notes.settle(key, Mock(side_effect=AssertionError("nothing left to ask")))
-    assert notes.entries() == ["已合并 · title of s2", "已合并 · title of s1", "没有改动 · title of s3"]
-    assert "https://x/pull/1" in notes.text() and "https://x/pull/2" in notes.text()
+class OwnMergeCase(SweepCase):
+    # Attempts of one task (work_key task:9) in its worktree, one after the other.
+    def setUp(self) -> None:
+        super().setUp()
+        self.notes = Notes(self.root)
+        self.addCleanup(self.notes.close)
+        self.workspaces.claim_owner("task:9", ALPHA)
+        plain = self.manager
+        self.manager = lambda usage=None: self.settling(plain(usage))
+        self.asked = 0
+
+    def settling(self, manager: Any) -> Any:
+        manager._settle = self.notes.notes.settle
+        return manager
+
+    def runner(self, cmd: Any, cwd: Any) -> Any:
+        self.asked += cmd[0] == "gh"
+        return super().runner(cmd, cwd)
+
+    def attempt(self, session: str, result: AttemptResult | None, work: Any = None, inbox: str = ALPHA) -> Any:
+        self.notes.begin(session, inbox=inbox)
+        self.notes.notes.located(session, "task:9", str(self.wt))
+        done = work() if work is not None else None
+        self.notes.notes.progress(session, f"summary of {session}")
+        if result is not None:
+            self.notes.notes.finish(session, result)
+        return done
+
+    def merged(self, head: str, merge: str = "", url: str = "https://x/pull/3") -> None:
+        self.gh["merged"] = CommandResult(0, json.dumps([
+            {"number": 3, "headRefOid": head, "mergeCommit": {"oid": merge}, "url": url}]), "")
+
+    def settle(self) -> None:
+        record = self.workspaces.get("task:9")
+        assert record is not None
+        self.manager().settle(record)
+
+    def entries(self, project: str = "alpha") -> list[str]:
+        return self.notes.entries(project=project)
 
 
-class TestSweepSettlesRecords(SweepCase, unittest.TestCase):
+class TestOnlyItsOwnMergeCounts(OwnMergeCase, unittest.TestCase):
     def test_a_pr_merged_elsewhere_is_recorded_while_the_session_still_holds_the_worktree(self) -> None:
-        notes = Notes(self.root)
-        self.addCleanup(notes.close)
-        notes.begin()
-        notes.notes.located("s1", "task:9")
-        notes.notes.finish("s1", AttemptResult(UNMERGED, summary="one"))
-        self.sessions.save(SessionRef(session_id="s1", inbox_id="proj:x", executor_id="sde", work_key="task:9"))
-        base = self.manager
-        self.manager = lambda usage=None: self.settling(base(usage), notes)
-        head, merge = self.squashed_task()
+        head, merge = self.attempt("s1", AttemptResult(UNMERGED), self.squashed_task)
+        self.sessions.save(SessionRef(session_id="s1", inbox_id=ALPHA, executor_id="sde", work_key="task:9"))
         self.sweeper().sweep_once()
-        self.assertEqual(notes.entries(), ["没合并 · title of s1"])
-        self.gh["merged"] = type(self.gh["merged"])(0, json.dumps(
-            [{"number": 3, "headRefOid": head, "mergeCommit": {"oid": merge}, "url": "https://x/pull/3"}]), "")
+        self.assertEqual(self.entries(), ["没合并 · title of s1"])
+        self.merged(head, merge)
         [outcome] = self.sweeper().sweep_once()
         self.assertFalse(outcome.reclaimed)
-        self.assertEqual(notes.entries(), ["已合并 · title of s1"])
-        self.assertIn("https://x/pull/3", notes.text())
+        self.assertEqual(self.entries(), ["已合并 · title of s1"])
+        self.assertIn("https://x/pull/3", self.notes.text())
+
+    def test_a_merge_from_before_is_not_that_of_a_later_attempt_without_commits(self) -> None:
+        head, merge = self.attempt("s1", AttemptResult(UNMERGED, pr_url="https://x/pull/3"), self.squashed_task)
+        self.merged(head, merge)
+        self.settle()
+        self.attempt("s2", AttemptResult(FAILED, detail="crashed"))
+        self.attempt("s3", AttemptResult(STOPPED, detail="question declined"))
+        self.attempt("s4", None)
+        self.notes.notes.session_closed("s4")
+        expected = ["停止 · title of s4", "停止 · title of s3", "失败 · title of s2", "已合并 · title of s1"]
+        self.assertEqual(self.entries(), expected)
+        asked = self.asked
+        self.settle()
+        # Attempts that committed nothing have no merge to wait for.
+        self.assertEqual(self.asked, asked)
+        self.sweeper().sweep_once()
+        self.assertTrue(self.workspaces.get("task:9") is None)
+        self.assertEqual(self.entries(), expected)
+        self.assertEqual(self.notes.text().count("https://x/pull/3"), 1)
+
+    def test_a_merge_of_earlier_work_after_the_attempt_is_not_its_own_either(self) -> None:
+        head, merge = self.attempt("s1", AttemptResult(UNMERGED, pr_url="https://x/pull/3"), self.squashed_task)
+        self.attempt("s2", AttemptResult(FAILED))
+        self.merged(head, merge)
+        self.settle()
+        self.assertEqual(self.entries(), ["已合并 · title of s1", "失败 · title of s2"])
+
+    def test_commits_made_after_the_merged_head_are_not_merged(self) -> None:
+        head, merge = self.attempt("s1", AttemptResult(UNMERGED), self.squashed_task)
+        later = self.attempt("s2", AttemptResult(UNMERGED), lambda: self.commit("y = 2\n"))
+        self.merged(head, merge)
+        self.settle()
+        self.assertEqual(self.entries(), ["已合并 · title of s1", "没合并 · title of s2"])
+        # A PR of more work contains it.
+        self.merged(later, url="https://x/pull/4")
+        self.settle()
+        self.assertEqual(self.entries()[0], "已合并 · title of s2")
+        self.assertIn("https://x/pull/4", self.notes.text())
+
+    def test_a_failed_or_closed_attempt_with_commits_follows_its_merge(self) -> None:
+        self.attempt("s1", AttemptResult(FAILED), lambda: self.commit("x = 1\n"))
+        self.notes.begin("s2")
+        self.notes.notes.located("s2", "task:9", str(self.wt))
+        head = self.commit("x = 2\n")
+        self.notes.notes.session_closed("s2")
+        self.assertEqual(self.entries(), ["停止 · title of s2", "失败 · title of s1"])
+        self.merged(head)
+        self.settle()
+        self.assertEqual(sorted(self.entries()), ["已合并 · title of s1", "已合并 · title of s2"])
+
+    def test_a_task_of_another_project_with_the_same_key_is_left_alone(self) -> None:
+        head, merge = self.attempt("s1", AttemptResult(UNMERGED, pr_url="https://x/pull/3"), self.squashed_task, inbox=BETA)
+        self.attempt("s2", AttemptResult(FAILED))
+        self.merged(head, merge)
+        self.settle()
+        self.assertTrue(self.manager().reclaim("task:9").reclaimed)
+        self.assertEqual(self.entries("beta"), ["没合并 · title of s1"])
+        self.assertEqual(self.entries(), ["失败 · title of s2"])
+
+    def test_a_workspace_of_nobody_settles_nothing(self) -> None:
+        head, merge = self.attempt("s1", AttemptResult(UNMERGED), self.squashed_task)
+        self.merged(head, merge)
+        with self.db.transaction() as conn:
+            conn.execute("UPDATE workspaces SET inbox_id = NULL")
+        self.settle()
+        self.assertEqual(self.entries(), ["没合并 · title of s1"])
 
     def test_a_reclaim_records_the_merge_first(self) -> None:
-        notes = Notes(self.root)
-        self.addCleanup(notes.close)
-        notes.begin()
-        notes.notes.located("s1", "task:9")
-        notes.notes.finish("s1", AttemptResult(STOPPED))
-        head, merge = self.squashed_task()
-        self.merged_pr(head, merge)
-        result = self.settling(self.manager(), notes).reclaim("task:9")
+        head, merge = self.attempt("s1", AttemptResult(STOPPED), self.squashed_task)
+        self.merged(head, merge)
+        result = self.manager().reclaim("task:9")
         self.assertTrue(result.reclaimed, result.reason)
-        self.assertEqual(notes.entries(), ["已合并 · title of s1"])
+        self.assertEqual(self.entries(), ["已合并 · title of s1"])
 
-    @staticmethod
-    def settling(manager: Any, notes: Notes) -> Any:
-        manager._settle = notes.notes.settle
-        return manager
+    def test_a_merge_is_recorded_after_the_directory_went_too(self) -> None:
+        head, merge = self.attempt("s1", AttemptResult(UNMERGED), self.squashed_task)
+        self.merged(head, merge)
+        git(self.primary, "worktree", "remove", "--force", str(self.wt))
+        self.sweeper().sweep_once()
+        self.assertEqual(self.entries(), ["已合并 · title of s1"])
+
+    def test_what_a_delivery_says_counts_only_for_the_commits_it_covers(self) -> None:
+        # The delivery record belongs to the work_key: it may still name the PR of an earlier attempt.
+        head, _ = self.attempt("s1", AttemptResult(MERGED, pr_url="https://x/pull/3"), self.squashed_task)
+        old = {"pr_url": "https://x/pull/3", "head": head}
+        self.attempt("s2", AttemptResult(MERGED, **old))
+        self.attempt("s3", AttemptResult(UNMERGED, **old))
+        self.attempt("s4", AttemptResult(MERGED, **old), lambda: self.commit("y = 2\n"))
+        self.attempt("s5", AttemptResult(UNMERGED, **old), lambda: self.commit("y = 3\n"))
+        self.assertEqual(self.entries(), ["没合并 · title of s5", "没合并 · title of s4", "没有改动 · title of s3",
+                                          "没有改动 · title of s2", "已合并 · title of s1"])
+        self.merged(head)
+        self.settle()
+        self.assertEqual(self.entries()[:2], ["没合并 · title of s5", "没合并 · title of s4"])
+        # The delivery's own commits on top (the version, the base) are still this attempt's delivery.
+        ours = self.attempt("s6", None, lambda: self.commit("y = 4\n"))
+        self.notes.notes.finish("s6", AttemptResult(MERGED, pr_url="https://x/pull/6", head=self.commit("version\n")))
+        self.assertTrue(ours)
+        self.assertEqual(self.entries()[0], "已合并 · title of s6")
+
+    def test_a_follow_up_without_commits_keeps_the_attempts_own_work(self) -> None:
+        head = self.attempt("s1", AttemptResult(UNMERGED, pr_url="https://x/pull/3"), lambda: self.commit("y = 2\n"))
+        self.commit("version\n")
+        self.notes.notes.begin("s1", ALPHA, None, "again")
+        self.notes.notes.located("s1", "task:9", str(self.wt))
+        self.notes.notes.progress("s1", "nothing to add")
+        self.notes.notes.finish("s1", AttemptResult(MERGED, pr_url="https://x/pull/3", head=head))
+        self.assertEqual(self.entries(), ["已合并 · title of s1"])
+
+    def test_a_run_started_over_before_its_end_keeps_its_commits(self) -> None:
+        # A restart without a usable state begins the same event again, in a worktree that has its commits by then.
+        self.notes.begin("s1")
+        self.notes.notes.located("s1", "task:9", str(self.wt))
+        head = self.commit("y = 2\n")
+        self.attempt("s1", AttemptResult(MERGED, pr_url="https://x/pull/3", head=head))
+        self.assertEqual(self.entries(), ["已合并 · title of s1"])
 
 
 # --- goal names ---------------------------------------------------------------------------------------------------
@@ -621,16 +738,27 @@ class TestDelivered(SDEDeliveryCase):
         self.assertEqual(self.kept.entries(project="x"), ["已合并 · Reject zero divisors"])
         self.assertIn("https://github.example/o/r/pull/1", self.kept.text("x"))
 
-    async def test_an_open_pr_is_not_merged_yet_and_the_record_follows_the_merge(self) -> None:
+    async def test_an_open_pr_is_not_merged_yet(self) -> None:
         self.set_plan(sde=[delivered_dev({"calc.py": "x = 1\n"})])
-        task = event(self.payload(attempt_notes=GOAL))
-        outcome = await self.executor(delivery=self.delivery()).execute([task], None, self.caps)
+        outcome = await self.executor(delivery=self.delivery()).execute(
+            [event(self.payload(attempt_notes=GOAL))], None, self.caps)
         assert isinstance(outcome, Emit), outcome
         self.assertEqual(self.kept.entries(project="x"), ["没合并 · Reject zero divisors"])
         self.assertIn("https://github.example/o/r/pull/1", self.kept.text("x"))
-        row = self.kept.db.fetchone("SELECT work_key FROM attempt_notes")
-        self.kept.notes.settle(row["work_key"], lambda: "")
-        self.assertEqual(self.kept.entries(project="x"), ["已合并 · Reject zero divisors"])
+
+    async def test_later_attempts_are_not_given_the_merge_of_the_first(self) -> None:
+        async def run(title: str, step: Any) -> None:
+            self.set_plan(sde=[step], reviewer=[PASS])
+            self.log.unlink(missing_ok=True)
+            await self.executor(True, self.delivery(auto_merge=True)).execute(
+                [event(self.payload(attempt_notes=GOAL, title=title))], None, self.caps)
+
+        await run("first", delivered_dev({"calc.py": "x = 1\n"}))
+        nothing = delivered_dev({}, kind="test_docs", commit=None, code_change=False)
+        await run("second", nothing)
+        await run("third", delivered_dev({"calc.py": "x = 2\n"}))
+        self.assertEqual(self.kept.entries(project="x"), ["没合并 · third", "没有改动 · second", "已合并 · first"])
+        self.assertEqual(self.kept.text("x").count("- PR: "), 1)
 
 
 # --- end to end ---------------------------------------------------------------------------------------------------

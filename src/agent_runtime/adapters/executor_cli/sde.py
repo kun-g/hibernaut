@@ -647,7 +647,7 @@ class SDEExecutor:
             state = await self._new_state(events, targets, session)
             state.resume_log += notes
             if goal is not None and self._attempts is not None:
-                await asyncio.to_thread(self._attempts.located, session_id, self._work_key(state))
+                await asyncio.to_thread(self._attempts.located, session_id, self._work_key(state), state.workdir)
             prompt = await self._first_prompt(state, caps, goal)
         return await self._run(session_id, native, state, caps, prompt, approved_launch=approved_launch,
                                progress=progress)
@@ -1307,7 +1307,7 @@ class SDEExecutor:
         why += [delivery.problem, *delivery.notes] if delivery is not None else ["只有本地提交，项目没有交付步骤"]
         self._ended[session_id] = AttemptResult(
             MERGED if merged else UNMERGED, detail="" if merged else "; ".join(filter(None, why)), summary=state.summary,
-            pr_url=delivery.pr_url if delivery is not None else "")
+            pr_url=delivery.pr_url if delivery is not None else "", head=delivery.pushed_sha if delivery is not None else "")
         # Only a merge (by this delivery or confirmed elsewhere) finishes the task; a PR or local commits keep it open,
         # and so do follow-ups nobody has developed yet.
         finished = delivery is not None and delivery.state == "merged" and not delivery.problem and not state.followups
