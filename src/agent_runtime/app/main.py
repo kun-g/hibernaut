@@ -11,7 +11,7 @@ import sys
 import threading
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, MutableMapping
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -56,6 +56,7 @@ from agent_runtime.adapters.executor_cli import (
     SDEExecutor,
     StewardExecutor,
 )
+from agent_runtime.adapters.executor_cli.memory_access import MemoryAccess, channel_path
 from agent_runtime.adapters.executor_cli.orca import (
     OrcaCommandTerminal,
     OrcaVisibleRunner,
@@ -97,6 +98,7 @@ from agent_runtime.adapters.storage_sqlite import (
     SQLiteWorkUsage,
     SQLiteInboxAdapter,
     SQLiteLeaseLockAdapter,
+    SQLiteMemoryGrantStore,
     SQLiteOutboxAdapter,
     SQLiteReviewerStore,
     SQLiteSessionStoreAdapter,
@@ -459,6 +461,8 @@ class AlwaysOnDaemon:
     memory_gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
     # One per process too; a reload points it at the new configuration once that is in force.
     forward_targets: ForwardTargets | None = None
+    # One per process and re-pointed likewise; served while Runs may go on. None: SDE sessions get no memory tools.
+    memory_access: MemoryAccess | None = None
     reloads: ReloadStatus = field(default_factory=ReloadStatus)
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -486,7 +490,7 @@ class AlwaysOnDaemon:
         webhook_host: str | None = None,
         webhook_port: int | None = None,
     ) -> None:
-        async with _running_runner(self.runner):
+        async with _memory_served(self.memory_access), _running_runner(self.runner):
             await self._run(
                 server=server,
                 stop_event=stop_event,
@@ -607,6 +611,10 @@ async def _running_runner(runner: RunnerHandle | None) -> AsyncGenerator[None]:
         yield
     finally:
         await runner.stop()
+
+
+def _memory_served(access: MemoryAccess | None) -> AbstractAsyncContextManager[None]:
+    return access.serving() if access is not None else nullcontext()
 
 
 def run_ledger_path(db_path: str | Path, ledger_db_path: str | Path | None) -> Path | None:
@@ -1082,6 +1090,7 @@ def build_daemon_from_config(
     memory_hub: GovernedMemoryHub | None = None,
     collaboration: CollaborationRuntime | None = None,
     forward_targets: ForwardTargets | None = None,
+    memory_access: MemoryAccess | None = None,
     reloads: ReloadStatus | None = None,
 ) -> AlwaysOnDaemon:
     if demo and config.runner_pilot.enabled:
@@ -1200,6 +1209,12 @@ def build_daemon_from_config(
     targets = forward_targets if forward_targets is not None else ForwardTargets(config)
     daemon.forward_targets = targets
     daemon.reloads = reloads if reloads is not None else ReloadStatus()
+
+    channel_at = channel_path(config.runtime.db_path) if not demo else None
+    if memory_access is None and channel_at is not None:
+        memory_access = MemoryAccess(grants=SQLiteMemoryGrantStore(daemon.db), sessions=daemon.sessions, path=channel_at)
+        memory_access.activate(daemon.partitions.memory_for, _permissions(config.runner))
+    daemon.memory_access = memory_access
 
     if config.runner.enabled and not demo:
         # A reload passes the running one, whose settings cannot change without a restart.
@@ -1361,6 +1376,7 @@ def build_daemon_from_config(
                     tasks=tasks,
                     delivery=PRDelivery(delivery, deliveries) if delivery is not None else None,
                     live_peers=usage.peers,
+                    memory=memory_access,
                 )
             return built
 
@@ -1823,7 +1839,7 @@ async def serve_configured(
     await start_runner_pilot(runner_pilot)
 
     # The runner outlives the task group, which ends with the last Run of every generation.
-    async with _running_runner(daemon.runner), asyncio.TaskGroup() as tasks:
+    async with _memory_served(daemon.memory_access), _running_runner(daemon.runner), asyncio.TaskGroup() as tasks:
         # Shared across config-reload generations so retired Runs keep occupying slots until they finish.
         shared_limiter = daemon.pool.limiter
         generation = _Generation.start(daemon, tasks, outbox_interval_seconds=outbox_interval_seconds, halt=stop)
@@ -1889,6 +1905,7 @@ async def serve_configured(
                         memory_hub=daemon.memory_hub,
                         collaboration=daemon.collaboration,
                         forward_targets=daemon.forward_targets,
+                        memory_access=daemon.memory_access,
                         reloads=reloads,
                         attach=False,
                     )
@@ -1925,6 +1942,8 @@ async def serve_configured(
                     replacement.runner.apply(candidate)
                 if replacement.forward_targets is not None:
                     replacement.forward_targets.activate(candidate)
+                if replacement.memory_access is not None:
+                    replacement.memory_access.activate(replacement.partitions.memory_for, _permissions(candidate.runner))
                 replacement.timers.reconcile(candidate.timers)
                 previous = generation
                 # Apply the new caps only after activation succeeds; retired Runs stay counted in shared_limiter.

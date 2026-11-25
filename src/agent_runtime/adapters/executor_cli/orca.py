@@ -27,6 +27,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     env_overrides,
     harness_args,
     interactive_args,
+    with_mcp_server,
 )
 from agent_runtime.adapters.executor_cli.peer_handoff import (
     PeerHandoff,
@@ -53,7 +54,8 @@ GATE_SCRIPT = Path(__file__).with_name("claude_gate.py")
 CLI_TERMINAL_SCRIPT = Path(__file__).with_name("cli_terminal.py")
 HANDOFF_SCRIPT = Path(__file__).with_name("handoff_mcp.py")
 HANDOFF_SERVER = "hibernaut_handoff"
-HANDOFF_TOOLS = (f"mcp__{HANDOFF_SERVER}__get_task", f"mcp__{HANDOFF_SERVER}__submit_result")
+_HANDOFF_TOOL_NAMES = ("get_task", "submit_result")
+HANDOFF_TOOLS = tuple(f"mcp__{HANDOFF_SERVER}__{name}" for name in _HANDOFF_TOOL_NAMES)
 # A peer-handoff session replies with SendMessage and must start under ~/.claude, where the receiver is registered.
 PEER_HANDOFF_TOOLS = ("SendMessage",)
 PEER_UNSET_ENV = ("CLAUDE_CONFIG_DIR",)
@@ -245,14 +247,8 @@ def _instruction(turn: str) -> str:
 def with_handoff(role_args: Sequence[str], root: Path) -> list[str]:
     # The launcher's handoff server is the agent's only channel for the task and the result, so no directory
     # outside the worktree is added (that opens a trust dialog) and no file-writing permission is needed.
-    args = list(role_args)
-    if "--allowedTools" in args:
-        i = args.index("--allowedTools") + 1
-        args[i] = ",".join((args[i], *HANDOFF_TOOLS))
-    else:
-        args += ["--allowedTools", ",".join(HANDOFF_TOOLS)]
     server = {"type": "stdio", "command": sys.executable, "args": ["-I", str(HANDOFF_SCRIPT), str(root)]}
-    return [*args, "--mcp-config", json.dumps({"mcpServers": {HANDOFF_SERVER: server}})]
+    return with_mcp_server(role_args, HANDOFF_SERVER, server, _HANDOFF_TOOL_NAMES)
 
 
 def with_peer_handoff(role_args: Sequence[str]) -> list[str]:

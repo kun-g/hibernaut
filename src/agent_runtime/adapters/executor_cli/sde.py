@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import sqlite3
 import subprocess
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -32,7 +34,10 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     child_env,
     role_system_prompt,
     run_claude_code,
+    with_mcp_server,
 )
+from agent_runtime.adapters.executor_cli.memory_access import MEMORY_TOOLS, MemoryAccess
+from agent_runtime.adapters.executor_cli.memory_mcp import SERVER_NAME as MEMORY_SERVER
 from agent_runtime.adapters.executor_cli.orca import (
     OrcaVisibleRunner,
     TerminalUnavailable,
@@ -93,6 +98,7 @@ from agent_runtime.core.models import (
 )
 from agent_runtime.core.ports import RunCapabilities, RunContext
 
+_log = logging.getLogger(__name__)
 SDE_ROLE = "sde"
 SDE_OPTION_KEYS = frozenset({"review", "reviewer", "max_review_rounds"})
 _CHECKPOINT_KEY = "sde"
@@ -128,6 +134,12 @@ SDE_SCHEMA: dict[str, Any] = {
     },
     "required": ["status", "summary", "test_evidence", "change_kind", "change_rationale"],
 }
+
+_MEMORY_SECTION = f"""## Project memory tools
+index.md above lists the project's notes. Open one with memory_read (mcp__{MEMORY_SERVER}__memory_read), e.g. uri \
+"notes/<name>.md", and find others with memory_search (mcp__{MEMORY_SERVER}__memory_search). Before you start, read the \
+notes related to this task, such as what was already tried. Both tools are read-only and stay for the whole task; when they \
+do not answer, go on without them."""
 
 # An interactive conversation stays open after its result, so an independently dispatched reviewer can message it.
 _INTERACTIVE_ROLE_ARGS = (
@@ -383,6 +395,7 @@ class SDEExecutor:
         live_peers: Callable[[str], list[str]] | None = None,
         peer_reviewer: str | None = None,
         pool: ReviewerPool | None = None,
+        memory: MemoryAccess | None = None,
     ) -> None:
         if options.review and reviewer is None and pool is None:
             raise ValueError(f"executors.{profile.name}: review is on but no reviewer was given")
@@ -391,6 +404,8 @@ class SDEExecutor:
         self._reviewer = reviewer
         # Chooses each task's reviewer; None reviews every task with the one given.
         self._pool = pool
+        # None: its sessions cannot read the project memory beyond what their first prompt carries.
+        self._memory = memory
         self._worktrees = worktree_manager
         # Looked up per task: the configured map also answers inboxes matched by a project's pattern.
         self._checkouts = inbox_checkout_map
@@ -662,7 +677,10 @@ class SDEExecutor:
             raise ReviewAborted(str(exc)) from exc
 
     async def _first_prompt(self, state: _State, caps: RunCapabilities) -> str:
-        parts = [f"## {name}\n{text}" for name, text in baseline_segments(caps.memory).stable if text]
+        stable = baseline_segments(caps.memory).stable
+        parts = [f"## {name}\n{text}" for name, text in stable if text]
+        if self._memory is not None and any(name == "index.md" and text.strip() for name, text in stable):
+            parts.append(_MEMORY_SECTION)
         parts.append(f"## Task requirements\n{state.requirements}")
         if self._terminal is not None and state.work_key:
             parts.append(_reviewer_channel(self._peer_reviewer, state.work_key))
@@ -726,6 +744,7 @@ class SDEExecutor:
             args[args.index("--disallowedTools") + 1] += ",Bash(git push:*),Bash(gh pr create:*),Bash(gh pr merge:*)"
         if isinstance(self._terminal, TerminalUnavailable):
             raise ClaudeCodeError(f"interactive session unavailable: {self._terminal.reason}")
+        args = await asyncio.to_thread(self._with_memory, args, session_id)
         if self._terminal is not None:
             # Fix rounds and later events continue the task's conversation: its live terminal, else --resume.
             resumable: dict[str, Any] = (
@@ -763,6 +782,16 @@ class SDEExecutor:
         raw_sid = result.get("session_id")
         sid = raw_sid if isinstance(raw_sid, str) and raw_sid else native
         return _validate_report(result.get("structured_output")), sid
+
+    def _with_memory(self, args: list[str], session_id: str) -> list[str]:
+        if self._memory is None:
+            return args
+        try:
+            server = self._memory.mcp_server(session_id)
+        except sqlite3.Error:
+            _log.exception("session %s starts without the memory tools", session_id)
+            return args
+        return with_mcp_server(args, MEMORY_SERVER, server, MEMORY_TOOLS)
 
     async def _run(
         self,

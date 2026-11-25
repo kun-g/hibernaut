@@ -100,6 +100,25 @@ def apply_work(step):
 HANDOFF_TOOLS = ("mcp__hibernaut_handoff__get_task", "mcp__hibernaut_handoff__submit_result")
 
 
+def call_memory(step, server=None):
+    # A step's "memory" calls go to the SDE's memory server; the answers, and what the session may call, to the log.
+    if not isinstance(step, dict) or "memory" not in step:
+        return server
+    permitted = [t for t in allowed.split(",") if t.startswith("mcp__hibernaut_memory__")]
+    config = json.loads(argv[argv.index("--mcp-config") + 1]) if "--mcp-config" in argv else {"mcpServers": {}}
+    if "hibernaut_memory" not in config["mcpServers"]:
+        write_log(memory=None, memory_permitted=permitted)
+        return None
+    server = server or Handoff("hibernaut_memory")
+    if step.get("memory_wait"):
+        Path(step["memory_wait"][0]).touch()
+        while not Path(step["memory_wait"][1]).exists():
+            time.sleep(0.01)
+    write_log(memory=[server.call(tool, arguments) for tool, arguments in step["memory"]],
+              memory_tools=sorted(server.tools), memory_permitted=permitted)
+    return server
+
+
 class Handoff:
     # Talks to the stdio MCP server named in --mcp-config the way Claude Code does: one JSON-RPC message per line.
     def __init__(self, name="hibernaut_handoff"):
@@ -161,7 +180,7 @@ def run_interactive():
             "name": argv[argv.index("--name") + 1] if "--name" in argv else "",
             "messagingSocketPath": f"/tmp/fake-socks/{os.getpid()}.sock",
         }))
-    handoff = Handoff()
+    handoff, memory = Handoff(), None
     permitted = [t for t in HANDOFF_TOOLS if t in allowed.split(",")]
     instruction = argv[-1]
     while instruction:
@@ -175,6 +194,8 @@ def run_interactive():
         assert not failed, prompt
         step = next_step(role)
         write_log(session_id=sid, turn=turns, instruction=instruction, handoff_tools=sorted(handoff.tools))
+        # One server for the life of the session, as in Claude Code.
+        memory = call_memory(step, memory)
         if isinstance(step, dict) and (step.get("exit") or step.get("error")):
             sys.exit(3)
         if isinstance(step, dict) and step.get("hang"):
@@ -249,6 +270,7 @@ elif role == "steward":
     output = step.get("output", {"action": "silent", "message": ""})
 else:
     step = step or {}
+    call_memory(step)
     apply_work(step)
     output = step.get("output", {"status": "done", "summary": "implemented", "test_evidence": "red: 1 failed; green: 1 passed", "change_kind": "fix", "change_rationale": "corrects the behaviour under test"})
 if isinstance(step, dict) and step.get("error"):
