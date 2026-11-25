@@ -77,7 +77,8 @@ class SQLiteAttemptStore:
         return _row(row)
 
     def update(self, attempt_id: str, change: Callable[[AttemptRow], AttemptRow]) -> AttemptRow:
-        # change gets the row as it is now, whatever the caller read before, and holds up every writer: no git in it.
+        # change gets the row as it is now, whatever the caller read before: the transaction has the write lock (BEGIN
+        # IMMEDIATE) before it reads, so no other connection writes in between. They wait meanwhile: no git in it.
         # What is written stays so as long as the row says the same.
         with self._db.transaction() as conn:
             row = self.get(attempt_id)
@@ -92,7 +93,7 @@ class SQLiteAttemptStore:
         return now
 
     def mark_written(self, row: AttemptRow) -> None:
-        # Unless it changed meanwhile.
+        # row: as the file says it. Compared in the same statement: one that changed meanwhile is still to be written.
         with self._db.transaction() as conn:
             conn.execute(
                 "UPDATE attempt_notes SET written = 1 "

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 import threading
@@ -406,6 +407,94 @@ def test_a_merge_recorded_while_an_older_result_is_on_its_way_into_the_file_stay
         race.notes.notes.finish("s1", AttemptResult(UNMERGED, detail="still open", pr_url=PR, summary="two"))
     assert not held
     race.assert_merged()
+
+
+@pytest.mark.parametrize("merge_first", [False, True])
+@pytest.mark.parametrize("writer", ["progress", "delivered", "unmerged"])
+def test_two_updates_of_one_row_never_overlap(race: Race, writer: str, merge_first: bool) -> None:
+    race.unmerged()
+    with race.notes.db.transaction() as conn:
+        conn.execute("UPDATE attempt_notes SET dev_head = ?", ("c" * 40,))
+
+    def merge(notes: AttemptNotes) -> None:
+        notes.settle("task:9", ALPHA, lambda: [MergedPR(url=PR, head="c" * 40)])
+
+    first, second = (merge, WRITERS[writer]) if merge_first else (WRITERS[writer], merge)
+    ours, theirs = race.notes.store.update, race.elsewhere.store.update
+    begun, inside, overlapped = threading.Event(), threading.Event(), list[bool]()
+    other = threading.Thread(target=lambda: second(race.elsewhere.notes))
+
+    def entered(attempt: str, change: Any) -> Any:
+        def noted(row: Any) -> Any:
+            inside.set()
+            return change(row)
+        return theirs(attempt, noted)
+
+    def held(attempt: str, change: Any) -> Any:
+        def slow(row: Any) -> Any:
+            # The row is read and not yet written: the other connection starts its own update now.
+            other.start()
+            assert begun.wait(5)
+            overlapped.append(inside.wait(0.05))
+            return change(row)
+        with patch.object(race.notes.store, "update", ours):
+            return ours(attempt, slow)
+
+    race.elsewhere.db._conn.set_trace_callback(lambda sql: begun.set() if sql.startswith("BEGIN") else None)
+    with patch.object(race.elsewhere.store, "update", entered), patch.object(race.notes.store, "update", held):
+        first(race.notes.notes)
+        other.join(10)
+    assert not other.is_alive()
+    assert overlapped == [False]
+    # Progress and a PR change the row of an unmerged attempt without writing its record.
+    race.notes.notes.finish("s1", AttemptResult(UNMERGED, summary="three"))
+    row = race.row()
+    assert (row["result"], row["written"]) == (MERGED, 1)
+    assert race.notes.entries() == ["已合并 · title of s1"]
+
+
+@pytest.mark.parametrize("failing", [False, True])
+@pytest.mark.parametrize("marked_last", [False, True])
+def test_a_merge_recorded_between_reading_the_row_and_writing_the_file_stays(
+    race: Race, marked_last: bool, failing: bool
+) -> None:
+    race.unmerged()
+    write, mark, update = race.notes.hub.propose_write, race.notes.store.mark_written, race.elsewhere.store.update
+    committed = threading.Event()
+    sweep = threading.Thread(target=race.merge)
+
+    def merging(attempt: str, change: Any) -> Any:
+        row = update(attempt, change)
+        committed.set()
+        return row
+
+    def propose(proposal: Any) -> Any:
+        # Under the lock, with the row read: the sweep commits its merge and then waits for the lock to write it.
+        sweep.start()
+        assert committed.wait(5)
+        assert "没合并" in proposal.content
+        return write(proposal)
+
+    def marking(row: Any) -> None:
+        if marked_last:
+            sweep.join(10)
+        mark(row)
+
+    broken: Any = patch.object(race.elsewhere.hub, "propose_write", side_effect=OSError("disk full")) if failing \
+        else contextlib.nullcontext()
+    with broken, patch.object(race.elsewhere.store, "update", merging), \
+            patch.object(race.notes.hub, "propose_write", propose), patch.object(race.notes.store, "mark_written", marking):
+        race.notes.notes.finish("s1", AttemptResult(UNMERGED, detail="still open", pr_url=PR, summary="two"))
+        sweep.join(10)
+    assert not sweep.is_alive() and committed.is_set()
+    if failing:
+        # What the file does not say yet must not count as written, or no end would make up for it.
+        assert (race.row()["result"], race.row()["written"]) == (MERGED, 0)
+    else:
+        race.assert_merged()
+    for ended in (AttemptResult(UNMERGED, pr_url=PR, summary="three"), AttemptResult(FAILED, detail="crashed")):
+        race.notes.notes.finish("s1", ended)
+        race.assert_merged()
 
 
 def test_a_sweep_that_asked_before_the_attempt_went_on_takes_nothing_back(race: Race) -> None:
