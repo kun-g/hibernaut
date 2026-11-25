@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, cast
 
+from agent_runtime.adapters.executor_cli.attempt_notes import MergedPR
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore, WorkspaceRecord
 from agent_runtime.core.ports import OutboxPort, SessionStorePort
 
@@ -104,6 +105,7 @@ class OrcaWorktreeManager:
         usage: Callable[[str], list[str]] | None = None,
         primary_inbox_id: str | None = None,
         isolate_inboxes: bool = False,
+        settle: Callable[[str, str, Callable[[], Sequence[MergedPR]]], None] | None = None,
     ) -> None:
         # isolate_inboxes: the project serves several inboxes from one checkout, so each (inbox, work_key) writes
         # only in its own managed hb-* worktree. The primary inbox keeps the bare work_key, as before isolation.
@@ -114,6 +116,9 @@ class OrcaWorktreeManager:
         self._store = workspace_store
         # Reports who else still needs a task's worktree (reviewers, queued events, an unfinished delivery).
         self._usage = usage
+        # Told of a workspace, its inbox, and how to find out which PRs of its branch were merged: in every sweep, and
+        # before it goes.
+        self._settle = settle
         self._session_store = session_store
         self._reclaim_stale_after_seconds = reclaim_stale_after_seconds
         self._backend: WorktreeBackend = backend
@@ -289,6 +294,7 @@ class OrcaWorktreeManager:
             msg = f"Refused reclaim for '{record.workdir}': owned by {record.inbox_id!r}, not {inbox_id!r}"
             self._alert(notify_outbox, inbox_id, msg)
             return ReclaimResult(reclaimed=False, reason=msg, workdir=record.workdir)
+        self.settle(record)
         sessions_key, owner = self._users_scope(record, work_key, inbox_id)
         workdir = Path(record.workdir)
         if not _present(workdir):
@@ -502,6 +508,17 @@ class OrcaWorktreeManager:
         # Gates 0 and 1 only, read from the database: why the worktree cannot go yet, or None.
         sessions_key, owner = self._users_scope(record, record.work_key, None)
         return self._in_use(sessions_key, owner, record.work_key)
+
+    def settle(self, record: WorkspaceRecord) -> None:
+        owner = record.inbox_id or self._primary_inbox_id
+        if self._settle is not None and owner is not None:
+            self._settle(record.work_key, owner, lambda: self._merged_prs(record))
+
+    def _merged_prs(self, record: WorkspaceRecord) -> list[MergedPR]:
+        workdir = Path(record.workdir)
+        cwd = workdir if workdir.is_dir() else Path(record.repo_checkout)
+        return [MergedPR(url=str(pr.get("url") or ""), head=str(pr.get("headRefOid") or ""))
+                for pr in self._pr_list(record.branch, "merged", "url,headRefOid", cwd) or ()]
 
     def merged_at_head(self, record: WorkspaceRecord) -> bool | None:
         # Whether GitHub reports a merged PR for the branch whose head is the worktree's HEAD, so the work in this

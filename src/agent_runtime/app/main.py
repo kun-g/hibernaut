@@ -63,6 +63,7 @@ from agent_runtime.adapters.executor_cli.orca import (
     TerminalUnavailable,
     default_transcript_roots,
 )
+from agent_runtime.adapters.executor_cli.attempt_notes import AttemptNotes
 from agent_runtime.adapters.executor_cli.steward import GlobalScope
 from agent_runtime.adapters.executor_cli.reviewer_pool import ReviewerPool, SwitchNotice
 from agent_runtime.adapters.executor_cli.reclaim_sweep import (
@@ -93,6 +94,7 @@ from agent_runtime.adapters.runner_pilot import ClosedRouteExecutor, ProtocolChe
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore
 from agent_runtime.adapters.storage_sqlite.open_runs import SQLiteOpenRunStore
 from agent_runtime.adapters.storage_sqlite import (
+    SQLiteAttemptStore,
     SQLiteDatabase,
     SQLiteDeliveryStore,
     SQLiteWorkUsage,
@@ -1216,6 +1218,10 @@ def build_daemon_from_config(
         memory_access.activate(daemon.partitions.memory_for, _permissions(config.runner))
     daemon.memory_access = memory_access
 
+    attempts = AttemptNotes(store=SQLiteAttemptStore(daemon.db), memory_for=daemon.partitions.memory_for)
+    if not demo:
+        daemon.sessions.on_closed = attempts.session_closed
+
     if config.runner.enabled and not demo:
         # A reload passes the running one, whose settings cannot change without a restart.
         daemon.runner = runner if runner is not None else open_runner(config)
@@ -1377,6 +1383,7 @@ def build_daemon_from_config(
                     delivery=PRDelivery(delivery, deliveries) if delivery is not None else None,
                     live_peers=usage.peers,
                     memory=memory_access,
+                    attempts=attempts,
                 )
             return built
 
@@ -1391,6 +1398,7 @@ def build_daemon_from_config(
                 usage=usage.blockers,
                 primary_inbox_id=proj.inbox_id,
                 isolate_inboxes=proj.serves_multiple_inboxes,
+                settle=attempts.settle,
             )
             wt_mgr_by_project[proj.name] = wt_mgr
             executors_by_project[proj.name] = {
@@ -1418,6 +1426,7 @@ def build_daemon_from_config(
             workspace_store=daemon.workspaces,
             session_store=daemon.sessions,
             usage=usage.blockers,
+            settle=attempts.settle,
         )
         fallback_executors: dict[str, ExecutorPort] = {
             exec_name: LocalCLIExecutor(

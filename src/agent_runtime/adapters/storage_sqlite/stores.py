@@ -706,8 +706,15 @@ def _held_from_json(raw: object) -> HeldReturn | None:
 
 
 class SQLiteSessionStoreAdapter:
-    def __init__(self, db: SQLiteDatabase) -> None:
+    def __init__(self, db: SQLiteDatabase, on_closed: Callable[[str], None] | None = None) -> None:
         self._db = db
+        # Told, after the fact, of each session that can not go on any more: closed or archived.
+        self.on_closed = on_closed
+
+    def _closed(self, *session_ids: str) -> None:
+        if self.on_closed is not None:
+            for session_id in session_ids:
+                self.on_closed(session_id)
 
     def _row_to_session(self, row: Any) -> SessionRef:
         return SessionRef(
@@ -804,6 +811,7 @@ class SQLiteSessionStoreAdapter:
                 """,
                 (utc_now_iso(), session_id),
             )
+        self._closed(session_id)
 
     def close_session(self, session_id: str) -> None:
         with self._db.transaction() as conn:
@@ -819,6 +827,7 @@ class SQLiteSessionStoreAdapter:
                 """,
                 (utc_now_iso(), session_id),
             )
+        self._closed(session_id)
 
     def list_sessions(
         self,
@@ -853,9 +862,15 @@ class SQLiteSessionStoreAdapter:
         return [self._row_to_session(row) for row in rows]
 
     def save(self, session: SessionRef) -> None:
+        ended = [session.session_id] if session.status in ("archived", "closed") else []
         with self._db.transaction() as conn:
             if session.correlation_key is not None and session.status in ("active", "suspended"):
                 # Rebind correlation_key exclusively to the latest active session_id (rotation archives old).
+                ended += [str(row["session_id"]) for row in conn.execute(
+                    "SELECT session_id FROM sessions WHERE inbox_id = ? AND correlation_key = ? "
+                    "AND session_id != ? AND status IN ('active', 'suspended')",
+                    (session.inbox_id, session.correlation_key, session.session_id),
+                )]
                 conn.execute(
                     """
                     UPDATE sessions
@@ -906,3 +921,4 @@ class SQLiteSessionStoreAdapter:
                     _forward_to_json(session.forward),
                 ),
             )
+        self._closed(*ended)

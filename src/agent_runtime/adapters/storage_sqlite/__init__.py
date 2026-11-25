@@ -1,3 +1,4 @@
+from agent_runtime.adapters.storage_sqlite.attempts import AttemptRow, SQLiteAttemptStore
 from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
 from agent_runtime.adapters.storage_sqlite.deliveries import SQLiteDeliveryStore
 from agent_runtime.adapters.storage_sqlite.memory_grants import SQLiteMemoryGrantStore
@@ -20,9 +21,11 @@ from agent_runtime.adapters.storage_sqlite.workspaces import (
 )
 
 __all__ = [
+    "AttemptRow",
     "EventDiagnostics",
     "QuotaMark",
     "ReviewerChoice",
+    "SQLiteAttemptStore",
     "SQLiteDatabase",
     "SQLiteDeliveryStore",
     "SQLiteInboxAdapter",

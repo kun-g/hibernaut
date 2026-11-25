@@ -132,6 +132,9 @@ class WorktreeReclaimSweeper:
                 return skipped(result.reason)
             self._outbox.enqueue(target.inbox_id, result.reason, metadata={"kind": "reclaim_alert"})
             return SweepOutcome(record.work_key, record.workdir, True, "forgotten: directory no longer exists")
+        # A merge made elsewhere is recorded even while a session keeps the worktree; GitHub is asked only for a task
+        # that is recorded at all (payload attempt_notes) and not yet as merged.
+        target.manager.settle(record)
         # Database-only checks first, so a busy worktree costs no git or GitHub call.
         in_use = target.manager.in_use(record)
         if in_use is not None:

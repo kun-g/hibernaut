@@ -14,7 +14,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | Steward 与转投 | 项目前台 `steward`：在主检出（或 `workdir`）的 Orca 终端里一次性只读运行，跑完即关，没有 Orca 终端就挂起等人批准重试，不作 daemon 子进程；自己答复或用 `forward_to_inbox` 转投给别的 Agent（同项目、最多主动转投 3 次、回投不计、逐次过权限门禁）；单步活由接手的 Agent 直接回复来源，多步活的结果回投给 Steward 汇总 |
 | 全局 Steward | 同一个 `steward` 角色绑到不属于项目的 Inbox（如 `user:main`）：能答的自己答，新活按绑定的 `forward_to` 转投到列出的项目主 Inbox，由项目自己的规则选 Agent；同一个聊天派出的每件活各有会话与 worktree，补充用 `continues` 回到原来那件 |
 | 系统 Steward | 绑在 `sys:ops`（写了 `system_tools = true`）的 `steward`：由全局 Steward 转交（到了就算人提的，不再确认授权），接入新项目（克隆、登记 Orca、建标签、写项目段与 Steward 绑定、加进全局 Steward 的 `forward_to`）、检查各项目缺什么、补上缺的；改动直接写进 `hibernaut.toml` 并热加载，留备份，热加载不成功就恢复。没有 Shell，不改执行器、权限、交付检查、凭据和自己的绑定。需求见 [`docs/requirements/system-steward.md`](docs/requirements/system-steward.md) |
-| SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `agent_id = "sde"`（Drive 任务 frontmatter 写 `agent_id: sde`，旧键 `executor_id: sde` 仍可用），项目或 Inbox 也可设为默认 Agent；GitHub Issue 以 `# 标题` + 正文为需求、标题为 PR 标题；整个任务期间能只读检索和打开本项目的记忆（`memory_search`、`memory_read`） |
+| SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `agent_id = "sde"`（Drive 任务 frontmatter 写 `agent_id: sde`，旧键 `executor_id: sde` 仍可用），项目或 Inbox 也可设为默认 Agent；GitHub Issue 以 `# 标题` + 正文为需求、标题为 PR 标题；整个任务期间能只读检索和打开本项目的记忆（`memory_search`、`memory_read`）；派单写 `attempt_notes = "<目标名>"` 时，任务结束后 hb 把试了什么、结果如何记进项目记忆 `notes/attempts/<目标名>.md`，下一个同目标的任务先读它 |
 | 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok，模板写 `terminal = "orca"` 可在 Orca 终端里旁观评审，命令结束、结果读回后立即关闭该终端，且不让 Orca 登记并续接这次会话，评审记录留终端句柄与 CLI 会话 ID）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested`；SDE 内置评审第 1 轮通审，第 2 轮起只做增量复核：只有上一轮没修好的项和之后改动引入的新问题能打回，其余由程序降为跟进，交付时列在 PR 正文「跟进」小节和完成消息里。评审者可写成有序列表（评审候选）：按可用表取第一个可用的，任务内不换；报额度用完（`quota_errors`）才自动换下一个重跑这一轮并通知一次，全不可用则挂起等人 |
 | PR 交付 | SDE 完成后由 Hibernaut 合入主干、按改动类型定版本号、跑检查、推分支、开 PR，可选在评审通过且 CI 绿后自动合并；合入主干冲突（版本号以外）或合入后检查失败时交回同一开发会话解决，开启评审时，手工解决冲突后一律复审上次通过的快照到合并结果的完整变更（含主干改动），检查失败后的修复按增量复审，超过次数上限才挂起等人；合并后删除源分支并结案；与任务来源无关 |
 | 可见终端 | 运行在 Orca 终端里打开，人可以旁观、回答提问，后续事件回到同一对话；项目设 `handoff = "peer"` 时任务、返工与结果经 ccpeer 消息往来，结果落在 launchd 常驻接收端的收件箱，hb 重启不丢 |
@@ -66,6 +66,8 @@ PYTHONPATH=src python3 -m agent_runtime.app.main --config hibernaut.toml
 ```bash
 curl -s localhost:8080/events -H 'Content-Type: application/json' -d @docs/dispatch/sde-task.json
 ```
+
+为同一个目标反复派活（例如给测试提速）时，payload（或 Drive frontmatter）可加 `attempt_notes`，值是目标名，如 `"test-speed"`：任务的结局记进项目记忆，供下一单先读。一次性任务不要写，每个目标在 `index.md` 占一行。目标名不合格时 `/events` 返回 400，见 [`docs/architecture.md`](docs/architecture.md) §14「任务记录」。
 
 `source` 不能用 `agent:forward`、`agent:return`、`agent:return_cancelled`、`agent:close`：这些由 Hibernaut 自己入队，外部提交返回 400。
 

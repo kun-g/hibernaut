@@ -403,6 +403,50 @@ class IngestBoundaryTests(unittest.TestCase):
         self.assertEqual(self.daemon.inbox.fetch_pending("proj:x"), [])
         self.assertEqual(post("webhook")[0], 202)
 
+    def test_an_unusable_attempt_notes_goal_is_refused_where_the_task_is_put_in(self) -> None:
+        assert self.daemon.mcp_server is not None
+        server = create_webhook_server("127.0.0.1", 0, self.daemon.handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2.0)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        def post(number: int, goal: Any) -> tuple[int, Any]:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}/events", method="POST",
+                data=json.dumps({"inbox_id": "proj:x", "source": "webhook", "external_id": str(number),
+                                 "payload": {"text": "t", "attempt_notes": goal}}).encode(),
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=5.0) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.load(exc)
+
+        def call(goal: Any) -> dict[str, Any]:
+            assert self.daemon.mcp_server is not None
+            reply = self.daemon.mcp_server.handle_rpc({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "hibernaut_ingest_event", "arguments": {
+                    "inbox_id": "proj:x", "source": "cli", "payload": {"text": "t", "attempt_notes": goal}}},
+            })
+            assert reply is not None
+            return reply
+
+        for number, goal in enumerate(("../x", "", "a/b", None, 3, "x" * 65)):
+            with self.subTest(goal):
+                code, body = post(number, goal)
+                self.assertEqual(code, 400)
+                self.assertIn("attempt_notes", body["error"])
+                reply = call(goal)
+                self.assertEqual(reply["error"]["code"], -32602)
+                self.assertIn("attempt_notes", reply["error"]["message"])
+        self.assertEqual(self.daemon.inbox.fetch_pending("proj:x"), [])
+        self.assertEqual(post(99, "test-speed")[0], 202)
+        self.assertNotIn("error", call("test-speed"))
+        self.assertEqual({e.payload["attempt_notes"] for e in self.daemon.inbox.fetch_pending("proj:x")}, {"test-speed"})
+
 
 class CloseSessionTests(ForwardCase):
     # Closing over MCP, on sessions as the worker really leaves them.
