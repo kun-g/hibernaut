@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unicodedata
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,7 @@ from agent_runtime.adapters.memory_fs.expert_mount import ExpertMount, is_role_u
 from agent_runtime.adapters.memory_fs.hub import GovernedMemoryHub
 from agent_runtime.adapters.memory_fs.legacy import adopt_legacy_memory
 from agent_runtime.adapters.memory_fs.tool_args import read_document, required, search_query, write_proposal
-from memory_hub import BaselineBundle, LegacyMemoryPortAdapter, MemoryHubConfig
+from memory_hub import BaselineBundle, LegacyMemoryPortAdapter, MemoryHubConfig, WriteProposal
 from memory_hub.governance import classify_write_policy
 from memory_hub.partition import ParsedUri, parse_memory_uri
 
@@ -104,6 +105,23 @@ class PartitionedMemoryAdapter:
             return
         self._writable(path)
         self._legacy.write(path, content)
+
+    def rewrite_note(self, path: str, change: Callable[[str, int], str], *, rationale: str) -> None:
+        # change(text, max_note_bytes) -> the note's new text. Read and written under the hub's lock, so what others
+        # write meanwhile is kept; "" when there is no such note yet. Only notes of the project, which need no approval.
+        parsed = self._writable(path)
+        if parsed.scheme != "proj" or not parsed.rel_path.startswith("notes/"):
+            raise PermissionError(f"{path} is not a note of project '{self.project_key}'")
+        with self._hub.exclusive():
+            text = ""
+            with suppress(FileNotFoundError):
+                text = self._hub.read_on_demand(parsed.raw_uri).content
+            result = self._hub.propose_write(WriteProposal(
+                target_uri=parsed.raw_uri, op="upsert_file", content=change(text, self._hub.config.max_note_bytes),
+                rationale=rationale, force_new=True, author="hibernaut",
+            ))
+        if result.status != "applied":
+            raise RuntimeError(f"{path} was not written ({result.status}): {result.message}")
 
     # True when write() only queues a proposal: the port returns nothing, so a tool asks this to say what happened.
     def needs_approval(self, path: str) -> bool:

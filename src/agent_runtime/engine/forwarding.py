@@ -27,12 +27,14 @@ from agent_runtime.core.models import (
     resolve_trigger_event,
 )
 from agent_runtime.core.ports import PermissionPort, SessionStorePort
+from agent_runtime.engine.attempts import ATTEMPT_NOTES_KEY
 
 _AGENT_SOURCES = (FORWARD_SOURCE, RETURN_SOURCE)
 # Who put an event here: a person in their own one-to-one chat, or somebody on this host.
 EventOrigin = Literal["chat", "operator"]
-# Which project documents the task needs travels with it; everything else the receiver learns from the text.
-_INHERITED_KEYS = ("activities", "base_ref")
+# Which project documents the task needs, and the goal it is recorded under, travel with it; everything else the receiver
+# learns from the text.
+_INHERITED_KEYS = ("activities", "base_ref", ATTEMPT_NOTES_KEY)
 
 
 def _text(value: object) -> str | None:

@@ -1311,6 +1311,15 @@ class DelegationTests(ForwardCase):
         )
         self.assertEqual(event.payload["activities"], ["versioning"])
 
+    async def test_the_goal_a_task_records_under_is_the_dispatchers_and_travels_with_it(self) -> None:
+        self.agents["steward"].script = lambda _e, _s, caps: (
+            caps.forward_to_inbox(SDE, "do it", target_agent="sde") and Silent())
+        self.ingest(attempt_notes="test-speed")
+        self.ingest(text="and this")
+        await self.run_inbox()
+        [queued] = self.queued(SDE)
+        self.assertEqual(queued.payload["attempt_notes"], "test-speed")
+
     async def test_two_runs_that_each_send_a_piece_get_a_result_for_each(self) -> None:
         for policy in ("defer", "fold", "interrupt"):
             with self.subTest(policy):

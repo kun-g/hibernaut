@@ -33,6 +33,7 @@
 | **Memory** | 跨 Run 持久化记忆目录，分为每轮必载基线（`instructions.md`、`index.md`、`reported.md`）与按需读取目录（`notes/`、`progress/`） | 按 `project_key` 隔离项目记忆，同一项目的 Inbox 共用；全局 `instructions.md` 只读共享；项目 `instructions.md` 的改动经人批准后生效 |
 | **project_key** | 项目记忆的分区键，由 `inbox_id` 归并得到（`proj:<key>[:…]`、`<key>:<任务>`，或 `[memory_hub.inbox_projects]` 指定）；`sys:*`、`user:*` 与绑定了 `workdir` 的 Inbox 各自独立 | Memory Hub 的目录名与 `proj://<project_key>/` 的范围；不是队列或租约的键 |
 | **SDE 的记忆工具** | SDE 会话只读本项目记忆的 `memory_search` 与 `memory_read`，按会话令牌经 daemon 的固定 Unix socket 调用，任务结案前一直可用 | 范围与权限同该会话 `inbox_id` 的 Run；评审会话没有 |
+| **任务记录 / 目标名（`attempt_notes`）** | 派活时用 `attempt_notes` 写上目标名的 SDE 任务，结束时由 hb 记下的一条「试了什么、结果如何」，同一目标的记在同一个 `notes/attempts/<目标名>.md` | 一次任务一条，只写本项目记忆；是记录不是指令；没写该字段就不记 |
 | **Memory 提案（Proposal）** | 对 `instructions.md` 等受控记忆的待批写入，编号 `prop_<hex>` | 人批准后才写入；过期自动失效 |
 | **Permissions & Credential Proxy** | 工具调用前置三态门禁（`allow / block / defer`）与外置凭证代理（沙箱内零真实密钥） | 全局共享 1 套安全网关，按项目/工具维度路由策略与凭据 |
 | **Outbox & Dispatcher** | 待发消息持久队列与后台节流投递引擎，负责去噪、防刷屏与失败重试 | 全局共享 1 套表与投递服务，按 `inbox_id` 标记归属 |

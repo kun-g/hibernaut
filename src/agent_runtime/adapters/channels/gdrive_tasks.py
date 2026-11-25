@@ -18,6 +18,7 @@ from agent_runtime.adapters.channels.gdrive_attachments import (
 )
 from agent_runtime.core.models import FORWARD_SOURCE, Emit, Event, Suspend, utc_now_iso
 from agent_runtime.core.ports import ChannelPort, SessionStorePort
+from agent_runtime.engine.attempts import ATTEMPT_NOTES_KEY
 from agent_runtime.engine.handler import EventHandler, IngestResult
 from agent_runtime.engine.worker import RunReport
 
@@ -68,7 +69,8 @@ class DriveClientProtocol(Protocol):
     def download(self, file_meta: DriveFileMeta) -> DriveDownload: ...
 
 
-TASK_META_KEYS = ("scope", "agent_id", "executor_id", "priority", "title", "activities", "tags", "base_ref", "attachments")
+TASK_META_KEYS = ("scope", "agent_id", "executor_id", "priority", "title", "activities", "tags", "base_ref", "attachments",
+                  ATTEMPT_NOTES_KEY)
 # A thematic break: ---, ***, ___ (spaced or longer, such as the underscore rule a Google Doc exports as text).
 _RULE = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
 _SETEXT_EQ = re.compile(r"^\s{0,3}=+\s*$")
@@ -479,6 +481,9 @@ class DriveTaskPoller:
             for key in ("activities", "tags", "base_ref", "attachments"):
                 if frontmatter.get(key):
                     payload[key] = frontmatter[key]
+            # As written, empty or unusable too: the Run refuses it, and the task's file says why.
+            if ATTEMPT_NOTES_KEY in frontmatter:
+                payload[ATTEMPT_NOTES_KEY] = frontmatter[ATTEMPT_NOTES_KEY]
 
             ingest_res = self._handler.ingest(
                 inbox_id=inbox_id,

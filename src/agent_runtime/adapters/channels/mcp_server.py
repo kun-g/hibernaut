@@ -18,6 +18,7 @@ from agent_runtime.adapters.storage_sqlite.stores import (
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.core.models import CLOSE_SOURCE, MCP_APPROVAL_SOURCE, Event, explicit_trace_id, new_id
 from agent_runtime.core.ports import LockPort, OutboxPort
+from agent_runtime.engine.attempts import check_payload
 from agent_runtime.engine.closing import close_session
 from agent_runtime.engine.handler import EventHandler
 from ledger import ErrorKind, ServiceName, Severity
@@ -367,6 +368,7 @@ class MCPServerAdapter:
             payload = args["payload"]
             if not isinstance(payload, dict):
                 raise ValueError("payload must be a JSON object")
+            check_payload(payload)
             external_id = str(args.get("external_id") or new_id("mcp"))
             correlation_key = (
                 str(args["correlation_key"]) if args.get("correlation_key") is not None else None

@@ -208,6 +208,25 @@ CREATE TABLE IF NOT EXISTS memory_grants (
     token TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL
 );
+
+-- SDE tasks whose end is recorded in the project memory (payload attempt_notes); attempt_id is of the task's event.
+CREATE TABLE IF NOT EXISTS attempt_notes (
+    attempt_id TEXT PRIMARY KEY,
+    inbox_id TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    work_key TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    result TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    pr_url TEXT NOT NULL DEFAULT '',
+    written INTEGER NOT NULL DEFAULT 0,
+    begun_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attempt_notes_session ON attempt_notes (session_id);
+CREATE INDEX IF NOT EXISTS idx_attempt_notes_work_key ON attempt_notes (work_key);
 """
 
 
