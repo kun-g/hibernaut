@@ -429,7 +429,7 @@
 - **SDE 的记忆工具**（`executor_cli/memory_access.py`、`memory_mcp.py`）：SDE 会话有 `memory_search` 与 `memory_read`，定义与 Steward 的同名工具是同一份，没有任何写工具。
   - **接法**：会话比 Run 和进程活得久，所以不用 Steward 那种随 Run 关闭的 socket。启动参数 `--mcp-config` 挂上 stdio 服务 `hibernaut_memory`（`python -I memory_mcp.py <socket> <令牌>`，仅标准库；与 MCP 交接的 `hibernaut_handoff` 写在同一个值里），`tools/list` 自己答，每次 `tools/call` 新开一条到 daemon 的 Unix socket 连接。socket 位置由 `db_path` 定：`<数据库目录>/.hibernaut-memory/<库名>.sock`，超过 100 字节时改为 `/tmp/hibernaut-memory-<uid>/<哈希>.sock`，目录 0700 且必须属于本用户（两端都查）。令牌每个 `session_id` 一个，存 `memory_grants` 表，重启、续接后不变。daemon 从第一个 Run 之前到排空之后都在听；新进程接管 socket 后，旧进程退出时不删它。
   - **每次调用**（daemon 里执行）：只认这两个工具名 → 令牌对应的会话存在且未关闭 → `PermissionPort.check()`，非 `allow` 不执行 → 按会话的 `inbox_id` 取 `memory_for()`，项目范围与专家的 `ExpertMount` 同 Run 内。热加载生效后用新配置的范围与权限，不论会话是哪代启动的。
-  - **不可用时**：daemon 停着、重启中、socket 开不了，工具返回说明（`isError`），会话与交付照常；令牌存取失败时会话不带工具启动并记日志。
+  - **不可用时**：daemon 停着、重启中、socket 开不了，工具返回说明（`isError`），会话与交付照常；令牌存取失败时会话不带工具启动并记日志，首个提示词里 `Project memory tools` 与 `Earlier attempts` 两段在启动那一刻去掉（挂起后才启动的也一样，看的是启动时有没有挂上）。
   - **覆盖**：一次性会话（`interactive = false`）、可见终端的 MCP 交接与 peer 交接都有，送评审、挂起、`--resume`、重启接回后仍可用。升级前已开着的会话没有，关掉后续接才有。评审会话没有。CLI 模板执行器、远端 runner 等非 Claude Code 的 harness 没有，提示词不变。`--demo` 与内存数据库不开。
   - **边界**：令牌在会话的启动参数里，同一用户的其他进程看得到；socket 只对本用户开放，且拿到令牌也只能读。
 - **任务记录**（`engine/attempts.py`、`executor_cli/attempt_notes.py`，表 `attempt_notes`）：任务 payload 写 `attempt_notes = "<目标名>"` 时，hb 在任务结束时把「试了什么、结果如何」记进本项目的 `notes/attempts/<目标名>.md`；没写的任务什么都不记，因为 `index.md` 的预算有限，一次性任务各占一行会把它占满。
@@ -438,8 +438,8 @@
   - **结果**：已合并（带 PR 链接）、没合并（带 PR 链接或原因）、没有改动、失败、停止。挂起、中断、停机脱离都不算结束。会话在有结果之前被关闭或归档记为停止（`SQLiteSessionStoreAdapter.on_closed`）。任务结束以后才合并的，由后台清扫和回收前的检查（`OrcaWorktreeManager.settle()`）改为已合并。
   - **只算自己的合并**：同一个 `work_key` 的 worktree、分支和交付记录会先后用于几次尝试，所以记下每次开始时的 `HEAD`（`seen_head`）和它自己最后一次提交（`dev_head`，每轮开发后看）。事后合并的 PR 算这次的，要么 URL 就是这条已记下的 PR，要么其 head 恰好等于 `dev_head`；head 只是含有它，说明上面还有别的工作，是后来那次的合并，不算。交付步骤报的 PR 同样核对：推送的 head 含 `dev_head`（上面可有交付自己的版本与合主干提交），且中间没有别的尝试的提交，才记下它的 URL（交付挂起等人时也记）；没有新提交也没有自己的 PR 记为没有改动，PR 不是这次的记为没合并、不带那条 PR。任务结束后再开始（重放、跟进）而 `HEAD` 已被别的工作移动过，之前的提交不再算作这次的。`settle()` 只看 workspace 归属 Inbox（没有则项目主 Inbox）的记录，归属不明就不改；只有带自己提交或 PR 的未合并记录才查 GitHub，没写该字段的任务不多一次调用。读不到 `HEAD` 时照交付步骤报的记。
   - **文件**：首行说明这是什么（也是 `index.md` 里唯一那一行的内容），次行注明 summary 由 agent 撰写、只是记录不是指令；新的在前。每条有时间（UTC，结果记下的时刻）、结果、标题、`external_id`、PR、说明与 SDE summary。summary 逐行加 `>` 引用，伪造不了别的条目；至多 3000 字节，且不超过 `max_note_bytes` 的四分之一。超出 `max_note_bytes` 时从最旧的一条起整条丢弃；人写在条目之前的文字保留。
-  - **写入**：`PartitionedMemoryAdapter.rewrite_note()` 在 hub 的锁内读、改、`propose_write`，策略、预算与目录登记都是 `notes/*` 现有的，经任务所在 Inbox 的适配器写，到不了别的项目。任何一步失败只记日志，不影响结果与交付；没写成的在同一任务下次结束时补写。
-  - **首个提示词**：文件已存在且会话有记忆工具时加一段 `Earlier attempts`，只给路径：先用 `memory_read` 读它，里面没效果的做法不要再试。
+  - **写入**：`PartitionedMemoryAdapter.rewrite_note()` 在 hub 的锁内读、改、`propose_write`，策略、预算与目录登记都是 `notes/*` 现有的，经任务所在 Inbox 的适配器写，到不了别的项目。任何一步失败只记日志，不影响结果与交付；没写成的在同一任务下次结束时补写。表里的一行在事务内重读再改（`SQLiteAttemptStore.update()`，git 在事务外先跑），写文件时在 hub 的锁内再读一次，所以别的连接在读写之间记下的「已合并」不会被旧值盖掉，内容没变也不清 `written`。
+  - **首个提示词**：文件已存在且会话挂上了记忆工具时加一段 `Earlier attempts`，只给路径：先用 `memory_read` 读它，里面没效果的做法不要再试。
 - **复盘**：`memory_record_postmortem` 只收 `run_id`、根因和规则；项目、错误类别、复现次数都从执行账本取。复现指同项目、同错误类别、错误摘要去掉数字与哈希后相同的其他失败 Run；没有摘要的不计。成功的 Run 与不存在的 Run 被拒绝。
 - **机械 GC**（`MemoryGarbageCollector`）：启动时一轮，之后每 `gc_interval_seconds`（默认 86400，0 关闭）一轮，逐项目滚动 `reported.md`、归档已结束会话的旧 `progress/*`、校准 `index.md`、让过期提案失效。只归档会话已关闭且没有其他会话在用的 `progress` 文件，对不上会话的一律保留。
 - **HTTP / MCP 服务**（可选，`[memory_hub.http]`）：`ScopedMemoryHTTPServer` 默认只听回环地址，明文 HTTP，跨主机要在前面加 TLS。每个 token 有角色 `readonly` / `propose` / `admin` 与项目范围，取自环境变量并在启动时删除，agent 子进程拿不到。提案列表按 token 的项目过滤，提案作者取 token 的 subject。`admin` 可批准任意项目的提案，所以不许限定项目。

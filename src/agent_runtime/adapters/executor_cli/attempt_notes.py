@@ -76,13 +76,17 @@ class AttemptNotes:
         try:
             row = self._store.latest(session_id)
             if row is not None:
-                row = replace(row, work_key=work_key, workdir=workdir)
-                # What lies there when the attempt begins is not its own. One begun again before it ended (a restart) has
-                # its commits there already; after its end, whatever moved HEAD since is somebody else's work.
                 head = _head(workdir)
-                if not row.seen_head or (row.result and head != row.seen_head):
-                    row = replace(row, seen_head=head, dev_head="")
-                self._store.save(row)
+
+                def change(now: AttemptRow) -> AttemptRow:
+                    now = replace(now, work_key=work_key, workdir=workdir)
+                    # What lies there when the attempt begins is not its own. One begun again before it ended (a restart)
+                    # has its commits there already; after its end, whatever moved HEAD since is somebody else's work.
+                    if not now.seen_head or (now.result and head != now.seen_head):
+                        now = replace(now, seen_head=head, dev_head="")
+                    return now
+
+                self._store.update(row.attempt_id, change)
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the workspace of its attempt is not recorded", session_id)
 
@@ -92,8 +96,9 @@ class AttemptNotes:
         try:
             row = self._store.latest(session_id)
             if row is not None and row.result != MERGED:
-                now = replace(_with_commits(row), summary=summary or row.summary)
-                self._store.save(replace(now, written=row.written and now.summary == row.summary))
+                head = _head(row.workdir)
+                self._store.update(row.attempt_id, lambda now: now if now.result == MERGED else replace(
+                    _with_commits(now, head), summary=summary or now.summary))
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the progress of its attempt is not recorded", session_id)
 
@@ -104,7 +109,8 @@ class AttemptNotes:
             if row is None or row.result == MERGED or not pr_url or pr_url == row.pr_url:
                 return
             if self._own(row, pr_url, head):
-                self._store.save(replace(row, pr_url=pr_url, written=False))
+                self._store.update(
+                    row.attempt_id, lambda now: now if now.result == MERGED else replace(now, pr_url=pr_url))
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the PR of its attempt is not recorded", session_id)
 
@@ -112,9 +118,8 @@ class AttemptNotes:
         try:
             row = self._store.latest(session_id)
             if row is not None:
-                if ended.result in (FAILED, STOPPED) and not row.dev_head:
-                    row = _with_commits(row)
-                self._record(_at_end(row), self._judged(row, ended))
+                head, judged = _head(row.workdir), self._judged(row, ended)
+                self._record(row, lambda now: _ended(now, judged, head))
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the end of its attempt is not in the project memory", session_id)
 
@@ -123,8 +128,8 @@ class AttemptNotes:
         try:
             row = self._store.latest(session_id)
             if row is not None and not row.result:
-                row = row if row.dev_head else _with_commits(row)
-                self._record(_at_end(row), AttemptResult(STOPPED, detail="会话被关闭"))
+                head, closed = _head(row.workdir), AttemptResult(STOPPED, detail="会话被关闭")
+                self._record(row, lambda now: now if now.result else _ended(now, closed, head))
         except Exception:  # noqa: BLE001
             _log.exception("session %s: the end of its attempt is not in the project memory", session_id)
 
@@ -134,14 +139,16 @@ class AttemptNotes:
         # the one it had, or one whose head is its last commit. A head that merely contains that is a later attempt's.
         # merged() asks GitHub, and only while such an attempt waits for the answer.
         try:
-            waiting = [r for r in self._store.by_work_key(work_key) if r.inbox_id == inbox_id
-                       and r.result in (UNMERGED, FAILED, STOPPED) and (r.dev_head or r.pr_url)]
+            waiting = [r for r in self._store.by_work_key(work_key) if r.inbox_id == inbox_id and _waits(r)]
             prs = merged() if waiting else ()
+
+            def change(now: AttemptRow) -> AttemptRow:
+                own = _own_merge(now, prs)
+                return _ended(now, AttemptResult(MERGED, pr_url=own.url)) if own is not None else now
+
             for row in reversed(waiting):
-                own = next((p for p in prs if (p.url and p.url == row.pr_url)
-                            or (p.head and p.head == row.dev_head)), None)
-                if own is not None:
-                    self._record(row, AttemptResult(MERGED, pr_url=own.url))
+                if _own_merge(row, prs) is not None:
+                    self._record(row, change)
         except Exception:  # noqa: BLE001
             _log.exception("%s: its merge is not in the project memory", work_key)
 
@@ -169,29 +176,44 @@ class AttemptNotes:
             return replace(ended, pr_url="")
         return ended
 
-    def _record(self, row: AttemptRow, ended: AttemptResult) -> None:
-        # Merged is final: what the same task does afterwards (a replay, a follow-up) does not take it back.
-        if row.result != MERGED or ended.result == MERGED:
-            now = replace(row, result=ended.result, detail=ended.detail, pr_url=ended.pr_url or row.pr_url,
-                          summary=ended.summary or row.summary)
-            now = replace(now, written=now.written and now.said() == row.said())
-            self._store.save(now)
-            row = now
+    def _record(self, row: AttemptRow, change: Callable[[AttemptRow], AttemptRow]) -> None:
+        row = self._store.update(row.attempt_id, change)
         if row.written:
             return
+
+        def rewritten(text: str, limit: int) -> str:
+            # Under the lock of the notes the row is read again: the last to write the file writes what is true then.
+            nonlocal row
+            row = self._store.get(row.attempt_id)
+            return _with_record(text, limit, row)
+
         # Read and written in one go, so records written at the same moment are all kept.
-        self._memory_for(row.inbox_id).rewrite_note(
-            note_path(row.goal), lambda text, limit: _with_record(text, limit, row), rationale=_title(row.goal))
+        self._memory_for(row.inbox_id).rewrite_note(note_path(row.goal), rewritten, rationale=_title(row.goal))
         self._store.mark_written(row)
 
 
-def _at_end(row: AttemptRow) -> AttemptRow:
-    # With what the delivery put on top (the version, the base).
-    return replace(row, seen_head=_head(row.workdir) or row.seen_head)
+def _waits(row: AttemptRow) -> bool:
+    return row.result in (UNMERGED, FAILED, STOPPED) and bool(row.dev_head or row.pr_url)
 
 
-def _with_commits(row: AttemptRow) -> AttemptRow:
-    head = _head(row.workdir)
+def _own_merge(row: AttemptRow, prs: Sequence[MergedPR]) -> MergedPR | None:
+    if not _waits(row):
+        return None
+    return next((p for p in prs if (p.url and p.url == row.pr_url) or (p.head and p.head == row.dev_head)), None)
+
+
+def _ended(row: AttemptRow, ended: AttemptResult, head: str = "") -> AttemptRow:
+    # Merged is final: what the same task does afterwards (a replay, a follow-up) does not take it back.
+    if row.result == MERGED and ended.result != MERGED:
+        return row
+    if ended.result in (FAILED, STOPPED) and not row.dev_head:
+        row = _with_commits(row, head)
+    # seen_head: with what the delivery put on top (the version, the base).
+    return replace(row, seen_head=head or row.seen_head, result=ended.result, detail=ended.detail,
+                   pr_url=ended.pr_url or row.pr_url, summary=ended.summary or row.summary)
+
+
+def _with_commits(row: AttemptRow, head: str) -> AttemptRow:
     if not row.seen_head or not head or head == row.seen_head:
         return row
     return replace(row, seen_head=head, dev_head=head)

@@ -300,6 +300,8 @@ class _State:
     handback: dict[str, Any] = field(default_factory=_no_project)
     # Where the task's results go (correlation_key, reply_channel, reply_target), for a notice sent while it runs.
     reply: dict[str, str] = field(default_factory=_no_reply)
+    # What the first prompt says about the memory tools; taken out of it when the session is launched without them.
+    memory_note: str = ""
 
     def fields(self) -> dict[str, Any]:
         return {f: getattr(self, f) for f in self.__slots__}
@@ -741,11 +743,14 @@ class SDEExecutor:
     async def _first_prompt(self, state: _State, caps: RunCapabilities, goal: str | None = None) -> str:
         stable = baseline_segments(caps.memory).stable
         parts = [f"## {name}\n{text}" for name, text in stable if text]
+        note: list[str] = []
         if self._memory is not None and any(name == "index.md" and text.strip() for name, text in stable):
-            parts.append(_MEMORY_SECTION)
+            note.append(_MEMORY_SECTION)
         if (goal is not None and self._memory is not None and self._attempts is not None
                 and await asyncio.to_thread(self._attempts.known, state.inbox_id, goal)):
-            parts.append(_attempts_section(goal))
+            note.append(_attempts_section(goal))
+        state.memory_note = "\n\n".join(note)
+        parts += note
         parts.append(f"## Task requirements\n{state.requirements}")
         if self._terminal is not None and state.work_key:
             parts.append(_reviewer_channel(self._peer_reviewer, state.work_key))
@@ -809,7 +814,11 @@ class SDEExecutor:
             args[args.index("--disallowedTools") + 1] += ",Bash(git push:*),Bash(gh pr create:*),Bash(gh pr merge:*)"
         if isinstance(self._terminal, TerminalUnavailable):
             raise ClaudeCodeError(f"interactive session unavailable: {self._terminal.reason}")
-        args = await asyncio.to_thread(self._with_memory, args, session_id)
+        server = await asyncio.to_thread(self._memory_server, session_id)
+        if server is not None:
+            args = with_mcp_server(args, MEMORY_SERVER, server, MEMORY_TOOLS)
+        elif state.memory_note:
+            prompt = prompt.replace(f"{state.memory_note}\n\n", "", 1)
         if self._terminal is not None:
             # Fix rounds and later events continue the task's conversation: its live terminal, else --resume.
             resumable: dict[str, Any] = (
@@ -848,15 +857,14 @@ class SDEExecutor:
         sid = raw_sid if isinstance(raw_sid, str) and raw_sid else native
         return _validate_report(result.get("structured_output")), sid
 
-    def _with_memory(self, args: list[str], session_id: str) -> list[str]:
+    def _memory_server(self, session_id: str) -> dict[str, Any] | None:
         if self._memory is None:
-            return args
+            return None
         try:
-            server = self._memory.mcp_server(session_id)
+            return self._memory.mcp_server(session_id)
         except sqlite3.Error:
             _log.exception("session %s starts without the memory tools", session_id)
-            return args
-        return with_mcp_server(args, MEMORY_SERVER, server, MEMORY_TOOLS)
+            return None
 
     async def _run(
         self,
