@@ -132,11 +132,11 @@ class TestCLITerminalProcesses(Case):
         self.assertEqual(set(ORCA_SESSION_ENV) & set(env), set())
         self.assertEqual((env["FROM_TEMPLATE"], {k: env.get(k) for k in OTHER_ENV}), ("yes", OTHER_ENV))
         # Everything else arrives as it was. Only names are compared in the message: the values are the machine's own,
-        # and the shell that starts the wrapper sets a few itself.
+        # and the shell that starts the wrapper sets a few itself, including the prompt (PS1).
         dropped = {k for k in terminal_env if k.startswith(("ORCA_AGENT_HOOK_", "ORCA_AGENT_LAUNCH"))}
         self.assertEqual(sorted(k for k, v in terminal_env.items() if env.get(k) != v and k not in dropped
                                 and k not in ("ORCA_AGENT_PANE", "ORCA_PANE_KEY", "ORCA_TAB_ID")
-                                and k not in ("PWD", "OLDPWD", "SHLVL", "_")), [])
+                                and k not in ("PWD", "OLDPWD", "SHLVL", "_", "PS1")), [])
 
     async def test_closing_the_terminal_while_the_cli_runs_ends_the_cli_and_its_children(self):
         task = asyncio.create_task(self.run_cli(self.busy_cli()))
