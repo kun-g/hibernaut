@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 FULL_SUITE_PATTERNS = (
+    "tests/unit/conftest.py",
+    "tests/integration/conftest.py",
     "pyproject.toml",
     ".importlinter",
     "pyrightconfig.json",
@@ -39,77 +41,135 @@ ISOLATED_ADAPTER_PREFIXES = (
 # Non-import edges: subprocess entrypoints and implicit runtime wiring.
 STATIC_DEPS: dict[str, tuple[str, ...]] = {
     "scripts/run_updating.py": ("src/agent_runtime/app/main.py",),
-    "tests/test_config_reload.py": ("scripts/run_updating.py",),
-    "tests/test_auto_update.py": (
+    "tests/integration/test_config_reload.py": ("scripts/run_updating.py",),
+    "tests/integration/test_auto_update.py": (
         "scripts/run_updating.py",
         "src/agent_runtime/__init__.py",
         "src/agent_runtime/adapters/executor_whitebox/executor.py",
     ),
-    "tests/test_switchboard_relay.py": ("src/switchboard/relay_agent.py",),
-    "tests/test_switchboard_bridge.py": ("src/switchboard/app.py",),
-    "tests/test_webhooks.py": ("src/agent_runtime/adapters/channels/channels.py",),
-    "tests/test_mcp_server.py": ("src/agent_runtime/adapters/channels/mcp_server.py",),
-    "tests/test_gdrive_tasks.py": ("src/agent_runtime/adapters/channels/gdrive_tasks.py",),
-    "tests/test_gdrive_credential_proxy.py": ("src/agent_runtime/adapters/channels/gdrive_tasks.py",),
+    "tests/integration/test_switchboard_relay.py": ("src/switchboard/relay_agent.py",),
+    "tests/unit/test_switchboard_bridge.py": ("src/switchboard/app.py",),
+    "tests/unit/test_webhooks.py": ("src/agent_runtime/adapters/channels/channels.py",),
+    "tests/unit/test_mcp_server.py": ("src/agent_runtime/adapters/channels/mcp_server.py",),
+    "tests/unit/test_gdrive_tasks.py": ("src/agent_runtime/adapters/channels/gdrive_tasks.py",),
+    "tests/integration/test_gdrive_credential_proxy.py": ("src/agent_runtime/adapters/channels/gdrive_tasks.py",),
     # Both start `python -m taskboard.app`; the dual-process test also `python -m switchboard.app`.
-    "tests/taskboard/test_m7_service.py": ("src/taskboard/app/__main__.py",),
-    "tests/test_taskboard_dual_process_e2e.py": ("src/taskboard/app/__main__.py", "src/switchboard/app.py"),
+    "tests/integration/taskboard/test_m7_service.py": ("src/taskboard/app/__main__.py",),
+    "tests/integration/test_taskboard_dual_process_e2e.py": ("src/taskboard/app/__main__.py", "src/switchboard/app.py"),
     # Both start `python -m runner.service`; the pilot test also Hibernaut main(). The check program runs as a script.
-    "tests/test_runner_service.py": ("src/runner/service.py", "src/runner/protocol_check.py"),
-    "tests/test_runner_pilot.py": (
+    "tests/integration/test_runner_service.py": ("src/runner/service.py", "src/runner/protocol_check.py"),
+    "tests/integration/test_runner_pilot.py": (
         "src/runner/service.py",
         "src/runner/protocol_check.py",
         "src/agent_runtime/app/main.py",
     ),
     # Starts all three: switchboard.app, taskboard.app and Hibernaut main() through dual_process_hibernaut.py.
-    "tests/test_taskboard_triple_process_e2e.py": (
+    "tests/integration/test_taskboard_triple_process_e2e.py": (
         "src/taskboard/app/__main__.py",
         "src/switchboard/app.py",
         "src/agent_runtime/app/main.py",
-        "tests/dual_process_hibernaut.py",
+        "tests/support/dual_process_hibernaut.py",
     ),
 }
+
+SDE_DELIVERY_TESTS = ("tests/unit/test_sde_delivery.py", "tests/integration/test_sde_delivery.py")
 
 RESOURCE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("src/agent_runtime/adapters/executor_cli/skills/**", ("src/agent_runtime/adapters/executor_cli/role_skills.py",)),
     ("src/dashboard/static/**", ("src/dashboard/server.py",)),
-    ("hibernaut.example.toml", ("tests/test_bootstrap_loop.py", "tests/test_sde_delivery.py", "tests/test_runner_pilot.py",
-                                "tests/test_onboarding.py")),
-    ("switchboard.example.toml", ("tests/test_switchboard_core.py", "tests/test_switchboard_check.py")),
-    ("taskboard.example.toml", ("tests/taskboard/test_m7_service.py",)),
-    ("deploy/gdrive-proxy/**", ("tests/test_gdrive_credential_proxy.py",)),
-    ("deploy/switchboard/**", ("tests/test_switchboard_deploy.py",)),
-    ("deploy/taskboard/**", ("tests/test_taskboard_deploy.py",)),
-    ("scripts/prepare_taskboard_deploy.py", ("tests/test_taskboard_deploy.py",)),
-    ("deploy/ccpeer/**", ("tests/test_ccpeer.py",)),
+    (
+        "hibernaut.example.toml",
+        (
+            "tests/integration/test_bootstrap_loop.py",
+            "tests/integration/test_onboarding.py",
+            "tests/integration/test_runner_pilot.py",
+            "tests/integration/test_sde_delivery.py",
+            "tests/unit/test_bootstrap_loop.py",
+            "tests/unit/test_onboarding.py",
+            "tests/unit/test_runner_pilot.py",
+            "tests/unit/test_sde_delivery.py",
+        ),
+    ),
+    (
+        "switchboard.example.toml",
+        (
+            "tests/integration/test_switchboard_check.py",
+            "tests/unit/test_switchboard_check.py",
+            "tests/unit/test_switchboard_core.py",
+        ),
+    ),
+    (
+        "taskboard.example.toml",
+        (
+            "tests/integration/taskboard/test_m7_service.py",
+            "tests/unit/taskboard/test_m7_service.py",
+        ),
+    ),
+    (
+        "deploy/gdrive-proxy/**",
+        (
+            "tests/integration/test_gdrive_credential_proxy.py",
+            "tests/unit/test_gdrive_credential_proxy.py",
+        ),
+    ),
+    (
+        "deploy/switchboard/**",
+        (
+            "tests/integration/test_switchboard_deploy.py",
+            "tests/unit/test_switchboard_deploy.py",
+        ),
+    ),
+    ("deploy/taskboard/**", ("tests/integration/test_taskboard_deploy.py", "tests/unit/test_taskboard_deploy.py")),
+    (
+        "scripts/prepare_taskboard_deploy.py",
+        (
+            "tests/integration/test_taskboard_deploy.py",
+            "tests/unit/test_taskboard_deploy.py",
+        ),
+    ),
+    ("deploy/ccpeer/**", ("tests/integration/test_ccpeer.py", "tests/unit/test_ccpeer.py")),
     (
         "schemas/taskboard/**",
         (
-            "tests/taskboard/test_m3_engine_and_switchboard.py",
-            "tests/taskboard/test_m4_architecture_and_schemas.py",
-            "tests/taskboard/test_m5_publish_replay.py",
-            "tests/taskboard/test_m6_switchboard_contract.py",
-            "tests/taskboard/test_m7_service.py",
-            "tests/test_taskboard_dual_process_e2e.py",
-            "tests/test_taskboard_hibernaut_loop.py",
+            "tests/integration/taskboard/test_m7_service.py",
+            "tests/integration/test_taskboard_dual_process_e2e.py",
+            "tests/unit/taskboard/test_m3_engine_and_switchboard.py",
+            "tests/unit/taskboard/test_m4_architecture_and_schemas.py",
+            "tests/unit/taskboard/test_m5_publish_replay.py",
+            "tests/unit/taskboard/test_m6_switchboard_contract.py",
+            "tests/unit/taskboard/test_m7_service.py",
+            "tests/unit/test_taskboard_hibernaut_loop.py",
         ),
     ),
     (
         "schemas/runner/**",
         (
-            "tests/test_runner_stage1.py",
-            "tests/test_runner_tool_gate.py",
-            "tests/test_runner_service.py",
-            "tests/test_runner_pilot.py",
+            "tests/integration/test_runner_pilot.py",
+            "tests/integration/test_runner_service.py",
+            "tests/integration/test_runner_stage1.py",
+            "tests/integration/test_runner_tool_gate.py",
+            "tests/unit/test_runner_pilot.py",
+            "tests/unit/test_runner_service.py",
+            "tests/unit/test_runner_stage1.py",
+            "tests/unit/test_runner_tool_gate.py",
         ),
     ),
-    ("deploy/runner/**", ("tests/test_runner_service.py",)),
-    ("schemas/v1/**", ("tests/test_ledger_all.py", "tests/test_memory_hub.py", "tests/test_collaboration_wiring.py")),
-    ("docs/dispatch/**", ("tests/test_sde_delivery.py",)),
-    ("docs/process/versioning.md", ("tests/test_sde_delivery.py",)),
-    ("guidance.toml", ("tests/test_sde_delivery.py",)),
-    ("AGENTS.md", ("tests/test_sde_delivery.py",)),
-    ("README.md", ("tests/test_sde_delivery.py",)),
+    ("deploy/runner/**", ("tests/integration/test_runner_service.py", "tests/unit/test_runner_service.py")),
+    (
+        "schemas/v1/**",
+        (
+            "tests/integration/test_collaboration_wiring.py",
+            "tests/integration/test_memory_hub.py",
+            "tests/unit/test_collaboration_wiring.py",
+            "tests/unit/test_ledger_all.py",
+            "tests/unit/test_memory_hub.py",
+        ),
+    ),
+    ("docs/dispatch/**", SDE_DELIVERY_TESTS),
+    ("docs/process/versioning.md", SDE_DELIVERY_TESTS),
+    ("guidance.toml", SDE_DELIVERY_TESTS),
+    ("AGENTS.md", SDE_DELIVERY_TESTS),
+    ("README.md", SDE_DELIVERY_TESTS),
 )
 
 NO_TEST_PATTERNS = (
@@ -330,11 +390,11 @@ def select_tests(changed_files: list[str], *, root: Path = ROOT) -> SelectionRes
             continue
 
         if rel.startswith("src/agent_runtime/") and rel.endswith(".py"):
-            if "tests/test_architecture_boundaries.py" in all_test_set:
-                selected.add("tests/test_architecture_boundaries.py")
+            if "tests/unit/test_architecture_boundaries.py" in all_test_set:
+                selected.add("tests/unit/test_architecture_boundaries.py")
         if rel.startswith("src/switchboard/") and rel.endswith(".py"):
-            if "tests/test_switchboard_core.py" in all_test_set:
-                selected.add("tests/test_switchboard_core.py")
+            if "tests/unit/test_switchboard_core.py" in all_test_set:
+                selected.add("tests/unit/test_switchboard_core.py")
 
         exists = (root / rel).exists()
         if not exists:
