@@ -178,6 +178,8 @@ schemas/v1/         # 执行账本的 AuditRecord / RunRecord（ADR-0001）、Me
 
 测试按是否启动外部进程分在 `tests/unit/` 和 `tests/integration/`，共用工具在 `tests/support/`。串行计时命令见 [AGENTS.md](AGENTS.md#5-提交前必跑的三道门禁命令)。
 
+协作流程测试使用真实的 Hub HTTP 服务。测试夹具让 Hub 每 10 毫秒检查一次停机请求，以缩短每例结束时等待服务线程退出的时间。
+
 Steward 路由测试在配置的工作目录启动模拟 CLI，通过 MCP 调用工具。要验证终端启动、账号检查和进程清理，见 [`test_terminal_processes.py`](tests/integration/test_terminal_processes.py)。
 
 提交前三道门禁必须全绿：

@@ -4,6 +4,7 @@ import json
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from functools import partialmethod
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ import pytest
 from agent_runtime.app.config import HibernautConfig, parse_config
 from agent_runtime.app.main import AlwaysOnDaemon, build_daemon_from_config
 from agent_runtime.core.models import CLOSEOUT_SOURCE
+from collaboration.hub_server import _HubHTTPServer
 from taskboard.adapters.http_server import TaskboardHTTPServer
 from taskboard.adapters.mcp_tools import TaskboardMCPServer
 from taskboard.adapters.sqlite_store import SQLiteTaskStore
@@ -73,7 +75,9 @@ def tokens(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def daemon(tmp_path: Path, board: Board, tokens: None) -> Iterator[AlwaysOnDaemon]:
+def daemon(tmp_path: Path, board: Board, tokens: None, monkeypatch: pytest.MonkeyPatch) -> Iterator[AlwaysOnDaemon]:
+    # shutdown() waits for serve_forever's next poll before it can join the Hub thread.
+    monkeypatch.setattr(_HubHTTPServer, "serve_forever", partialmethod(_HubHTTPServer.serve_forever, poll_interval=0.01))
     opened = build_daemon_from_config(settings(tmp_path, board, hub=True))
     yield opened
     opened.close()
