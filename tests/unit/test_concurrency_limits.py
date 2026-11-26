@@ -601,7 +601,9 @@ class TestReplay(PoolCase):
                         self.replay(daemon, first.event_id, executor_id="sde", force=True)
                     self.probe.release("block-claude")
                     await self.until(lambda: "block-claude" in self.probe.finished)
-                    await self.settle()
+                    await self.until(lambda: "proj:a:c" not in daemon.pool._active)
+                    await self.waiting_for_quota(daemon, "proj:a:x")
+                    self.assertEqual(daemon.pool._queued_keys["proj:a:x"].executor, "sde")
                     self.assertEqual(self.probe.active_texts(), ["block-sde"])
                     self.assertEqual(daemon.pool.limiter.active, 1)
                     self.probe.release("block-sde")
@@ -622,7 +624,7 @@ class TestReplay(PoolCase):
             with patch.object(daemon.pool.limiter, "try_acquire", wraps=daemon.pool.limiter.try_acquire) as acquire:
                 self.probe.release("block-claude")
                 await self.until(lambda: "block-claude" in self.probe.finished)
-                await self.settle()
+                await self.until(lambda: any(c.args == ("proj:a:x",) for c in acquire.call_args_list))
                 admitted = [c.kwargs["executor_key"] for c in acquire.call_args_list if c.args == ("proj:a:x",)]
             self.assertEqual(self.probe.peak("executor", "sde"), 1)
             self.assertEqual(list(daemon.pool._queue), ["proj:a:x", "proj:a:y"])
