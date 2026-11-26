@@ -37,8 +37,14 @@ def pytest_runtest_protocol(item, nextitem):
             if sys.platform != "win32" and sys.version_info < (3, 14):
                 # Older CPython does not audit this primitive (also used to start the resource tracker).
                 import _posixsubprocess
+                import subprocess
 
-                patch.setattr(_posixsubprocess, "fork_exec", lambda *args: _block_process("_posixsubprocess.fork_exec", args))
+                def forbid_fork_exec(*args, **kwargs):
+                    _block_process("_posixsubprocess.fork_exec", args)
+
+                patch.setattr(_posixsubprocess, "fork_exec", forbid_fork_exec)
+                # subprocess binds its own reference when it imports the native function.
+                patch.setattr(subprocess, "_fork_exec", forbid_fork_exec)
             return (yield)
     finally:
         _violations = None
