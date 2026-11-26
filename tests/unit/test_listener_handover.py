@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import os
+import select
 import socket
 import tempfile
 import threading
@@ -132,16 +133,17 @@ class ListenerHandoverTests(unittest.TestCase):
         self.assertFalse(fd_open(channel_fd))
 
         # Only the supervisor holds the listener now: a request waits in the backlog instead of being refused.
-        status: list[object] = []
-        client = threading.Thread(target=lambda: status.append(get(port, timeout=10)))
-        client.start()
-        client.join(0.3)
-        self.assertEqual(status, [])
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        self.addCleanup(conn.close)
+        conn.request("GET", "/")
+        self.assertEqual(select.select([fd], [], [], 10)[0], [fd])
+        assert conn.sock is not None
+        self.assertEqual(select.select([conn.sock], [], [], 0)[0], [])
 
         next_server = ListenerHandover.from_environ({LISTEN_FD_ENV: str(fd)}).server(("127.0.0.1", port), NoContent)
         self.serve(next_server)
-        client.join(10)
-        self.assertEqual(status, [204])
+        with conn.getresponse() as response:
+            self.assertEqual(response.status, 204)
 
     def test_reclaim_finds_nothing_when_the_daemon_sent_no_listener(self):
         supervisor_end, daemon_end = socket.socketpair()
