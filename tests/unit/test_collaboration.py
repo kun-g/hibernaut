@@ -22,6 +22,7 @@ from collaboration import (
     RoleSkillMemoryStore,
     build_four_layer_mount_plan,
 )
+from tests.support.collaboration_hub import fast_hub_shutdown
 
 
 class _RecordingChiefSink:
@@ -261,7 +262,8 @@ def test_hub_server_pull_digest_and_one_click_approvals(tmp_path: Path) -> None:
         closeout_coordinator=coord,
         state_provider=_StaticStateProvider(),
     )
-    server.start_background()
+    with fast_hub_shutdown():
+        server.start_background()
     try:
         host, port = server.address
         base = f"http://{host}:{port}"
