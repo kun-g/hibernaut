@@ -344,9 +344,14 @@ class TimeoutTests(ShutdownHarness):
         with self.assertRaises(sqlite3.ProgrammingError):
             board.store.count_inbound()
 
+    def permanently_blocked_board(self, **sections: Mapping[str, Any]) -> Switchboard:
+        # The test holds the gate or store lock until stop() returns, even after the drain deadline.
+        self.enterContext(mock.patch("switchboard.app._SETTLE_SEC", 0.02))
+        return self.board(timeout=0.2, sections=sections)
+
     def stuck_delivery(self, **sections: Mapping[str, Any]) -> tuple[Switchboard, Gate]:
         gate = Gate()
-        board = self.board(timeout=0.2, sections=sections)
+        board = self.permanently_blocked_board(**sections)
         self.addCleanup(gate.opened.set)
 
         def handler(event: CanonicalEvent) -> DeliverStatus:
@@ -553,7 +558,7 @@ class TimeoutTests(ShutdownHarness):
         self.assertEqual(self.rows("SELECT status, attempts FROM delivery_log"), [("pending", 0)])
 
     def test_stuck_write_leaves_the_connection_to_process_exit(self) -> None:
-        board = self.board(timeout=0.2)
+        board = self.permanently_blocked_board()
         lock = board.store._lock  # pyright: ignore[reportPrivateUsage]
         lock.acquire()
         try:
