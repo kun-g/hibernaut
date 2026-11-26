@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from memory_hub import AuthPrincipal, MemoryHubHTTPServer, StaticTokenAuth
-from tests.support.memory_hub_fixtures import _make_hub
+from tests.support.memory_hub_fixtures import _make_hub, fast_memory_http_shutdown
 
 
 def _http_json(url: str, *, method: str = "GET", token: str | None = None, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
@@ -26,7 +26,7 @@ def _http_json(url: str, *, method: str = "GET", token: str | None = None, body:
         return err.code, json.loads(err.read().decode("utf-8"))
 
 
-def test_phase3_primary_writer_mcp_http_auth_and_git_commit(tmp_path: Path) -> None:
+def test_phase3_primary_writer_mcp_http_auth_and_git_commit(tmp_path: Path, fast_memory_http_shutdown: None) -> None:
     mem_root = tmp_path / "memory"
     mem_root.mkdir(parents=True)
     subprocess.run(["git", "init"], cwd=mem_root, check=True, capture_output=True)

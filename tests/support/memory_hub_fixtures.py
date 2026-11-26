@@ -1,9 +1,22 @@
 from __future__ import annotations
 
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from memory_hub import BaselineBudgetConfig, KnowledgeMountConfig, MemoryHub, MemoryHubConfig
+import pytest
+
+from memory_hub import BaselineBudgetConfig, KnowledgeMountConfig, MemoryHub, MemoryHubConfig, mcp_server
+
+
+class _FastShutdownServer(ThreadingHTTPServer):
+    def serve_forever(self, poll_interval: float = 0.01) -> None:
+        super().serve_forever(poll_interval)
+
+
+@pytest.fixture
+def fast_memory_http_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mcp_server, "ThreadingHTTPServer", _FastShutdownServer)
 
 
 class _RecordingAudit:
