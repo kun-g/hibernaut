@@ -291,7 +291,8 @@ def test_taskboard_redirects_do_not_take_the_token_along(tmp_path: Path) -> None
             self.end_headers()
 
     server = HTTPServer(("127.0.0.1", 0), Redirecting)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    thread.start()
     try:
         client = TaskboardMCPClient(f"http://127.0.0.1:{server.server_port}/mcp", "secret")
         with pytest.raises(RuntimeError):
@@ -299,6 +300,7 @@ def test_taskboard_redirects_do_not_take_the_token_along(tmp_path: Path) -> None
         assert seen == []
     finally:
         server.shutdown()
+        thread.join()
         server.server_close()
 
 
