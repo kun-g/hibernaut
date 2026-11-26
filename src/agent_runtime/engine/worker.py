@@ -6,6 +6,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator, Callable, Collection, Generator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from typing import Any, Never, assert_never, cast
 
 from agent_runtime.core.models import (
@@ -38,8 +39,10 @@ from agent_runtime.core.models import (
     Silent,
     Suspend,
     TaskLink,
+    is_timed_resume,
     new_id,
     resolve_agent_id,
+    to_utc_iso,
     utc_now_iso,
 )
 from agent_runtime.core.ports import (
@@ -1954,7 +1957,8 @@ class AgentWorker:
         return isinstance(request_id, str) and bool(request_id)
 
     def _matches_pending_approval(self, event: Event) -> bool:
-        if event.payload.get("event_type") != "approval.decided" and event.source != MCP_APPROVAL_SOURCE:
+        if (event.payload.get("event_type") != "approval.decided" and event.source != MCP_APPROVAL_SOURCE
+                and not is_timed_resume(event)):
             return True
         request_id = event.payload.get("approval_request_id")
         if not isinstance(request_id, str) or not request_id:
@@ -2343,6 +2347,13 @@ class AgentWorker:
                 repeated = request_id == session_ref.pending_request_id and target_sid == session_ref.session_id
                 if target_sid != session_ref.session_id:
                     self._archive_into(session_ref, target_sid)
+                if outcome.resume_after_seconds is not None and not repeated:
+                    # Queue the wake before saving the checkpoint: a crash may leave a stale timer,
+                    # which the request-id check discards, but never a checkpoint without its wake.
+                    due = datetime.now(timezone.utc) + timedelta(seconds=outcome.resume_after_seconds)
+                    self._timers.schedule("follow_up", to_utc_iso(due),
+                                          {"event_type": "suspend.elapsed", "approval_request_id": request_id},
+                                          inbox_id=inbox_id, session_id=target_sid)
                 self._sessions.save(
                     SessionRef(
                         session_id=target_sid,
@@ -2360,7 +2371,7 @@ class AgentWorker:
                         forward=forward,
                     )
                 )
-                if repeated:
+                if repeated or outcome.resume_after_seconds is not None:
                     return target_sid
                 self._outbox.enqueue(
                     inbox_id=inbox_id,

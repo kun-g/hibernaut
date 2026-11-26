@@ -46,7 +46,7 @@ def run(command, *, env, cwd):
     if cmd in ("create", "edit", "merge") and state.get("fail", {}).get(cmd, 0):
         state["fail"][cmd] -= 1
         save()
-        return result(code=1, stderr=f"fake gh: {cmd} failed (injected)\n")
+        return result(code=1, stderr=state.get("fail_error", f"fake gh: {cmd} failed (injected)\n"))
     if cmd == "list":
         head = opt(argv, "--head")
         rows = []
