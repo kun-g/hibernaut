@@ -132,7 +132,7 @@ class ListenerHandoverTests(unittest.TestCase):
         self.addCleanup(lambda: fd_open(fd) and os.close(fd))
         self.assertFalse(fd_open(channel_fd))
 
-        # Only the supervisor holds the listener now: a request waits in the backlog instead of being refused.
+        # A readable listener proves the connection is queued before the next daemon serves that same request.
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
         self.addCleanup(conn.close)
         conn.request("GET", "/")

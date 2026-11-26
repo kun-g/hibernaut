@@ -620,6 +620,7 @@ class TestReplay(PoolCase):
             await self.waiting_for_quota(daemon, "proj:a:y")
             # An HTTP thread stores the replay before its wake runs on the loop; a scan can come in between.
             daemon.inbox.replay(first.event_id, executor_id_override="sde", force=True)
+            # Until the wake arrives the cache can be stale, so observe the key used for admission.
             admitted = []
             with patch.object(daemon.pool.limiter, "try_acquire", wraps=daemon.pool.limiter.try_acquire) as acquire:
                 self.probe.release("block-claude")
