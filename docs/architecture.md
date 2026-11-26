@@ -423,6 +423,7 @@
   | `reported.md` | 追加，超出预算的旧条目滚动归档 |
 
   `MemoryPort.write("instructions.md", …)` 因此不再立即生效；`write_memory` 工具的返回文字会说明已排队待批。去重只判 `memory_propose_write`，`MemoryPort.write` 是整文件替换。
+- **HTTP 测试**：直接启动 Memory Hub 和经 daemon 启动的用例共用 `tests/support/memory_hub_fixtures.py` 的真实 HTTP 服务器，夹具仅将停机检查间隔设为 10 毫秒。
 - **端口委托**（`memory_fs/partitioned.py`）：`PartitionedMemoryAdapter` 委托 `LegacyMemoryPortAdapter`，保持 `MemoryPort` 的方法与返回值，另有 `load_baseline_bundle()`。URI 可以写任意项目，适配器只许本项目，越界抛 `PermissionError`。
 - **单写者**（`memory_fs/hub.py` 的 `GovernedMemoryHub`）：包内读改写不加锁，所以每个进程一个 hub，读写与审批持线程锁加 `<memory_root>/.memory_hub.lock` 文件锁，daemon、HTTP 服务与 `--mcp-stdio` 伴随进程不会互相覆盖。提案号校验格式，已决定的提案不能再改判。热加载各代共用同一个 hub，改 `[memory_hub]` 需要重启。
 - **检索索引**（`memory_hub/index_fts5.py`）：项目与共享记忆、知识库挂载各一个 FTS5 库。列文件、同步、查询在同一个 `BEGIN IMMEDIATE` 事务里，GC 的同步与写入后的索引刷新要等它结束，线程间与进程间都互斥；中途失败整体回滚。按项目的局部同步与重建只动该项目和共享层的行，别的项目不受影响。检索不占上面的文件锁，索引大挂载时写入照常。

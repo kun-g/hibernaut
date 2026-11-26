@@ -39,6 +39,7 @@ from agent_runtime.core.models import Emit, Event, SessionRef, Suspend
 from ledger import RunRecord
 from memory_hub import BaselineBudgetConfig, LegacyMemoryPortAdapter, MemoryHubConfig, SearchQuery, WriteProposal
 from tests.support.fakes import InMemoryMemoryStore
+from tests.support.memory_hub_fixtures import fast_memory_http_shutdown
 
 ROOT = Path(__file__).resolve().parents[2]
 PROJ = "proj:hibernaut"
@@ -966,7 +967,7 @@ def test_http_service_is_off_unless_enabled(hub: GovernedMemoryHub) -> None:
     assert open_memory_http(parse_config({}).memory_hub.http, hub, environ={}) is None
 
 
-def test_http_service_takes_its_tokens_out_of_the_environment(hub: GovernedMemoryHub) -> None:
+def test_http_service_takes_its_tokens_out_of_the_environment(hub: GovernedMemoryHub, fast_memory_http_shutdown: None) -> None:
     http = parse_config({"memory_hub": {"http": HTTP}}).memory_hub.http
     with pytest.raises(ValueError, match="MH_ADMIN"):
         open_memory_http(http, hub, environ={"MH_AGENT": "a" * 8})
@@ -998,7 +999,9 @@ def test_http_service_takes_its_tokens_out_of_the_environment(hub: GovernedMemor
         server.shutdown()
 
 
-def test_the_daemon_owns_the_http_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_daemon_owns_the_http_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fast_memory_http_shutdown: None
+) -> None:
     monkeypatch.setenv("MH_AGENT", "tok-agent")
     monkeypatch.setenv("MH_ADMIN", "tok-admin")
     cfg = parse_config({
