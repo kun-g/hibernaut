@@ -291,6 +291,7 @@ def test_taskboard_redirects_do_not_take_the_token_along(tmp_path: Path) -> None
             self.end_headers()
 
     server = HTTPServer(("127.0.0.1", 0), Redirecting)
+    # shutdown() waits for the next poll before the redirect server's thread can exit.
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
     try:

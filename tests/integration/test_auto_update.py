@@ -342,6 +342,7 @@ class AutoUpdateTests(UpdateRepository):
 
         log = stderr_path.read_text()
         self.assertEqual([outcome for _, _, outcome in results if outcome != 202], [], log)
+        # With no active Run, the longest wait and relay outage measured 0.25–0.29 s in the original test runs.
         waits = [answered - sent for sent, answered, _ in results]
         offline = [(transitions[i + 1][0] - at) for i, (at, online) in enumerate(transitions[:-1]) if not online]
         print(f"\n[restart] {len(results)} requests, longest wait {max(waits):.3f}s; "

@@ -10,6 +10,7 @@ from memory_hub import BaselineBudgetConfig, KnowledgeMountConfig, MemoryHub, Me
 
 
 class _FastShutdownServer(ThreadingHTTPServer):
+    # A short poll lets both standalone and daemon tests shut down the real server promptly.
     def serve_forever(self, poll_interval: float = 0.01) -> None:
         super().serve_forever(poll_interval)
 
