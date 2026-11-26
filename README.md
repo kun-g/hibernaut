@@ -180,7 +180,7 @@ schemas/v1/         # 执行账本的 AuditRecord / RunRecord（ADR-0001）、Me
 
 并发限额的重放测试等待调度器检查排队的 Inbox，再验证重放顺序与名额占用。见 [`TestReplay`](tests/unit/test_concurrency_limits.py)。
 
-协作流程、协作 Hub 和 Memory Hub 的 HTTP 接口测试使用真实服务，以 10 毫秒的间隔检查停机请求，缩短每例结束时等待服务线程退出的时间。
+协作流程（含 Taskboard 重定向）、协作 Hub 和 Memory Hub 的 HTTP 接口测试使用真实服务，以 10 毫秒的间隔检查停机请求，缩短每例结束时等待服务线程退出的时间。
 
 Steward 路由测试在配置的工作目录启动模拟 CLI，通过 MCP 调用工具。要验证终端启动、账号检查和进程清理，见 [`test_terminal_processes.py`](tests/integration/test_terminal_processes.py)。
 
