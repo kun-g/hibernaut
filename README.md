@@ -126,7 +126,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 
 停机（SIGINT / SIGTERM，自动更新也走这条路）分两步：先只停止认领新事件，进行中的 Run 照常跑完并写回结果（正在等 Orca 终端里 agent 结果的 Run 例外：旧进程不等它、不关终端，登记和 `runs/` 下的状态目录留给新进程接着等，agent 不会收到重复任务），期间 HTTP 入口（`/events`、`/mcp`）照常接收入库并返回 202、留给下一个进程处理，Outbox 投递、定时器和 Drive 轮询照常运行（worktree 回收清扫不再开始新一轮）；Run 全部结束后才关闭 HTTP（等已接收的请求写完）、停后台服务并退出。新进程启动后先接回这些 Run，再处理同一 Inbox 的新事件。
 
-经 `run_updating.py` 重启时 HTTP 入口不拒绝连接：旧 daemon 停止接收后把监听 socket 交还监督进程，监督进程带着它快进、`execv`，再交给新 daemon 直接使用；这段时间到达的连接在内核 backlog（128）里排队，新 daemon 开始监听后按序处理。实测排队最长约 0.3 秒（不跑 Run 的测试实例；生产上取决于新进程的导入与组装耗时），客户端超时须长于这段时间。Switchboard 中继（`mode = "relay"`）在旧 daemon 退出前主动断开，新 daemon 组装时立即重连（实测断开约 0.3 秒），断开期间的事件由 Switchboard 暂存，重连后立即重投。不经监督进程直接运行 daemon、或第一次启动时，daemon 照旧自己绑定端口；进程内 Switchboard（`mode = "in_process"`）自己的 HTTP 端口不在交接范围内，重启期间仍会拒绝连接；它在 daemon 停机的最后排空在途工作（上限 `shutdown_timeout_seconds`）再关闭。
+经 `run_updating.py` 重启时 HTTP 入口不拒绝连接：旧 daemon 停止接收后把监听 socket 交还监督进程，监督进程带着它快进、`execv`，再交给新 daemon 直接使用；这段时间到达的连接在内核 backlog（128）里排队，新 daemon 开始监听后按序处理。排队时长取决于新进程的导入与组装耗时，客户端超时须长于这段时间。Switchboard 中继（`mode = "relay"`）在旧 daemon 退出前主动断开，新 daemon 组装时立即重连，断开期间的事件由 Switchboard 暂存，重连后立即重投。不经监督进程直接运行 daemon、或第一次启动时，daemon 照旧自己绑定端口；进程内 Switchboard（`mode = "in_process"`）自己的 HTTP 端口不在交接范围内，重启期间仍会拒绝连接；它在 daemon 停机的最后排空在途工作（上限 `shutdown_timeout_seconds`）再关闭。
 
 再发一次 SIGINT / SIGTERM（直接发给 daemon，或发给 `run_updating.py`，它会转给 daemon）则不再等待：进行中的 Run 按中断处理，不写半成品，事件回到 `pending`，由下一个进程重跑。
 
