@@ -23,6 +23,7 @@ from collaboration import (
     ExpertPoolRegistry,
     RoleSkillMemoryStore,
 )
+from tests.support.collaboration_hub import fast_hub_shutdown
 
 DECISIONS = (CloseoutDecision(key="D6-A", title="Sync", choice="Explicit card"),)
 TOKEN = "hub-token-for-tests"
@@ -222,7 +223,8 @@ def serving(tmp_path: Path, **over: Any) -> Iterator[Hub]:
         host="127.0.0.1", port=0, role_store=roles, closeout_store=closeouts,
         closeout_coordinator=options.pop("coordinator", None) or CloseoutCoordinator(closeouts), **options,
     )
-    server.start_background()
+    with fast_hub_shutdown():
+        server.start_background()
     try:
         yield Hub(server, roles, closeouts)
     finally:
