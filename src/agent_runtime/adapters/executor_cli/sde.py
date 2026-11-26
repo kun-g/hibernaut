@@ -104,6 +104,7 @@ from agent_runtime.core.models import (
     SessionRef,
     Silent,
     Suspend,
+    is_timed_resume,
     new_id,
 )
 from agent_runtime.core.ports import RunCapabilities, RunContext
@@ -116,6 +117,7 @@ _CHECKPOINT_KEY = "sde"
 # Version of the state.json layout in a Run's directory; another value is not read, and the Run starts over.
 STATE_FORMAT = 1
 _PHASES = ("develop", "review", "deliver")
+_DELIVERY_RETRY_MINUTES = (1, 5, 15)
 # Sources whose events carry no task of their own (the GitHub webhook keeps a comment's payload as GitHub sent it).
 _FOLLOW_UP_SOURCES = frozenset({"github:issue_comment"})
 _DEV_TOOLS = ("Read", "Grep", "Glob", "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash")
@@ -244,7 +246,7 @@ def _strs(raw: object) -> tuple[str, ...]:
 @dataclass(slots=True)
 class _State:
     stage: Literal["develop", "launch_pending", "terminal_pending", "needs_input", "review_pending", "no_reviewer",
-                   "delivery_pending", "incomplete"]
+                   "delivery_pending", "delivery_retry", "incomplete"]
     workdir: str
     base_ref: str
     requirements: str
@@ -273,6 +275,7 @@ class _State:
     review_note: str = ""
     # The permission tool a person was asked to approve for the delivery step.
     delivery_approval: str = ""
+    delivery_retries: int = 0
     # The developer's claim that no repository change is needed; checked against the worktree, never trusted alone.
     code_change: bool = True
     # Unfinished work was already sent back once automatically; the next time a person decides.
@@ -578,7 +581,10 @@ class SDEExecutor:
                 if text:
                     state.followups.append(text)
                 return self._suspend(session_id, native, state, request_id=pending_id)
-            approved, comment = answer
+            timed_resume = state.stage == "delivery_retry" and any(
+                is_timed_resume(e) and e.payload.get("approval_request_id") == pending_id for e in events
+            )
+            approved, comment = (True, "") if timed_resume else answer
             # Messages claimed in the same batch as the decision count as follow-ups too.
             batched = _task_text([e for e in events if not is_approval(e)])
             if batched:
@@ -591,7 +597,7 @@ class SDEExecutor:
                     reason = "; ".join(ln.removeprefix("- ") for ln in state.reason.splitlines())
                     return await self._finish(session_id, native, state, caps, review="pending",
                                               note=f"retry declined; {reason}", progress=progress)
-                if state.stage == "delivery_pending":
+                if state.stage in ("delivery_pending", "delivery_retry"):
                     return self._deliver(session_id, native, state, self._record(state),
                                          declined=f"delivery declined: {state.reason}")
                 why = {"needs_input": "question declined", "terminal_pending": "interactive session declined",
@@ -601,7 +607,8 @@ class SDEExecutor:
             if state.stage == "delivery_pending":
                 # A person decided: the developer may be sent back again up to the limit.
                 state.handbacks = 0
-            if state.stage == "delivery_pending" and not followups:
+                state.delivery_retries = 0
+            if state.stage in ("delivery_pending", "delivery_retry") and not followups:
                 # Only the delivery step is retried; an approved permission counts for this attempt.
                 granted = frozenset({state.delivery_approval}) - {""}
                 return await self._finish(session_id, native, state, caps, review=state.review_status,
@@ -617,7 +624,8 @@ class SDEExecutor:
                 state.nudged = True
                 reply = "\n\n".join(p for p in (comment, followups) if p)
                 prompt = _unfinished_prompt(state.reason) + (f"\n\n## From a person\n{reply}" if reply else "")
-            elif state.stage == "delivery_pending":
+            elif state.stage in ("delivery_pending", "delivery_retry"):
+                state.delivery_retries = 0
                 # New requirements arrived with the approval: develop them, then review and deliver again.
                 state.rounds = 0
                 prompt = f"## Follow-up from a person\n{followups}"
@@ -1142,6 +1150,11 @@ class SDEExecutor:
                 "developer can finish. Approve to send the developer back to finish; reject to stop here (the "
                 "worktree stays as it is)."
             )
+        elif state.stage == "delivery_retry":
+            delay = _DELIVERY_RETRY_MINUTES[state.delivery_retries - 1]
+            return Suspend(request_id=request_id or new_id("req"), prompt=f"Delivery retry in {delay} min: {state.reason}",
+                           session_checkpoint=state.dump(), session_id=session_id, executor_session_id=native,
+                           resume_after_seconds=60 * delay)
         elif state.stage == "delivery_pending":
             record = self._record(state)
             prompt = "\n".join([
@@ -1235,10 +1248,18 @@ class SDEExecutor:
             await asyncio.to_thread(self._attempts.delivered, session_id, record.pr_url, record.pushed_sha)
         if record.problem:
             limit = self._delivery.config.max_handbacks
+            if record.transient and state.delivery_retries < len(_DELIVERY_RETRY_MINUTES):
+                state.delivery_retries += 1
+                state.stage, state.reason, state.delivery_approval = "delivery_retry", record.problem, ""
+                return self._suspend(session_id, native, state)
             if record.handback and state.handbacks < limit:
+                state.delivery_retries = 0
                 return await self._hand_back(session_id, native, state, caps, record.handback, limit, progress)
             # Recoverable: the record keeps what already happened, so approval resumes from there.
             reason = record.problem
+            if state.delivery_retries:
+                delays = ", ".join(str(n) for n in _DELIVERY_RETRY_MINUTES[:state.delivery_retries])
+                reason = f"After {state.delivery_retries} automatic retries ({delays} min): {reason}"
             if record.handback and state.handbacks:
                 reason += (f"\nHanded back to the developer {state.handbacks} time(s) already (limit {limit}); "
                            "a person decides now.")

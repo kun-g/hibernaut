@@ -794,7 +794,7 @@ class DriveResultWriter:
                 session_id=session.session_id,
                 dedup_key=dedup,
             )
-        if isinstance(report.outcome, Suspend):
+        if isinstance(report.outcome, Suspend) and report.outcome.resume_after_seconds is None:
             return self.write_suspend(
                 file_id,
                 prompt=report.outcome.prompt,

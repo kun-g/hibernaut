@@ -319,6 +319,7 @@ class DeliveryRecord:
     merge_hold_detail: str = ""
     # Recoverable: approving a retry runs the step again from the recorded state.
     problem: str = ""
+    transient: bool = False
     # The permission tool that deferred to a person in this attempt.
     approval: str = ""
     # Set with problem when the developer can fix it (a base merge conflict, failing checks): what went wrong.
@@ -388,6 +389,27 @@ class DeliveryDetached(Exception):
 
 class _Problem(Exception):
     pass
+
+
+class _TransientRemoteError(_Problem):
+    pass
+
+
+_REMOTE_TRANSIENT = re.compile(
+    r"could not resolve (?:host(?:name)?|proxy)|temporary failure in name resolution|no such host|"
+    r"name or service not known|nodename nor servname provided|connection (?:timed out|timeout|reset)|"
+    r"error connecting to (?:api\.)?github\.com|"
+    r"(?:i/o|tls handshake) timeout|operation timed out|timed out (?:while |after )?connect|"
+    r"(?:http(?:/\d(?:\.\d)?)?|returned error:|status code[: ]+)\s*(?:429|5\d\d)\b|"
+    r"(?:api |secondary )?rate limit exceeded|exceeded (?:a |the |your )?(?:secondary )?rate limit|"
+    r"rate[- ]limited|too many requests", re.I,
+)
+
+
+def _remote_problem(prefix: str, proc: subprocess.CompletedProcess[str]) -> _Problem:
+    output = proc.stderr or proc.stdout
+    error = _TransientRemoteError if _REMOTE_TRANSIENT.search(output) else _Problem
+    return error(f"{prefix}: {_tail(output, 800)}")
 
 
 class _Handback(_Problem):
@@ -540,6 +562,7 @@ class PRDelivery:
 
         rec.notes, rec.problem, rec.approval, rec.handback = [], "", "", {}
         rec.merge_hold, rec.merge_hold_detail = "", ""
+        rec.transient = False
         rec.attempts += 1
         if rec.state == "merged":
             rec.notes.append("already merged; nothing to do")
@@ -551,6 +574,7 @@ class PRDelivery:
                 self._delete_remote_branch(req, rec)
         except _Problem as exc:
             rec.problem = str(exc)
+            rec.transient = isinstance(exc, _TransientRemoteError)
             if isinstance(exc, _Handback):
                 rec.handback = exc.detail
         finally:
@@ -631,11 +655,15 @@ class PRDelivery:
         except FileNotFoundError:
             raise _Problem(f"{argv[0]} is not installed or not on PATH") from None
         except subprocess.TimeoutExpired:
-            raise _Problem(f"`{shlex.join(argv[:3])} ...` timed out after {timeout:g}s") from None
+            remote = argv[0] == self._config.gh_command or argv[1] in ("fetch", "ls-remote", "push")
+            error = _TransientRemoteError if remote else _Problem
+            raise error(f"`{shlex.join(argv[:3])} ...` timed out after {timeout:g}s") from None
 
     def _git(self, cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         proc = self._run([self._config.git_command, *args], cwd)
         if check and proc.returncode != 0:
+            if args[0] in ("fetch", "ls-remote"):
+                raise _remote_problem(f"git {args[0]} failed", proc)
             raise _Problem(f"git {args[0]} failed: {_tail(proc.stderr or proc.stdout, 800)}")
         return proc
 
@@ -643,7 +671,7 @@ class PRDelivery:
         repo = ("-R", self._config.repo) if self._config.repo else ()
         proc = self._run([self._config.gh_command, *args, *repo], cwd)
         if check and proc.returncode != 0:
-            raise _Problem(f"gh {' '.join(args[:2])} failed: {_tail(proc.stderr or proc.stdout, 800)}")
+            raise _remote_problem(f"gh {' '.join(args[:2])} failed", proc)
         return proc
 
     @contextmanager
@@ -835,7 +863,7 @@ class PRDelivery:
             # Never forced: a branch that gained commits elsewhere is reported instead of overwritten.
             proc = self._git(cwd, "push", "--quiet", cfg.remote, f"HEAD:refs/heads/{rec.branch}", check=False)
             if proc.returncode != 0:
-                raise _Problem(f"push of {rec.branch} to {cfg.remote} was rejected: {_tail(proc.stderr, 800)}")
+                raise _remote_problem(f"push of {rec.branch} to {cfg.remote} was rejected", proc)
         rec.pushed_sha = rec.head_sha
         self._store.save(req.work_key, rec.to_dict())
 
@@ -1057,7 +1085,7 @@ class PRDelivery:
             return [cast(dict[str, Any], c) for c in cast(list[object], data) if isinstance(c, dict)]
         if "no checks reported" in proc.stderr:
             return []
-        raise _Problem(f"gh pr checks failed: {_tail(proc.stderr or proc.stdout, 800)}")
+        raise _remote_problem("gh pr checks failed", proc)
 
     def _conflicting(self, cwd: Path, number: int) -> bool:
         view = self._gh(cwd, "pr", "view", str(number), "--json", "mergeable,mergeStateStatus", check=False)

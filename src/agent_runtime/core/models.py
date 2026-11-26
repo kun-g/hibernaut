@@ -79,6 +79,10 @@ class Event:
     seq: int | None = field(default=None, compare=False)
 
 
+def is_timed_resume(event: Event) -> bool:
+    return event.source == "timer:follow_up" and event.payload.get("event_type") == "suspend.elapsed"
+
+
 def explicit_trace_id(event: Event) -> str | None:
     for key in ("trace_id", "_trace_id"):
         value = event.payload.get(key)
@@ -394,6 +398,8 @@ class Suspend:
     session_id: str | None = None
     executor_session_id: str | None = None
     telemetry: RunTelemetry | None = field(default=None, compare=False)
+    # A timer wakes this request instead of sending a prompt to a person.
+    resume_after_seconds: int | None = None
 
 
 RunOutcome: TypeAlias = Silent | Emit | Suspend
