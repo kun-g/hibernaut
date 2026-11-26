@@ -56,8 +56,17 @@ pyright
 ```
 
 - `lint-imports`：验证 `.importlinter` 全部架构分层与反向依赖契约（0 broken）。
-- `pytest -n auto --dist worksteal -v`：并行跑全量，验证 AST 静态边界测试、Port 契约测试、多 `inbox_id` 并发隔离及 `NewEventPolicy`（`defer`/`fold`/`interrupt`）端到端测试。串行 `pytest -v` 只在排查并行相关的失败时用。
+- `pytest -n auto --dist worksteal -v`：并行跑全量，验证 AST 静态边界测试、Port 契约测试、多 `inbox_id` 并发隔离及 `NewEventPolicy`（`defer`/`fold`/`interrupt`）场景。
 - `pyright`：对 `src/agent_runtime/core`、`src/agent_runtime/engine`、`src/switchboard`、`src/ccpeer`、`src/taskboard`、`src/runner`、`src/ledger`、`src/dashboard` 与 `src/collaboration` 执行 strict 静态类型检查（0 errors, 0 warnings）。
+
+新增测试按单个用例分目录（含夹具准备与清理）。全程在进程内运行的放 `tests/unit/`，启动外部进程的放 `tests/integration/`；共用假对象、脚本和建仓工具放 `tests/support/`。从用户入口走真实服务的端到端测试预留，定义见 [`docs/glossary.md`](docs/glossary.md#测试分层)。
+
+分别串行计时：
+
+```bash
+pytest -p no:xdist tests/unit
+pytest -p no:xdist tests/integration
+```
 
 ## 6. 文档增量协作闭环规范
 
