@@ -1110,6 +1110,7 @@ def build_daemon_from_config(
         resolved_channel = SwitchboardChannelAdapter(
             switchboard_bus(switchboard).publish, fallback=resolved_channel,
             push_policy=NotificationPolicyEngine() if config.collaboration.enabled else None,
+            deciders=GroupEntrances(config.feishu_groups).members_of,
         )
 
     mcp_token = (

@@ -536,6 +536,44 @@ class GroupTests(ServedCase):
         self.assertIn("deliveries", json.loads(said))
         self.assertEqual(self.replies(), [])
 
+    async def test_r10_a_click_of_somebody_else_leaves_the_group_s_approval_to_the_listed_person(self) -> None:
+        from tests.support.switchboard_approval_flow import card_click
+
+        # The system Steward asks before it starts; whoever sees the card can click it.
+        self.enterContext(patch.object(AutoModePermissionAdapter, "DEFAULT_ALLOW_TOOLS",
+                                       AutoModePermissionAdapter.DEFAULT_ALLOW_TOOLS - {"steward.launch"}))
+        self.enterContext(patch.object(AutoModePermissionAdapter, "DEFAULT_DEFER_TOOLS",
+                                       AutoModePermissionAdapter.DEFAULT_DEFER_TOOLS | {"steward.launch"}))
+        await self.serve(self.text() + GROUPS)
+        self.set_plan([reply("近 24 小时：0 个失败")])
+        await self.message("hb 最近运转得怎样", chat="oc_hb", chat_type="group")
+
+        def cards() -> list[dict[str, Any]]:
+            return [c for c in self.board.http.calls if c["json"].get("msg_type") == "interactive"]
+
+        await self.wait_for(cards, "the approval card in the group")
+        [sent] = cards()
+        where = sent["json"].get("receive_id") or "oc_hb"
+        card = json.loads(sent["json"]["content"])
+        approve = next(el for el in card["elements"] if el["tag"] == "action")["actions"][0]["value"]
+        url = f"{self.board.url}/webhooks/feishu"
+
+        def click(operator: str) -> tuple[int, dict[str, Any]]:
+            body = card_click(approve, operator=operator)
+            body["event"]["context"]["open_chat_id"] = where
+            return post(url, body)
+
+        status, refused = await asyncio.to_thread(click, "ou_stranger")
+        self.assertEqual((status, refused["toast"]["type"]), (200, "error"))
+        # The card stays as it is, and nothing is stored that would make the person's click a duplicate.
+        self.assertNotIn("card", refused)
+        status, taken = await asyncio.to_thread(click, "ou_kun")
+        self.assertEqual((status, taken["toast"]["type"]), (200, "success"))
+        await self.wait_for(lambda: any("近 24 小时" in r for r in self.thread_replies("om_1")), "the approved run")
+        [decided] = [e for e in self.events("sb:feishu", OPS) if e.payload.get("approval_request_id")]
+        self.assertEqual((decided.payload["approved"], decided.payload["actor"]), (True, "ou_kun"))
+        self.assertEqual(len(self.launches()), 1)
+
     async def test_new_r_somebody_else_in_that_group_reaches_nothing_and_hears_nothing(self) -> None:
         await self.serve(self.text() + GROUPS)
         self.set_plan([reply("ran")])

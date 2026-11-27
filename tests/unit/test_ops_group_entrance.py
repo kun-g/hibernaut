@@ -128,6 +128,24 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.inboxes(), [ASH])
 
 
+class DecidersTests(unittest.TestCase):
+    def report(self, inbox_id: str, outcome: str = "suspend") -> dict[str, Any]:
+        from agent_runtime.adapters.channels.switchboard_bridge import SwitchboardChannelAdapter
+
+        adapter = SwitchboardChannelAdapter(lambda _e: None, deciders=ENTRANCES.members_of)
+        metadata = {"outcome_kind": outcome, "session_id": "s1", "approval_request_id": "req_1",
+                    "correlation_key": "feishu:thread:om_1"}
+        report = adapter.build_report(inbox_id, "Start?", metadata)
+        assert report is not None
+        return dict(report.metadata)
+
+    def test_r10_a_card_of_the_group_s_inbox_names_the_listed_people_as_its_deciders(self) -> None:
+        self.assertEqual(self.report(OPS)["deciders"], [KUN])
+        self.assertNotIn("deciders", self.report(ASH))
+        self.assertNotIn("deciders", self.report(OPS, outcome="emit"))
+        self.assertIsNone(GroupEntrances().members_of(OPS))
+
+
 class OriginTests(unittest.TestCase):
     origin = staticmethod(event_origin_for(ENTRANCES))
 

@@ -151,5 +151,50 @@ class CrossSourceApprovalTests(unittest.TestCase):
         self.assertEqual(decisions[0].metadata["decision"], "approve")
 
 
+class DecidersTests(unittest.TestCase):
+    # A report may name who decides its approval; a click of anybody else is turned away before it is stored.
+    def setUp(self) -> None:
+        self.h: Harness = make_harness(routing={"feishu_chats": {"oc_approvals": "sys:ops"}})
+        self.hibernaut: list[CanonicalEvent] = []
+        self.h.board.bus.subscribe("hibernaut", lambda e: self.hibernaut.append(e) or None)
+        self.h.board.bus.subscribe("taskboard", lambda e: None)
+        self.addCleanup(self.h.close)
+
+    def card(self, **metadata: object) -> dict[str, object]:
+        _, rpc = mcp_call(self.h.url, "report_execution", {
+            "external_id": "outbox:ops", "scope": "sys:ops", "subject": "Start?",
+            "metadata": {"run_id": "run", "outcome_kind": "suspend", "session_id": "s-ops",
+                         "approval_request_id": "req-ops", **metadata},
+        })
+        self.assertEqual(tool_result(rpc)["status"], "accepted")
+        self.h.board.worker.run_once()
+        self.h.board.gateway.run_once()
+        (send,) = self.h.http.calls
+        card = json.loads(send["json"]["content"])
+        return next(el for el in card["elements"] if el["tag"] == "action")["actions"][0]["value"]
+
+    def test_r10_somebody_not_named_is_refused_and_the_named_person_still_decides(self) -> None:
+        value = self.card(deciders=["ou_kun"])
+        url = f"{self.h.url}/webhooks/feishu"
+        before = self.h.board.store.count_inbound()
+        status, refused = post(url, card_click(value, operator="ou_stranger"))
+        self.assertEqual((status, refused["toast"]["type"]), (200, "error"))
+        self.assertNotIn("card", refused)
+        self.assertEqual(self.h.board.store.count_inbound(), before)
+        status, taken = post(url, card_click(value))
+        self.assertEqual((status, taken["toast"]["type"]), (200, "success"))
+        self.h.board.worker.run_once()
+        (decision,) = [e for e in self.hibernaut if e.event_type == "approval.decided"]
+        self.assertEqual((decision.actor, decision.metadata["decision"]), ("ou_kun", "approve"))
+        status, again = post(url, card_click(value, operator="ou_stranger"))
+        self.assertEqual(again["toast"]["type"], "error")
+
+    def test_r10_without_a_list_the_first_click_of_anybody_decides_as_before(self) -> None:
+        value = self.card()
+        url = f"{self.h.url}/webhooks/feishu"
+        self.assertEqual(post(url, card_click(value, operator="ou_stranger"))[1]["toast"]["type"], "success")
+        self.assertIn("已处理", post(url, card_click(value))[1]["toast"]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

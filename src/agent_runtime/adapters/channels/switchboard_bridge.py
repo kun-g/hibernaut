@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from typing import Any, Protocol, cast
 
 from collaboration import NotificationPolicyEngine
@@ -211,10 +211,13 @@ class SwitchboardChannelAdapter:
         fallback: ChannelPort | None = None,
         # Decides what may be pushed to Feishu unasked (D8-B); None leaves every message as it is.
         push_policy: NotificationPolicyEngine | None = None,
+        # inbox_id -> the only people whose click on its approval card counts; None for anybody who sees it.
+        deciders: Callable[[str], Collection[str] | None] | None = None,
     ) -> None:
         self._publish = publish
         self._fallback = fallback
         self.push_policy = push_policy
+        self._deciders = deciders
 
     def build_report(self, inbox_id: str, content: str, metadata: Mapping[str, Any]) -> CanonicalEvent | None:
         outcome = outcome_kind_for(metadata)
@@ -242,6 +245,10 @@ class SwitchboardChannelAdapter:
             # Taskboard's execution.reported schema requires both; a Run that lost them still reports a valid trace.
             report.setdefault("trace_id", report["run_id"])
             report.setdefault("hop_count", 1)
+        allowed = self._deciders(inbox_id) if self._deciders is not None and outcome == "suspend" else None
+        if allowed:
+            # Switchboard turns other clicks away before storing them, so they cannot use the approval up.
+            report["deciders"] = sorted(allowed)
         legacy_request_id = metadata.get("request_id")
         if outcome == "suspend" and "approval_request_id" not in report and legacy_request_id:
             # Outbox rows written before the worker added approval_request_id carry only request_id.

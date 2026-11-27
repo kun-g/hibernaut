@@ -37,6 +37,10 @@ class GroupEntrances:
         for group in self._by_chat.values():
             self._members_of[group.inbox_id] = self._members_of.get(group.inbox_id, frozenset()) | group.members
 
+    def members_of(self, inbox_id: str) -> frozenset[str] | None:
+        # The people whose decisions count in this inbox; None where no group is bound to it.
+        return self._members_of.get(inbox_id)
+
     def _group(self, metadata: Mapping[str, object]) -> FeishuGroup | None:
         if metadata.get("chat_type") == "p2p":
             return None
