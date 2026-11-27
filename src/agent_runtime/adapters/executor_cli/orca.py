@@ -24,6 +24,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     PROBE_ROLE_ARGS,
     ClaudeCodeError,
     ClaudeCodeProfile,
+    env_check,
     env_overrides,
     harness_args,
     interactive_args,
@@ -297,6 +298,7 @@ def session_gate(profile: ClaudeCodeProfile, *, unset_extra: Sequence[str] = ())
     # What claude_gate.py needs to set the environment and check the session the launcher would open.
     launcher = profile.launcher
     unset, values = env_overrides(profile)
+    check = env_check(profile)
     return {
         "profile": {"name": profile.name, "launcher": launcher.name, "launcher_command": launcher.command,
                     "launcher_env": launcher.env, "env": profile.env,
@@ -304,8 +306,10 @@ def session_gate(profile: ClaudeCodeProfile, *, unset_extra: Sequence[str] = ())
                     "credential_proxy_url": profile.credential_proxy_url},
         "unset": [*unset, *(k for k in unset_extra if k not in unset)],
         "set": values,
-        "probe": [launcher.command, *harness_args(profile, permission_mode="dontAsk", role_args=PROBE_ROLE_ARGS)],
+        "probe": [launcher.command,
+                  *harness_args(profile, permission_mode="dontAsk", role_args=PROBE_ROLE_ARGS, check=check)],
         "probe_timeout": _PROBE_TIMEOUT_SECONDS,
+        "env_check": None if check is None else {"keys": list(check.keys), "salt": check.salt},
     }
 
 

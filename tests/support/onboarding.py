@@ -38,7 +38,8 @@ system_tools = true
 [executors.claude-code]
 harness = "claude-code"
 [executors.claude-code.env]
-ANTHROPIC_AUTH_TOKEN = "placeholder-gateway-token"   # keep
+ANTHROPIC_BASE_URL = "http://127.0.0.1:3425"
+ANTHROPIC_AUTH_TOKEN = "placeholder-gw-tok"   # keep
 
 [agents]
 ash = {{ role = "steward", executor = "claude-code" }}

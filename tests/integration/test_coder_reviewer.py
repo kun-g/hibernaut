@@ -222,7 +222,7 @@ class TestReviewerLauncher(ReviewerCase):
 
     async def test_subscription_accepts_only_the_credential_source_written_in_the_config(self):
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-daemon"}):
-            outcome = await self.executor(env={"ANTHROPIC_API_KEY": "configured"}).execute(
+            outcome = await self.executor(env={**GATEWAY_ENV, "ANTHROPIC_API_KEY": "configured"}).execute(
                 [event(self.payload())], None, self.caps
             )
         assert isinstance(outcome, Emit)

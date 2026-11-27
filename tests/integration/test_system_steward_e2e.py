@@ -41,7 +41,7 @@ from tests.support.jsonl import read_jsonl
 
 ASH, OPS, CHAT = "user:main", "sys:ops", "feishu:p2p:oc_person"
 # Placeholder, not a real credential.
-SECRET = "placeholder-gateway-secret"
+SECRET = "placeholder-gw-secret"
 CONFIG = """# the deployment
 [channels]
 host = "127.0.0.1"
@@ -85,7 +85,8 @@ command = "{command}"
 [executors.claude-code]
 launcher = "fake"
 [executors.claude-code.env]
-SOME_SERVICE_TOKEN = "placeholder-gateway-secret"
+ANTHROPIC_BASE_URL = "http://127.0.0.1:3425"
+SOME_SERVICE_TOKEN = "placeholder-gw-secret"
 
 [agents.ash]
 role = "steward"

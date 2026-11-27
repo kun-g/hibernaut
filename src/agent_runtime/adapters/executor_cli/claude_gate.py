@@ -30,7 +30,9 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     ClaudeCodeError,
     ClaudeCodeLauncher,
     ClaudeCodeProfile,
+    EnvCheck,
     check_init,
+    is_hook_response,
 )
 from agent_runtime.adapters.executor_cli.cli_terminal import (
     GRACE_SECONDS,
@@ -89,8 +91,12 @@ def _main(spec: dict[str, Any], running: list[subprocess.Popen[bytes]]) -> int:
         env=p.get("env", {}),
         credential_proxy_url=p["credential_proxy_url"],
     )
+    # A spec without env_check (written by an older daemon) cannot confirm a configured credential: check_init stops it.
+    raw_check = spec.get("env_check")
+    check = None if raw_check is None else EnvCheck(keys=tuple(raw_check["keys"]), salt=raw_check["salt"])
     try:
-        check_init(profile, _probe(spec["probe"], env, spec["probe_timeout"], lease, running))
+        init, hooks = _probe(spec["probe"], env, spec["probe_timeout"], lease, running)
+        check_init(profile, init, check=check, hooks=hooks)
     except ClaudeCodeError as exc:
         if not once:
             _report(Path(spec["status"]), {"ok": False, "error": str(exc)})
@@ -105,7 +111,7 @@ def _main(spec: dict[str, Any], running: list[subprocess.Popen[bytes]]) -> int:
 
 
 def _probe(argv: list[str], env: dict[str, str], timeout: float, lease: Path,
-           running: list[subprocess.Popen[bytes]]) -> dict[str, Any]:
+           running: list[subprocess.Popen[bytes]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     # Starts the harness headless and stops it at its init message, before any model request matters.
     try:
         with starting():
@@ -121,6 +127,7 @@ def _probe(argv: list[str], env: dict[str, str], timeout: float, lease: Path,
     except (BrokenPipeError, ConnectionResetError):
         pass
     found: list[dict[str, Any]] = []
+    hooks: list[dict[str, Any]] = []
     errors = bytearray()
     stdout, stderr = proc.stdout, proc.stderr
 
@@ -132,7 +139,9 @@ def _probe(argv: list[str], env: dict[str, str], timeout: float, lease: Path,
                 continue
             if isinstance(parsed, dict):
                 message = cast(dict[str, Any], parsed)
-                if message.get("type") == "system" and message.get("subtype") == "init":
+                if is_hook_response(message):
+                    hooks.append(message)
+                elif message.get("type") == "system" and message.get("subtype") == "init":
                     found.append(message)
                     return
 
@@ -160,7 +169,7 @@ def _probe(argv: list[str], env: dict[str, str], timeout: float, lease: Path,
     if not found:
         text = errors.decode("utf-8", errors="replace").strip()
         raise ClaudeCodeError(f"exited ({proc.returncode}) before reporting its session: {text[-2000:]}")
-    return found[0]
+    return found[0], hooks
 
 
 def _become(argv: list[str], env: dict[str, str], lease: Path) -> int:

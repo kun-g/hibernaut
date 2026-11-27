@@ -45,7 +45,10 @@ timeout_seconds = 300.0
 
 # Claude Code 启动器：只能在本部署文件里声明，事件无法指定。内置 claude（command = "claude"）。
 # 启动器自管配置目录、账号、网关或代理，并原样转交模型、effort 与角色参数。
-# env 原样传给 Claude Code，写什么网关、token 由运营者决定；daemon 自身环境里的付费凭据与路由变量先剥离，再叠加启动器、执行器的 env。
+# env 原样传给 Claude Code；daemon 自身环境里的付费凭据与路由变量先剥离，再叠加启动器、执行器的 env。
+# agent 能读到自己的 env，所以这里不放真实密钥：凭据类键（键名按 _ 分段，有一段以 KEY、TOKEN、SECRET、PASSWORD、AUTH 等结尾）
+# 只能配在 ANTHROPIC_BASE_URL 指向本机回环地址（127.0.0.1、::1、localhost）的网关旁，值只能是不超过 24 个字符的占位，
+# 以 sk-、ghp_、gho_、ghs_、xox 等真实密钥前缀开头也报错；报错只写键名与所在段，--check 同样拦。
 # [launchers.claude-sg]
 # harness = "claude-code"
 # command = "claude-sg"         # 部署机 PATH 上的命令名或绝对路径
@@ -64,7 +67,7 @@ timeout_seconds = 300.0
 [executors.claude-code]
 harness = "claude-code"         # 目前仅支持 claude-code
 launcher = "claude"             # [launchers.<name>] 之一
-billing = "subscription"        # subscription（用启动器自己的登录，剥离继承来的付费凭据，发现 env 没写明的付费来源即中止）| api（经 [credential_proxy]）
+billing = "subscription"        # subscription（用启动器自己的登录，剥离继承来的付费凭据；发现 env 没写明的付费来源、或 env 写明的网关与 token 被启动器改掉即中止；网关须在本机）| api（经 [credential_proxy]）
 timeout_seconds = 1800.0        # 交互模式下含等人回答的时间
 # max_concurrency = 2           # 可选：同时跑这个执行器的 Inbox 上限，跨项目、跨引用它的 agent 合计；只想限某个 agent 就写在 [agents.<id>]。普通 CLI 执行器同样可写。SDE 内置评审算在 SDE 那次 Run 的名额里
 # model / effort 也可写在这里作默认值，agent 里写的优先
@@ -83,7 +86,8 @@ interactive = true              # 需要人可接入的交互会话，由项目�
 # 正文与资源目录经 --append-system-prompt 传给评审者；只读权限、结论 schema 与契约由程序控制，Skill 改不了。
 # skills = ["builtin:code-reviewer", "./skills/team-review"]
 
-# 经本机模型网关跑非 Claude 模型：执行器的 env 写网关地址与 token，billing 仍用 subscription（不经 [credential_proxy]）。SDE 与 Steward 同样可用。
+# 经本机模型网关跑非 Claude 模型：执行器的 env 写网关地址与占位 token，billing 仍用 subscription（不经 [credential_proxy]）。SDE 与 Steward 同样可用。
+# 网关须在本机回环地址；会话开始时核对 Claude Code 实际拿到的就是这两个值（只比对加盐指纹，不打印），启动器另行导出覆盖值即中止。
 [executors.model-gateway]
 harness = "claude-code"
 billing = "subscription"

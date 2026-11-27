@@ -33,7 +33,7 @@ from tests.support.onboarding import CONFIG, FakeCommands, OnboardingCase, Reloa
 
 
 # Placeholders, not real credentials.
-ENV_TOKEN = "placeholder-gateway-token"
+ENV_TOKEN = "placeholder-gw-tok"
 
 
 class OnboardTests(OnboardingCase):

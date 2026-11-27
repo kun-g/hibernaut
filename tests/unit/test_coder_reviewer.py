@@ -81,7 +81,7 @@ class TestReviewerProfile(unittest.TestCase):
         documented = parse_config(tomllib.loads(example.read_text(encoding="utf-8"))).roles["gpt-reviewer"].profile
         self.assertEqual((documented.billing, documented.model, documented.env), ("subscription", GATEWAY_MODEL, GATEWAY_ENV))
 
-    def test_env_key_names_are_not_restricted(self):
+    def test_env_key_names_beside_a_local_gateway_are_not_restricted(self):
         env = {"ANTHROPIC_API_KEY": "k", "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_OAUTH_TOKEN": "t",
                "MY_PASSWORD": "p", "SOME_SECRET": "s", **GATEWAY_ENV}
         cfg = parse_config({
@@ -106,12 +106,17 @@ class TestReviewerProfile(unittest.TestCase):
                         "executors": {"r": {"role": "code-reviewer", "launcher": "sg", "billing": "api", **role}},
                     })
                 self.assertNotIn("v-secret", str(raised.exception))
-        # Anything that does not choose the route still passes through.
+        # A setting that does not choose the route still passes through; a credential has no local gateway to go with.
         cfg = parse_config({
             "credential_proxy": proxy,
-            "executors": {"r": {"role": "code-reviewer", "billing": "api", "env": {"MY_TOKEN": "t"}}},
+            "executors": {"r": {"role": "code-reviewer", "billing": "api", "env": {"MY_SETTING": "t"}}},
         })
-        self.assertEqual(cfg.roles["r"].profile.env, {"MY_TOKEN": "t"})
+        self.assertEqual(cfg.roles["r"].profile.env, {"MY_SETTING": "t"})
+        with self.assertRaisesRegex(ValueError, "executors.r.env.MY_TOKEN is a credential"):
+            parse_config({
+                "credential_proxy": proxy,
+                "executors": {"r": {"role": "code-reviewer", "billing": "api", "env": {"MY_TOKEN": "t"}}},
+            })
 
     def test_reviewer_alone_is_enough_to_leave_ingest_only(self):
         cfg = parse_config({

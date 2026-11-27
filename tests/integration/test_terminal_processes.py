@@ -245,10 +245,13 @@ class TestSessionCheckBeforeACommand(Case):
         self.interrupted = False
 
     def run_checked(self, argv, env):
-        profile = ClaudeCodeProfile(name="steward", env=env,
+        # Set as configured values in the gate itself: as executor env, most of them would be refused as credentials.
+        profile = ClaudeCodeProfile(name="steward",
                                     launcher=ClaudeCodeLauncher(name="fake", command=fake_command(self.root)))
+        gate = session_gate(profile)
+        gate["set"] = {**gate["set"], **env}
         return self.terminal.run(title="t", workdir=self.repo, argv=argv, env={}, timeout_seconds=20,
-                                 is_interrupted=lambda: self.interrupted, gate=session_gate(profile))
+                                 is_interrupted=lambda: self.interrupted, gate=gate)
 
     async def test_stopping_during_the_session_check_ends_the_probe(self):
         for lose in (False, True):
