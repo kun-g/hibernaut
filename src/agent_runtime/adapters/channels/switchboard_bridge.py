@@ -266,8 +266,7 @@ class SwitchboardChannelAdapter:
                 break
         else:
             # Older hubs require a nonempty subject even when the reply has no title.
-            subject = "Hibernaut update"
-            report["subject_is_fallback"] = True
+            subject = "待审批" if outcome == "suspend" else "Hibernaut update"
         return CanonicalEvent(
             source="hibernaut",
             event_type="execution.reported",

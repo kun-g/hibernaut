@@ -116,7 +116,6 @@ class OutboundGateway:
         if is_internal_task_sync(meta):
             return None
 
-        title = "" if meta.get("subject_is_fallback") is True else event.subject
         if outcome == "suspend":
             channel = str(meta.get("approval_channel") or self._config.approval_channel)
             address = meta.get("approval_target") or self._config.approval_target
@@ -136,9 +135,8 @@ class OutboundGateway:
                 if not isinstance(approval_request_id, str) or not approval_request_id.strip():
                     return None
                 kind = "approval_card"
-                title = title or "待审批"
                 card = render_approval_card(
-                    title=title,
+                    title=event.subject,
                     body_md=event.body,
                     approval_request_id=approval_request_id,
                     correlation_key=key or "",
@@ -152,7 +150,7 @@ class OutboundGateway:
                 kind=kind,
                 target=target,
                 correlation_key=key,
-                title=title,
+                title=event.subject,
                 body_md=event.body,
                 card_payload=card,
             )
@@ -181,7 +179,7 @@ class OutboundGateway:
             kind="comment" if channel == "github" else "text",
             target=target,
             correlation_key=key,
-            title=title,
+            title=event.subject,
             body_md=event.body,
         )
 

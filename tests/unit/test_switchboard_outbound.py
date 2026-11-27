@@ -155,7 +155,7 @@ class GatewayTests(unittest.TestCase):
         )
         self.assertEqual(self.http.calls[0]["json"], {"labels": ["review"]})
         self.assertEqual(
-            self.http.calls[2]["json"]["body"], f"**Done**\n\nPR opened\n\n{GITHUB_OUTBOUND_MARKER}"
+            self.http.calls[2]["json"]["body"], f"PR opened\n\n{GITHUB_OUTBOUND_MARKER}"
         )
         self.assertEqual(self.http.calls[2]["headers"]["Authorization"], "Bearer ephemeral-github")
         row = self.store.list_outbound()[0]
