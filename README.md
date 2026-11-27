@@ -151,7 +151,7 @@ python3 scripts/run_updating.py --config hibernaut.toml
 | [`docs/requirements/system-steward.md`](docs/requirements/system-steward.md) | 系统 Steward 的需求（R/C 编号） |
 | [`AGENTS.md`](AGENTS.md) | 开发规范与提交门禁 |
 | [`docs/dispatch/`](docs/dispatch) | 派单模板：SDE 任务（`/events`、Drive）、独立评审 |
-| [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md) | Drive 队列凭据代理的安装与维护 |
+| [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md) | Drive 队列凭据代理的安装与升级（仅部署 `src/agent_runtime`） |
 | [`deploy/switchboard/`](deploy/switchboard/README.md) | Switchboard 公网 VPS 容器部署（Docker Compose + Caddy 自动 TLS，或接入 Dokploy / Traefik 等已有反向代理）、GitHub App 收事件与回写评论、`scripts/onboard_project.py` 一键接入新仓库、Hibernaut 配对、冒烟验收、灰度切流与回滚 |
 | [`deploy/taskboard/`](deploy/taskboard/README.md) | Switchboard + Taskboard 同域子路径联合部署（`/switchboard`、`/taskboard`，Dokploy / Traefik 或 Caddy）、各服务独立 ref 与配置哈希的按需更新、路由切流与一键回滚、旧域名平滑下线 |
 | [`scripts/prepare_taskboard_deploy.py`](scripts/prepare_taskboard_deploy.py) | `render`：校验两份配置、生成 `TASKBOARD_MCP_TOKEN`（0600 文件，默认打码）、算配置哈希与切流状态；`smoke --base-url https://<域名>`：两个健康检查、`/taskboard/mcp` 无令牌 401、带令牌列出 7 个 `tb_*` 工具 |

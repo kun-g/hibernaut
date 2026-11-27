@@ -27,8 +27,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from agent_runtime.adapters.channels.gdrive_tasks import (
+from agent_runtime.adapters.gdrive_contract import (
     ATTACHMENTS_FOLDER_NAME,
+    QUEUE_FOLDER_NAMES,
     DriveClientProtocol,
     DriveDownload,
     DriveFileMeta,
@@ -41,7 +42,6 @@ _GOOGLE_API_BASE = "https://www.googleapis.com"
 _GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 _GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
 _GOOGLE_APPS_PREFIX = "application/vnd.google-apps."
-_QUEUE_FOLDER_NAMES = ("待执行", "执行中", "已完成", "失败")
 # Drive IDs are URL-safe base64-ish; anything else could break out of the quoted Drive query.
 _DRIVE_ID = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
 _SERVICE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -428,7 +428,7 @@ class DriveQueueGuard:
         if op == "subfolders":
             if _drive_id(args, "parent_id") != self._root:
                 raise ProxyRefused(403, "'parent_id' is not the task queue root")
-            folders = dict(zip(_QUEUE_FOLDER_NAMES, self._queue_ids(), strict=True))
+            folders = dict(zip(QUEUE_FOLDER_NAMES, self._queue_ids(), strict=True))
             if self.folders().attachments_id:
                 folders[ATTACHMENTS_FOLDER_NAME] = self.folders().attachments_id
             return {"folders": folders}
@@ -473,7 +473,7 @@ class DriveQueueGuard:
         ids = (f.pending_id, f.in_progress_id, f.done_id, f.failed_id)
         lines = [
             f"{name} = {fid} ({len(self._drive.list_files(fid))} files)"
-            for name, fid in zip(_QUEUE_FOLDER_NAMES, ids, strict=True)
+            for name, fid in zip(QUEUE_FOLDER_NAMES, ids, strict=True)
         ]
         if f.attachments_id:
             lines.append(f"{ATTACHMENTS_FOLDER_NAME} = {f.attachments_id} ({len(self._drive.list_files(f.attachments_id))} files)")

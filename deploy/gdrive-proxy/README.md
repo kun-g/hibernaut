@@ -18,7 +18,7 @@ Add `--https-proxy http://127.0.0.1:7890` when this machine reaches Google throu
 The installer:
 
 1. Creates the service user: `_hbdriveproxy` (macOS, hidden, no login shell) or `hb-drive-proxy` (Linux, system account).
-2. Copies `src/agent_runtime` to `/opt/hibernaut-drive-proxy/src`, owned by root, and installs the launcher `/opt/hibernaut-drive-proxy/bin/hibernaut-drive-proxy`. The proxy never runs code from the checkout Hibernaut can edit.
+2. Copies `src/agent_runtime` to `/opt/hibernaut-drive-proxy/src`, owned by root, and installs the launcher `/opt/hibernaut-drive-proxy/bin/hibernaut-drive-proxy`. The staged `agent_runtime` package and the Python standard library suffice for the launcher's import check. The proxy never runs code from the checkout Hibernaut can edit.
 3. Installs into `/etc/hibernaut-drive-proxy/`: `sa.json` (the key, mode 0400, owned by the service user), `client.token` (random, 0400, owned by the service user) and `config.toml` (root, readable by the service user).
 4. Copies the client token to `~<hb-user>/.config/hibernaut/gdrive-proxy.token` (mode 0600).
 5. Checks as the service user: the Python and code load; the Hibernaut user cannot read `sa.json`; `--check` finds the four queue folders and the optional `附件` folder and counts their files (read-only; skip with `--no-check`).
