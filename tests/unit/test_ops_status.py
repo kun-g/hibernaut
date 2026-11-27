@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+from agent_runtime.adapters.executor_cli.sde import WAIT_IDLE
 from agent_runtime.adapters.executor_cli.steward_tools import StewardTools
 from agent_runtime.adapters.permissions import AutoModePermissionAdapter
 from agent_runtime.adapters.storage_sqlite import (
@@ -35,7 +36,8 @@ TIMERS = (ConfiguredTimer("model-policy", "sys:model-policy", 900, {"probe": BOD
 
 
 def sde_checkpoint(stage: str, reason: str) -> str:
-    return json.dumps({"sde": {"stage": stage, "reason": reason, "requirements": BODY}})
+    # The fields _State requires, so the checkpoint loads the way the SDE wrote it.
+    return json.dumps({"sde": {"stage": stage, "reason": reason, "requirements": BODY, "workdir": "/w", "base_ref": "b"}})
 
 
 class OpsStatusTests(unittest.TestCase):
@@ -78,7 +80,7 @@ class OpsStatusTests(unittest.TestCase):
         self.failed_event(self.event("proj:a:1", "agent:forward", "e1", title="修除法"),
                   f"claude exited 1 with {SECRET} and {GH_TOKEN}\nTraceback line two")
         self.event("proj:a:2", "agent:forward", "e2", title="还在排队")
-        self.suspend("s-idle", "proj:a:3", sde_checkpoint("needs_input", "WAIT_IDLE 等用户离开电脑再计时"), "r1")
+        self.suspend("s-idle", "proj:a:3", sde_checkpoint("needs_input", f"{WAIT_IDLE} 等用户离开电脑再计时"), "r1")
         self.suspend("s-ask", "proj:a:4", sde_checkpoint("needs_input", "选 A 还是 B？"), "r2")
         self.suspend("s-review", "proj:a:5", sde_checkpoint("no_reviewer", "no review candidate is available"), "r3")
         self.suspend("s-retry", "proj:a:6", sde_checkpoint("delivery_retry", "gh: connection reset"), "r4")

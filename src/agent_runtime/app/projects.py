@@ -528,7 +528,9 @@ def _rule_line(rule: InboxMatchRule) -> str:
     return f"{' and '.join(conditions)} -> `{rule.agent}`"
 
 
-_SYSTEM_PURPOSE = "Onboards projects, and checks and fills in how projects are set up"
+_SYSTEM_PURPOSE = ("Onboards projects, checks and fills in how they are set up, and says how Hibernaut has been running "
+                   "(failed and suspended tasks, deliveries, undelivered messages, its [[timers]]) and what could be "
+                   "improved")
 
 
 def build_global_manifest(
@@ -548,11 +550,13 @@ def build_global_manifest(
         parts.append(f"{line}. {project.description}" if project.description else line)
     if systems:
         about = {a.name: a.description for a in agents}
-        parts += ["", "System inboxes you may forward to. They change how Hibernaut is set up, and take only what a person "
-                      "asks for in the same turn:"]
+        parts += ["", "System inboxes you may forward to. They set Hibernaut up and say how it has been running, and "
+                      "take only what a person asks for in the same turn:"]
         for bound in systems:
             agent = bound.binding.default_agent
-            parts.append(f"- `{bound.rule.literal}`: agent `{agent}`. {about.get(agent) or _SYSTEM_PURPOSE}")
+            # What they do is fixed by their tools; a description only adds to it.
+            said = f" {about[agent]}" if about.get(agent) else ""
+            parts.append(f"- `{bound.rule.literal}`: agent `{agent}`. {_SYSTEM_PURPOSE}.{said}")
     return "\n".join(parts)
 
 

@@ -7,15 +7,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
+from agent_runtime.adapters.executor_cli.sde import WAIT_IDLE, suspended_stage
 from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
 from agent_runtime.core.models import CONFIG_TIMER_PREFIX, TASK_CONTEXT_KEY, ConfiguredTimer, to_utc_iso
 
 _MAX_ITEMS = 20
 _TITLE = 80
 _REASON = 200
-# The SDE's checkpoint, and the reason prefix with which a task waits for the person to leave the computer.
-_SDE_KEY = "sde"
-_WAIT_IDLE = "WAIT_IDLE"
 _FAILED_ENDS = ("failed", "stopped", "refused")
 
 
@@ -145,13 +143,12 @@ class SQLiteOpsStatus:
             "SELECT due_at FROM timers WHERE session_id = ? AND status = 'pending' "
             "AND json_extract(payload_json, '$.approval_request_id') = ?", (row["session_id"], request),
         ) if request else None
-        sde: object = _json(row["checkpoint"]).get(_SDE_KEY)
-        if isinstance(sde, dict):
-            state = cast(dict[str, Any], sde)
-            stage, reason = str(state.get("stage") or ""), str(state.get("reason") or "")
+        sde = suspended_stage(row["checkpoint"])
+        if sde is not None:
+            stage, reason = sde
             item["stage"] = stage
             if stage == "needs_input":
-                item["waits_for"] = "user_away" if reason.lstrip().startswith(_WAIT_IDLE) else "answer"
+                item["waits_for"] = "user_away" if reason.lstrip().startswith(WAIT_IDLE) else "answer"
             elif due is not None:
                 item["waits_for"] = "retry"
             else:

@@ -95,7 +95,9 @@ forward_to = ["proj:hibernaut", "proj:sure"]
 
 ## 系统 Steward
 
-接入项目、检查和补齐项目配置。需求与编号见 [`requirements/system-steward.md`](requirements/system-steward.md)。人在单聊跟全局 Steward 说，由它转交，结果按普通转投的回信方式回到原单聊；或在 `[[feishu_groups]]` 绑定的群里直接说（只认 `members` 列出的人），答复回群里的同一话题。
+接入项目、检查和补齐项目配置。需求与编号见 [`requirements/system-steward.md`](requirements/system-steward.md)。人在单聊跟全局 Steward 说，由它转交，结果按普通转投的回信方式回到原单聊；或在 `[[feishu_groups]]` 绑定的群里直接说（只认 `members` 列出的人），答复回群里的同一话题。问 hb 运转得怎样、某个 `[[timers]]` 执行得如何、有什么可优化的，全局 Steward 同样转给它，不用 `list_events`、`list_sessions` 自己答：那两个看不到任务在等什么、交付怎么结束、定时任务的 Run 怎么结束。
+
+SDE 等用户离开电脑（任务说要等空闲再做）时按契约返回 `needs_input`，问题以 `WAIT_IDLE` 开头；`runtime_status` 据此把它列为 `user_away`，与等人回答的 `answer` 分开。
 
 绑定写 `system_tools = true` 就是系统 Inbox（写法见上「非项目 Inbox 的 `workdir`」），须是单个精确的 `sys:<name>`、`checkout_access = "readonly"`、agent 全是 `steward`、不写 `forward_to`。要转到它的绑定在自己的 `forward_to` 里列出它，须是精确 ID、只读、agent 全是 `steward`。
 
