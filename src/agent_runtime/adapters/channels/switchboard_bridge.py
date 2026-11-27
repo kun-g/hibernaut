@@ -260,7 +260,13 @@ class SwitchboardChannelAdapter:
         if withheld is not None:
             # Published as a mere sync, which no Switchboard posts to a person; Taskboard still gets its task action.
             report |= {"outcome_kind": "done", "notification_channel": withheld}
-        subject = metadata.get("title") or metadata.get("subject") or "Hibernaut update"
+        for field in ("title", "subject"):
+            subject = metadata.get(field)
+            if subject and str(subject).strip():
+                break
+        else:
+            # Older hubs require a nonempty subject even when the reply has no title.
+            subject = "待审批" if outcome == "suspend" else "Hibernaut update"
         return CanonicalEvent(
             source="hibernaut",
             event_type="execution.reported",
