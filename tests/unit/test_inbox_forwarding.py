@@ -2101,7 +2101,7 @@ class HeldReturnTests(ForwardCase):
     async def test_a_declined_return_tells_the_waiting_agent_only_that_it_was_withheld(self) -> None:
         await self.owed()
         self.gate("defer")
-        _report, card = await self.held("secret result")
+        _report, card = await self.held("secret result", chat_reply="secret result in brief")
         await self.decide(card, False)
         [event] = self.queued(MAIN)
         self.assertEqual((event.source, event.payload["status"]), (RETURN_SOURCE, "refused"))
