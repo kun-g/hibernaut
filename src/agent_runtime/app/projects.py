@@ -143,19 +143,28 @@ class WorkdirBinding:
     binding: InboxBinding
     workdir: str
     readonly: bool = False
-    # What its agents may forward work to: main inboxes of projects, and inboxes with system_tools.
+    # What its agents may forward work to: main inboxes of projects, and inboxes with system_tools or ops_tools.
     forward_to: tuple[str, ...] = ()
     # Its Steward gets the system tools (onboarding, filling in project settings).
     system_tools: bool = False
+    # Its Steward gets the operations tools (Dokploy through the workspace's script).
+    ops_tools: bool = False
+    # Its Steward may create a repository from a Drive folder ([repo_tools]).
+    repo_tools: bool = False
+
+    @property
+    def person_only(self) -> bool:
+        # It takes work from a person only and passes none on: what its tools do needs somebody's own request.
+        return self.system_tools or self.ops_tools
 
     def route(self) -> InboxRoute:
         # A scope of its own: work goes to no other binding's directory, and to a project only through forward_to.
         return InboxRoute(project=f"runtime.inbox_bindings:{self.binding.inbox}", binding=self.binding,
-                          has_bindings=True, forward_to=self.forward_to, system=self.system_tools)
+                          has_bindings=True, forward_to=self.forward_to, system=self.person_only)
 
 
 _BINDING_KEYS = frozenset({"pattern", "default_agent", "agents", "rules"})
-_WORKDIR_KEYS = frozenset({"workdir", "checkout_access", "forward_to", "system_tools"})
+_WORKDIR_KEYS = frozenset({"workdir", "checkout_access", "forward_to", "system_tools", "ops_tools", "repo_tools"})
 SYSTEM_INBOX_PREFIX = "sys:"
 CHECKOUT_ACCESS = ("readwrite", "readonly")
 _MATCH_KEYS = frozenset({"source", "event_type", "tags", "agent"})
@@ -305,19 +314,23 @@ def parse_workdir_bindings(
             own = stewards[agent]
             if own and directory_key(Path(own)) != directory_key(Path(workdir)):
                 raise ValueError(f"{where}: agents.{agent} has another workdir ({own}) than this binding ({workdir})")
-        system_tools = item.get("system_tools", False)
-        if not isinstance(system_tools, bool):
-            raise ValueError(f"{where}: system_tools must be true or false")
+        system_tools, ops_tools, repo_tools = (_flag(where, item, key) for key in ("system_tools", "ops_tools",
+                                                                                     "repo_tools"))
+        if system_tools and ops_tools:
+            raise ValueError(f"{where}: system_tools and ops_tools go to two inboxes of their own, not one")
         # An omitted list means any agent that can work here: every CLI agent, and the Stewards the binding names.
-        allowed = binding.agents or tuple(dict.fromkeys(named if system_tools else (*plain, *named)))
+        allowed = binding.agents or tuple(dict.fromkeys(named if system_tools or ops_tools else (*plain, *named)))
         bound = WorkdirBinding(
             rule=rule, workdir=workdir, readonly=access == "readonly", forward_to=_texts(where, item, "forward_to"),
-            binding=replace(binding, agents=allowed), system_tools=system_tools,
+            binding=replace(binding, agents=allowed), system_tools=system_tools, ops_tools=ops_tools,
+            repo_tools=repo_tools,
         )
-        if system_tools:
+        if bound.person_only:
             _check_system_binding(where, bound, stewards, bindings)
+        if repo_tools:
+            _check_repo_binding(where, bound, stewards)
         bindings.append(bound)
-    systems = {b.rule.literal for b in bindings if b.system_tools}
+    systems = {b.rule.literal for b in bindings if b.person_only}
     for index, bound in enumerate(bindings):
         where = f"runtime.inbox_bindings[{index}]"
         for target in bound.forward_to:
@@ -325,7 +338,8 @@ def parse_workdir_bindings(
                 continue
             if target not in systems:
                 raise ValueError(f"{where}: forward_to '{target}' is not the main inbox of a project (main inboxes: "
-                                 f"{', '.join(sorted(main_inboxes)) or 'none'}) or an inbox with system_tools")
+                                 f"{', '.join(sorted(main_inboxes)) or 'none'}) or an inbox with system_tools or "
+                                 "ops_tools")
             others = sorted(set(bound.binding.agents) - set(stewards))
             if bound.rule.literal is None or not bound.readonly or others:
                 raise ValueError(f"{where}: forward_to '{target}' needs one exact inbox id, checkout_access = "
@@ -334,24 +348,45 @@ def parse_workdir_bindings(
     return tuple(bindings)
 
 
+def _flag(where: str, item: Mapping[str, Any], key: str) -> bool:
+    value = item.get(key, False)
+    if not isinstance(value, bool):
+        raise ValueError(f"{where}: {key} must be true or false")
+    return value
+
+
 def _check_system_binding(
     where: str, bound: WorkdirBinding, stewards: Collection[str], earlier: Sequence[WorkdirBinding]
 ) -> None:
+    key = "system_tools" if bound.system_tools else "ops_tools"
     inbox = bound.rule.literal
     if inbox is None:
-        raise ValueError(f"{where}: system_tools needs a pattern that is one exact inbox id, got {bound.rule.text!r}")
+        raise ValueError(f"{where}: {key} needs a pattern that is one exact inbox id, got {bound.rule.text!r}")
     if not inbox.startswith(SYSTEM_INBOX_PREFIX):
-        raise ValueError(f"{where}: system_tools needs an inbox id that starts with {SYSTEM_INBOX_PREFIX}, got {inbox!r}")
+        raise ValueError(f"{where}: {key} needs an inbox id that starts with {SYSTEM_INBOX_PREFIX}, got {inbox!r}")
     if not bound.readonly:
-        raise ValueError(f"{where}: system_tools needs checkout_access = \"readonly\"")
+        raise ValueError(f"{where}: {key} needs checkout_access = \"readonly\"")
     for agent in bound.binding.agents:
         if agent not in stewards:
-            raise ValueError(f"{where}: system_tools needs agents with role steward only, not '{agent}'")
+            raise ValueError(f"{where}: {key} needs agents with role steward only, not '{agent}'")
     if bound.forward_to:
-        raise ValueError(f"{where}: an inbox with system_tools passes no work on; leave forward_to out")
+        raise ValueError(f"{where}: an inbox with {key} passes no work on; leave forward_to out")
+    if bound.repo_tools:
+        raise ValueError(f"{where}: repo_tools belongs to the general Steward's inbox, not to one with {key}")
     for other in earlier:
         if other.rule.matches(inbox):
             raise ValueError(f"{where}: pattern {other.rule.text!r} of an earlier binding matches {inbox!r} first")
+
+
+def _check_repo_binding(where: str, bound: WorkdirBinding, stewards: Collection[str]) -> None:
+    # The chat's own Steward: only it is told what a person asks for in their chat.
+    if bound.rule.literal is None or not bound.readonly:
+        raise ValueError(f"{where}: repo_tools needs one exact inbox id and checkout_access = \"readonly\"")
+    if bound.rule.literal.startswith(SYSTEM_INBOX_PREFIX):
+        raise ValueError(f"{where}: repo_tools belongs to the general Steward's inbox, not to a {SYSTEM_INBOX_PREFIX} one")
+    for agent in bound.binding.agents:
+        if agent not in stewards:
+            raise ValueError(f"{where}: repo_tools needs agents with role steward only, not '{agent}'")
 
 
 def _binding_rule(where: str, item: Mapping[str, Any], earlier: Sequence[InboxRule]) -> InboxRule:
@@ -528,6 +563,8 @@ def _rule_line(rule: InboxMatchRule) -> str:
     return f"{' and '.join(conditions)} -> `{rule.agent}`"
 
 
+_OPS_PURPOSE = ("Operations: sets up and deploys a project's environments on Dokploy (staging and production); the "
+                "first deployment of a production environment waits for a person's approval")
 _SYSTEM_PURPOSE = ("Onboards projects, checks and fills in how they are set up, and says how Hibernaut has been running "
                    "(failed and suspended tasks, deliveries, undelivered messages, its [[timers]]) and what could be "
                    "improved")
@@ -535,7 +572,7 @@ _SYSTEM_PURPOSE = ("Onboards projects, checks and fills in how they are set up, 
 
 def build_global_manifest(
     inbox_id: str, binding: InboxBinding, agents: Sequence[AgentConfig], targets: Sequence[_Target],
-    default_agent: str, systems: Sequence[WorkdirBinding] = (),
+    default_agent: str, systems: Sequence[WorkdirBinding] = (), repo_owner: str = "",
 ) -> str:
     # What a Steward outside any project needs: the projects it may send work to, and nothing of what is inside them.
     parts = [f"You work in `{inbox_id}`, which belongs to no project. Its default agent is `{binding.default_agent}`.",
@@ -550,18 +587,25 @@ def build_global_manifest(
         parts.append(f"{line}. {project.description}" if project.description else line)
     if systems:
         about = {a.name: a.description for a in agents}
-        parts += ["", "System inboxes you may forward to. They set Hibernaut up and say how it has been running, and "
-                      "take only what a person asks for in the same turn:"]
+        parts += ["", "System inboxes you may forward to. They set Hibernaut up, say how it has been running or run its "
+                      "deployments, and take only what a person asks for in the same turn, or the result of such work "
+                      "that one of them sent back to you:"]
         for bound in systems:
             agent = bound.binding.default_agent
             # What they do is fixed by their tools; a description only adds to it.
             said = f" {about[agent]}" if about.get(agent) else ""
-            parts.append(f"- `{bound.rule.literal}`: agent `{agent}`. {_SYSTEM_PURPOSE}.{said}")
+            purpose = _OPS_PURPOSE if bound.ops_tools else _SYSTEM_PURPOSE
+            parts.append(f"- `{bound.rule.literal}`: agent `{agent}`. {purpose}.{said}")
+    if repo_owner:
+        parts += ["", f"You may create a private repository under `{repo_owner}` from a Drive folder with create_repo."]
     return "\n".join(parts)
 
 
-def build_system_manifest(inbox_id: str, binding: InboxBinding, agents: Sequence[AgentConfig]) -> str:
-    parts = [f"You work in `{inbox_id}`, a system inbox. Its default agent is `{binding.default_agent}`.", "",
+def build_system_manifest(
+    inbox_id: str, binding: InboxBinding, agents: Sequence[AgentConfig], *, ops: bool = False
+) -> str:
+    kind = "an operations inbox" if ops else "a system inbox"
+    parts = [f"You work in `{inbox_id}`, {kind}. Its default agent is `{binding.default_agent}`.", "",
              "Agents of this inbox:"]
     parts += [_agent_line(a) for a in agents if a.name in (*binding.agents, binding.default_agent)]
     return "\n".join([*parts, "", "You pass no work on to another inbox."])

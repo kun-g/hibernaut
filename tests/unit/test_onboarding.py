@@ -306,11 +306,11 @@ class ExampleTests(OnboardingCase):
         start, end = text.index("[[projects.hibernaut.inbox_bindings]]"), text.index("[projects.hibernaut.delivery]")
         text = text[:start] + text[end:]
         other = '[projects.other]\nrepo = "o/r"\ncheckout = "/x"\ninbox_id = "proj:other"\ndefault_agent = "steward"\n'
-        self.use(text.replace('forward_to = ["proj:hibernaut", "sys:ops"]', 'forward_to = ["sys:ops"]')
+        self.use(text.replace('forward_to = ["proj:hibernaut", "sys:ops", "sys:infra"]', 'forward_to = ["sys:ops", "sys:infra"]')
                  .replace('\ndefault_agent = "steward"\n# 可选：本项目', '\ndefault_agent = "sde"\n# 可选：本项目') + other)
         self.complete("hibernaut")
         after = self.path.read_text()
-        self.assertIn('forward_to = ["sys:ops", "proj:hibernaut"]   # 可选', after)
+        self.assertIn('forward_to = ["sys:ops", "sys:infra", "proj:hibernaut"]   # 可选', after)
         self.path.write_text(after.replace(', "proj:hibernaut"]   #', ']   #'))
         self.assertEqual([line.split(" = ")[0] for line in self.added_lines() if line.strip()], [
             "description",

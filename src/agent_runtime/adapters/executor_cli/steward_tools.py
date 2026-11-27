@@ -61,6 +61,29 @@ class SystemTools(StatusTools, Protocol):
     def hides(self, path: Path) -> bool: ...
 
 
+@dataclass(frozen=True, slots=True)
+class PlannedCall:
+    # One call of an operations tool as it will be made: the gate judges `tool` with `args`, a person sees `summary`.
+    tool: str
+    args: dict[str, Any]
+    summary: str
+
+
+class RepoTools(Protocol):
+    # create_repo: a private repository under the configured owner, its first commit the latest version in a Drive
+    # folder. Blocks; a failure is raised as ToolError saying where it stopped and what it left behind.
+    def create(self, *, name: str, drive_folder: str | None, description: str | None) -> str: ...
+
+
+class OpsTools(Protocol):
+    # The operations agent's Dokploy commands. plan() reads what a call would touch (blocking) and says which gate it
+    # passes; run() makes it.
+    def plan(self, action: str, args: Sequence[str]) -> PlannedCall: ...
+
+    def run(self, call: PlannedCall) -> str: ...
+
+
+HELD_DOKPLOY = "dokploy"
 _STATUS_HOURS, _MAX_STATUS_HOURS = 24, 24 * 30
 _TIMER_RUNS, _MAX_TIMER_RUNS = 5, 20
 _MATCH = re.compile(rb"([^\0]+)\0(\d+)[\0:]([^\n]*)\n")
@@ -205,6 +228,42 @@ def _system_definitions() -> list[dict[str, Any]]:
     return found
 
 
+def _repo_definition() -> dict[str, Any]:
+    return {
+        "name": "create_repo",
+        "description": "Create a private GitHub repository under the owner in the routing manifest, with the latest "
+                       "version in a Google Drive folder as its first commit (the newest file there; an archive is "
+                       "unpacked). It stops without changing anything when the repository exists already or the folder "
+                       "is empty, and says where it stopped otherwise.",
+        "inputSchema": {**_schema(
+            ("name",), name={**_TEXT, "description": "The repository's name, e.g. aura-desk."},
+            drive_folder={**_TEXT, "description": "A Drive folder link or ID, as the person gave it. Leave it out to "
+                                                  "use the folder of the same name in the configured sources folder."},
+            description={**_TEXT, "description": "One sentence saying what the project is, in the person's words."},
+        ), "additionalProperties": False},
+    }
+
+
+def _ops_definition() -> dict[str, Any]:
+    return {
+        "name": "dokploy",
+        "description": "Run one action of the Dokploy script (dokploy-api.sh) in your directory; output is redacted. "
+                       "Actions: projects, project <projectId>, app <applicationId>, compose <composeId>, app-env <id>, "
+                       "domains <applicationId>, deployments <applicationId>, deployments-compose <composeId>, "
+                       "containers [serverId], health, version, project-create <name> [description], app-set-env <id> "
+                       "<KEY=value lines>, domain-create <applicationId> <host> [port] [https true|false], app-stop, "
+                       "compose-stop, app-deploy, app-redeploy, app-start, compose-deploy, compose-redeploy, "
+                       "compose-start <id>, get <endpoint> [?query], post <endpoint> <json>. A deployment in an "
+                       "environment that is not staging, or one that cannot be told, is held for a person's approval "
+                       "and made once they approve; so is deleting.",
+        "inputSchema": {**_schema(
+            ("action",), action=_TEXT,
+            args={**_TEXTS, "description": 'The arguments after the action, e.g. ["abc123"] or '
+                                           '["application.create", "{\"name\": \"web\"}"].'},
+        ), "additionalProperties": False},
+    }
+
+
 def _status_definition() -> dict[str, Any]:
     return {
         "name": "runtime_status",
@@ -237,14 +296,20 @@ class StewardTools:
     system: SystemTools | None = None
     # Set for a Steward that may read how Hibernaut has been running; the system tools include it.
     status: StatusTools | None = None
+    # Set for the general Steward of a binding with repo_tools.
+    repo: RepoTools | None = None
+    # Set for the Steward of an operations inbox (ops_tools); like a system inbox it passes no work on.
+    ops: OpsTools | None = None
     calls: int = 0
     # Forwards this Run took; they go out once it ends in anything but a failure.
     forwarded: int = 0
-    # forward_to_inbox arguments a person has to approve before they go out.
+    # forward_to_inbox arguments a person has to approve before they go out, and operations held the same way (their
+    # "kind" is HELD_DOKPLOY).
     deferred: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
 
     @staticmethod
-    def definitions(*, projectless: bool = False, system: bool = False, status: bool = False) -> list[dict[str, Any]]:
+    def definitions(*, projectless: bool = False, system: bool = False, status: bool = False, repo: bool = False,
+                    ops: bool = False) -> list[dict[str, Any]]:
         where = "your own inbox or a project in the routing manifest" if projectless else "this project"
         memory = "your inbox's memory" if projectless else "the project memory"
         whose = "your inbox's" if projectless else "the project's"
@@ -314,10 +379,17 @@ class StewardTools:
             # It passes no work on.
             return [*_system_definitions(), _status_definition(),
                     *(tool for tool in tools if tool["name"] != "forward_to_inbox")]
-        return [*tools, _status_definition()] if status else tools
+        if ops:
+            # Nor does an operations inbox.
+            return [_ops_definition(), *(tool for tool in tools if tool["name"] != "forward_to_inbox")]
+        return [*tools, *([_status_definition()] if status else []), *([_repo_definition()] if repo else [])]
 
     def reads_status(self) -> bool:
         return self.system is not None or self.status is not None
+
+    def offered(self) -> list[dict[str, Any]]:
+        return self.definitions(projectless=self.projectless, system=self.system is not None,
+                                status=self.status is not None, repo=self.repo is not None, ops=self.ops is not None)
 
     async def call(self, name: object, arguments: object) -> tuple[str, bool]:
         # (answer, is_error)
@@ -340,8 +412,13 @@ class StewardTools:
             del handlers["forward_to_inbox"]
             handlers |= {"check_projects": self._check_projects, "onboard_project": self._onboard_project,
                          "complete_project": self._complete_project}
+        elif self.ops is not None:
+            del handlers["forward_to_inbox"]
+            handlers["dokploy"] = self._dokploy
         if self.reads_status():
             handlers["runtime_status"] = self._runtime_status
+        if self.repo is not None and self.system is None and self.ops is None:
+            handlers["create_repo"] = self._create_repo
         handler = handlers.get(name) if isinstance(name, str) else None
         if handler is None:
             return f"unknown tool {name}", True
@@ -383,6 +460,54 @@ class StewardTools:
         name, description = _required(arguments, "name"), _optional(arguments, "description")
         system = self._system("complete_project", arguments, "name", "description")
         return await asyncio.to_thread(system.complete, name=name, description=description)
+
+    async def _create_repo(self, arguments: dict[str, Any]) -> str:
+        name, folder = _required(arguments, "name"), _optional(arguments, "drive_folder")
+        description = _optional(arguments, "description")
+        repo = self.repo
+        assert repo is not None
+        self._named("create_repo", arguments, "name", "drive_folder", "description")
+        return await asyncio.to_thread(repo.create, name=name, drive_folder=folder, description=description)
+
+    async def _dokploy(self, arguments: dict[str, Any]) -> str:
+        unknown = sorted(set(arguments) - {"action", "args"})
+        if unknown:
+            raise ToolError(f"dokploy takes action and args, not {', '.join(unknown)}")
+        action, args = _required(arguments, "action"), _strings(arguments, "args")
+        ops = self.ops
+        assert ops is not None
+        # The tool itself first, then the call as planned: what the second judgement sees is what the call does, the
+        # environment it deploys to included, read from Dokploy by the plan.
+        self._allow("dokploy", {"action": action, "args": args})
+        call = await asyncio.to_thread(ops.plan, action, args)
+        decision = self.caps.permissions.check(call.tool, call.args)
+        if decision.action == "block":
+            raise ToolError(f"{call.summary} is not permitted (block): {decision.reason}")
+        if decision.action == "defer":
+            self.deferred.append({"kind": HELD_DOKPLOY, "action": action, "args": args, "summary": call.summary})
+            return (f"Held for a person's approval: {call.summary} ({decision.reason}). Hibernaut asks for it when this "
+                    "turn ends, makes the call once it is approved and tells you the result; do not make it again.")
+        return await asyncio.to_thread(ops.run, call)
+
+    def run_held(self, held: dict[str, Any], approved: bool) -> str:
+        # An operation a person decided on: planned again, so it is made as it is now, and only a block stops it then.
+        summary = str(held.get("summary", ""))
+        if not approved:
+            return f"declined: {summary}"
+        ops = self.ops
+        if ops is None:
+            return f"refused (this inbox has no operations tools any more): {summary}"
+        try:
+            listed: object = held.get("args")
+            args = [str(a) for a in cast(list[object], listed)] if isinstance(listed, list) else []
+            call = ops.plan(str(held.get("action", "")), args)
+            decision = self.caps.permissions.check(call.tool, call.args)
+            if decision.action == "block":
+                return f"refused ({decision.reason}): {call.summary}"
+            self.calls += 1
+            return f"approved and made: {call.summary}\n{clip(ops.run(call))}"
+        except (ToolError, OSError, ValueError) as exc:
+            return f"approved, but it failed ({exc}): {summary}"
 
     async def _runtime_status(self, arguments: dict[str, Any]) -> str:
         hours = _bounded(arguments, "hours", _STATUS_HOURS, _MAX_STATUS_HOURS)
@@ -561,7 +686,6 @@ class StewardTools:
         if item is None:
             return {"text": "malformed request", "error": True}
         if item.get("op") == "tools":
-            return {"tools": self.definitions(projectless=self.projectless, system=self.system is not None,
-                                              status=self.status is not None)}
+            return {"tools": self.offered()}
         text, error = await self.call(item.get("name"), item.get("arguments"))
         return {"text": text, "error": error}

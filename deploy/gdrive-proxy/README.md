@@ -92,6 +92,10 @@ Every request is `POST /proxy/gdrive-queue/<operation>` with a JSON body and `Au
 | `append` | `file_id`, `text` | as `read`; `text` at most 256 KiB |
 | `move` | `file_id`, `add_parent`, `remove_parent` | both folders are queue folders (not `附件`), they differ, and the file is in `remove_parent` |
 | `download` | `file_id` | the file sits directly in `附件` (not in a subfolder) and is not a folder; at most `max_download_bytes` |
+| `source_folder` | `name` or `folder_id` | `sources_folder_id` is configured and the folder sits directly in it (by `name`: the subfolder of that name); returns the folder and every file in it, following Drive's pages |
+| `source_download` | `file_id` | `sources_folder_id` is configured, the file sits directly in a folder that sits directly in it, and is not a folder; at most `max_download_bytes`; answered like `download` |
+
+`source_folder` and `source_download` serve `create_repo` of the general Steward (a new repository's first commit is the newest file of a project's folder). They never reach the queue, the sources folder's own files, or anything deeper than one folder down.
 
 `read` and `download` export a Google Doc as `text/markdown`, falling back to `text/plain` when Drive refuses the Markdown export. `append` reads the Doc as plain text and writes plain text back, as before. `download` answers 200 with the file's bytes unchanged (`Content-Type: application/octet-stream`) and the name (percent-encoded), type and export type in the `X-Drive-File-Name`, `X-Drive-Mime-Type` and `X-Drive-Export-Mime-Type` headers; its refusals are JSON like every other operation. It refuses other Google files (Sheets, Slides: 415; export them to a file first), and a file over the limit with 413, from Drive's size before fetching anything (a Doc export, which has no size, after the export).
 
@@ -113,6 +117,7 @@ The proxy listens only on a loopback address and refuses to start when the key o
 | `root_folder_id` | required | queue folder; subfolders found by name |
 | `pending_folder_id`, `in_progress_folder_id`, `done_folder_id`, `failed_folder_id` | found by name | explicit queue folder IDs |
 | `attachments_folder_id` | found by name (`附件`) | explicit attachments folder ID; without one and without a `附件` folder, `download` is refused |
+| `sources_folder_id` | none | folder whose subfolders hold each project's versions (shared with the service account, read-only is enough); without it `source_folder` and `source_download` are refused |
 | `max_download_bytes` | `104857600` (100 MiB) | largest attachment `download` returns. Big enough for a code bundle or a scanned PDF; the proxy and Hibernaut each hold one download in memory while passing it on, so this also bounds their memory per request |
 
 ## Operating

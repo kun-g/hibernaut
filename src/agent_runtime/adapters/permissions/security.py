@@ -42,6 +42,16 @@ class AutoModePermissionAdapter:
             "onboard_project",
             "complete_project",
             "runtime_status",
+            # Offered only in the general Steward's inbox with repo_tools = true: a new private repository, never one
+            # that exists.
+            "create_repo",
+            # Offered only in an inbox with ops_tools = true. A deployment that is not staging is judged as
+            # deploy_production and deleting as delete_resource, both deferred below; dokploy.admin (housekeeping of
+            # the whole server) is on no list and so waits for a person too.
+            "dokploy",
+            "dokploy.read",
+            "dokploy.change",
+            "dokploy.deploy",
             # Each is granted per project in [projects.<name>.delivery] (open_pr, auto_merge); move one to the
             # defer list to also ask a person every time.
             "delivery.open_pr",

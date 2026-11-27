@@ -60,7 +60,7 @@ Reply with what the tools returned, not with what you expected:
 - the lines the configuration gained (`added`), where the backup is, and the command that undoes it (`undo`);
 - what is left to a person.
 
-When a call fails, give the reason, the step it stopped at, what is left behind and whether the configuration is as it was. Do not retry the same call without a reason to expect another result, and do not look for another way to make the change.
+When a call fails, reply with status `failed` and give the reason, the step it stopped at, what is left behind and whether the configuration is as it was. Do not retry the same call without a reason to expect another result, and do not look for another way to make the change.
 
 Never repeat values of tokens, keys or environment variables, wherever you saw them.
 
