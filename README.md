@@ -103,6 +103,8 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 | `[collaboration]`、`[experts.<role>]` | 个人人机协作（默认关闭）：`chief_inbox` 幕僚长的 Inbox、`[collaboration.taskboard]` 后续任务与简报用的 Taskboard、`[collaboration.hub]` 看板与审批页；`[experts.<role>]` 声明共享专家，项目用 `experts = ["<role>"]` 抽调。见 `docs/architecture.md` §15 |
 | `[switchboard]` | 同进程运行 Switchboard 或经 Relay 连接远程 Switchboard；公网 VPS 容器部署见 [`deploy/switchboard/`](deploy/switchboard/README.md)，与 Taskboard 同域部署见 [`deploy/taskboard/`](deploy/taskboard/README.md) |
 
+升级 Taskboard 或 Switchboard 前，可用部署指南里的 `scripts/backup_sqlite.py` 在线备份各自的 SQLite 数据库。两端的 HTTP `/mcp` 都在读请求体前校验 Bearer 令牌，读取空闲超时为 10 秒。
+
 并发上限分四级：全局、项目、执行器（驱动）、Agent，后三级不写就不单独限制，大于全局值时以全局为准。满额的一级只让受它限制的 Inbox 按到达顺序排队，其他 Inbox 照常运行。
 
 GitHub 入站只经 Switchboard。把 GitHub Webhook 指向 Switchboard 的 `/webhooks/github`，在 `switchboard.toml` 里设置 `[github] require_label` 和仓库路由，使路由目标匹配 Hibernaut 项目的 `inbox_id`，再启用同进程桥接或 Relay。未部署 Taskboard 时，按 `switchboard.example.toml` 的 `[routing.event_consumers]` 示例把 `work.opened`、`work.updated`、`work.closed` 路由到 Hibernaut。部署 Taskboard 时保持默认路由，按 [`taskboard.example.toml`](taskboard.example.toml) 写 `taskboard.toml`，设置 `SWITCHBOARD_RELAY_TOKEN`、`SWITCHBOARD_MCP_TOKEN`、`TASKBOARD_MCP_TOKEN` 后运行 `python -m taskboard.app --config taskboard.toml`；`[intake] auto_ready_sources`（默认 `["github"]`）来源的 Issue / PR（包括后贴触发标签的旧 Issue）直接进入 `ready`，由 Taskboard 发 `work.ready` 给 Hibernaut，Hibernaut 执行时把状态回写 Taskboard（这些内部同步不发评论）。人工待办与依赖异常通知没有可回复的来源时发往 `switchboard.toml` 的 `[outbound] notify_target`，未设置则发往 `approval_target`。Switchboard 与 Taskboard 共用一个域名时，`[http] base_path`（如 `/switchboard`）让 Switchboard 在带前缀和不带前缀的路径上都可访问。升级前使用本机 Issue 轮询或 daemon Webhook 的部署需要先切换入口。

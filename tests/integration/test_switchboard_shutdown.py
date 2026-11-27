@@ -78,7 +78,7 @@ class SignalTests(unittest.TestCase):
     def hang_request(self, port: int) -> socket.socket:
         sock = socket.create_connection(("127.0.0.1", port), timeout=5)
         self.addCleanup(sock.close)
-        sock.sendall(b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+        sock.sendall(b"POST /mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-mcp-bearer\r\nContent-Length: 100\r\n\r\n{")
         time.sleep(0.3)
         return sock
 

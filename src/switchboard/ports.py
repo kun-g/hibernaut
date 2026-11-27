@@ -36,6 +36,11 @@ class InboundAdapter(Protocol):
 
 
 @runtime_checkable
+class HeaderAuthAdapter(Protocol):
+    def authorized(self, headers: Mapping[str, str]) -> bool: ...
+
+
+@runtime_checkable
 class IngestAwareAdapter(Protocol):
     def finalize(self, parsed: AdapterParseResult, ingest: IngestResult) -> AdapterParseResult: ...
 

@@ -35,6 +35,7 @@ class _Server(ThreadingHTTPServer):
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "Taskboard"
+    timeout = 10.0
 
     def log_message(self, format: str, *args: Any) -> None:
         return None
@@ -64,9 +65,18 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._reply(413, {"error": "payload too large"})
             return
-        raw_body = self.rfile.read(length)
         if not self._authorized():
+            self.close_connection = True
             self._reply(401, {"error": "invalid bearer token"})
+            return
+        try:
+            raw_body = self.rfile.read(length)
+        except TimeoutError:
+            self.close_connection = True
+            self._reply(408, {"error": "request body timed out"})
+            return
+        if len(raw_body) != length:
+            self.close_connection = True
             return
         try:
             request = json.loads(raw_body.decode("utf-8"))
@@ -100,6 +110,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _reply(self, status: int, body: Mapping[str, Any] | None) -> None:
         payload = b"" if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         if body is not None:
             self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
