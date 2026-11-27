@@ -179,7 +179,7 @@ class TestVisibleSDE(VisibleCase):
             with self.subTest(where):
                 self.log.unlink(missing_ok=True)
                 self.set_plan(sde=[dev(FIXED)])
-                configured = {"ANTHROPIC_API_KEY": "configured"}
+                configured = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:3425", "ANTHROPIC_API_KEY": "configured"}
                 overrides = {"env": configured} if where == "executor" else {
                     "launcher": ClaudeCodeLauncher(name="fake", command=fake_command(self.root), env=configured)}
                 outcome = await self.sde(review=False, **overrides).execute([event(self.payload())], None, self.caps)

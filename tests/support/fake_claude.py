@@ -239,6 +239,20 @@ def park(pidfile):
     sys.exit(0)
 
 
+def session_start_hooks():
+    # As Claude Code 2.1 does: SessionStart hooks of --settings run in its own environment before init, and with
+    # --include-hook-events each one's output is reported on the stream.
+    settings = json.loads(argv[argv.index("--settings") + 1]) if "--settings" in argv else {}
+    for group in settings.get("hooks", {}).get("SessionStart", []):
+        for hook in group.get("hooks", []):
+            done = subprocess.run(hook["command"], shell=True, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            if "--include-hook-events" in argv:
+                emit({"type": "system", "subtype": "hook_response", "hook_event": "SessionStart",
+                      "stdout": done.stdout, "stderr": done.stderr, "exit_code": done.returncode})
+
+
+if not interactive:
+    session_start_hooks()
 if probe and os.environ.get("FAKE_PROBE_PIDFILE"):
     park(os.environ["FAKE_PROBE_PIDFILE"])  # a probe that never reports
 if probe:

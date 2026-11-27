@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import ipaddress
 import json
 import math
-from collections.abc import Callable, Mapping, Sequence
+import re
+import secrets
+import shlex
+import sys
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout, supervise
 from agent_runtime.adapters.executor_cli.quota import parse_quota_errors
@@ -30,6 +37,20 @@ _PAID_ENV_KEYS = (
 # Never inherited: a daemon-wide token or base URL would override the launcher's own login, or send the
 # subscription token to a gateway the operator did not pick for it. The deployment file may set them explicitly.
 _ROUTING_ENV_KEYS = (*_PAID_ENV_KEYS, "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN")
+# Matched against each "_"-separated part of a key, so MAX_THINKING_TOKENS stays a setting while GH_TOKEN is a credential.
+_CREDENTIAL_PART_RE = re.compile(r".*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH|CREDENTIALS?|COOKIE)|PASS|PAT")
+# A configured credential may only be a placeholder for a gateway on this machine, which holds the real one.
+_MAX_PLACEHOLDER_CHARS = 24
+_REAL_SECRET_PREFIXES = ("sk-", "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "glpat-", "xox", "AKIA", "AIza",
+                         "ya29.", "eyJ", "-----BEGIN")
+_ENV_CHECK_MARK = "hibernaut-env-check "
+# Runs as a SessionStart hook inside Claude Code: salted hashes of the values it really started with, never the values.
+_ENV_CHECK_HOOK = (
+    "import hashlib,json,os,sys\n"
+    "s=sys.argv[1]\n"
+    "h=lambda v:None if v is None else hashlib.sha256((s+chr(0)+v).encode(errors='surrogateescape')).hexdigest()\n"
+    f"sys.stderr.write({_ENV_CHECK_MARK!r}+json.dumps({{k:h(os.environ.get(k)) for k in sys.argv[2:]}}))\n"
+)
 _STREAM_LIMIT = 16 * 1024 * 1024
 # The end of what a launcher printed outside its JSON messages, kept for telling why it failed.
 _MAX_PLAIN_CHARS = 16_000
@@ -51,6 +72,67 @@ def _str_env(where: str, raw: object) -> dict[str, str]:
     return {str(k): str(v) for k, v in cast(Mapping[object, object], raw).items()}
 
 
+def is_credential_key(key: str) -> bool:
+    return any(_CREDENTIAL_PART_RE.fullmatch(part) for part in key.upper().split("_"))
+
+
+def is_loopback_url(url: str) -> bool:
+    try:
+        parts = urlsplit(url.strip())
+        host = parts.hostname
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _url_password(value: str) -> bool:
+    try:
+        return bool(urlsplit(value.strip()).password)
+    except ValueError:
+        return False
+
+
+def _check_placeholders(section: str, env: Mapping[str, str]) -> None:
+    # Errors name the key and its section only: the value may be the very secret being refused.
+    for key, value in env.items():
+        if _url_password(value):
+            raise ValueError(f"{section}.{key} carries a password in its URL; the agent can read its env, so the "
+                             "credential stays in the gateway or the credential proxy")
+        if is_credential_key(key) and (len(value) > _MAX_PLACEHOLDER_CHARS or value.startswith(_REAL_SECRET_PREFIXES)):
+            raise ValueError(
+                f"{section}.{key} looks like a real credential (a known key prefix or longer than "
+                f"{_MAX_PLACEHOLDER_CHARS} characters); the agent can read its env, so real keys stay in the gateway "
+                "or the credential proxy and the env holds only a short placeholder"
+            )
+
+
+def _check_routes(where: str, sections: Sequence[tuple[str, Mapping[str, str]]], billing: str) -> None:
+    merged = {k: v for _, env in sections for k, v in env.items()}
+    base_url = merged.get("ANTHROPIC_BASE_URL", "")
+    local = is_loopback_url(base_url)
+    if not local:
+        for section, env in sections:
+            for key in env:
+                if is_credential_key(key):
+                    raise ValueError(
+                        f"{section}.{key} is a credential, allowed only beside an ANTHROPIC_BASE_URL on a loopback "
+                        "address (a gateway on this machine that holds the real key); remove it or route through such "
+                        "a gateway"
+                    )
+    if billing == "subscription" and base_url and not local:
+        raise ValueError(
+            f"{where}: ANTHROPIC_BASE_URL is not a loopback address and no gateway token is set, so Claude Code "
+            "would send the subscription's OAuth token to it; point it at a gateway on this machine"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ClaudeCodeLauncher:
     # A trusted command that starts the harness; it may pick its own config dir, account, gateway or proxy,
@@ -66,6 +148,7 @@ class ClaudeCodeLauncher:
             raise ValueError(f"{where}: unsupported harness '{self.harness}' (supported: {', '.join(HARNESSES)})")
         if not self.command.strip():
             raise ValueError(f"{where}: command must not be empty")
+        _check_placeholders(f"{where}.env", self.env)
 
 
 BUILTIN_LAUNCHERS: dict[str, ClaudeCodeLauncher] = {
@@ -122,6 +205,9 @@ class ClaudeCodeProfile:
                             f"{where}: billing 'api' sends every request through [credential_proxy] and conflicts "
                             f"with {source}.env.{key}; remove it or set billing = \"subscription\""
                         )
+        _check_placeholders(f"{where}.env", self.env)
+        _check_routes(where, ((f"launchers.{self.launcher.name}.env", self.launcher.env), (f"{where}.env", self.env)),
+                      self.billing)
 
 
 # Keys a pure [executors.<id>] (no role, no command) may set; an agent picks its own model, effort and skills.
@@ -215,8 +301,35 @@ def child_env(profile: ClaudeCodeProfile, base: Mapping[str, str]) -> dict[str, 
     return env
 
 
+@dataclass(frozen=True, slots=True)
+class EnvCheck:
+    # The configured routing and credential variables, which a subscription session must start with exactly as
+    # configured: a launcher must not export, say, a key from the keychain over them. The salt is new for every launch.
+    keys: tuple[str, ...]
+    salt: str
+
+
+def env_check(profile: ClaudeCodeProfile) -> EnvCheck | None:
+    if profile.billing != "subscription":
+        return None
+    keys = tuple(sorted(k for k in configured_env(profile) if k in _ROUTING_ENV_KEYS or is_credential_key(k)))
+    return EnvCheck(keys=keys, salt=secrets.token_hex(16)) if keys else None
+
+
+def env_fingerprint(salt: str, value: str) -> str:
+    return hashlib.sha256(f"{salt}\0{value}".encode(errors="surrogateescape")).hexdigest()
+
+
+def _env_check_args(check: EnvCheck) -> list[str]:
+    # The hook's report reaches the stream before init; it goes to stderr so it never enters the model's context.
+    command = shlex.join([sys.executable, "-I", "-c", _ENV_CHECK_HOOK, check.salt, *check.keys])
+    settings = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": command}]}]}}
+    return ["--include-hook-events", "--settings", json.dumps(settings)]
+
+
 def harness_args(
-    profile: ClaudeCodeProfile, *, permission_mode: str, role_args: Sequence[str], stream: bool = True
+    profile: ClaudeCodeProfile, *, permission_mode: str, role_args: Sequence[str], stream: bool = True,
+    check: EnvCheck | None = None,
 ) -> list[str]:
     # An explicit mode is mandatory: launchers such as claude-sg fall back to bypassPermissions without one.
     # Without the stream only the result is printed, so the session has to be checked before (claude_gate.py).
@@ -226,6 +339,7 @@ def harness_args(
         "--model", profile.model,
         "--effort", profile.effort,
         "--permission-mode", permission_mode,
+        *(_env_check_args(check) if check is not None else ()),
         *role_args,
     ]
 
@@ -283,10 +397,11 @@ async def run_claude_code(
     poll_interval: float,
 ) -> dict[str, Any]:
     launcher = profile.launcher
+    check = env_check(profile)
     try:
         proc = await asyncio.create_subprocess_exec(
             launcher.command,
-            *harness_args(profile, permission_mode=permission_mode, role_args=role_args),
+            *harness_args(profile, permission_mode=permission_mode, role_args=role_args, check=check),
             cwd=str(cwd),
             env=dict(env),
             stdin=asyncio.subprocess.PIPE,
@@ -301,7 +416,7 @@ async def run_claude_code(
     try:
         return await supervise(
             proc,
-            _consume(profile, proc, prompt),
+            _consume(profile, proc, prompt, check),
             is_interrupted=is_interrupted,
             timeout_seconds=profile.timeout_seconds,
             poll_interval=poll_interval,
@@ -310,7 +425,9 @@ async def run_claude_code(
         raise ClaudeCodeError(str(exc)) from exc
 
 
-async def _consume(profile: ClaudeCodeProfile, proc: asyncio.subprocess.Process, prompt: str) -> dict[str, Any]:
+async def _consume(
+    profile: ClaudeCodeProfile, proc: asyncio.subprocess.Process, prompt: str, check: EnvCheck | None
+) -> dict[str, Any]:
     assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
     stdin = proc.stdin
 
@@ -325,7 +442,7 @@ async def _consume(profile: ClaudeCodeProfile, proc: asyncio.subprocess.Process,
     stderr_task = asyncio.create_task(proc.stderr.read())
     feed_task = asyncio.create_task(feed())
     try:
-        return await _read_stream(profile, proc, stderr_task)
+        return await _read_stream(profile, proc, stderr_task, check)
     finally:
         for task in (feed_task, stderr_task):
             if not task.done():
@@ -333,12 +450,14 @@ async def _consume(profile: ClaudeCodeProfile, proc: asyncio.subprocess.Process,
 
 
 async def _read_stream(
-    profile: ClaudeCodeProfile, proc: asyncio.subprocess.Process, stderr_task: asyncio.Task[bytes]
+    profile: ClaudeCodeProfile, proc: asyncio.subprocess.Process, stderr_task: asyncio.Task[bytes],
+    check: EnvCheck | None,
 ) -> dict[str, Any]:
     assert proc.stdout is not None
     initialized = False
     result: dict[str, Any] | None = None
     plain = ""
+    hooks: list[Mapping[str, Any]] = []
     while line := await proc.stdout.readline():
         try:
             parsed: object = json.loads(line)
@@ -348,9 +467,11 @@ async def _read_stream(
         if not isinstance(parsed, dict):
             continue
         message = cast(dict[str, Any], parsed)
-        if message.get("type") == "system" and message.get("subtype") == "init":
+        if not initialized and is_hook_response(message):
+            hooks.append(message)
+        elif message.get("type") == "system" and message.get("subtype") == "init":
             # init precedes the first model request, so a wrong account or model is stopped at session start.
-            check_init(profile, message)
+            check_init(profile, message, check=check, hooks=hooks)
             initialized = True
         elif message.get("type") == "result":
             result = message
@@ -395,15 +516,60 @@ def print_result(profile: ClaudeCodeProfile, *, returncode: int | None, stdout: 
                            stderr.decode("utf-8", errors="replace").strip())
 
 
-def check_init(profile: ClaudeCodeProfile, init: Mapping[str, Any]) -> None:
+def is_hook_response(message: Mapping[str, Any]) -> bool:
+    return message.get("type") == "system" and message.get("subtype") == "hook_response"
+
+
+def _reported_env(hooks: Iterable[Mapping[str, Any]]) -> dict[str, object] | None:
+    for message in hooks:
+        for line in str(message.get("stderr", "")).splitlines():
+            if line.startswith(_ENV_CHECK_MARK):
+                try:
+                    parsed: object = json.loads(line.removeprefix(_ENV_CHECK_MARK))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    return cast(dict[str, object], parsed)
+    return None
+
+
+def _check_effective_env(profile: ClaudeCodeProfile, check: EnvCheck, hooks: Iterable[Mapping[str, Any]]) -> None:
+    launcher = profile.launcher.name
+    reported = _reported_env(hooks)
+    if reported is None:
+        raise ClaudeCodeError(
+            f"billing is 'subscription' but Claude Code (launcher '{launcher}') did not report the values it started "
+            f"with, so Hibernaut could not confirm {', '.join(check.keys)}; stopped at session start. Its SessionStart "
+            "hooks may be disabled"
+        )
+    configured = configured_env(profile)
+    changed = [k for k in check.keys if reported.get(k) != env_fingerprint(check.salt, configured[k])]
+    if changed:
+        raise ClaudeCodeError(
+            f"billing is 'subscription' but Claude Code (launcher '{launcher}') started with {', '.join(changed)} "
+            "not set to the configured value (the launcher or a settings file replaced or removed it); stopped at session "
+            "start. Remove that override or set billing = \"api\""
+        )
+
+
+def check_init(
+    profile: ClaudeCodeProfile,
+    init: Mapping[str, Any],
+    *,
+    check: EnvCheck | None = None,
+    hooks: Iterable[Mapping[str, Any]] = (),
+) -> None:
     source = str(init.get("apiKeySource", ""))
     launcher = profile.launcher.name
-    # Claude Code names the variable it authenticates with; one the deployment file sets is the operator's choice.
-    if profile.billing == "subscription" and source != "none" and not configured_env(profile).get(source):
+    if profile.billing == "subscription" and check is not None:
+        _check_effective_env(profile, check, hooks)
+    # Claude Code names the variable it authenticates with; one the deployment file sets is the operator's choice,
+    # and only once the check above confirmed the session holds the configured value.
+    if profile.billing == "subscription" and source != "none" and (check is None or source not in check.keys):
         raise ClaudeCodeError(
             f"billing is 'subscription' but Claude Code (launcher '{launcher}') would authenticate with "
-            f"'{source}', which the launcher and executor env do not set; stopped at session start. Remove that "
-            "credential source, set it in the executor's env or set billing = \"api\""
+            f"'{source}', which the launcher and executor env do not set or Hibernaut could not confirm; stopped at "
+            "session start. Remove that credential source, set it in the executor's env or set billing = \"api\""
         )
     if profile.billing == "api" and source != "ANTHROPIC_API_KEY":
         raise ClaudeCodeError(
