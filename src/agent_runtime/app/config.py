@@ -99,8 +99,9 @@ TerminalBackend = Literal["orca", "none"]
 TERMINAL_BACKENDS: tuple[TerminalBackend, ...] = ("orca", "none")
 @dataclass(frozen=True, slots=True)
 class RepoToolsConfig:
-    # The GitHub owner create_repo makes private repositories under; "" when no inbox has repo_tools.
+    # Default GitHub owner when the person did not name one.
     owner: str = ""
+    allowed_owners: tuple[str, ...] = ()
     # Most bytes the unpacked first version may take on disk.
     max_bytes: int = 512 * 1024 * 1024
 
@@ -855,12 +856,18 @@ def parse_onboarding(raw: Any) -> OnboardingConfig:
 
 
 def parse_repo_tools(raw: Any, runtime: RuntimeConfig, gdrive: GDriveConfig) -> RepoToolsConfig:
-    section = _Table(raw if raw is not None else {}, "repo_tools", frozenset({"owner", "max_bytes"}))
+    section = _Table(raw if raw is not None else {}, "repo_tools", frozenset({"owner", "allowed_owners", "max_bytes"}))
     defaults = RepoToolsConfig()
     owner = section.text("owner").lower() if "owner" in section.raw else ""
     if owner and not _OWNER_RE.fullmatch(owner):
         raise ValueError(f"repo_tools.owner: {owner!r} is not a GitHub owner")
-    found = RepoToolsConfig(owner=owner, max_bytes=section.count("max_bytes", defaults.max_bytes))
+    owners = section.names("allowed_owners", (owner,) if owner else ())
+    for candidate in owners:
+        if not candidate.isascii() or not _OWNER_RE.fullmatch(candidate.lower()):
+            raise ValueError(f"repo_tools.allowed_owners: {candidate!r} is not a GitHub owner")
+    if "allowed_owners" in section.raw and owner not in {candidate.lower() for candidate in owners}:
+        raise ValueError("repo_tools.allowed_owners must include the default [repo_tools] owner")
+    found = RepoToolsConfig(owner=owner, allowed_owners=owners, max_bytes=section.count("max_bytes", defaults.max_bytes))
     used = [b.rule.text for b in runtime.inbox_bindings if b.repo_tools]
     if used and not owner:
         raise ValueError(f"repo_tools = true ({', '.join(used)}) needs [repo_tools] owner")

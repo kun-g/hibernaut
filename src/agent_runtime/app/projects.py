@@ -573,6 +573,7 @@ _SYSTEM_PURPOSE = ("Onboards projects, checks and fills in how they are set up, 
 def build_global_manifest(
     inbox_id: str, binding: InboxBinding, agents: Sequence[AgentConfig], targets: Sequence[_Target],
     default_agent: str, systems: Sequence[WorkdirBinding] = (), repo_owner: str = "",
+    repo_owners: Sequence[str] = (),
 ) -> str:
     # What a Steward outside any project needs: the projects it may send work to, and nothing of what is inside them.
     parts = [f"You work in `{inbox_id}`, which belongs to no project. Its default agent is `{binding.default_agent}`.",
@@ -597,7 +598,8 @@ def build_global_manifest(
             purpose = _OPS_PURPOSE if bound.ops_tools else _SYSTEM_PURPOSE
             parts.append(f"- `{bound.rule.literal}`: agent `{agent}`. {purpose}.{said}")
     if repo_owner:
-        parts += ["", f"You may create a private repository under `{repo_owner}` from a Drive folder with create_repo."]
+        parts += ["", f"You may create a private repository under `{repo_owner}` by default with create_repo.",
+                  "Allowed GitHub owners: " + ", ".join(repo_owners or (repo_owner,)) + "."]
     return "\n".join(parts)
 
 
