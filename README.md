@@ -180,15 +180,16 @@ schemas/runner/v1/  # Runner 协议（capabilities、run_request、run_result、
 schemas/v1/         # 执行账本的 AuditRecord / RunRecord（ADR-0001）、Memory Hub 与协作（收口卡、专家、简报）的 JSON Schema（Draft 2020-12）
 ```
 
-测试按是否启动外部进程分在 `tests/unit/` 和 `tests/integration/`，共用工具在 `tests/support/`。串行计时命令见 [AGENTS.md](AGENTS.md#5-提交前必跑的三道门禁命令)。
+测试按是否启动外部进程分在 `tests/unit/` 和 `tests/integration/`，共用工具在 `tests/support/`。串行计时命令见 [AGENTS.md](AGENTS.md#5-提交前必跑的四道门禁命令)。
 
 Steward 路由测试在配置的工作目录启动模拟 CLI，通过 MCP 调用工具。要验证终端启动、账号检查和进程清理，见 [`test_terminal_processes.py`](tests/integration/test_terminal_processes.py)。
 
-提交前三道门禁必须全绿：
+提交前四道门禁必须全绿（CI 并行跑同样四道）：
 
 ```bash
 pip install -e ".[dev]"
 lint-imports   # 分层与反向依赖检查
+ruff check     # 查 bug 类问题，规则在 pyproject.toml 的 [tool.ruff.lint]，不查格式
 pytest -n auto --dist worksteal -v   # 单元和集成测试全量（本地快检可用 pytest -n auto $(python scripts/select_tests.py)）
-pyright        # core/、engine/、switchboard/、ccpeer/、taskboard/、runner/、ledger/、dashboard/、collaboration/ 的 strict 类型检查
+pyright        # src/ 下全部包的 strict 类型检查
 ```

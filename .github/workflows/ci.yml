@@ -28,7 +28,7 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/pip install --disable-pip-version-check -e ".[dev]"
-      - name: Run architecture, test and type gates in parallel
+      - name: Run architecture, lint, test and type gates in parallel
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
@@ -48,6 +48,8 @@ jobs:
 
           lint-imports > /tmp/gate-lint.log 2>&1 &
           pid_lint=$!
+          ruff check --output-format=github > /tmp/gate-ruff.log 2>&1 &
+          pid_ruff=$!
           pyright > /tmp/gate-pyright.log 2>&1 &
           pid_pyright=$!
 
@@ -70,14 +72,18 @@ jobs:
           echo "=== Gate 1 - Static import boundaries (import-linter) ==="
           cat /tmp/gate-lint.log
 
+          wait "$pid_ruff" || rc=$?
+          echo "=== Gate 2 - Lint (ruff) ==="
+          cat /tmp/gate-ruff.log
+
           wait "$pid_pyright" || rc=$?
-          echo "=== Gate 3 - Strict static typing (pyright) ==="
+          echo "=== Gate 4 - Strict static typing (pyright) ==="
           cat /tmp/gate-pyright.log
 
           if [ -n "$pid_pytest" ]; then
             wait "$pid_pytest" || rc=$?
           fi
-          echo "=== Gate 2 - Contract & E2E tests (pytest) ==="
+          echo "=== Gate 3 - Contract & E2E tests (pytest) ==="
           cat /tmp/gate-pytest.log
 
           exit "$rc"

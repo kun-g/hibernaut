@@ -231,7 +231,7 @@
 
 ## 6. 三道防腐化门禁与术语基准
 
-提交前与 `.github/workflows/ci.yml` 强制执行：`lint-imports`、`pytest -n auto --dist worksteal -v`（全量覆盖 `tests/unit/` 与 `tests/integration/`）、`pyright`（strict，覆盖 `agent_runtime/core`、`agent_runtime/engine`、`switchboard`、`ccpeer`、`taskboard`、`runner`、`ledger`、`dashboard` 与 `collaboration`）。PR 上由 `scripts/select_tests.py` 按 Python AST 反向依赖图与资源映射仅跑受影响测试（加 `full-ci` 标签或合入 `main` 时跑全量兜底）。
+提交前与 `.github/workflows/ci.yml` 强制执行（CI 中四道并行）：`lint-imports`、`ruff check`（`pyproject.toml` 的 `[tool.ruff.lint]`，只查 bug 类规则、不查格式）、`pytest -n auto --dist worksteal -v`（全量覆盖 `tests/unit/` 与 `tests/integration/`）、`pyright`（strict，覆盖 `src/` 下全部包，`pythonPlatform` 固定为 Linux）。类型检查只用 pyright，不再保留 mypy。PR 上由 `scripts/select_tests.py` 按 Python AST 反向依赖图与资源映射仅跑受影响测试（加 `full-ci` 标签或合入 `main` 时跑全量兜底）。
 
 全局与系统 Steward 的路由测试在终端接口处直接启动模拟 CLI，覆盖实际工作目录、提示、MCP 子进程和权限判定。需要观察 Orca 终端创建、账号不符或中断后子进程退出的用例使用真实 shell 包装进程。
 

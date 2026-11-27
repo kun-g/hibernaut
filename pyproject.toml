@@ -19,7 +19,8 @@ dev = [
     "pytest>=8.0",
     "pytest-xdist>=3.6",
     "pyright>=1.1.380",
-    "mypy>=1.11",
+    # A new minor release can promote rules into the selected sets; upgrade it on purpose.
+    "ruff>=0.17.6,<0.18",
     "import-linter>=2.0",
 ]
 
