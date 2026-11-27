@@ -30,8 +30,7 @@ class FeishuOutboundAdapter:
             if msg.card_payload is None:
                 raise ValueError("approval_card requires card_payload")
             return "interactive", json.dumps(dict(msg.card_payload), ensure_ascii=False)
-        text = f"{msg.title}\n{msg.body_md}" if msg.title else msg.body_md
-        return "text", json.dumps({"text": text}, ensure_ascii=False)
+        return "text", json.dumps({"text": msg.body_md}, ensure_ascii=False)
 
     def send(self, msg: OutboundMessage) -> SendResult:
         try:
