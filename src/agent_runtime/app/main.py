@@ -2169,6 +2169,7 @@ async def _close_server(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hibernaut multi-inbox Always-on Agent daemon")
     parser.add_argument("--config", default=None, help="Path to hibernaut.toml")
+    parser.add_argument("--check", action="store_true", help="Validate --config and exit")
     parser.add_argument(
         "--demo",
         action="store_true",
@@ -2192,11 +2193,24 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=banner)
     args = parser.parse_args()
 
+    if args.check:
+        if not args.config:
+            parser.error("--check requires --config")
+        try:
+            cfg = load_config(args.config)
+        except (OSError, ValueError) as exc:
+            print(f"{args.config}: {exc}", file=sys.stderr)
+            raise SystemExit(1) from None
+        bindings = len(cfg.runtime.inbox_bindings) + sum(len(p.inbox_bindings) for p in cfg.projects.values())
+        print(f"OK projects={len(cfg.projects)} bindings={bindings} timers={len(cfg.timers)}")
+        return
+
     # Before anything can start a subprocess: the descriptor numbers leave os.environ here.
     listeners = ListenerHandover.from_environ(os.environ)
     board: SwitchboardHandle | None = None
     if args.config:
-        cfg = load_config(args.config)
+        reloads = ReloadStatus()
+        cfg = load_config(args.config, reloads=reloads)
         ledger_path = run_ledger_path(cfg.runtime.db_path, cfg.runtime.ledger_db_path)
         # Opened before the Switchboard, whose in-process audits it records; the daemon owns and closes it.
         ledger = RunLedger(ledger_path) if ledger_path is not None else None
@@ -2216,7 +2230,8 @@ def main() -> None:
                 print(f"[runner_pilot] {exc}; the pilot inbox stays held.", file=sys.stderr, flush=True)
         companion = companion_config(cfg, os.environ) if args.mcp_stdio else cfg
         daemon = build_daemon_from_config(
-            companion, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot, attach=not args.mcp_stdio
+            companion, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot,
+            attach=not args.mcp_stdio, reloads=reloads,
         )
         host = cfg.channels.host
         port = cfg.channels.port

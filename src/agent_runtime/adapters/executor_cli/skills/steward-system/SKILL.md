@@ -23,6 +23,7 @@ Answer numbers first, then the lines behind them:
 - failed tasks: how many, and for each the inbox, the task and the first line of its error;
 - suspended tasks, each with what it waits for, as `waits_for` says: `approval` 等审批, `answer` 等人回答, `user_away` 等用户离开电脑, `retry` 等到点重试. A task that waits is not stuck: say what it waits for and since when;
 - deliveries by result: `merged` 合并了, `pr_open` 开着 PR（with `hold`, why it was not merged）, `no_change` 没改动, `failed`/`stopped` 失败或停了, `no_delivery_step` 项目没有交付步骤;
+- a refused configuration (`config_reload`), with the file, offending field and `active_sha256` still in use;
 - Outbox messages that did not go out, with the error;
 - for a timer: when it last fired and how each firing ended; `status` pending means its Run has not ended yet;
 - what the tool cannot see (`not_covered`), so nobody reads a gap as "nothing happened".
@@ -53,6 +54,8 @@ Work inside a project, or which project gets some work, belongs to the general S
 - `description` is one sentence saying what the project is, from the person's words. Leave it out when you were told nothing; Hibernaut then writes a neutral one, and you say so.
 
 # After a call
+
+The write tools validate the candidate, save a backup and wait for the daemon to accept it. For manual edits, the operator can check the candidate beside the original and check the installed file with `python -m agent_runtime.app.main --config <file> --check`.
 
 Reply with what the tools returned, not with what you expected:
 
