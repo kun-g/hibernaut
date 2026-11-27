@@ -10,6 +10,7 @@ from agent_runtime.adapters.executor_cli import sde
 from agent_runtime.adapters.executor_cli.reviewer import ReviewAborted
 from agent_runtime.adapters.executor_cli.sde import _State
 from agent_runtime.core.models import Emit, Suspend
+from tests.support.input_decision import DECISION
 from tests.support.review_flow_support import CHECKS, CONFLICT, DONE, FIX, MAIN, QUESTION, REPORT, ReviewFlowCase
 from tests.support.incremental_review import block, verdict
 from tests.support.pr_delivery import VERSION_FILE
@@ -167,12 +168,12 @@ class TestHandBackReview(ReviewFlowCase):
 
     async def test_a_question_from_the_developer_during_a_hand_back_suspends(self):
         conflict = self.persistent_conflict(2)
-        question = {"status": "needs_input", "question": "keep main's divide or ours?"}
+        question = {"status": "needs_input", "decision": DECISION, "question": "保留主分支的除法吗？"}
         outcome = await self.run_flow(snapshots=["first"], diffs={}, reviews=[PASS], deliveries=[conflict],
                                       reports=[REPORT, question])
         self.assertIsInstance(outcome, Suspend)
-        self.assertIn("[sde] needs input: keep main's divide or ours?", outcome.prompt)
-        self.assertIn("Delivery hand-back 1 of 2: merging origin/main conflicts in calc.py", outcome.prompt)
+        self.assertIn("问题：保留主分支的除法吗？", outcome.prompt)
+        self.assertIn("Delivery hand-back 1 of 2: merging origin/main conflicts in calc.py", outcome.session_checkpoint)
         self.assertEqual(self.delivery.deliver.call_count, 1)
         self.assertNotIn("PR created", outcome.prompt)
 

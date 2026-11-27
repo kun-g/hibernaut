@@ -43,7 +43,10 @@ CLOSE_SOURCE = "agent:close"
 # A closeout the Owner confirmed, on its way to the Chief of Staff; an agent wrote it.
 CLOSEOUT_SOURCE = "agent:closeout"
 # Only Hibernaut queues these, and the worker trusts them for it; no public entrance accepts them.
-INTERNAL_SOURCES = frozenset({FORWARD_SOURCE, RETURN_SOURCE, RETURN_CANCELLED_SOURCE, CLOSE_SOURCE, CLOSEOUT_SOURCE})
+QUESTION_SOURCE = "agent:development_question"
+ADVICE_SOURCE = "agent:development_answer"
+INTERNAL_SOURCES = frozenset({FORWARD_SOURCE, RETURN_SOURCE, RETURN_CANCELLED_SOURCE, CLOSE_SOURCE, CLOSEOUT_SOURCE,
+                              QUESTION_SOURCE, ADVICE_SOURCE})
 MCP_APPROVAL_SOURCE = "mcp:approval"
 
 
@@ -158,6 +161,9 @@ class ForwardSpec:
     hop_count: int = 0
     forwarded_from: str | None = None
     parent_session_id: str | None = None
+    # Actual dispatchers, nearest first. A passed-on result can have a different parent.
+    question_parents: tuple[str, ...] = ()
+    question_inbox: str | None = None
     # The trace of this work and the event its latest Run descends from: what the session sends on carries both, also
     # after an approval that names neither. Empty only in a record stored before they were kept.
     trace_id: str = ""
@@ -417,6 +423,8 @@ class Suspend:
     telemetry: RunTelemetry | None = field(default=None, compare=False)
     # A timer wakes this request instead of sending a prompt to a person.
     resume_after_seconds: int | None = None
+    # Original brief for a development question that a dispatcher may answer.
+    question_brief: str | None = None
 
 
 RunOutcome: TypeAlias = Silent | Emit | Suspend

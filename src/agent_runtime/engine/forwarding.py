@@ -105,6 +105,7 @@ def carried_spec(event: Event) -> ForwardSpec | None:
         hop_count=cast(int, hops) if valid else MAX_FORWARD_HOPS,
         forwarded_from=_text(payload.get("forwarded_from")),
         parent_session_id=_text(payload.get("parent_session_id")),
+        question_parents=tuple(str(s) for s in payload.get("question_parents", ())) if forwarded else (),
         reply_channel=_text(payload.get("reply_channel")),
         reply_target=_text(payload.get("reply_target")),
         origin_key=_text(payload.get("origin_key")),
@@ -300,9 +301,9 @@ def _chain_spec(events: Sequence[Event], session: SessionRef | None) -> ForwardS
     if saved is None:
         return None
     fresh = any(not is_approval(evt) and not evt.source.startswith("timer:") for evt in events)
-    if fresh and saved.return_to is None:
+    if fresh and saved.return_to is None and not (session and session.pending_request_id):
         # A new message from outside starts a new chain.
-        return replace(saved, hop_count=0, forwarded_from=None, handed_on=False)
+        return replace(saved, hop_count=0, forwarded_from=None, handed_on=False, question_parents=(), question_inbox=None)
     return saved
 
 
@@ -796,6 +797,7 @@ class ForwardStage:
             "hop_count": hops + 1,
             "forwarded_from": self.inbox_id,
             "forwarded_by": self.agent_id,
+            "question_parents": [self.session.session_id, *(spec.question_parents if spec else ())],
             "trace_id": trace_id,
             "parent_event_id": parent_event_id,
             **_reply_fields(spec, events),

@@ -281,6 +281,10 @@ def _status_definition() -> dict[str, Any]:
     }
 
 
+_ADVISORY_READS = {"read_file", "search_files", "list_files", "read_memory", "memory_search", "memory_read",
+                   "list_sessions", "list_events", "git"}
+
+
 @dataclass(slots=True)
 class StewardTools:
     # The tools of one Steward run. Every call passes PermissionPort.check under its own tool name first.
@@ -301,6 +305,7 @@ class StewardTools:
     repo: RepoTools | None = None
     # Set for the Steward of an operations inbox (ops_tools); like a system inbox it passes no work on.
     ops: OpsTools | None = None
+    advisory: bool = False
     calls: int = 0
     # Forwards this Run took; they go out once it ends in anything but a failure.
     forwarded: int = 0
@@ -389,8 +394,12 @@ class StewardTools:
         return self.system is not None or self.status is not None
 
     def offered(self) -> list[dict[str, Any]]:
-        return self.definitions(projectless=self.projectless, system=self.system is not None,
+        tools = self.definitions(projectless=self.projectless, system=self.system is not None,
                                 status=self.status is not None, repo=self.repo is not None, ops=self.ops is not None)
+
+        if self.advisory:
+            return [t for t in tools if t["name"] in _ADVISORY_READS]
+        return tools
 
     async def call(self, name: object, arguments: object) -> tuple[str, bool]:
         # (answer, is_error)
@@ -421,7 +430,7 @@ class StewardTools:
         if self.repo is not None and self.system is None and self.ops is None:
             handlers["create_repo"] = self._create_repo
         handler = handlers.get(name) if isinstance(name, str) else None
-        if handler is None:
+        if handler is None or (self.advisory and name not in _ADVISORY_READS):
             return f"unknown tool {name}", True
         if not isinstance(arguments, dict):
             return "arguments must be an object", True

@@ -7,6 +7,7 @@ from agent_runtime.adapters.executor_cli.base_merge import SinceReview
 from agent_runtime.adapters.executor_cli.claude_code import ClaudeCodeProfile
 from agent_runtime.adapters.executor_cli.reviewer import render_review
 from agent_runtime.adapters.executor_cli.sde import _State
+from tests.support.input_decision import DECISION
 from tests.support.fakes import InMemoryPermission
 from tests.support.sde_delivery import PASS, dev
 
@@ -15,7 +16,7 @@ CONFLICT = DeliveryRecord(problem="merge conflict", handback={"kind": "conflict"
 CHECKS = DeliveryRecord(problem="check failed", handback={"kind": "checks", "failed": "needs ok.txt"})
 DONE = DeliveryRecord(state="pr_open")
 REPORT = {**dev({})["output"], "code_change": True}
-QUESTION = {"status": "needs_input", "question": "which side?"}
+QUESTION = {"status": "needs_input", "decision": DECISION, "question": "保留主分支的实现吗？"}
 MAIN = "--- /dev/null\n+++ b/main_only.py\n@@ -0,0 +1 @@\n+return 1\n"
 FIX = "--- /dev/null\n+++ b/ok.txt\n@@ -0,0 +1 @@\n+ok\n"
 
