@@ -314,6 +314,8 @@ def extract_verdict(stdout: str) -> object:
     found = _json_in(text)
     if isinstance(found, dict) and "verdict" not in found:
         envelope = cast(dict[str, Any], found)
+        if unfinished := _unfinished(envelope):
+            raise ReviewAborted(unfinished)
         for key in ("structured_output", "structuredOutput"):
             structured = envelope.get(key)
             if isinstance(structured, dict):
@@ -330,11 +332,27 @@ def extract_verdict(stdout: str) -> object:
     return cast(object, found)
 
 
+def _unfinished(envelope: Mapping[str, Any]) -> str:
+    # A run whose turn did not finish may still exit 0 with text holding an interim answer: grok printed
+    # {"text": "<placeholder verdict>", "stopReason": "cancelled"} when a tool call it could not approve ended the
+    # turn (2026-11-28, PR #134). claude reports stop_reason "tool_use" on success, so only grok's stopReason is read.
+    subtype = envelope.get("subtype")
+    if envelope.get("is_error") is True or (isinstance(subtype, str) and subtype != "success"):
+        return f"the reviewer's run reported an error ({subtype if isinstance(subtype, str) else 'is_error'})"
+    stop = envelope.get("stopReason")
+    if isinstance(stop, str) and stop != "end_turn":
+        return f"the reviewer's turn ended '{stop}' before a final answer"
+    return ""
+
+
 def _json_in(text: str) -> object | None:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+    # The last object with a verdict wins: a model may print an interim verdict before reading the code.
+    if (last := _last_verdict(text)) is not None:
+        return last
     # The last parsable fenced block wins: a model may quote the schema before its answer.
     for block in reversed(_FENCE.findall(text)):
         try:
@@ -342,3 +360,19 @@ def _json_in(text: str) -> object | None:
         except json.JSONDecodeError:
             continue
     return None
+
+
+def _last_verdict(text: str) -> dict[str, Any] | None:
+    decoder = json.JSONDecoder()
+    last: dict[str, Any] | None = None
+    start = text.find("{")
+    while start != -1:
+        try:
+            found, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            start = text.find("{", start + 1)
+            continue
+        if isinstance(found, dict) and "verdict" in found:
+            last = cast(dict[str, Any], found)
+        start = text.find("{", end)
+    return last
