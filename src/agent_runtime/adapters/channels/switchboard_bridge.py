@@ -113,6 +113,15 @@ def canonical_to_payload(event: CanonicalEvent) -> dict[str, Any]:
     return payload
 
 
+class CardTarget(Protocol):
+    # The chat an inbox's approval cards go to (None: Switchboard's approval chat) and the only people who decide them.
+    @property
+    def chat_id(self) -> str | None: ...
+
+    @property
+    def deciders(self) -> Collection[str]: ...
+
+
 class InboxChoice(Protocol):
     # Where an event goes; None: nowhere.
     def inbox_for(self, event: CanonicalEvent) -> str | None: ...
@@ -211,9 +220,9 @@ class SwitchboardChannelAdapter:
         fallback: ChannelPort | None = None,
         # Decides what may be pushed to Feishu unasked (D8-B); None leaves every message as it is.
         push_policy: NotificationPolicyEngine | None = None,
-        # inbox_id -> (the Feishu chat its approval cards go to, the only people whose click counts); None for the
-        # Switchboard's own choice of chat and anybody who sees the card.
-        card_group: Callable[[str], tuple[str, Collection[str]] | None] | None = None,
+        # inbox_id -> where its approval cards go and who alone decides them; None for the Switchboard's own choice of
+        # chat and anybody who sees the card.
+        card_group: Callable[[str], CardTarget | None] | None = None,
     ) -> None:
         self._publish = publish
         self._fallback = fallback
@@ -248,10 +257,11 @@ class SwitchboardChannelAdapter:
             report.setdefault("hop_count", 1)
         group = self._card_group(inbox_id) if self._card_group is not None and outcome == "suspend" else None
         if group is not None:
-            # The card goes to the group, where alone it is decided; Switchboard turns other people's clicks away
-            # before storing them, so they cannot use the approval up.
-            chat_id, deciders = group
-            report |= {"approval_channel": _FEISHU, "approval_target": chat_id, "deciders": sorted(deciders)}
+            # Switchboard turns the clicks of anybody else away before storing them, so they cannot use the approval up.
+            report["deciders"] = sorted(group.deciders)
+            if group.chat_id is not None:
+                # A system group's card goes to the group, where alone it is decided.
+                report |= {"approval_channel": _FEISHU, "approval_target": group.chat_id}
         legacy_request_id = metadata.get("request_id")
         if outcome == "suspend" and "approval_request_id" not in report and legacy_request_id:
             # Outbox rows written before the worker added approval_request_id carry only request_id.
