@@ -14,7 +14,7 @@ from agent_runtime.core.models import DeliveryOutcome, Emit
 from tests.support.fakes import InMemoryPermission
 from tests.support.gdrive_tasks import _FakeDriveClient
 from tests.support.pr_delivery import VERSION_FILE
-from tests.support.sde_delivery import REPO, event
+from tests.support.sde_delivery import REPO
 
 
 class TestSDEDeliveryResult(unittest.IsolatedAsyncioTestCase):

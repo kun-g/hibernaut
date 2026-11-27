@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from agent_runtime.core.models import Event
-from tests.support.coder_reviewer import CHANGES_REQUESTED, git
+from tests.support.coder_reviewer import git
 
 
 PROXY = "http://127.0.0.1:9"

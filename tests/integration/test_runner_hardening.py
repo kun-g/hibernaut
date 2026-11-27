@@ -13,13 +13,13 @@ from runner.supervisor import ProcessSupervisor
 from runner.transport.relay_hub import RunnerConnectionLostError, RunnerRelayHub
 from runner.transport.ws_protocol import WSConnectionClosed, WSProtocolError, client_handshake, recv_json, send_json
 from tests.support.runner_safety import PY, _config, _count_drivers, _count_started, _hold_count, _init_repo, _req
-import threading  # noqa: E402
-from runner.protocol import InterruptRequest, InterruptResult, ReclaimRequest, ReclaimResult, RunResult  # noqa: E402
-from runner.transport import relay_client  # noqa: E402
-from runner.transport.relay_client import RunnerRelayAgent  # noqa: E402
-from runner.config import NamespacePolicy  # noqa: E402
-from runner.transport.in_process import InProcessRunnerClient  # noqa: E402
-from tests.support.runner_safety import _drivers  # noqa: E402
+import threading
+from runner.protocol import InterruptRequest, InterruptResult, ReclaimRequest, ReclaimResult, RunResult
+from runner.transport import relay_client
+from runner.transport.relay_client import RunnerRelayAgent
+from runner.config import NamespacePolicy
+from runner.transport.in_process import InProcessRunnerClient
+from tests.support.runner_safety import _drivers
 
 
 _ENV_SCRIPT = "import json, os; print(json.dumps({'env': dict(os.environ)}))"
@@ -464,7 +464,7 @@ def test_hub_ignores_replies_from_a_connection_the_request_was_not_sent_on(tmp_p
     async def scenario() -> None:
         host, port = await hub.start("127.0.0.1", 0)
         ra, wa, epoch_a = await _raw_agent(host, port, caps_a.capabilities_sync().to_dict())
-        rb, wb, epoch_b = await _raw_agent(host, port, caps_b.capabilities_sync().to_dict())
+        _rb, wb, epoch_b = await _raw_agent(host, port, caps_b.capabilities_sync().to_dict())
         try:
             run = asyncio.create_task(hub.run(req))
             submit = await asyncio.wait_for(recv_json(ra, wa, expect_masked=False, send_masked=True), 2.0)

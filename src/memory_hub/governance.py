@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Literal
+from collections.abc import Callable
 
 from memory_hub.fs_store import MarkdownFileStore, atomic_write_text, replace_markdown_section
 from memory_hub.index_fts5 import DualFTSIndex

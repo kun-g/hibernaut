@@ -4,7 +4,7 @@ import ast
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
 import pytest
@@ -211,7 +211,7 @@ def test_q2_mechanical_gc_and_dreaming_proposal(tmp_path: Path) -> None:
         # Create an old closed progress file and a dangling index link
         prog = hub.root / "projects" / "hibernaut" / "progress" / "issue-99.md"
         prog.write_text("# Progress 99\nDone.\n", encoding="utf-8")
-        old_ts = (datetime.now(timezone.utc) - timedelta(days=10)).timestamp()
+        old_ts = (datetime.now(UTC) - timedelta(days=10)).timestamp()
         os.utime(prog, (old_ts, old_ts))
 
         idx = hub.root / "projects" / "hibernaut" / "index.md"
@@ -229,7 +229,7 @@ def test_q2_mechanical_gc_and_dreaming_proposal(tmp_path: Path) -> None:
         assert p_res.proposal_id
         p_file = hub.root / "proposals" / f"{p_res.proposal_id}.json"
         rec = json.loads(p_file.read_text(encoding="utf-8"))
-        rec["created_at"] = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat().replace("+00:00", "Z")
+        rec["created_at"] = (datetime.now(UTC) - timedelta(days=20)).isoformat().replace("+00:00", "Z")
         p_file.write_text(json.dumps(rec), encoding="utf-8")
 
         report = hub.run_mechanical_gc("hibernaut", closed_work_keys={"issue-99"})

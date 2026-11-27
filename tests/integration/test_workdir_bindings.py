@@ -43,7 +43,7 @@ class TestDispatch(_DispatchCase):
         self.assert_primary_untouched()
 
     async def test_the_whole_binding_applies_to_a_bound_inbox(self):
-        agents = f'[agents.other]\nexecutor = "cli"\n[agents.third]\nexecutor = "cli"\n'
+        agents = '[agents.other]\nexecutor = "cli"\n[agents.third]\nexecutor = "cli"\n'
         path = self.write_config(self.project + agents + binding_table(
             OPS, self.ops, agents='["cli", "other"]', rules='[{ tags = ["x"], agent = "other" }]'))
         await self.dispatch(path, [

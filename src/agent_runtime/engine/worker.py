@@ -6,7 +6,7 @@ import logging
 import time
 from collections.abc import AsyncGenerator, Callable, Collection, Generator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from typing import Any, Never, assert_never, cast
 
 from agent_runtime.core.models import (
@@ -1750,7 +1750,7 @@ class AgentWorker:
                     timeout=self._interrupt_poll_interval_seconds,
                 )
                 wake_signal.clear()
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
     def _batch_key(
@@ -2351,7 +2351,7 @@ class AgentWorker:
                 if outcome.resume_after_seconds is not None and not repeated:
                     # Queue the wake before saving the checkpoint: a crash may leave a stale timer,
                     # which the request-id check discards, but never a checkpoint without its wake.
-                    due = datetime.now(timezone.utc) + timedelta(seconds=outcome.resume_after_seconds)
+                    due = datetime.now(UTC) + timedelta(seconds=outcome.resume_after_seconds)
                     self._timers.schedule("follow_up", to_utc_iso(due),
                                           {"event_type": "suspend.elapsed", "approval_request_id": request_id},
                                           inbox_id=inbox_id, session_id=target_sid)

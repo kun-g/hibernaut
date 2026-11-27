@@ -8,6 +8,7 @@ from pathlib import Path
 from agent_runtime.adapters.executor_cli.run_state import STATE_FILE
 from agent_runtime.app.main import AsyncWorkerPool, drain_pools, startup_inboxes
 from agent_runtime.core.models import Emit, RunDetached
+from agent_runtime.engine.worker import ExecutorFailed
 from tests.support.resume_runs import INBOX, ParkingExecutor, RuntimeCase
 
 
@@ -124,7 +125,7 @@ class TestDetachAndResume(RuntimeCase):
         other.executor_id = "other"
         other.release.set()
         worker = self.worker("new", {"other": other})
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(ExecutorFailed, "'parker' is not registered"):
             # Sticky routing still names the missing executor, so the batch stays pending for a person.
             await worker.process_inbox(INBOX)
         self.assertEqual(self.status(evt), "pending")
@@ -139,7 +140,7 @@ class TestDetachAndResume(RuntimeCase):
                 raise RuntimeError("boom")
 
         evt = self.append()
-        with self.assertRaises(Exception):
+        with self.assertRaises(RuntimeError):
             await self.worker("w", {"parker": Failing()}).process_inbox(INBOX)
         self.assertEqual(self.status(evt), "failed")
         self.assertEqual(self.runs.list_open(INBOX), [])

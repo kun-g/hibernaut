@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Callable
+from datetime import datetime, timedelta, UTC
+from collections.abc import Callable
 
 from memory_hub.fs_store import MarkdownFileStore, atomic_write_text
 from memory_hub.governance import WriteGovernanceGate
@@ -48,7 +48,7 @@ class CompactionAndDreaming:
     ) -> GCReport:
         pk = sanitize_segment(project_key, field_name="project_key")
         proj_dir = self._store.ensure_project(pk)
-        cur_now = now or datetime.now(timezone.utc)
+        cur_now = now or datetime.now(UTC)
 
         archived_reported = self._store.roll_reported_if_needed(pk)
 
@@ -59,7 +59,7 @@ class CompactionAndDreaming:
         cutoff = cur_now - timedelta(days=self._config.progress_archive_days)
 
         for pfile in sorted(progress_dir.glob("*.md")):
-            mtime = datetime.fromtimestamp(pfile.stat().st_mtime, tz=timezone.utc)
+            mtime = datetime.fromtimestamp(pfile.stat().st_mtime, tz=UTC)
             stem = pfile.stem
             is_closed = closed_work_keys is not None and stem in closed_work_keys
             if (is_closed and mtime <= cutoff) or (closed_work_keys is None and mtime <= cutoff):

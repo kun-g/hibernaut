@@ -9,7 +9,8 @@ import pytest
 
 from agent_runtime.app.config import parse_config
 from agent_runtime.app.main import AlwaysOnDaemon, build_daemon_from_config, serve_configured
-from tests.support.collaboration_flow import CARD, call, chief_events, hub_call, refused, tokens
+from tests.support.collaboration_flow import CARD, call, chief_events, hub_call, refused
+from tests.support.collaboration_flow import tokens  # noqa: F401 -- pytest fixture, requested by parameter name
 
 
 def write_config(path: Path, tmp_path: Path, *, experts: str, budget: int = 6500) -> None:

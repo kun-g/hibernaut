@@ -575,7 +575,6 @@ class PRDelivery:
         should_detach: Callable[[], bool] = _never,
     ) -> DeliveryRecord:
         # Raises DeliveryDetached at a checkpoint once should_detach() is true; every step before it is recorded.
-        cfg = self._config
         rec = self.record(req.work_key)
 
         def stop() -> bool:
@@ -678,7 +677,8 @@ class PRDelivery:
 
     def _run(self, argv: list[str], cwd: Path, *, timeout: float = 300.0) -> subprocess.CompletedProcess[str]:
         try:
-            return subprocess.run(argv, cwd=cwd, env=self._env, capture_output=True, text=True, timeout=timeout)
+            return subprocess.run(argv, cwd=cwd, env=self._env, capture_output=True, text=True, timeout=timeout,
+                                  check=False)
         except FileNotFoundError:
             raise _Problem(f"{argv[0]} is not installed or not on PATH",
                            f"{_operation(argv)}所需的工具未安装或找不到") from None
@@ -873,7 +873,7 @@ class PRDelivery:
             self._checkpoint(is_interrupted)
             try:
                 proc = subprocess.run(list(argv), cwd=cwd, env=self._env, capture_output=True, text=True,
-                                      timeout=cfg.check_timeout_seconds)
+                                      timeout=cfg.check_timeout_seconds, check=False)
                 code, output = proc.returncode, proc.stdout + proc.stderr
             except FileNotFoundError:
                 code, output = 127, f"{argv[0]}: command not found"

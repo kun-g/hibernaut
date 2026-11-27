@@ -272,7 +272,7 @@ class LocalCLIExecutor:
                 poll_interval=self._interrupt_poll_interval,
             )
         except ProcessTimeout:
-            return b"", f"CLI timed out after {timeout_seconds}s".encode("utf-8"), 124
+            return b"", f"CLI timed out after {timeout_seconds}s".encode(), 124
         return stdout, stderr, int(proc.returncode or 0)
 
     def _extract_explicit_workdir(self, events: Sequence[Event]) -> str | None:

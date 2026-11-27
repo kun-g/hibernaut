@@ -38,8 +38,47 @@ where = ["src"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 
-[tool.mypy]
-python_version = "3.12"
-strict = true
-mypy_path = "src"
-packages = ["agent_runtime.core", "agent_runtime.engine"]
+[tool.ruff]
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+# Bug-finding rules only; formatting is not enforced.
+select = [
+    "F",      # pyflakes: undefined names, unused imports/variables, redefinitions
+    "E4", "E7", "E9",  # pycodestyle errors (imports, statements, syntax); no layout rules
+    "B",      # bugbear
+    "UP",     # pyupgrade, for the py311 floor
+    "SIM115", "SIM201", "SIM202", "SIM208", "SIM222", "SIM223",  # unclosed files, contradictory/tautological booleans
+    "PLE", "PLW",  # pylint errors and warnings
+    "RUF",
+]
+ignore = [
+    "RUF001", "RUF002", "RUF003",  # full-width CJK punctuation in strings, docstrings and comments is intended
+    "RUF005", "RUF015", "RUF022",  # style preferences
+    "B905",     # zip(strict=True) would change behaviour on uneven inputs
+    "PLW0108",  # unnecessary lambda: style
+    "PLW0603",  # module-level singletons are updated with `global` on purpose
+    "PLW2901",  # rebinding a loop variable: style
+]
+# Codes of linters this repository does not run, kept on lines that document a deliberate exception.
+external = ["A002", "BLE001", "N802", "N815", "S310"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["agent_runtime.adapters.executor_cli.project_guidance.Selection"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "B023",     # closures are polled within the same loop iteration (wait-until helpers), so late binding is harmless
+    "RUF012",   # class-level constants of test cases and fakes
+    "PLW1510",  # helpers read returncode, or ignore a failure on purpose
+]
+# These modules import shared pytest fixtures by name and take them as parameters of the same name.
+"tests/integration/test_collaboration_flow.py" = ["F811"]
+"tests/integration/test_memory_hub.py" = ["F811"]
+"tests/integration/test_runner_pilot.py" = ["F811"]
+"tests/integration/test_runner_remote.py" = ["F811"]
+"tests/integration/test_sde_memory.py" = ["F811"]
+"tests/unit/test_collaboration_flow.py" = ["F811"]
+"tests/unit/test_memory_hub_wiring.py" = ["F811"]
+"tests/unit/test_sde_memory.py" = ["F811"]

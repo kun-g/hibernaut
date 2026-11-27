@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 from memory_hub.fs_store import MarkdownFileStore
@@ -240,7 +240,7 @@ class _SingleFTSDatabase:
                 content = path.read_text(encoding="utf-8", errors="replace")
                 digest = sha256_text(content)
                 updated_at = (
-                    datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+                    datetime.fromtimestamp(st.st_mtime, tz=UTC)
                     .replace(microsecond=0)
                     .isoformat()
                     .replace("+00:00", "Z")
@@ -282,7 +282,7 @@ class _SingleFTSDatabase:
             content = path.read_text(encoding="utf-8", errors="replace")
             digest = sha256_text(content)
             updated_at = (
-                datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+                datetime.fromtimestamp(st.st_mtime, tz=UTC)
                 .replace(microsecond=0)
                 .isoformat()
                 .replace("+00:00", "Z")

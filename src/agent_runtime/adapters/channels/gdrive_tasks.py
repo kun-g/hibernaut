@@ -532,7 +532,7 @@ class DriveTaskPoller:
                 logging.getLogger(__name__).exception("Google Drive task poll failed")
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
 

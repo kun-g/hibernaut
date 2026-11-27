@@ -7,7 +7,8 @@ import sys
 import tomllib
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Final, Mapping, cast
+from typing import Any, Final, cast
+from collections.abc import Mapping
 
 from runner.cli_drivers import TemplateCLIDriver
 from runner.protocol_check import PROTOCOL_CHECK_EXECUTOR_ID

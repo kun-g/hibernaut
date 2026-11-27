@@ -16,7 +16,7 @@ def test_only_the_configured_owners_receive_the_first_commit():
     policy = parse_repo_tools({"owner": "kun-g", "allowed_owners": ["kun-g", "LambdaTheory"]},
                               RuntimeConfig(), GDriveConfig())
     creator = RepoCreator(config=lambda: policy, drive=lambda: drive, run=github)
-    with pytest.raises(ToolError, match="elsewhere.*kun-g.*LambdaTheory"):
+    with pytest.raises(ToolError, match=r"elsewhere.*kun-g.*LambdaTheory"):
         creator.create(name="auradesk", owner="elsewhere", drive_folder=None, description=None)
     assert github.calls == []
     assert drive.downloads == []

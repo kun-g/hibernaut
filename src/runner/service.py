@@ -12,7 +12,8 @@ import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Final, Mapping, cast
+from typing import Any, Final, cast
+from collections.abc import Callable, Mapping
 from urllib.parse import urlsplit
 
 from runner.check_driver import ProtocolCheckDriver

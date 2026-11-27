@@ -330,7 +330,7 @@ class EndToEndTests(ServedCase):
 
         await self.message("acme/tool 的除法坏了")
         await self.wait_for(lambda: len(self.launches()) == 5, "the developer")
-        ash, ops, again, front, sde = self.launches()
+        ash, _ops, again, front, sde = self.launches()
         for launch in (ash, again):
             self.assertIn("`sys:ops`", arg(launch, "--append-system-prompt"))
             self.assertNotIn("onboard_project", arg(launch, "--allowedTools"))

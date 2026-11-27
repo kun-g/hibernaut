@@ -93,7 +93,7 @@ class ApprovalRunner:
                          final_text="all done")
 
 
-def approval_scenario(body=plan(("Bash", CLEANUP))):
+def approval_scenario(body=plan(("Bash", CLEANUP))):  # noqa: B008 -- read, never mutated
     runner, policy = ApprovalRunner(), Policy({"Bash": "defer"})
     bridge = bridge_to(runner)
     first = execute(bridge, [event(body)], session(), Caps(policy))

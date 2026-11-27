@@ -94,7 +94,7 @@ def registered_repos() -> list[dict[str, Any]]:
     # Synchronous: read while the configuration is parsed, not on the event loop.
     try:
         done = subprocess.run(["orca", "repo", "list", "--json"], stdin=subprocess.DEVNULL, capture_output=True,
-                              timeout=_REPO_LIST_TIMEOUT_SECONDS)
+                              timeout=_REPO_LIST_TIMEOUT_SECONDS, check=False)
         if done.returncode:
             raise RuntimeError((done.stderr or done.stdout).decode(errors="replace").strip()[:2000])
         repos: object = json.loads(done.stdout)["result"]["repos"]

@@ -35,7 +35,6 @@ from agent_runtime.engine.attempts import ATTEMPT_NOTES_KEY, attempt_goal, check
 from agent_runtime.engine.handler import EventHandler
 from memory_hub import MemoryHubConfig
 from tests.support.gdrive_tasks import _FakeDriveClient
-from tests.support.resume_runs import committed
 from tests.support.sde_memory import ALPHA, BETA
 from tests.support.attempt_notes import GOAL, NOTE, Notes, headings
 

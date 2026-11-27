@@ -418,7 +418,7 @@ class EndToEndTests(ChatCase):
     async def test_a_question_is_answered_in_the_chat(self) -> None:
         self.set_plan([reply("收到")])
         await self.chat("测试")
-        [(target, content)] = self.replies()
+        [(_target, content)] = self.replies()
         self.assertIn("收到", content)
         self.assertEqual(self.events(FORWARD_SOURCE), [])
 
@@ -426,7 +426,7 @@ class EndToEndTests(ChatCase):
         self.set_plan([{"calls": [forward("proj:a", "divide must reject zero", title="Zero")]}], [WORK])
         await self.chat("divide is broken")
         self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde"])
-        [(target, content)] = self.replies()
+        [(_target, content)] = self.replies()
         self.assertIn("implemented", content)
         [session] = self.daemon.sessions.list_sessions(inbox_id="proj:a")
         self.assertIn("divide must reject zero", self.launches()[1]["prompt"])
@@ -439,7 +439,7 @@ class EndToEndTests(ChatCase):
         self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde", "steward"])
         self.assertIn("implemented", self.launches()[2]["prompt"])
         self.assertIn("--resume", self.launches()[2]["argv"])
-        [(target, content)] = self.replies()
+        [(_target, content)] = self.replies()
         self.assertIn("checked: all good", content)
         [back] = self.events(RETURN_SOURCE)
         self.assertEqual((back.inbox_id, back.payload["forwarded_from"]), (ASH, "proj:a"))
