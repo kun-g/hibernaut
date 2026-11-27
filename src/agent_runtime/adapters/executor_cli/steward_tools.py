@@ -42,7 +42,12 @@ class EventLister(Protocol):
     ) -> list[Event]: ...
 
 
-class SystemTools(Protocol):
+class StatusTools(Protocol):
+    # How Hibernaut has been running: summaries as JSON text, read only.
+    def status(self, *, hours: int, timer_runs: int) -> str: ...
+
+
+class SystemTools(StatusTools, Protocol):
     # What a Steward with system tools may do to the deployment; each call blocks, so it runs in a thread. A failure is
     # raised as ToolError with the reason and what was left behind.
     def check(self) -> str: ...
@@ -52,8 +57,6 @@ class SystemTools(Protocol):
     def complete(self, *, name: str, description: str | None) -> str: ...
 
     # Read only: a summary of failures, suspensions, deliveries, undelivered messages and timer firings.
-    def status(self, *, hours: int, timer_runs: int) -> str: ...
-
     # Whether a path must not be shown to it: the deployment file and what is written beside it.
     def hides(self, path: Path) -> bool: ...
 
@@ -196,21 +199,26 @@ def _system_definitions() -> list[dict[str, Any]]:
          "inputSchema": _schema(
              ("name",), name={**_TEXT, "description": "The project's name, from check_projects."}, description=description,
          )},
-        {"name": "runtime_status",
-         "description": "How Hibernaut has been running, read only: failed tasks, suspended tasks and what each waits "
-                        "for (approval, an answer, the user to leave the computer, a retry), delivery results, Outbox "
-                        "messages that did not go out, and the last firings of each [[timers]] entry with their "
-                        "results. Summaries only; it also says which time it covers and what it cannot see.",
-         "inputSchema": _schema(
-             hours={"type": "integer", "minimum": 1, "maximum": _MAX_STATUS_HOURS,
-                    "description": f"How far back to look; default {_STATUS_HOURS}."},
-             timer_runs={"type": "integer", "minimum": 1, "maximum": _MAX_TIMER_RUNS,
-                         "description": f"Firings to show per timer; default {_TIMER_RUNS}."},
-         )},
     ]
     for tool in found:
         tool["inputSchema"] = {**cast(dict[str, Any], tool["inputSchema"]), "additionalProperties": False}
     return found
+
+
+def _status_definition() -> dict[str, Any]:
+    return {
+        "name": "runtime_status",
+        "description": "How Hibernaut has been running, read only: failed tasks, suspended tasks and what each waits "
+                       "for (approval, an answer, the user to leave the computer, a retry), delivery results, Outbox "
+                       "messages that did not go out, and the last firings of each [[timers]] entry with their "
+                       "results. Summaries only; it also says which time it covers and what it cannot see.",
+        "inputSchema": {**_schema(
+            hours={"type": "integer", "minimum": 1, "maximum": _MAX_STATUS_HOURS,
+                   "description": f"How far back to look; default {_STATUS_HOURS}."},
+            timer_runs={"type": "integer", "minimum": 1, "maximum": _MAX_TIMER_RUNS,
+                        "description": f"Firings to show per timer; default {_TIMER_RUNS}."},
+        ), "additionalProperties": False},
+    }
 
 
 @dataclass(slots=True)
@@ -227,6 +235,8 @@ class StewardTools:
     projectless: bool = False
     # Set only for a Steward whose inbox has system tools; without it they are neither offered nor served.
     system: SystemTools | None = None
+    # Set for a Steward that may read how Hibernaut has been running; the system tools include it.
+    status: StatusTools | None = None
     calls: int = 0
     # Forwards this Run took; they go out once it ends in anything but a failure.
     forwarded: int = 0
@@ -234,7 +244,7 @@ class StewardTools:
     deferred: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
 
     @staticmethod
-    def definitions(*, projectless: bool = False, system: bool = False) -> list[dict[str, Any]]:
+    def definitions(*, projectless: bool = False, system: bool = False, status: bool = False) -> list[dict[str, Any]]:
         where = "your own inbox or a project in the routing manifest" if projectless else "this project"
         memory = "your inbox's memory" if projectless else "the project memory"
         whose = "your inbox's" if projectless else "the project's"
@@ -300,10 +310,14 @@ class StewardTools:
                             "to be readable to you; --stat and --name-only need none.",
              "inputSchema": _schema(("args",), args={**_TEXTS, "description": 'e.g. ["log", "--oneline", "-10"]'})},
         ]
-        if not system:
-            return tools
-        # It passes no work on.
-        return [*_system_definitions(), *(tool for tool in tools if tool["name"] != "forward_to_inbox")]
+        if system:
+            # It passes no work on.
+            return [*_system_definitions(), _status_definition(),
+                    *(tool for tool in tools if tool["name"] != "forward_to_inbox")]
+        return [*tools, _status_definition()] if status else tools
+
+    def reads_status(self) -> bool:
+        return self.system is not None or self.status is not None
 
     async def call(self, name: object, arguments: object) -> tuple[str, bool]:
         # (answer, is_error)
@@ -325,7 +339,9 @@ class StewardTools:
         if self.system is not None:
             del handlers["forward_to_inbox"]
             handlers |= {"check_projects": self._check_projects, "onboard_project": self._onboard_project,
-                         "complete_project": self._complete_project, "runtime_status": self._runtime_status}
+                         "complete_project": self._complete_project}
+        if self.reads_status():
+            handlers["runtime_status"] = self._runtime_status
         handler = handlers.get(name) if isinstance(name, str) else None
         if handler is None:
             return f"unknown tool {name}", True
@@ -342,12 +358,15 @@ class StewardTools:
         if decision.action != "allow":
             raise ToolError(f"{tool} is not permitted ({decision.action}): {decision.reason}")
 
-    def _system(self, tool: str, arguments: dict[str, Any], *keys: str) -> SystemTools:
-        assert self.system is not None
+    def _named(self, tool: str, arguments: dict[str, Any], *keys: str) -> None:
         unknown = sorted(set(arguments) - set(keys))
         if unknown:
             raise ToolError(f"{tool} takes {', '.join(keys) or 'no arguments'}, not {', '.join(unknown)}")
         self._allow(tool, arguments)
+
+    def _system(self, tool: str, arguments: dict[str, Any], *keys: str) -> SystemTools:
+        assert self.system is not None
+        self._named(tool, arguments, *keys)
         return self.system
 
     async def _check_projects(self, arguments: dict[str, Any]) -> str:
@@ -368,8 +387,10 @@ class StewardTools:
     async def _runtime_status(self, arguments: dict[str, Any]) -> str:
         hours = _bounded(arguments, "hours", _STATUS_HOURS, _MAX_STATUS_HOURS)
         timer_runs = _bounded(arguments, "timer_runs", _TIMER_RUNS, _MAX_TIMER_RUNS)
-        system = self._system("runtime_status", arguments, "hours", "timer_runs")
-        return await asyncio.to_thread(system.status, hours=hours, timer_runs=timer_runs)
+        reader = self.system or self.status
+        assert reader is not None
+        self._named("runtime_status", arguments, "hours", "timer_runs")
+        return await asyncio.to_thread(reader.status, hours=hours, timer_runs=timer_runs)
 
     def _readable(self, path: str) -> bool:
         # Every way a file's content is shown passes the gate as a read of that file.
@@ -540,6 +561,7 @@ class StewardTools:
         if item is None:
             return {"text": "malformed request", "error": True}
         if item.get("op") == "tools":
-            return {"tools": self.definitions(projectless=self.projectless, system=self.system is not None)}
+            return {"tools": self.definitions(projectless=self.projectless, system=self.system is not None,
+                                              status=self.status is not None)}
         text, error = await self.call(item.get("name"), item.get("arguments"))
         return {"text": text, "error": error}

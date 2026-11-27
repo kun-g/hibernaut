@@ -149,11 +149,12 @@ class BindingConfigTests(unittest.TestCase):
 
 
 class GlobalSkillTests(unittest.TestCase):
-    def test_r9_r11_the_chat_s_steward_forwards_questions_about_how_hibernaut_runs(self) -> None:
+    def test_r11_the_chat_s_steward_answers_how_hibernaut_runs_itself_with_runtime_status(self) -> None:
         skill = (Path(__file__).resolve().parents[2] / "src/agent_runtime/adapters/executor_cli/skills/steward-global"
                  / "SKILL.md").read_text()
         rule = next(p for p in skill.split("\n- ") if "how Hibernaut has been running" in p)
-        for said in ("system inbox", "[[timers]]", "could be improved", "not from `list_events` or `list_sessions`"):
+        for said in ("`runtime_status`", "[[timers]]", "could be improved", "not from `list_events` or `list_sessions`",
+                     "do not forward"):
             self.assertIn(said, rule)
 
 
@@ -166,6 +167,17 @@ class ToolListTests(unittest.TestCase):
         for kwargs in ({}, {"projectless": True}):
             self.assertFalse(set(SYSTEM_TOOLS) & set(names(**kwargs)))
         self.assertNotIn("forward_to_inbox", names(projectless=True, system=True))
+
+    def test_r11_c4_a_steward_given_the_status_reads_it_and_gets_no_system_tool(self) -> None:
+        def names(**kwargs: Any) -> list[str]:
+            return [tool["name"] for tool in StewardTools.definitions(**kwargs)]
+
+        ash = names(projectless=True, status=True)
+        self.assertLessEqual({"runtime_status", "list_sessions", "list_events", "forward_to_inbox"}, set(ash))
+        self.assertFalse(set(SYSTEM_TOOLS) & set(ash))
+        self.assertEqual(names(projectless=True, status=True, system=True).count("runtime_status"), 1)
+        for kwargs in ({}, {"projectless": True}):
+            self.assertNotIn("runtime_status", names(**kwargs))
 
     def test_c1_the_tools_take_named_values_and_no_free_configuration(self) -> None:
         found = {t["name"]: t["inputSchema"] for t in StewardTools.definitions(projectless=True, system=True)}

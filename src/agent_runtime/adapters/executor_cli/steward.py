@@ -28,7 +28,7 @@ from agent_runtime.adapters.executor_cli.orca import (
 from agent_runtime.adapters.executor_cli.process import ProcessTimeout, is_approval
 from agent_runtime.adapters.executor_cli.role_skills import builtin_skill
 from agent_runtime.adapters.executor_cli.steward_git import ToolError, exec_git
-from agent_runtime.adapters.executor_cli.steward_tools import EventLister, StewardTools, SystemTools
+from agent_runtime.adapters.executor_cli.steward_tools import EventLister, StatusTools, StewardTools, SystemTools
 from agent_runtime.adapters.memory_fs import baseline_segments
 from agent_runtime.core.models import (
     Emit,
@@ -117,8 +117,9 @@ def _launcher_args() -> list[str]:
     return ["-I", str(Path(steward_mcp.__file__).resolve())]
 
 
-def _allowed_tools(system: bool = False) -> str:
-    tools = [f"mcp__{steward_mcp.SERVER_NAME}__{tool['name']}" for tool in StewardTools.definitions(system=system)]
+def _allowed_tools(system: bool = False, status: bool = False) -> str:
+    tools = [f"mcp__{steward_mcp.SERVER_NAME}__{tool['name']}"
+             for tool in StewardTools.definitions(system=system, status=status)]
     return ",".join(tools)
 
 
@@ -204,6 +205,8 @@ class GlobalScope:
     readable: Callable[[str, str], bool]
     # Set for the Steward of a system inbox.
     system: SystemTools | None = None
+    # How Hibernaut has been running, for a Steward of no system inbox; read only.
+    status: StatusTools | None = None
 
 
 class StewardExecutor:
@@ -257,6 +260,7 @@ class StewardExecutor:
             caps=caps, checkout=directory.resolve(), inbox_id=inbox_id, sessions=self._sessions,
             events=self._events, in_project=self._readable(inbox_id), projectless=self._scope is not None,
             system=self._scope.system if self._scope is not None else None,
+            status=self._scope.status if self._scope is not None else None,
         )
         pending = session.pending_request_id if session is not None else None
         state = _State.load(session.checkpoint) if session is not None and pending else None
@@ -415,7 +419,7 @@ class StewardExecutor:
             server = {"command": sys.executable, "args": [*_launcher_args(), socket_path]}
             role_args = (
                 "--tools", "",
-                "--allowedTools", _allowed_tools(tools.system is not None),
+                "--allowedTools", _allowed_tools(tools.system is not None, tools.status is not None),
                 "--disallowedTools", ",".join(_REFUSED_TOOLS),
                 "--strict-mcp-config",
                 "--mcp-config", json.dumps({"mcpServers": {steward_mcp.SERVER_NAME: server}}),

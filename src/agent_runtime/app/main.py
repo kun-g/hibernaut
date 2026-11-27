@@ -150,7 +150,7 @@ from agent_runtime.app.projects import (
     project_memory_key,
 )
 from agent_runtime.app.reload import ReloadStatus
-from agent_runtime.app.system_tools import SystemToolbox
+from agent_runtime.app.system_tools import RuntimeStatus, SystemToolbox
 from agent_runtime.core.models import Event, InboxBinding, InboxRoute, NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, OutboxPort, RunCapabilities
 from agent_runtime.engine import (
@@ -1296,6 +1296,9 @@ def build_daemon_from_config(
             ),
         )
 
+        # The chat's Steward reads the same status as the system Steward, without any system tool.
+        runtime_status = RuntimeStatus(ops_status, daemon.reloads)
+
         def _bound_steward(role: RoleConfig, bound: WorkdirBinding) -> StewardExecutor:
             def listed(inbox_id: str) -> tuple[ProjectConfig, ...]:
                 route = _route(inbox_id)
@@ -1339,6 +1342,7 @@ def build_daemon_from_config(
                         allowed=lambda: targets.has_system_tools(bound.rule.literal or ""),
                         status=ops_status,
                     ) if bound.system_tools else None,
+                    status=None if bound.system_tools else runtime_status,
                 ),
             )
 

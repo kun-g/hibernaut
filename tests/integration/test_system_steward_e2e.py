@@ -654,6 +654,31 @@ class BoundaryTests(ServedCase):
                          [f"unknown tool {t['tool']}" for t in (*wanted, *wanted)])
         self.assertEqual(self.path.read_text(), self.before)
 
+    async def test_r11_c4_the_chat_s_steward_answers_how_hb_runs_itself_with_the_same_read_only_tool(self) -> None:
+        from agent_runtime.adapters.channels.mcp_server import _TOOL_DEFINITIONS
+
+        await self.serve()
+        wanted = [tool("runtime_status", hours=24), ONBOARD, tool("complete_project", name="a"),
+                  tool("hibernaut_close_session", session_id="s")]
+        self.set_plan([{"calls": wanted, **reply("近 24 小时：0 个失败")}])
+        await self.message("hb 最近运转得怎样")
+        await self.wait_for(lambda: any("近 24 小时" in r for r in self.replies()), "Ash's own answer")
+        [ash] = self.launches()
+        self.assertEqual(list(json.loads(arg(ash, "--mcp-config"))["mcpServers"]), ["hibernaut_steward"])
+        self.assertEqual(arg(ash, "--tools"), "")
+        given = {name.removeprefix("mcp__hibernaut_steward__") for name in arg(ash, "--allowedTools").split(",")}
+        self.assertLessEqual({"runtime_status", "list_sessions", "list_events"}, given)
+        # Neither the system Steward's onboarding and configuration tools nor any of hb's control plane.
+        control = {t["name"] for t in _TOOL_DEFINITIONS}
+        self.assertFalse(given & ({"check_projects", "onboard_project", "complete_project"} | control), given)
+        [(failed, said), *refused] = self.answers()
+        self.assertFalse(failed, said)
+        self.assertEqual(set(json.loads(said)), {"window", "failed", "suspended", "deliveries", "undelivered_messages",
+                                                 "timers", "not_covered"})
+        self.assertEqual([s for f, s in refused if f], [f"unknown tool {t['tool']}" for t in wanted[1:]])
+        self.assertEqual(self.events(FORWARD_SOURCE), [])
+        self.assertEqual(self.path.read_text(), self.before)
+
     async def test_c6_a_project_cannot_send_work_to_it(self) -> None:
         await self.serve()
         self.set_plan([{"calls": [forward(OPS, "onboard evil/x"), forward(OPS, "x", return_to="proj:a")]}])

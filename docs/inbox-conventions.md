@@ -95,7 +95,7 @@ forward_to = ["proj:hibernaut", "proj:sure"]
 
 ## 系统 Steward
 
-接入项目、检查和补齐项目配置。需求与编号见 [`requirements/system-steward.md`](requirements/system-steward.md)。人在单聊跟全局 Steward 说，由它转交，结果按普通转投的回信方式回到原单聊；或在 `[[feishu_groups]]` 绑定的群里直接说（只认 `members` 列出的人），答复回群里的同一话题。问 hb 运转得怎样、某个 `[[timers]]` 执行得如何、有什么可优化的，全局 Steward 同样转给它，不用 `list_events`、`list_sessions` 自己答：那两个看不到任务在等什么、交付怎么结束、定时任务的 Run 怎么结束。
+接入项目、检查和补齐项目配置。需求与编号见 [`requirements/system-steward.md`](requirements/system-steward.md)。人在单聊跟全局 Steward 说，由它转交，结果按普通转投的回信方式回到原单聊；或在 `[[feishu_groups]]` 绑定的群里直接说（只认 `members` 列出的人），答复回群里的同一话题。问 hb 运转得怎样、某个 `[[timers]]` 执行得如何、有什么可优化的，全局 Steward 不必转交：它也有同一份只读的 `runtime_status`（和系统 Steward 共用一份实现），直接答，不只凭 `list_events`、`list_sessions`（那两个看不到任务在等什么、交付怎么结束、定时任务的 Run 怎么结束）。它只多这一个只读工具，没有 `check_projects`、`onboard_project`、`complete_project`，也拿不到 hb MCP 控制面（`--strict-mcp-config` 只挂 Steward 自己的工具服务）。
 
 SDE 等用户离开电脑（任务说要等空闲再做）时按契约返回 `needs_input`，问题以 `WAIT_IDLE` 开头；`runtime_status` 据此把它列为 `user_away`，与等人回答的 `answer` 分开。
 
