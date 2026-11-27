@@ -47,7 +47,10 @@ class RuntimeStatus:
 
     def status(self, *, hours: int, timer_runs: int) -> str:
         try:
-            text = json.dumps(self._reader.report(hours=hours, timer_runs=timer_runs), ensure_ascii=False, indent=1)
+            report = self._reader.report(hours=hours, timer_runs=timer_runs)
+            if (rejection := self._reloads.rejection()) is not None:
+                report["config_reload"] = rejection
+            text = json.dumps(report, ensure_ascii=False, indent=1)
         except OSError as exc:
             raise ToolError(_scrubbed(self._reloads, str(exc))) from exc
         # Error texts come from commands and services: what they repeat of a credential does not get out.

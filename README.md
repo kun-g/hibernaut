@@ -79,6 +79,8 @@ curl -s localhost:8080/events -H 'Content-Type: application/json' -d @docs/dispa
 
 Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.example.toml`](hibernaut.example.toml)。保存后自动热加载：入口、消息发送和 Drive 轮询继续运行，进行中的任务用旧配置跑完，新事件用新配置；非法配置保留当前设置；改存储路径、`[switchboard]`、`[memory_hub]`、`[collaboration]` 或 `[experts]` 需要重启。
 
+改配置时，在原文件同目录编辑副本，运行 `python -m agent_runtime.app.main --config 候选文件.toml --check`。退出 0 时会显示项目数、Inbox 绑定数（全局与项目之和）和定时器数。退出 1 时按 stderr 里的路径和字段修正。替换原文件后可再查一次。问 Steward 配置是否生效，`runtime_status` 的 `config_reload` 会列出拒绝原因及仍在用的配置指纹。
+
 | 配置段 | 管什么 |
 | :--- | :--- |
 | `[runtime]` | 数据库与记忆目录、全局并发上限 `max_concurrency`、新事件策略（`defer` / `fold` / `interrupt`）、全局默认 Agent（`default_agent`，旧键 `default_executor`）；`ledger_db_path` 是执行账本的独立数据库（默认 `db_path` 同目录的 `ledger.db`，运行日志在它旁边的 `logs/runs/`） |
@@ -189,6 +191,7 @@ Steward 路由测试在配置的工作目录启动模拟 CLI，通过 MCP 调用
 
 ```bash
 pip install -e ".[dev]"
+python -m agent_runtime.app.main --config hibernaut.toml --check   # 只校验部署配置
 lint-imports   # 分层与反向依赖检查
 pytest -n auto --dist worksteal -v   # 单元和集成测试全量（本地快检可用 pytest -n auto $(python scripts/select_tests.py)）
 pyright        # core/、engine/、switchboard/、ccpeer/、taskboard/、runner/、ledger/、dashboard/、collaboration/ 的 strict 类型检查
