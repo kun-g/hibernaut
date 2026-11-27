@@ -85,8 +85,15 @@ class TestSDEDelivery(SDEDeliveryCase):
         executor = self.executor(review=False, delivery=self.delivery())
         outcome = await executor.execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Suspend), outcome
-        self.assertIn("[sde] delivery pending: gh pr create failed", outcome.prompt)
-        self.assertIn("Approve to retry the delivery step", outcome.prompt)
+        summary, approve_line, reject_line, details = outcome.prompt.split("\n", 3)
+        self.assertIn("任务「Reject zero divisors」", summary)
+        self.assertIn("创建 PR", summary)
+        self.assertIn("批准：重试", approve_line)
+        self.assertIn("拒绝：", reject_line)
+        self.assertIn("结束", reject_line)
+        self.assertTrue(details.lstrip().startswith("详情"))
+        self.assertIn("gh pr create failed", details)
+        self.assertIn(str(self.wt), details)
         approve = event({"approval_request_id": outcome.request_id, "approved": True})
         resumed = await executor.execute([approve], self.resume(outcome), self.caps)
         assert isinstance(resumed, Emit), resumed

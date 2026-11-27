@@ -1156,13 +1156,7 @@ class SDEExecutor:
                            session_checkpoint=state.dump(), session_id=session_id, executor_session_id=native,
                            resume_after_seconds=60 * delay)
         elif state.stage == "delivery_pending":
-            record = self._record(state)
-            prompt = "\n".join([
-                f"[{name}] delivery pending: {state.reason}",
-                f"The change is committed in {state.workdir} (review={state.review_status}).",
-                *(record.render() if record is not None else []),
-                "Approve to retry the delivery step; reject to deliver it as it stands.",
-            ])
+            prompt = self._delivery_prompt(state)
         elif state.stage == "no_reviewer":
             prompt = (
                 f"[{name}] review pending: {state.reason}\n"
@@ -1189,6 +1183,31 @@ class SDEExecutor:
             session_id=session_id,
             executor_session_id=native,
         )
+
+    def _delivery_prompt(self, state: _State) -> str:
+        record = self._record(state) or DeliveryRecord()
+        title = _first_line(state.title or state.requirements)[:120] or state.work_key
+        task = f"任务「{title}」" if title else "本次任务"
+        if record.pr_number:
+            task += f"（PR #{record.pr_number}）"
+        summary = record.problem_summary or "上次交付遇到错误，需要重新确认进度"
+        if record.state == "pr_open" and self._delivery and self._delivery.config.auto_merge:
+            retry = "重新检查并尝试合并 PR"
+        elif record.state == "local":
+            retry = "重试交付，继续推送分支并创建或复用 PR"
+        else:
+            retry = "从已记录的进度重试交付"
+        keep = "保留 PR 的现状，不再尝试合并" if record.state == "pr_open" else "保留已有提交，停止后续交付"
+        return "\n".join([
+            f"{task}：{summary}。", f"批准：{retry}。", f"拒绝：{keep}，任务结束。",
+            "", "详情", f"工作区：{state.workdir}", f"评审：{state.review_status}",
+            *([f"PR: {record.pr_url}"] if record.pr_url else []),
+            *([f"版本：{record.version}"] if record.version else []),
+            *([f"CI：{record.ci}"] if record.ci else []),
+            *(f"仓库检查：{c['command']}（退出码 {c['exit_code']}）" for c in record.checks),
+            f"错误记录：{state.reason}", *record.history[-5:],
+            "等待期间如有补充需求，批准后先处理补充需求，再继续交付。",
+        ])
 
     def _settings(self) -> str:
         p = self._profile
@@ -1258,8 +1277,8 @@ class SDEExecutor:
             # Recoverable: the record keeps what already happened, so approval resumes from there.
             reason = record.problem
             if state.delivery_retries:
-                delays = ", ".join(str(n) for n in _DELIVERY_RETRY_MINUTES[:state.delivery_retries])
-                reason = f"After {state.delivery_retries} automatic retries ({delays} min): {reason}"
+                delays = "、".join(str(n) for n in _DELIVERY_RETRY_MINUTES[:state.delivery_retries])
+                reason = f"已分别等待 {delays} 分钟，自动重试 {state.delivery_retries} 次后仍失败。\n{reason}"
             if record.handback and state.handbacks:
                 reason += (f"\nHanded back to the developer {state.handbacks} time(s) already (limit {limit}); "
                            "a person decides now.")

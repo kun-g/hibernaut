@@ -10,8 +10,8 @@ from tests.support.sde_delivery import PASS, SDEDeliveryCase, dev, event
 
 
 class TestDeliveryRetry(SDEDeliveryCase):
-    def start_delivery(self, failures, error, **delivery_options):
-        self.state_file.write_text(json.dumps({**self.gh_state(), "fail": {"create": failures}, "fail_error": error}))
+    def start_delivery(self, failures, error, step="create", **delivery_options):
+        self.state_file.write_text(json.dumps({**self.gh_state(), "fail": {step: failures}, "fail_error": error}))
         self.set_plan(sde=[dev({"calc.py": "x = 1\n"})], reviewer=[PASS])
         self.inbox, self.outbox, self.lock = InMemoryInbox(), InMemoryOutbox(), InMemoryLock()
         self.timers = SQLiteTimerAdapter(self.db)
@@ -45,19 +45,23 @@ class TestDeliveryRetry(SDEDeliveryCase):
         assert self.check_log.read_text().splitlines() == ["ran"]
 
     async def test_persistent_failure_asks_once_with_delays_and_latest_error(self):
-        self.start_delivery(4, "HTTP 502: Bad Gateway")
+        self.start_delivery(4, 'Post "https://api.github.com/graphql": EOF', step="checks")
         for delay in (1, 5, 15):
             await self.advance_retry(delay)
         state = self.gh_state()
-        state["fail_error"] = "HTTP 503: temporarily unavailable"
+        state["fail_error"] = "connection closed by peer"
         self.state_file.write_text(json.dumps(state))
         [report] = await self.worker.process_inbox("proj:x")
         assert isinstance(report.outcome, Suspend)
         [ask] = [m for m in self.outbox.fetch_pending() if m.metadata.get("kind") == "approval_request"]
-        assert "3 automatic retries (1, 5, 15 min)" in ask.content
-        assert "HTTP 503: temporarily unavailable" in ask.content
+        summary, approve, reject, details = ask.content.split("\n", 3)
+        assert all(s in summary for s in ("PR #1", "检查状态", "连接中断"))
+        assert "批准：" in approve and "合并" in approve
+        assert "拒绝：" in reject and "合并" in reject and "结束" in reject
+        assert details.lstrip().startswith("详情")
+        assert "1、5、15 分钟" in details and state["fail_error"] in details
         assert self.scheduler.tick("9999") == 0
-        assert len(self.gh_calls("create")) == 4
+        assert len(self.gh_calls("checks")) == 4
 
     async def test_forbidden_asks_immediately(self):
         self.start_delivery(1, "HTTP 403: Resource not accessible by integration")
