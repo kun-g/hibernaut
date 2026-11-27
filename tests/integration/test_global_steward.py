@@ -30,6 +30,7 @@ from tests.support.steward import arg, git_state
 from tests.support.switchboard_inbound import feishu_message
 from tests.support.visible_roles import FakeOrcaTerminals, poll_test_terminals
 from tests.support.global_steward import ASH, forward, reply
+from tests.support.jsonl import read_jsonl
 
 
 CHAT = "feishu:p2p:oc_kun"
@@ -175,7 +176,7 @@ class AshCase(unittest.IsolatedAsyncioTestCase):
             return conn.execute(sql).fetchall()
 
     def calls(self) -> list[dict[str, Any]]:
-        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return read_jsonl(self.log)
 
     def launches(self) -> list[dict[str, Any]]:
         return [c for c in self.calls() if "answers" not in c and c["role"] != "probe"]

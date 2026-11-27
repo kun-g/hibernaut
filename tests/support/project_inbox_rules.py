@@ -12,6 +12,7 @@ from pathlib import Path
 from agent_runtime.app.config import load_config
 from agent_runtime.app.main import build_daemon_from_config
 from tests.support.sde_executor import make_base_repo
+from tests.support.jsonl import read_jsonl
 
 
 FAKE_CLI = textwrap.dedent(
@@ -97,7 +98,7 @@ class _DispatchCase(unittest.IsolatedAsyncioTestCase):
         return dict(self.rows("SELECT inbox_id, content FROM outbox ORDER BY seq"))
 
     def cli_runs(self):
-        return [json.loads(line) for line in self.cli_log.read_text().splitlines()] if self.cli_log.exists() else []
+        return read_jsonl(self.cli_log)
 
     def assert_primary_untouched(self):
         self.assertEqual(git(self.repo, "status", "--porcelain", "--untracked-files=all"), "")

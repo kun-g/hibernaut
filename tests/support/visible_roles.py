@@ -24,6 +24,7 @@ from tests.support.empty_guidance import empty_project_guidance
 from tests.support.fakes import InMemoryPermission
 from tests.support.coder_reviewer import fake_command, git
 from tests.support.sde_executor import make_base_repo
+from tests.support.jsonl import read_jsonl
 
 
 def poll_test_terminals(root):
@@ -201,7 +202,7 @@ class VisibleCase(unittest.IsolatedAsyncioTestCase):
         )
 
     def calls(self, role=None, mode=None):
-        rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        rows = read_jsonl(self.log)
         return [r for r in rows if (role is None or r["role"] == role) and (mode is None or r["mode"] == mode)]
 
     def payload(self, **extra):

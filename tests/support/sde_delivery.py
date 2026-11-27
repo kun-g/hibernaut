@@ -16,6 +16,7 @@ from tests.support.empty_guidance import empty_project_guidance
 from tests.support.fakes import InMemoryPermission
 from tests.support.coder_reviewer import fake_command
 from tests.support.pr_delivery import DeliveryCase
+from tests.support.jsonl import read_jsonl
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -73,7 +74,7 @@ class SDEDeliveryCase(DeliveryCase, unittest.IsolatedAsyncioTestCase):
                 "explicit_workdir": str(self.wt), "base_ref": "origin/main", **extra}
 
     def calls(self, role=None):
-        rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        rows = read_jsonl(self.log)
         return [r for r in rows if role is None or r["role"] == role]
 
     @staticmethod

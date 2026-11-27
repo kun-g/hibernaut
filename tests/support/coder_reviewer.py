@@ -1,6 +1,5 @@
 import atexit
 import functools
-import json
 import os
 import shutil
 import subprocess
@@ -16,6 +15,7 @@ from agent_runtime.adapters.storage_sqlite import SQLiteDatabase
 from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from tests.support.fakes import InMemoryPermission
+from tests.support.jsonl import read_jsonl
 
 
 FAKE_CLAUDE = Path(__file__).with_name("fake_claude.py")
@@ -101,7 +101,7 @@ class ReviewerCase(unittest.IsolatedAsyncioTestCase):
                                      tasks=SQLiteTaskMetadataStore(self.db))
 
     def calls(self):
-        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return read_jsonl(self.log)
 
     def payload(self, **extra):
         return {

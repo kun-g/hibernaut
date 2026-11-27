@@ -28,6 +28,7 @@ from agent_runtime.core.models import Emit, Event, SessionRef, Suspend
 from tests.support.fakes import InMemoryPermission
 from tests.support.review_flow_support import DONE, ReviewFlowCase
 from tests.support.coder_reviewer import fake_command, git
+from tests.support.jsonl import read_jsonl
 
 GENERAL = "# rules\nGENERAL-RULE: run `make check` before committing.\nDetailed rules: guidance.toml.\n"
 VERSIONING = "# Versioning\nVERSIONING-BODY: bump VERSION and src/pkg/__init__.py in the same commit.\n"
@@ -240,7 +241,7 @@ class _Harness(unittest.IsolatedAsyncioTestCase):
         self.plan.write_text(json.dumps({"sde": list(sde), "reviewer": list(reviewer)}))
 
     def calls(self, role=None):
-        rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        rows = read_jsonl(self.log)
         return [r for r in rows if role is None or r["role"] == role]
 
     def reviewer(self):

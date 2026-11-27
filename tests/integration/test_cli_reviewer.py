@@ -28,6 +28,7 @@ from tests.support.coder_reviewer import CHANGES_REQUESTED, fake_command, make_r
 from tests.support.pr_delivery import DeliveryCase
 from tests.support.visible_roles import FakeOrcaTerminals
 from tests.support.cli_reviewer import CLIPlan, EVIDENCE, ORCA_LOG, PASS, TerminalCase, cli_command
+from tests.support.jsonl import read_jsonl
 
 
 REAL_ORCA = orca_module._orca
@@ -177,7 +178,7 @@ class TestSDEWithCLIReviewer(DeliveryCase, unittest.IsolatedAsyncioTestCase):
                      correlation_key="task:1")
 
     def dev_calls(self):
-        return [json.loads(ln) for ln in self.log.read_text().splitlines()] if self.log.exists() else []
+        return read_jsonl(self.log)
 
     async def test_a_cli_pass_counts_as_review_pass_for_a_merge_that_requires_review(self):
         self.set_dev(({"calc.py": "x = 1\n"}, "divide fixed"))

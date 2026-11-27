@@ -19,6 +19,7 @@ from agent_runtime.core.models import Emit
 from tests.support.coder_reviewer import _Capture, fake_command, git
 from tests.support.sde_executor import EVIDENCE, FIXED, PASS, dev, event, make_base_repo
 from tests.support.visible_roles import FakeOrcaTerminals, VisibleCase, arg, build_terminal_daemon
+from tests.support.jsonl import read_jsonl
 
 
 class TestReviewerChannel(VisibleCase):
@@ -159,7 +160,7 @@ class TestIndependentEventsTalk(unittest.TestCase):
                     "SELECT correlation_key, executor_id, executor_session_id, session_id FROM sessions")}
 
         def calls(role):
-            rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            rows = read_jsonl(log)
             return [r for r in rows if r["role"] == role and r["mode"] == "interactive"]
 
         async def scenario():
