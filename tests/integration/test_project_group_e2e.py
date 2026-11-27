@@ -91,9 +91,16 @@ class GroupTests(ProjectGroupCase):
     ) -> None:
         await self.serve()
         self.set_plan(
-            [{"calls": [forward("proj:a:sde", "订单页加导出（郭勇已确认）")]}],
+            [{"calls": [forward("proj:a:sde", "订单页加导出（郭勇已确认）")]},
+             {"output": {"action": "escalate", "category": "改需求", "message": "导出格式将成为对客户的承诺。",
+                         "recommendation": "批准"}}],
             [{"commit": False, "output": {"status": "needs_input", "summary": "", "test_evidence": "",
-                                          "question": "CSV 还是 Excel？", "change_kind": "feature", "change_rationale": "x"}},
+                         "question": "订单导出采用 CSV（逗号分隔的表格文件）吗？",
+                         "decision": {"background": "订单页需要提供导出功能，目前在确认文件格式。",
+                                      "reason": "合作方确认了要导出订单，具体格式需要项目负责人决定。",
+                                      "approve": "按逗号分隔的表格格式继续处理订单导出",
+                                      "reject": "保留订单页现有的导出方式", "recommendation": "批准"},
+                         "change_kind": "feature", "change_rationale": "订单导出新增格式选择"}},
              {"commit": False, "output": {"status": "done", "summary": "导出已经有了，不用改", "test_evidence": "pytest: 3 passed",
                          "change_kind": "test_docs", "change_rationale": "nothing changed", "code_change": False}}],
         )
@@ -107,12 +114,13 @@ class GroupTests(ProjectGroupCase):
         [sent] = cards()
         self.assertEqual(sent["json"]["receive_id"], "oc_approvals")
         self.assertIn("CSV", sent["json"]["content"])
+        self.assertIn("对客户的承诺", json.loads(sent["json"]["content"])["elements"][0]["content"])
         self.assertEqual(self.thread_replies("om_1"), [])
         value = next(el for el in json.loads(sent["json"]["content"])["elements"] if el["tag"] == "action")
         status, refused = await asyncio.to_thread(post, f"{self.board.url}/webhooks/feishu",
                                                   card_click(value["actions"][0]["value"], operator=PARTNER))
         self.assertEqual((status, refused["toast"]["type"]), (200, "error"))
-        self.assertEqual(len(self.launches()), 2)
+        self.assertEqual(len(self.launches()), 3)
         await asyncio.to_thread(post, f"{self.board.url}/webhooks/feishu",
                                 card_click(value["actions"][0]["value"], operator=KUN))
         # What the developer finally says goes back to the group's thread.
@@ -124,7 +132,7 @@ class GroupTests(ProjectGroupCase):
         self.assertIn("导出已经有了，不用改", report)
         self.assertIn("pytest: 3 passed", report)
         self.assertEqual([e.inbox_id for e in self.events(FORWARD_SOURCE)], ["proj:a:sde"])
-        self.assertEqual([launch["role"] for launch in self.launches()], ["steward", "sde", "sde"])
+        self.assertEqual([launch["role"] for launch in self.launches()], ["steward", "sde", "steward", "sde"])
 
     async def test_new_c_nobody_in_the_group_gets_work_out_of_the_project(self) -> None:
         await self.serve()

@@ -21,7 +21,7 @@ class ToolError(Exception):
 
 
 def schema_errors(value: Any, schema: dict[str, Any], where: str = "result") -> list[str]:
-    # The subset of JSON Schema the role schemas use: type, enum, properties, required, items.
+    # Only the JSON Schema keywords used by the role contracts.
     kind = schema.get("type")
     checks = {"object": dict, "array": list, "string": str, "boolean": bool}
     if kind in checks and not isinstance(value, checks[kind]):
@@ -35,6 +35,10 @@ def schema_errors(value: Any, schema: dict[str, Any], where: str = "result") -> 
         for key, sub in cast(dict[str, Any], schema.get("properties", {})).items():
             if key in obj:
                 errors += schema_errors(obj[key], sub, f"{where}.{key}")
+    if isinstance(value, str) and "pattern" in schema and not re.search(schema["pattern"], value):
+        errors.append(f"{where} must match {schema['pattern']}")
+    if "if" in schema and "then" in schema and not schema_errors(value, schema["if"], where):
+        errors += schema_errors(value, schema["then"], where)
     if isinstance(value, list) and "items" in schema:
         for i, item in enumerate(cast(list[Any], value)):
             errors += schema_errors(item, schema["items"], f"{where}[{i}]")

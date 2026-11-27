@@ -28,6 +28,7 @@ from agent_runtime.app.main import ForwardTargets, build_daemon_from_config, ser
 from agent_runtime.app.reload import ReloadFailed, ReloadStatus
 from agent_runtime.core.models import FORWARD_SOURCE, RETURN_SOURCE, Event
 from agent_runtime.engine.handler import EventHandler, RemoteRefused
+from tests.support.input_decision import DECISION
 from tests.support.fakes import RecordingChannel
 from tests.support.steward_terminal import steward_cli_terminal
 from tests.support.switchboard_support import Harness, make_harness, post
@@ -313,7 +314,7 @@ class EndToEndTests(ServedCase):
             [{"calls": [forward(OPS, "把 acme/tool 接进来")]}, {"calls": [ONBOARD], **reply("接好了：六步")},
              {"calls": [forward("proj:tool", "修一下除法")]},
              {"calls": [forward("proj:tool:sde", "divide must reject zero")]}],
-            [{"output": {"status": "needs_input", "summary": "", "test_evidence": "", "question": "哪一种？",
+            [{"output": {"status": "needs_input", "decision": DECISION, "summary": "", "test_evidence": "", "question": "哪一种？",
                          "change_kind": "fix", "change_rationale": "x"}}],
         )
         await self.message("把 acme/tool 接进来")

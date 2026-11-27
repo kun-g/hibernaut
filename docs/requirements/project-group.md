@@ -49,9 +49,9 @@
 - 配置写在 `hibernaut.toml` 的 `[[feishu_groups]]`：`chat_id`、`inbox_id`、`members`、`approvers`。`approvers` 只用于项目群、必填，一般只写 Kun；系统 Steward 改不了这一节（系统 Steward 需求 C3）。
 - 「项目所有 Inbox」按项目的 `inbox_id` 规则算：群 Inbox、主 Inbox、`proj:<p>:sde` 等子队列的审批都只认 `approvers`。
 - Kun 自己在群里说的话也只作用于这个项目（同 C1），不当成单聊里的请求。
-- SDE 遇到要人回答的问题（`needs_input`）照旧挂起，卡片发给 Kun，不发群里；合作方要补充，在群里说给 Steward。
+- SDE 遇到拿不准的实现取舍先问派活的 Steward。Steward 按原需求回答后，开发继续；需要原派单上下文时，沿转交链问上一跳。改需求、花钱、对外、删除、牵扯别人时，由 Steward 补充查到的背景和推荐，卡片发给 Kun。合作方可在群里给 Steward 补充信息。
 - 合并：`[projects.<p>.delivery] auto_merge = false`（默认），Kun 自己合；改成 `true` 等于 Kun 长期批准合并。
 
 ## 待定
 
-- 合作方想直接回答 SDE 的问题（不经 Kun 的审批卡）时怎么做：现在只能由 Kun 在卡片里答，或合作方在群里说给 Steward 后重新派。
+- 合作方想直接回答 SDE 的问题（不经 Kun 的审批卡）时怎么做：合作方可在群里补充事实，由 Steward 判断是否在原派单范围内。超出范围由 Kun 审批。
