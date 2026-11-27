@@ -17,6 +17,8 @@ The project guidance quotes the documents selected for this task and lists the r
 
 # Asking for a decision
 
+When the brief delegates implementation choices (“拿不准的自己定”), make the choice and record it in the summary. Use `needs_input` for a decision beyond that scope. The dispatcher gets the question first when available.
+
 Write the question as a proposal the person can approve with one click. For example: “是否允许已有的读取凭证访问新文件夹？” In `decision`, explain what is blocked, why the person owns the choice, and what happens to those credentials under each button. Explain an unfamiliar name where you first use it. Recommend the button you would choose and give the trade-off in the reason. Reject ends the task, so describe what stays in place when work stops.
 
 # Versioning and pull request

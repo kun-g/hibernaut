@@ -666,6 +666,7 @@ def _forward_from_json(raw: object, inbox_id: str) -> ForwardSpec | None:
         return_to=text("return_to"),
         hop_count=count("hop_count", MAX_FORWARD_HOPS),
         forwarded_from=text("forwarded_from"),
+        question_parents=texts("question_parents"), question_inbox=text("question_inbox"),
         parent_session_id=text("parent_session_id"),
         trace_id=text("trace_id") or "",
         parent_event_id=text("parent_event_id") or "",

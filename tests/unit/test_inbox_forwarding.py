@@ -248,13 +248,14 @@ class ForwardTests(ForwardCase):
     async def test_agents_cannot_smuggle_routing_into_the_event(self) -> None:
         # Only the checked arguments shape the payload, so a forward cannot name a workdir, an approval or a hop.
         self.forward("steward", SDE, "x")
-        self.ingest(work_key="wk", explicit_workdir="/tmp", approval_note="n")
+        self.ingest(work_key="wk", explicit_workdir="/tmp", approval_note="n", question_parents=["untrusted"])
         await self.run_inbox()
         [event] = self.queued(SDE)
+        self.assertEqual(event.payload["question_parents"], [event.payload["parent_session_id"]])
         self.assertEqual(
             sorted(event.payload),
             ["forwarded_by", "forwarded_from", "hop_count", "origin_key", "parent_event_id", "parent_session_id",
-             "text", "trace_id"],
+             "question_parents", "text", "trace_id"],
         )
 
     async def test_closing_the_parent_closes_children_in_other_inboxes(self) -> None:
