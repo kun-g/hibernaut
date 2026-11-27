@@ -39,6 +39,7 @@ from agent_runtime.adapters.memory_bridge import DEFAULT_GC_INTERVAL_SECONDS
 from agent_runtime.adapters.permissions.security import proxy_service_url
 from agent_runtime.app.projects import (
     AgentConfig,
+    AmbiguousProjectMatch,
     ExpertBinding,
     InboxRule,
     ProjectBinding,
@@ -605,7 +606,7 @@ class HibernautConfig:
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
     timers: tuple[ConfiguredTimer, ...] = ()
-    # Feishu groups whose listed people talk to a system inbox directly.
+    # Feishu groups whose listed people talk to a system inbox, or to an inbox of one project, directly.
     feishu_groups: tuple[FeishuGroup, ...] = ()
 
     def expert_plan(self, inbox_id: str) -> MemoryMountPlan | None:
@@ -651,10 +652,42 @@ def _parse_timers(raw: object, runtime: RuntimeConfig, projects: Mapping[str, Pr
     return tuple(result.values())
 
 
-_FEISHU_GROUP_KEYS = frozenset({"chat_id", "inbox_id", "members"})
+_FEISHU_GROUP_KEYS = frozenset({"chat_id", "inbox_id", "members", "approvers"})
 
 
-def _parse_feishu_groups(raw: object, runtime: RuntimeConfig) -> tuple[FeishuGroup, ...]:
+def _open_ids(where: str, raw: object, what: str) -> frozenset[str]:
+    names = cast(list[object], raw) if isinstance(raw, list) else []
+    if not names or not all(isinstance(m, str) and m.strip() and m == m.strip() for m in names):
+        raise ValueError(f"{where} must list the Feishu open ids (ou_...) {what}")
+    return frozenset(cast(list[str], names))
+
+
+def _group_project(
+    where: str, inbox: object, runtime: RuntimeConfig, projects: Mapping[str, ProjectConfig],
+    agents: Mapping[str, AgentConfig],
+) -> str | None:
+    # The project whose inbox a group may be bound to; None for no inbox of a project. Its people include partners, so
+    # the inbox is one a project Steward alone runs: no shell, and forwards only inside the project.
+    if not isinstance(inbox, str) or runtime.workdir_binding(inbox) is not None:
+        return None
+    try:
+        project = ProjectRouter(projects.values()).resolve(inbox)
+    except AmbiguousProjectMatch:
+        return None
+    if project is None:
+        return None
+    sanitize_segment(inbox, field_name=f"{where}.inbox_id")
+    binding = project.route(inbox).binding
+    named = (binding.default_agent, *binding.agents) if binding is not None and binding.agents else ()
+    if not named or any(name not in agents or agents[name].role != STEWARD_ROLE for name in named):
+        raise ValueError(f"{where}.inbox_id {inbox!r} must be covered by an inbox binding of project "
+                         f"'{project.name}' whose agents are all listed and all have role = \"{STEWARD_ROLE}\"")
+    return project.name
+
+
+def _parse_feishu_groups(
+    raw: object, runtime: RuntimeConfig, projects: Mapping[str, ProjectConfig], agents: Mapping[str, AgentConfig],
+) -> tuple[FeishuGroup, ...]:
     if not isinstance(raw, list):
         raise ValueError("feishu_groups must be an array of tables")
     found: dict[str, FeishuGroup] = {}
@@ -668,18 +701,25 @@ def _parse_feishu_groups(raw: object, runtime: RuntimeConfig) -> tuple[FeishuGro
             raise ValueError(f"{where}.chat_id must be a unique, non-blank Feishu chat id")
         inbox = group.get("inbox_id")
         bound = runtime.workdir_binding(inbox) if isinstance(inbox, str) else None
-        # Only a system inbox, which admits nothing else from a chat: an ordinary one would take anybody's message.
-        if bound is None or not bound.system_tools or bound.rule.literal != inbox:
+        system = bound is not None and bound.system_tools and bound.rule.literal == inbox
+        project = None if system else _group_project(where, inbox, runtime, projects, agents)
+        # A system inbox admits nothing else from a chat, and a project inbox passes nothing out of its project: an
+        # inbox of no project that is no system inbox would take a stranger's words wherever its forward_to reaches.
+        if not system and project is None:
             raise ValueError(f"{where}.inbox_id must be the exact pattern of a [[runtime.inbox_bindings]] entry with "
-                             f"system_tools, got {inbox!r}")
-        members = group.get("members")
-        names = cast(list[object], members) if isinstance(members, list) else []
-        if not names or not all(isinstance(m, str) and m.strip() and m == m.strip() for m in names):
-            raise ValueError(f"{where}.members must list the Feishu open ids (ou_...) whose messages count")
+                             f"system_tools, or an inbox of a project, got {inbox!r}")
+        assert isinstance(inbox, str)
+        members = _open_ids(f"{where}.members", group.get("members"), "whose messages count")
+        if system and "approvers" in group:
+            raise ValueError(f"{where}.approvers is only for a project group: a system group's members decide")
+        # Who decides the approvals of the project's inboxes, outside the group: never a partner just for being in it.
+        approvers = (_open_ids(f"{where}.approvers", group.get("approvers"), "who decide the project's approvals")
+                     if project is not None else frozenset[str]())
         if any(other.inbox_id == inbox for other in found.values()):
-            # Its approval cards go to that one group, and a decision counts only from there.
-            raise ValueError(f"{where}.inbox_id {inbox!r} already has a group: a system inbox takes one group")
-        found[chat_id] = FeishuGroup(chat_id=chat_id, inbox_id=inbox, members=frozenset(cast(list[str], names)))
+            # A system inbox's cards go to its one group, and a decision counts only from there.
+            raise ValueError(f"{where}.inbox_id {inbox!r} already has a group: an inbox takes one group")
+        found[chat_id] = FeishuGroup(chat_id=chat_id, inbox_id=inbox, members=members, project=project,
+                                     approvers=approvers)
     return tuple(found.values())
 
 
@@ -1657,7 +1697,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
 
     config = HibernautConfig(
         timers=_parse_timers(raw.get("timers", []), runtime, projects),
-        feishu_groups=_parse_feishu_groups(raw.get("feishu_groups", []), runtime),
+        feishu_groups=_parse_feishu_groups(raw.get("feishu_groups", []), runtime, projects, agents),
         runtime=runtime,
         channels=channels,
         executors=executors,

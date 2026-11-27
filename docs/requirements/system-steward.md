@@ -88,7 +88,7 @@
 
 - 系统 Steward 的入口是 `sys:ops`，agent 名 `hibernaut-ops`。
 - 默认 Steward 由接入脚本写入，不靠 agent 判断。
-- 群和名单写在 `hibernaut.toml` 的 `[[feishu_groups]]`（`chat_id`、`inbox_id`、`members`），只能绑到带 `system_tools` 的 Inbox；系统 Steward 改不了它（C3）。
+- 群和名单写在 `hibernaut.toml` 的 `[[feishu_groups]]`（`chat_id`、`inbox_id`、`members`），绑系统 Inbox 时须是带 `system_tools` 的；绑项目 Inbox 的见 [项目群需求](project-group.md)。系统 Steward 改不了它（C3）。
 - 「定时任务」只算 hb 自己的 `[[timers]]`；「最近」默认 24 小时，每个定时任务列最近 5 次。
 - 运维 agent 的入口是 `sys:infra`，agent 名 `infra`，绑定写 `ops_tools = true`；与 `sys:ops`（系统 Steward）分开，名字不混。
 - 用户给了 Drive 项目文件夹链接，Ash 从中取最新修改的直接文件。代理默认仅允许 `sources_folder_id` 的直接子目录，管理员显式开启 `allow_any_source_folder` 后可用服务账号可读的任意文件夹链接。省略链接时仍按项目名在 `sources_folder_id` 下查找；未配置该目录则提示给出文件夹链接并共享给服务账号，附可用的服务账号邮箱。

@@ -74,6 +74,7 @@ pytest -p no:xdist tests/integration
 
 - **需求文档**：系统 Steward（`sys:ops`，接入项目、检查和补齐项目配置）的需求在 [`docs/requirements/system-steward.md`](docs/requirements/system-steward.md)，编号（R/C）不改。
   按额度切评审（评审候选、可用表、额度报错换人）的需求在 [`docs/requirements/model-switching.md`](docs/requirements/model-switching.md)，编号（R/C）同样不改。
+  项目群（飞书群绑到项目 Inbox，合作方的话只作用于该项目）的需求在 [`docs/requirements/project-group.md`](docs/requirements/project-group.md)，编号（R/C）同样不改。
 
 - **Drive 基准只读**：Google Drive 原基准设计文档《Always-on Agent 整洁架构设计方案（Task 交接文档）》保持只读不动，不直接覆写。
 - **增量追踪**：新增架构讨论与待落地改动先记录在 Google Drive《Always-on Agent 架构增量变更（待落地）》。
