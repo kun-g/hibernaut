@@ -15,7 +15,7 @@ def main() -> None:
     database = parser.parse_args().database.resolve(strict=True)
     with TemporaryDirectory() as staging:
         snapshot = Path(staging) / database.name
-        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as source:
+        with closing(sqlite3.connect(database.as_uri() + "?mode=rw", uri=True)) as source:
             with closing(sqlite3.connect(snapshot)) as dest:
                 source.backup(dest, pages=256)
         with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as archive:

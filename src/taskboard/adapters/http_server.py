@@ -110,6 +110,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _reply(self, status: int, body: Mapping[str, Any] | None) -> None:
         payload = b"" if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         if body is not None:
             self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))

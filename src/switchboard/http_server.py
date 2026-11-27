@@ -193,10 +193,10 @@ class _Handler(BaseHTTPRequestHandler):
         headers = dict(self.headers.items())
         try:
             if isinstance(adapter, HeaderAuthAdapter) and not adapter.authorized(headers):
+                self.close_connection = True
                 if not self._srv().cut:
                     pipeline.record_rejection(stage="inbound", http_status=401, source=source, reason="invalid bearer token")
                     self._reply(401, {"error": "invalid bearer token"})
-                self.close_connection = True
                 return
             try:
                 raw_body = self.rfile.read(length)
@@ -247,6 +247,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _reply(self, status: int, body: Mapping[str, Any]) -> None:
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
