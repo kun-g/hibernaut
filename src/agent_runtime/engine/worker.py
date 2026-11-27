@@ -2299,6 +2299,7 @@ class AgentWorker:
                         content=text,
                         metadata={
                             **self._with_status(extra, emit_status, delivery),
+                            **({"chat_reply": outcome.chat_reply} if outcome.chat_reply else {}),
                             **(task_fields if last else {}),
                             "kind": "emit",
                             "outcome_kind": "emit",

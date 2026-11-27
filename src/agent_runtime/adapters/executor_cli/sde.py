@@ -662,7 +662,7 @@ class SDEExecutor:
                 named = attempt_goal(targets)
             except ValueError as exc:
                 return Emit(messages=(f"[{self._profile.name}] refused: {exc}",), session_id=session_id,
-                            executor_session_id=native, status="refused")
+                            executor_session_id=native, status="refused", chat_reply="开发任务未受理。请在 hb 查看任务要求后重试。")
             goal = await self._begin_attempt(session_id, events[0].inbox_id, named, targets)
             state = await self._new_state(events, targets, session)
             state.resume_log += notes
@@ -1129,7 +1129,8 @@ class SDEExecutor:
         ]
         if state.followups:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
-        return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native)
+        return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native,
+                    chat_reply="已核查，这次没有代码改动。")
 
     def _pending(self, session_id: str, native: str | None, state: _State, reason: str) -> Suspend:
         state.stage, state.reason = "review_pending", reason
@@ -1398,7 +1399,8 @@ class SDEExecutor:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
         outcome = self._delivery.outcome(delivery) if self._delivery is not None and delivery is not None else None
         return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native,
-                    close_session=finished, delivery=outcome)
+                    close_session=finished, delivery=outcome,
+                    chat_reply="改动已提交到本地，还没有创建 PR。" if outcome is None else "")
 
     def _stopped(self, session_id: str, native: str | None, state: _State, why: str) -> Emit:
         self._ended[session_id] = AttemptResult(STOPPED, detail=why, summary=state.summary)
@@ -1422,12 +1424,14 @@ class SDEExecutor:
         lines += _review_followups(state)
         if state.followups:
             lines.append("Unprocessed follow-ups:\n" + "\n\n".join(state.followups))
-        return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native, status="stopped")
+        return Emit(messages=("\n".join(lines),), session_id=session_id, executor_session_id=native, status="stopped",
+                    chat_reply="开发已停止，工作进度已保留。需要继续时，请在这里补充说明。")
 
     def _fail(self, session_id: str, native: str | None, detail: str, notes: Sequence[str] = ()) -> Emit:
         self._ended[session_id] = AttemptResult(FAILED, detail=detail)
         text = "\n".join([f"[{self._profile.name}] development failed: {detail}", *(f"Restart: {n}" for n in notes)])
-        return Emit(messages=(text,), session_id=session_id, executor_session_id=native, status="failed")
+        return Emit(messages=(text,), session_id=session_id, executor_session_id=native, status="failed",
+                    chat_reply="开发未完成。请在 hb 任务记录里查看失败原因后重试。")
 
 
 def _stays() -> bool:

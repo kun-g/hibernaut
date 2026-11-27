@@ -62,7 +62,13 @@ _OUTCOME_BY_KIND: Mapping[str, str] = {
 
 _FEISHU = "feishu"
 # Outbox kinds that mean work is stuck until a person acts; every other one is a result.
-_BLOCKER_KINDS = frozenset({"run_failed", "resume_failed", "agent_refused", "return_withheld", "forward_refused"})
+_BLOCKER_REPLIES = {
+    "run_failed": "任务执行失败。请在 hb 查看失败原因后重试。",
+    "resume_failed": "任务没能恢复。请在 hb 查看运行记录。",
+    "agent_refused": "任务未被接手。请在 hb 查看拒绝原因。",
+    "return_withheld": "任务结果未能返回，请在 hb 查看这次转交。",
+    "forward_refused": "任务转交被拒绝，请在 hb 查看转交权限。",
+}
 _BLOCKED_STATUSES = frozenset({"failed", "stopped", "refused"})
 
 
@@ -175,6 +181,31 @@ def _task_context(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
     return cast(dict[str, Any], context) if isinstance(context, dict) else {}
 
 
+def _chat_reply(metadata: Mapping[str, Any]) -> str:
+    kind = str(metadata.get("kind", ""))
+    if kind != "emit":
+        return _BLOCKER_REPLIES.get(kind, "")
+    explicit = metadata.get("chat_reply")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    raw = _task_context(metadata).get("delivery")
+    if not isinstance(raw, Mapping):
+        return ""
+    delivery = cast(Mapping[str, Any], raw)
+    match delivery.get("state"):
+        case "merged":
+            result = "改动已合并。"
+        case "pr_open":
+            result = {"ci": "PR 尚未合并，自动检查未通过。", "review": "PR 尚未合并，评审未通过。"}.get(
+                str(delivery.get("hold")), "PR 已创建，等待合并。")
+        case "local":
+            result = "改动已提交到本地，还没有创建 PR。"
+        case _:
+            return ""
+    url = delivery.get("pr_url")
+    return f"{result}\n{url}" if url else result
+
+
 def is_feishu_push(metadata: Mapping[str, Any]) -> bool:
     # A message nobody is waiting for in Feishu. What answers a person there goes to the conversation they started.
     key = metadata.get("correlation_key")
@@ -198,7 +229,7 @@ def notification_kind(metadata: Mapping[str, Any]) -> tuple[NotificationKind, bo
     # The kind, and whether it is a blocker that only a person can clear.
     if outcome_kind_for(metadata) == "suspend":
         return "approval_card", False
-    if metadata.get("kind") in _BLOCKER_KINDS:
+    if metadata.get("kind") in _BLOCKER_REPLIES:
         return "blocker_alert", False
     return "run_completed", _task_context(metadata).get("status") in _BLOCKED_STATUSES
 
@@ -260,6 +291,8 @@ class SwitchboardChannelAdapter:
         if withheld is not None:
             # Published as a mere sync, which no Switchboard posts to a person; Taskboard still gets its task action.
             report |= {"outcome_kind": "done", "notification_channel": withheld}
+        if reply := _chat_reply(metadata):
+            report["chat_reply"] = reply
         subject = metadata.get("title") or metadata.get("subject") or "Hibernaut update"
         return CanonicalEvent(
             source="hibernaut",

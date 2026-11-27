@@ -427,7 +427,10 @@ class EndToEndTests(ChatCase):
         await self.chat("divide is broken")
         self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde"])
         [(target, content)] = self.replies()
-        self.assertIn("implemented", content)
+        self.assertEqual(json.loads(content)["text"], "改动已提交到本地，还没有创建 PR。")
+        [(report,)] = self.rows("SELECT content FROM outbox WHERE inbox_id = 'proj:a'")
+        for field in ("implemented", "Workdir:", "Test evidence:"):
+            self.assertIn(field, report)
         [session] = self.daemon.sessions.list_sessions(inbox_id="proj:a")
         self.assertIn("divide must reject zero", self.launches()[1]["prompt"])
         self.assertEqual([e.inbox_id for e in self.events(FORWARD_SOURCE)], ["proj:a"])

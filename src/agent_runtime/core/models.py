@@ -388,6 +388,8 @@ class Emit:
     # Where the delivery step left the change; the worker passes it to channels as task_context["delivery"].
     delivery: DeliveryOutcome | None = None
     telemetry: RunTelemetry | None = field(default=None, compare=False)
+    # For a diagnostic report without a PR delivery state, the result to show in chat.
+    chat_reply: str = ""
 
 
 @dataclass(frozen=True, slots=True)
