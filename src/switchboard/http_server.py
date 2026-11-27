@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Final, cast
 
 from switchboard.pipeline import InboundPipeline, describe_ingest
-from switchboard.ports import InboundAdapter, IngestAwareAdapter
+from switchboard.ports import HeaderAuthAdapter, InboundAdapter, IngestAwareAdapter
 from switchboard.relay_protocol import HandshakeError, WebSocketConnection, server_handshake_headers
 
 # Takes over an upgraded connection and returns when it ends; runs on the request thread.
@@ -114,6 +114,7 @@ class _Server(ThreadingHTTPServer):
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "Switchboard"
+    timeout = 10.0
 
     def log_message(self, format: str, *args: Any) -> None:
         return None
@@ -153,6 +154,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         self._srv().release(self.connection)
+        self.connection.settimeout(None)  # Relay takes over idle/heartbeat handling after the upgrade.
         # rfile may already hold the client's first frame, so frames are read through it.
         ws = WebSocketConnection(
             cast(socket.socket, self.connection),
@@ -188,14 +190,23 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._reply(413, {"error": "payload too large"})
             return
-        raw_body = self.rfile.read(length)
-        if len(raw_body) < length:
-            # The client left, or the drain cut the connection; a partial body is never handled.
-            self.close_connection = True
-            return
-        headers = {key: value for key, value in self.headers.items()}
-
+        headers = dict(self.headers.items())
         try:
+            if isinstance(adapter, HeaderAuthAdapter) and not adapter.authorized(headers):
+                self.close_connection = True
+                if not self._srv().cut:
+                    pipeline.record_rejection(stage="inbound", http_status=401, source=source, reason="invalid bearer token")
+                    self._reply(401, {"error": "invalid bearer token"})
+                return
+            try:
+                raw_body = self.rfile.read(length)
+            except TimeoutError:
+                self.close_connection = True
+                self._reply(408, {"error": "request body timed out"})
+                return
+            if len(raw_body) < length or self._srv().cut:
+                self.close_connection = True
+                return
             parsed = adapter.handle(headers, raw_body)
         except Exception as exc:  # noqa: BLE001
             if self._srv().cut:
@@ -236,6 +247,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _reply(self, status: int, body: Mapping[str, Any]) -> None:
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
