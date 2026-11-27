@@ -319,6 +319,9 @@ class DeliveryRecord:
     # The one re-run of failed CI jobs a head gets: which head, the failed links it replaced, and what happened.
     ci_rerun_head: str = ""
     ci_rerun_links: list[str] = field(default_factory=_strs)
+    ci_rerun_runs: list[str] = field(default_factory=_strs)
+    # A remote error stopped the re-run of ci_rerun_head: it is not used up and runs again on the next attempt.
+    ci_rerun_retry: bool = False
     ci_rerun: str = ""
     merge_sha: str = ""
     attempts: int = 0
@@ -425,6 +428,8 @@ _REMOTE_TRANSIENT = re.compile(
 
 
 def _operation(argv: Sequence[str]) -> str:
+    if argv[1] == "run":
+        return "重跑失败的 CI 检查"
     if argv[1] == "pr":
         return {"checks": "查询合并前的检查状态", "create": "创建 PR", "edit": "更新 PR", "list": "查询 PR",
                 "view": "核对 PR 状态", "merge": "合并 PR"}.get(argv[2], "访问 GitHub")
@@ -1168,27 +1173,47 @@ class PRDelivery:
 
     def _rerun(self, req: DeliveryRequest, rec: DeliveryRecord, cwd: Path, failed: list[dict[str, Any]]) -> bool:
         # A failure may be a flaky test: each head gets one re-run of its failed jobs before anyone is asked to fix it.
-        if rec.ci_rerun_head == rec.head_sha:
+        if rec.ci_rerun_head == rec.head_sha and not rec.ci_rerun_retry:
             return False
-        rec.ci_rerun_head, rec.ci_rerun_links = rec.head_sha, []
-        runs = _runs(failed)
-        rec.ci_rerun = "not re-run: the failed checks name no GitHub Actions run"
-        for run in runs:
-            proc = self._gh(cwd, "run", "rerun", run, "--failed", check=False)
-            if proc.returncode != 0:
-                output = _tail(proc.stderr or proc.stdout, 300)
-                why = "no permission to re-run" if _NO_RERUN.search(output) else "re-run failed for"
-                rec.ci_rerun = f"not re-run: {why} run {run} with this gh account ({output})"
-                runs = []
-                break
-        if runs:
-            rec.ci_rerun_links = [str(c.get("link") or "") for c in failed]
-            rec.ci_rerun = f"re-ran the failed jobs of run {', '.join(runs)} once on {rec.head_sha[:12]}"
+        if rec.ci_rerun_head != rec.head_sha:
+            rec.ci_rerun_head, rec.ci_rerun_links, rec.ci_rerun_runs = rec.head_sha, [], []
+        rec.ci_rerun_retry = False
+        outside = [str(c.get("name")) for c in failed if not _runs([c])]
+        if outside:
+            # Re-running the Actions jobs cannot make these pass, so the developer gets every failure now.
+            rec.ci_rerun = f"not re-run: {', '.join(outside)} names no GitHub Actions run to re-run"
+            rec.ci_rerun_links = []
+        elif self._rerun_runs(rec, cwd, failed):
+            rec.ci_rerun = f"re-ran the failed jobs of run {', '.join(rec.ci_rerun_runs)} once on {rec.head_sha[:12]}"
             # The re-run gets a full wait of its own.
             rec.ci_since = self._clock()
         rec.history.append(rec.ci_rerun)
         self._store.save(req.work_key, rec.to_dict())
         return bool(rec.ci_rerun_links)
+
+    def _rerun_runs(self, rec: DeliveryRecord, cwd: Path, failed: list[dict[str, Any]]) -> bool:
+        for run in _runs(failed):
+            if run in rec.ci_rerun_runs:
+                continue
+            try:
+                proc = self._gh(cwd, "run", "rerun", run, "--failed", check=False)
+            except _TransientRemoteError:
+                rec.ci_rerun_retry = True
+                raise
+            if proc.returncode != 0:
+                if _REMOTE_TRANSIENT.search(proc.stderr or proc.stdout):
+                    # Not a refusal: the delivery retries later as for any transient remote error, re-run still owed.
+                    rec.ci_rerun_retry = True
+                    raise _remote_problem(f"gh run rerun {run} failed", proc)
+                output = _tail(proc.stderr or proc.stdout, 300)
+                why = "no permission to re-run" if _NO_RERUN.search(output) else "re-run failed for"
+                rec.ci_rerun = f"not re-run: {why} run {run} with this gh account ({output})"
+                rec.ci_rerun_links = []
+                return False
+            rec.ci_rerun_runs.append(run)
+            # Only checks of a re-run job get a new link; every other failure still counts.
+            rec.ci_rerun_links += [str(c.get("link")) for c in failed if _runs([c]) == [run]]
+        return True
 
     def _ci_failure(self, rec: DeliveryRecord, cwd: Path, failed: list[dict[str, Any]]) -> dict[str, Any]:
         cfg = self._config
