@@ -15,7 +15,8 @@ import time
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 import pytest
 

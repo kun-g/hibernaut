@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 import json
 from pathlib import Path
 import sys
@@ -281,7 +281,7 @@ def test_log_store_security_cleanup_and_remote_fallback(tmp_path: Path) -> None:
     ls.write_log("run_old", "old\n", date_str="2026-10-01")
     removed = ls.cleanup(
         max_age_days=14,
-        now_utc=datetime(2026, 11, 22, tzinfo=timezone.utc),
+        now_utc=datetime(2026, 11, 22, tzinfo=UTC),
     )
     assert any(p.name == "run_old.log" for p in removed)
 

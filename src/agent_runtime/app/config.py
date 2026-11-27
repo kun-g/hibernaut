@@ -9,7 +9,7 @@ import re
 import sys
 import tomllib
 import warnings
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -584,15 +584,15 @@ class RunnerPilotConfig:
 class HibernautConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
-    executors: dict[str, CLITemplate] = field(default_factory=dict)
-    launchers: dict[str, ClaudeCodeLauncher] = field(default_factory=dict)
+    executors: dict[str, CLITemplate] = field(default_factory=dict[str, CLITemplate])
+    launchers: dict[str, ClaudeCodeLauncher] = field(default_factory=dict[str, ClaudeCodeLauncher])
     credential_proxy: CredentialProxyConfig = field(default_factory=CredentialProxyConfig)
-    roles: dict[str, RoleConfig] = field(default_factory=dict)
+    roles: dict[str, RoleConfig] = field(default_factory=dict[str, RoleConfig])
     # Every agent an inbox can run: [agents], plus [executors] that carry a role or a command (the old form).
-    agents: dict[str, AgentConfig] = field(default_factory=dict)
+    agents: dict[str, AgentConfig] = field(default_factory=dict[str, AgentConfig])
     # max_concurrency of the [executors.<id>] that are neither, and only run through agents.
-    driver_limits: dict[str, int] = field(default_factory=dict)
-    projects: dict[str, ProjectConfig] = field(default_factory=dict)
+    driver_limits: dict[str, int] = field(default_factory=dict[str, int])
+    projects: dict[str, ProjectConfig] = field(default_factory=dict[str, ProjectConfig])
     gdrive: GDriveConfig = field(default_factory=GDriveConfig)
     switchboard: SwitchboardLinkConfig = field(default_factory=SwitchboardLinkConfig)
     peer: PeerHandoffConfig = field(default_factory=PeerHandoffConfig)
@@ -619,9 +619,9 @@ def _parse_timers(raw: object, runtime: RuntimeConfig, projects: Mapping[str, Pr
         raise ValueError("timers must be an array of tables")
     result: dict[str, ConfiguredTimer] = {}
     router = ProjectRouter(projects.values())
-    for i, item in enumerate(raw):
+    for i, entry in enumerate(cast(list[object], raw)):
         where = f"timers[{i}]"
-        item = _Table(item, where, frozenset({"name", "inbox_id", "interval_seconds", "enabled", "payload"})).raw
+        item = _Table(entry, where, frozenset({"name", "inbox_id", "interval_seconds", "enabled", "payload"})).raw
         name = item.get("name")
         if not isinstance(name, str) or not name.strip() or name != name.strip() or name in result:
             raise ValueError(f"{where}.name must be a unique, non-blank name without surrounding whitespace")
@@ -648,7 +648,7 @@ def _parse_timers(raw: object, runtime: RuntimeConfig, projects: Mapping[str, Pr
             json.dumps(payload, allow_nan=False)
         except (ValueError, TypeError) as exc:
             raise ValueError(f"{where}.payload must contain JSON values") from exc
-        result[name] = ConfiguredTimer(name, inbox, interval, payload, enabled)
+        result[name] = ConfiguredTimer(name, inbox, interval, cast(dict[str, Any], payload), enabled)
     return tuple(result.values())
 
 
@@ -723,7 +723,7 @@ def _parse_feishu_groups(
     for project in {g.project for g in found.values() if g.project is not None}:
         # The project's inboxes no group is bound to are decided by who every one of its groups lets decide.
         approvers = [g.approvers for g in found.values() if g.project == project]
-        if not frozenset.intersection(*approvers):
+        if not approvers[0].intersection(*approvers[1:]):
             raise ValueError(f"feishu_groups of project '{project}' share no approver: nobody could decide the "
                              "approvals of its other inboxes")
     return tuple(found.values())
@@ -818,7 +818,7 @@ def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> Switchb
     section = link.raw
     enabled = link.flag("enabled", False)
     mode_raw = str(section.get("mode", "in_process")).strip()
-    mode = next((m for m in _SWITCHBOARD_MODES if m == mode_raw), None)
+    mode: SwitchboardMode | None = next((m for m in _SWITCHBOARD_MODES if m == mode_raw), None)
     if mode is None:
         raise ValueError('switchboard.mode must be "in_process" or "relay"')
     consumer_id = str(section.get("consumer_id", "hibernaut")).strip()
@@ -1005,7 +1005,7 @@ def parse_runner_link(
         raise ValueError("runner.readonly_only must be true or false")
     if "token_env" in item and "token_file" in item:
         raise ValueError("runner.token_env and runner.token_file cannot both be set")
-    mode = next((m for m in _RUNNER_MODES if m == item.get("mode", defaults.mode)), None)
+    mode: RunnerMode | None = next((m for m in _RUNNER_MODES if m == item.get("mode", defaults.mode)), None)
     if mode is None:
         raise ValueError('runner.mode must be "in_process" or "relay"')
     backend = item.get("worktree_backend", defaults.worktree_backend)
@@ -1185,7 +1185,7 @@ def _memory_http(table: _Table) -> MemoryHTTPConfig:
     tokens: list[MemoryHTTPToken] = []
     entries = table.table("tokens").tables(frozenset({"token_env", "role", "allowed_projects", "allow_kb"}))
     for subject, entry in entries.items():
-        role = next((r for r in _MEMORY_ROLES if r == entry.raw.get("role", "readonly")), None)
+        role: AccessRole | None = next((r for r in _MEMORY_ROLES if r == entry.raw.get("role", "readonly")), None)
         if role is None:
             raise ValueError(f"{entry.where}.role must be one of {', '.join(_MEMORY_ROLES)}")
         projects = entry.names("allowed_projects", ("*",))
@@ -1392,7 +1392,7 @@ async def config_changes(
     stop: asyncio.Event,
     interval: float = 1.0,
     reloads: ReloadStatus | None = None,
-) -> AsyncIterator[HibernautConfig]:
+) -> AsyncGenerator[HibernautConfig, None]:
     # What is yielded is settled in `reloads` by whoever activates it.
     previous: bytes | None = None
     missing = False
@@ -1466,7 +1466,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         ledger_db_path=rt.string("ledger_db_path"),
         memory_root=rt.string("memory_root", "./agent_memory"),
         max_concurrency=rt.count("max_concurrency", 4),
-        new_event_policy=cast(NewEventPolicy, policy),
+        new_event_policy=policy,
         default_agent=runtime_default,
         default_executor=runtime_default,
         worktree_sweep_interval_seconds=rt.number("worktree_sweep_interval_seconds", DEFAULT_SWEEP_INTERVAL_SECONDS),
@@ -1542,7 +1542,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         args = item.get("args", [])
         resume = item.get("resume_args", [])
         for key, values in (("args", args), ("resume_args", resume)):
-            if not isinstance(values, list) or not all(isinstance(arg, str) for arg in values):
+            if not isinstance(values, list) or not all(isinstance(arg, str) for arg in cast(list[object], values)):
                 raise ValueError(f"executors.{name}.{key} must be an array of strings")
         orca_agent = item.get("orca_agent")
         if orca_agent is not None and (not isinstance(orca_agent, str) or not orca_agent.strip()):
@@ -1659,10 +1659,10 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             rules=rules,
             repo=repo,
             checkout=_project_checkout(str(name), item, repo),
-            worktree_backend=cast(Literal["orca", "git"], backend),
+            worktree_backend=backend,
             terminal_backend=terminal,
             orca_create_terminal=table_entry.flag("orca_create_terminal", False),
-            handoff=cast(Handoff, handoff),
+            handoff=handoff,
             default_agent=default_agent,
             delivery=delivery,
             inbox_bindings=parse_inbox_bindings(str(name), item.get("inbox_bindings"), inbox_rules=rules,

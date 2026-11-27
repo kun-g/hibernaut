@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tests.support.fake_counter import next_count  # noqa: E402
+from tests.support.fake_counter import next_count
 
 argv = sys.argv[1:]
 interactive = "-p" not in argv

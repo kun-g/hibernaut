@@ -327,7 +327,7 @@ def extract_verdict(stdout: str) -> object:
                 return inner
     if found is None:
         raise ReviewAborted("the reviewer's output is neither a JSON object nor a ```json block")
-    return found
+    return cast(object, found)
 
 
 def _json_in(text: str) -> object | None:

@@ -12,7 +12,8 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Final, Mapping, cast
+from typing import Any, Final, cast
+from collections.abc import Mapping
 
 PROTOCOL_CHECK_EXECUTOR_ID: Final = "runner-protocol-check"
 CHECK_SCHEMA: Final = "runner.protocol_check.v1"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 from agent_runtime.core.models import CONFIG_TIMER_PREFIX, Event, utc_now_iso
 from agent_runtime.core.ports import InboxPort, TimerPort
@@ -31,8 +31,8 @@ class TimerScheduler:
                 base_dt = datetime.fromisoformat(timer.due_at)
                 interval = timedelta(seconds=timer.recurrence_seconds)
                 now = datetime.fromisoformat(current_iso)
-                elapsed = (now if now.tzinfo else now.replace(tzinfo=timezone.utc)) - (
-                    base_dt if base_dt.tzinfo else base_dt.replace(tzinfo=timezone.utc)
+                elapsed = (now if now.tzinfo else now.replace(tzinfo=UTC)) - (
+                    base_dt if base_dt.tzinfo else base_dt.replace(tzinfo=UTC)
                 )
                 periods = max(1, elapsed // interval + 1) if interval > timedelta(0) else 1
                 next_due_at = (base_dt + periods * interval).isoformat()
@@ -79,5 +79,5 @@ class TimerScheduler:
             self.tick()
             try:
                 await asyncio.wait_for(stopper.wait(), timeout=interval_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue

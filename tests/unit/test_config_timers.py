@@ -18,7 +18,7 @@ def test_invalid_declarations_fail_at_load(declarations):
 
 
 def test_system_tools_target_is_refused_even_when_disabled(tmp_path):
-    with pytest.raises(ValueError, match="timers.*system_tools"):
+    with pytest.raises(ValueError, match=r"timers.*system_tools"):
         parse_config({"executors": {"ops": {"role": "steward"}},
                       "runtime": {"inbox_bindings": [{"pattern": "sys:ops", "workdir": str(tmp_path),
                           "checkout_access": "readonly", "system_tools": True, "default_agent": "ops"}]},

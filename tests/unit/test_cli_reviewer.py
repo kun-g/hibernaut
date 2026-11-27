@@ -230,7 +230,7 @@ class TestCLIReviewerRounds(ReviewFlowCase):
         text = await self.reviewed_rounds([CHANGES_REQUESTED, PASS], ["calc.py"])
         self.assertIn("review=pass after 2 round", text)
         self.assertIn("zero divisor rejected", text)
-        first, fix = self.develop.await_args_list
+        _first, fix = self.develop.await_args_list
         for part in ("calc.py:2", "divide(1, 0)", "ZeroDivisionError crashes the caller", "reject zero divisors"):
             self.assertIn(part, fix.args[3])
         self.assertIn("## Previous review round\n[grok] verdict=changes_requested (cli=", self.prompts[1])

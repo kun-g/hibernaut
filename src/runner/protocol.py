@@ -4,8 +4,9 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Final, Literal, Mapping, Protocol, TypeAlias, cast
+from datetime import datetime, UTC
+from typing import Any, Final, Literal, Protocol, TypeAlias, cast
+from collections.abc import Awaitable, Callable, Mapping
 
 SCHEMA_VERSION: Final = "runner.v1"
 MAX_STDOUT_EXCERPT_BYTES: Final = 262_144
@@ -56,7 +57,7 @@ _VALID_RECLAIM_STATUSES: Final = frozenset({"reclaimed", "blocked", "not_found",
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
 def _empty_str_dict() -> dict[str, str]:

@@ -22,7 +22,8 @@ from agent_runtime.core.models import Emit, PermissionDecision, SessionRef, Susp
 from tests.support.fakes import InMemoryPermission
 from tests.support.collaboration_wiring import config_of
 from tests.support.resume_runs import SDERestartCase, committed, until, verdict_pass
-from tests.support.sde_executor import BUGGY, CHANGES_REQUESTED, FIXED, PASS, dev, event
+from tests.support.coder_reviewer import CHANGES_REQUESTED
+from tests.support.sde_executor import BUGGY, FIXED, PASS, dev, event
 from tests.support.visible_roles import arg
 from tests.support.sde_memory import (
     ALPHA,
@@ -36,8 +37,8 @@ from tests.support.sde_memory import (
     _toml,
     servers,
     ungranted,
-    world,
 )
+from tests.support.sde_memory import world  # noqa: F401 -- pytest fixture, requested by parameter name
 
 
 UNAVAILABLE = "cannot be reached"

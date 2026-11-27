@@ -8,7 +8,8 @@ import time
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Mapping, ParamSpec, TypeAlias, TypeVar, cast
+from typing import Any, ParamSpec, TypeAlias, TypeVar, cast
+from collections.abc import Callable, Mapping
 
 from runner.cli_drivers import (
     CLIDriver,
