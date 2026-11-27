@@ -140,11 +140,11 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([c["role"] for c in self.calls()], ["sde"])
 
     async def test_needs_input_suspends_and_the_answer_resumes_the_developer_session(self):
-        self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?"), dev(FIXED)], reviewer=[PASS])
+        self.set_plan(sde=[dev(status="needs_input", question="除数为零时报错吗？"), dev(FIXED)], reviewer=[PASS])
         executor = self.executor()
         outcome = await executor.execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Suspend), outcome
-        self.assertIn("Raise or return None?", outcome.prompt)
+        self.assertIn("除数为零时报错吗？", outcome.prompt)
         session = SessionRef(session_id="s", inbox_id="proj:x", executor_id="sde", status="suspended",
                              executor_session_id=outcome.executor_session_id,
                              checkpoint=outcome.session_checkpoint, pending_request_id=outcome.request_id)
@@ -166,7 +166,7 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
 
     async def test_subscription_stops_on_paid_credentials(self):
         # A wrong init must fail even if the CLI immediately offers a usable reply. Leave no Git child to reap.
-        self.set_plan(sde=[dev(status="needs_input", question="which divisor?")])
+        self.set_plan(sde=[dev(status="needs_input", question="使用这个除数吗？")])
         with patch.dict(os.environ, {"FAKE_API_KEY_SOURCE": "apiKeyHelper"}):
             outcome = await self.executor().execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Emit), outcome

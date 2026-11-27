@@ -349,7 +349,7 @@ class TestEnds(SDENotesCase):
         self.assertEqual(self.recorded(), [])
 
     async def test_a_suspended_task_is_recorded_once_a_person_stops_it(self) -> None:
-        asked = await self.execute(dev(FIXED, status="needs_input", question="which?", summary="looked at xdist"))
+        asked = await self.execute(dev(FIXED, status="needs_input", question="采用哪种方式？", summary="looked at xdist"))
         assert isinstance(asked, Suspend), asked
         self.assertEqual(self.recorded(), [])
         waiting = self.session(status="suspended", pending_request_id=asked.request_id,

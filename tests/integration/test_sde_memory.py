@@ -293,7 +293,7 @@ class TestSessionsHaveTheTools(MemoryCase):
             self.assertNotIn(SERVER, json.dumps(call["argv"]))
 
     async def test_a_visible_developer_keeps_them_through_a_restart_and_the_reviewer_does_not_get_them(self) -> None:
-        self.set_plan(sde=[{**dev(FIXED, status="needs_input", question="which?"), **READ}, {**dev(FIXED), **READ}],
+        self.set_plan(sde=[{**dev(FIXED, status="needs_input", question="采用哪种方式？"), **READ}, {**dev(FIXED), **READ}],
                       reviewer=[PASS])
         executor = self.sde(terminal=self.runner)
         async with self.world.access.serving():

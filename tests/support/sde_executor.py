@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from agent_runtime.core.models import Event
+from tests.support.input_decision import DECISION
 from tests.support.coder_reviewer import CHANGES_REQUESTED, git
 
 
@@ -39,6 +40,8 @@ def make_base_repo(root: Path) -> Path:
 
 def dev(write=None, **output):
     out = {"status": "done", "summary": "divide implemented", "test_evidence": EVIDENCE, "change_kind": "fix", "change_rationale": "divide handled zero wrongly"}
+    if output.get("status") == "needs_input":
+        out["decision"] = DECISION
     out.update(output)
     return {"write": write or {}, "output": out}
 

@@ -19,6 +19,7 @@ from agent_runtime.adapters.storage_sqlite.tasks import SQLiteTaskMetadataStore
 from agent_runtime.adapters.storage_sqlite.terminals import SQLiteTerminalBindingStore, TerminalBinding
 from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStore
 from agent_runtime.core.models import Emit, Event, SessionRef, Suspend
+from tests.support.input_decision import DECISION
 from tests.support.empty_guidance import empty_project_guidance
 from tests.support.fakes import InMemoryPermission
 from tests.support.coder_reviewer import fake_command
@@ -277,7 +278,7 @@ class TestTerminalExit(SDECase):
         self.assertIn("merging is authorized but the PR is not merged", outcome.messages[0])
 
     async def test_needs_input_keeps_the_terminal(self):
-        question = {"write": {}, "output": report(status="needs_input", question="which rounding?")}
+        question = {"write": {}, "output": report(status="needs_input", decision=DECISION, question="向下取整吗？")}
         outcome, terminal = await self.run_task([question], self.delivery(close_terminal=True))
         assert isinstance(outcome, Suspend), outcome
         self.assertEqual(terminal.released, [])

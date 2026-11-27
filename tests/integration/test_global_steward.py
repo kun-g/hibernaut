@@ -21,6 +21,7 @@ from agent_runtime.app.config import load_config, parse_config
 from agent_runtime.app.main import build_daemon_from_config, serve_configured
 from agent_runtime.core.models import FORWARD_SOURCE, RETURN_SOURCE, Event, PermissionDecision, SessionRef
 from agent_runtime.engine import OutboxDispatcher
+from tests.support.input_decision import DECISION
 from tests.support.fakes import RecordingChannel
 from tests.support.steward_terminal import steward_cli_terminal
 from tests.support.switchboard_support import Harness, make_harness, post
@@ -493,12 +494,17 @@ class EndToEndTests(ChatCase):
         self.assertEqual(len(self.replies()), 3)
 
     async def test_an_approval_of_the_project_goes_where_approvals_go(self) -> None:
-        self.set_plan([{"calls": [forward("proj:a", "go")]}], [{"output": {
-            "status": "needs_input", "summary": "", "test_evidence": "", "question": "Which one?", "change_kind": "fix",
-            "change_rationale": "x"}}])
-        await self.chat("go")
+        task = "升级文件读取权限"
+        self.set_plan([{"calls": [forward("proj:a", task)]}], [{"output": {
+            "status": "needs_input", "decision": DECISION, "summary": "", "test_evidence": "",
+            "question": "允许已有凭证读取更多文件夹吗？", "change_kind": "fix", "change_rationale": "x"}}])
+        await self.chat(task)
         [card] = [c for c in self.board.http.calls if c["json"]["msg_type"] == "interactive"]
         self.assertEqual(card["json"]["receive_id"], "oc_approvals")
+        body = json.loads(card["json"]["content"])["elements"][0]["content"]
+        self.assertIn(f"任务「{task}」", body)
+        self.assertIn("批准 = " + DECISION["approve"], body)
+        self.assertIn("拒绝 = " + DECISION["reject"], body)
 
 
 class ReloadTests(RoutingCase):

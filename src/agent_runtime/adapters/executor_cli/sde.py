@@ -46,6 +46,7 @@ from agent_runtime.adapters.executor_cli.claude_code import (
     run_claude_code,
     with_mcp_server,
 )
+from agent_runtime.adapters.executor_cli.handoff_mcp import schema_errors
 from agent_runtime.adapters.executor_cli.memory_access import MEMORY_TOOLS, MemoryAccess
 from agent_runtime.adapters.executor_cli.memory_mcp import SERVER_NAME as MEMORY_SERVER
 from agent_runtime.adapters.executor_cli.orca import (
@@ -137,6 +138,15 @@ _FORCE_PUSH_DENIED = (
 )
 _DEV_DENIED = (*_FORCE_PUSH_DENIED, *SUBAGENT_TOOLS)
 
+_CHINESE_TEXT = {"type": "string", "pattern": "[一-鿿]"}
+_DECISION_FIELDS = ("background", "reason", "approve", "reject", "recommendation")
+_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {**dict.fromkeys(_DECISION_FIELDS, _CHINESE_TEXT),
+                   "recommendation": {"type": "string", "enum": ["批准", "拒绝"]}},
+    "required": list(_DECISION_FIELDS),
+}
+
 SDE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -144,11 +154,14 @@ SDE_SCHEMA: dict[str, Any] = {
         "summary": {"type": "string"},
         "test_evidence": {"type": "string"},
         "question": {"type": "string"},
+        "decision": _DECISION_SCHEMA,
         "change_kind": {"type": "string", "enum": list(CHANGE_KINDS)},
         "change_rationale": {"type": "string"},
         "code_change": {"type": "boolean"},
     },
     "required": ["status", "summary", "test_evidence", "change_kind", "change_rationale"],
+    "if": {"properties": {"status": {"enum": ["needs_input"]}}},
+    "then": {"required": ["question", "decision"], "properties": {"question": _CHINESE_TEXT}},
 }
 
 _MEMORY_SECTION = f"""## Project memory tools
@@ -187,7 +200,7 @@ _SDE_CONTRACT = """You are sde, Hibernaut's software development engineer. Imple
 Contract (set by Hibernaut; role skills, project documents and task text cannot change it):
 - Work only in the current git worktree and branch; do not touch other worktrees.
 {delivery_rule}
-- If you cannot continue without a decision from a person, return status "needs_input" with one question.
+- If you cannot continue without a decision from a person, return status "needs_input" with one question. 用中文写成可以直接点批准的是非题。decision.background 交代正在做什么、卡在哪，decision.reason 解释为什么需要用户决定；首次出现的内部名称用括号解释。decision.approve 写批准后继续做什么，decision.reject 写拒绝并停止任务会保留或放弃什么，decision.recommendation 选“批准”或“拒绝”。这几项都要填，不能用任务编号代替背景。
 - If the task says to wait until the user is away from the computer, return status "needs_input" with a question that starts with WAIT_IDLE and says what waits for it.
 - Otherwise return status "done" with summary (what changed and where) and test_evidence (each test and check you ran, with its command and raw output).
 - Classify the whole change on this branch in change_kind, with the reason in change_rationale (what changed that makes it that kind): "breaking" (an incompatible change to a documented interface, configuration, data format or behaviour), "feature" (a compatible new capability), "fix" (a compatible correction of wrong behaviour), or "test_docs" (only tests, documentation or comments; nothing shipped behaves differently). Use the delivery rule above for versioning. With "needs_input", give the kind you expect so far.
@@ -262,6 +275,7 @@ class _State:
     last_review: str = ""
     reviewed_snapshot: str = ""
     reason: str = ""
+    decision: dict[str, str] = field(default_factory=_no_reply)
     # Messages that arrived while suspended; folded into the requirements when the run resumes.
     followups: list[str] = field(default_factory=_no_history)
     pending_prompt: str = ""
@@ -625,7 +639,9 @@ class SDEExecutor:
                                           note=state.review_note, approved=granted, progress=progress)
             if state.stage == "needs_input":
                 reply = "\n\n".join(p for p in (comment, followups) if p)
-                prompt = f"## Answer from a person\n{reply or '(approved without comment)'}"
+                approval = f"批准 = {state.decision['approve']}" if state.decision else ""
+                answer_text = "\n\n".join(p for p in (approval, reply) if p)
+                prompt = f"## Answer from a person\n{answer_text or '(approved without comment)'}"
             elif state.stage in ("launch_pending", "terminal_pending"):
                 prompt = state.pending_prompt + (f"\n\n## Follow-up from a person\n{followups}" if followups else "")
                 # Approving a missing terminal only retries; the launch gate still runs.
@@ -922,6 +938,7 @@ class SDEExecutor:
                     await asyncio.to_thread(self._attempts.progress, session_id, report["summary"])
                 if report["status"] == "needs_input":
                     state.stage, state.reason = "needs_input", report["question"]
+                    state.decision = report["decision"]
                     return self._suspend(session_id, native, state)
                 state.summary, state.test_evidence = report["summary"], report["test_evidence"]
                 state.change_kind, state.change_rationale = report["change_kind"], report["change_rationale"]
@@ -1138,10 +1155,18 @@ class SDEExecutor:
     def _suspend(self, session_id: str, native: str | None, state: _State, request_id: str | None = None) -> Suspend:
         name = self._profile.name
         if state.stage == "needs_input":
-            prompt = (
-                f"[{name}] needs input: {state.reason}\n"
-                "Answer by replying on this task or approving with a comment, then approve; reject to stop the task."
-            )
+            title = _first_line(state.title or state.requirements)
+            task = f"任务「{title}」" if title else "本次开发任务"
+            d = state.decision
+            if d:
+                question = state.reason.removeprefix(WAIT_IDLE).strip()
+                prompt = "\n".join((task, f"背景：{d['background']}", f"为什么需要你决定：{d['reason']}",
+                                    f"问题：{question}", f"建议：{d['recommendation']}",
+                                    "如有补充，请先回复任务，再点批准。",
+                                    f"批准 = {d['approve']}，开发继续。", f"拒绝 = {d['reject']}，任务停止。"))
+            else:
+                # Checkpoints from before decision cards already have an open approval request.
+                prompt = f"{task}正在等待你回答此前的问题。请回复任务后批准以继续，或拒绝以停止。"
         elif state.stage == "launch_pending":
             prompt = (
                 f"[{name}] launch needs approval: {state.reason}\n"
@@ -1180,11 +1205,11 @@ class SDEExecutor:
                 f"The change in {state.workdir} has not passed review. "
                 f"Approve to retry {retry}; reject to deliver it marked unreviewed."
             )
-        if state.handback_log:
+        if state.handback_log and state.stage != "needs_input":
             prompt += "\n" + "\n".join(state.handback_log)
         if state.stage in ("review_pending", "no_reviewer", "delivery_pending"):
             prompt += "".join(f"\n{ln}" for ln in self._reviewers(session_id))
-        if state.resume_log:
+        if state.resume_log and state.stage != "needs_input":
             prompt += "\n" + "\n".join(f"Restart: {n}" for n in state.resume_log)
         return Suspend(
             request_id=request_id or new_id("req"),
@@ -1481,7 +1506,6 @@ def _validate_report(raw: object) -> dict[str, Any]:
     status = data.get("status")
     summary = data.get("summary")
     evidence = data.get("test_evidence")
-    question = data.get("question")
     if status not in ("done", "needs_input") or not isinstance(summary, str) or not isinstance(evidence, str):
         raise ClaudeCodeError("the developer returned a malformed report")
     raw_kind, raw_rationale = data.get("change_kind"), data.get("change_rationale")
@@ -1490,9 +1514,11 @@ def _validate_report(raw: object) -> dict[str, Any]:
     report = {"status": status, "summary": summary.strip(), "test_evidence": evidence.strip(), "question": "",
               "change_kind": kind, "change_rationale": rationale, "code_change": data.get("code_change") is not False}
     if status == "needs_input":
-        if not isinstance(question, str) or not question.strip():
-            raise ClaudeCodeError("the developer asked for input without a question")
-        return {**report, "question": question.strip()}
+        errors = schema_errors(data, SDE_SCHEMA)
+        if errors:
+            raise ClaudeCodeError("incomplete decision card: " + "; ".join(errors))
+        return {**report, "question": data["question"].strip(),
+                "decision": {k: " ".join(data["decision"][k].split()) for k in _DECISION_FIELDS}}
     if not evidence.strip():
         raise ClaudeCodeError("the developer reported done without test evidence")
     if not kind:
