@@ -279,10 +279,12 @@ def _meta_from_json(item: Any) -> DriveFileMeta:
 
 def _error_reason(body: bytes | str) -> str:
     try:
-        data = json.loads(body) if body else {}
+        data: object = json.loads(body) if body else {}
     except (json.JSONDecodeError, UnicodeDecodeError):
         data = {}
-    return str(data.get("error") or "no reason given") if isinstance(data, dict) else "no reason given"
+    if not isinstance(data, dict):
+        return "no reason given"
+    return str(cast(dict[str, Any], data).get("error") or "no reason given")
 
 
 class ProxiedDriveClient:
@@ -295,11 +297,10 @@ class ProxiedDriveClient:
     def _call(self, op: str, payload: dict[str, Any]) -> dict[str, Any]:
         resp = self._proxy.call_service(service_name=self._service, method="POST", path=op, payload=payload)
         try:
-            data = json.loads(resp.body) if resp.body else {}
+            raw: object = json.loads(resp.body) if resp.body else {}
         except json.JSONDecodeError:
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
+            raw = {}
+        data = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
         if resp.status_code != 200:
             raise DriveProxyError(op, resp.status_code, str(data.get("error") or "no reason given"))
         return data
@@ -331,8 +332,9 @@ class ProxiedDriveClient:
     def source_folder(self, *, name: str | None = None, folder_id: str | None = None) -> tuple[str, list[DriveFileMeta]]:
         # (the folder's name, the files directly inside it) of a folder in the proxy's sources folder.
         data = self._call("source_folder", {"folder_id": folder_id} if folder_id else {"name": name or ""})
-        folder = data.get("folder") if isinstance(data.get("folder"), dict) else {}
-        return str(cast(dict[str, Any], folder).get("name", "")), [
+        folder = data.get("folder")
+        name = cast(dict[str, Any], folder).get("name", "") if isinstance(folder, dict) else ""
+        return str(name), [
             _meta_from_json(item) for item in data.get("files", [])]
 
     def download_source(self, file_meta: DriveFileMeta) -> DriveDownload:

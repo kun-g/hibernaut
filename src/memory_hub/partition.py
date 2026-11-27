@@ -47,7 +47,7 @@ def parse_memory_uri(uri: str) -> ParsedUri:
     scheme_raw, remainder = uri.split("://", 1)
     if scheme_raw not in ("global", "proj", "shared", "kb"):
         raise ValueError(f"Unsupported memory URI scheme: {scheme_raw}")
-    scheme: UriScheme = scheme_raw  # type: ignore[assignment]
+    scheme: UriScheme = scheme_raw
     cleaned = remainder.lstrip("/")
     if not cleaned:
         raise ValueError(f"Memory URI path cannot be empty: {uri}")

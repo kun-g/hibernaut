@@ -194,7 +194,7 @@ def parse_delivery(where: str, raw: object, *, repo: str) -> DeliveryConfig:
         close_terminal=_flag(where, item, "close_terminal", d.close_terminal),
         max_handbacks=_count(where, item, "max_handbacks", d.max_handbacks),
         delete_branch=_flag(where, item, "delete_branch", d.delete_branch),
-        issue_link=cast(IssueLink, issue_link),
+        issue_link=issue_link,
     )
 
 
@@ -593,7 +593,8 @@ class PRDelivery:
             return rec
         try:
             self._publish(req, rec, permissions, approved, stop)
-            if rec.state == "merged":
+            # _publish moves rec.state on; the narrowing from the early return above no longer holds.
+            if cast(str, rec.state) == "merged":
                 self._delete_remote_branch(req, rec)
         except _Problem as exc:
             rec.problem = str(exc)

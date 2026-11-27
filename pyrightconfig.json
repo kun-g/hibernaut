@@ -1,19 +1,20 @@
 {
   "include": [
-    "src/agent_runtime/core",
-    "src/agent_runtime/engine",
+    "src/agent_runtime",
     "src/switchboard",
     "src/ccpeer",
     "src/taskboard",
     "src/runner",
     "src/ledger",
     "src/dashboard",
-    "src/collaboration"
+    "src/collaboration",
+    "src/memory_hub"
   ],
   "extraPaths": [
     "src"
   ],
   "pythonVersion": "3.12",
+  "pythonPlatform": "Linux",
   "typeCheckingMode": "strict",
   "reportUnnecessaryTypeIgnoreComment": "error"
 }

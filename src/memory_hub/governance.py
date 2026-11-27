@@ -75,7 +75,7 @@ class WriteGovernanceGate:
         index: DualFTSIndex,
         config: MemoryHubConfig,
         *,
-        on_commit: Callable[[str], None] | None = None,
+        on_commit: Callable[[str], object] | None = None,
     ) -> None:
         self._store = store
         self._index = index

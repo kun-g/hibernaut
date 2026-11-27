@@ -2170,6 +2170,8 @@ def main() -> None:
     # Before anything can start a subprocess: the descriptor numbers leave os.environ here.
     listeners = ListenerHandover.from_environ(os.environ)
     board: SwitchboardHandle | None = None
+    cfg: HibernautConfig | None = None
+    runner_pilot: RunnerPilotRelay | None = None
     if args.config:
         cfg = load_config(args.config)
         ledger_path = run_ledger_path(cfg.runtime.db_path, cfg.runtime.ledger_db_path)
@@ -2182,7 +2184,6 @@ def main() -> None:
             if args.mcp_stdio
             else start_switchboard(cfg.switchboard, audit=ledger.switchboard_audit() if ledger is not None else None)
         )
-        runner_pilot: RunnerPilotRelay | None = None
         if not args.mcp_stdio:
             try:
                 runner_pilot = open_runner_pilot(cfg.runner_pilot)
@@ -2237,7 +2238,7 @@ def main() -> None:
             except NotImplementedError:
                 pass
         try:
-            if args.config:
+            if cfg is not None:
                 await serve_configured(
                     Path(args.config),
                     cfg,

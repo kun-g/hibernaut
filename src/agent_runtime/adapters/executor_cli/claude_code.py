@@ -108,7 +108,8 @@ class ClaudeCodeProfile:
             raise ValueError(f"{where}: billing 'api' needs [credential_proxy] url; real keys never reach the harness")
         if self.effort not in EFFORTS:
             raise ValueError(f"{where}: unsupported effort '{self.effort}' (supported: {', '.join(EFFORTS)})")
-        if not isinstance(self.model, str) or not self.model.strip():
+        # Fields come straight from the deployment file, so the annotation is not yet a guarantee here.
+        if not isinstance(self.model, str) or not self.model.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             raise ValueError(f"{where}: model must be a non-empty string")
         if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
             raise ValueError(f"{where}: timeout_seconds must be finite and positive")

@@ -129,6 +129,14 @@ def registered_checkout(repo: str) -> str:
     return paths[0]
 
 
+def _texts(value: object) -> tuple[str, ...]:
+    # The messages of an emit outcome: a non-empty list of strings, else nothing.
+    if not isinstance(value, list):
+        return ()
+    items = cast(list[object], value)
+    return tuple(cast(list[str], items)) if all(isinstance(m, str) for m in items) else ()
+
+
 def _result(path: Path, session_id: str) -> RunOutcome | None:
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -144,8 +152,8 @@ def _result(path: Path, session_id: str) -> RunOutcome | None:
     match body:
         case {"outcome": "silent"}:
             return Silent()
-        case {"outcome": "emit", "messages": list(messages)} if messages and all(isinstance(m, str) for m in messages):
-            return Emit(messages=tuple(messages), session_id=session_id)
+        case {"outcome": "emit", "messages": messages} if (texts := _texts(messages)):
+            return Emit(messages=texts, session_id=session_id)
         case {"outcome": "suspend", "prompt": str(prompt)}:
             return Suspend(request_id=str(body.get("request_id") or new_id("req")), prompt=prompt,
                            session_checkpoint=str(body.get("session_checkpoint", "{}")), session_id=session_id)
@@ -210,7 +218,7 @@ def _with_native(outcome: RunOutcome, native: str | None) -> RunOutcome:
 @dataclass(frozen=True, slots=True)
 class RoleReply:
     data: dict[str, Any]
-    native_session_id: str
+    native_session_id: str | None
     handle: str
 
 

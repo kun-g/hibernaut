@@ -384,8 +384,8 @@ class KnowledgeMountConfig:
 class MemoryHubConfig:
     memory_root: str
     default_budget: BaselineBudgetConfig = field(default_factory=BaselineBudgetConfig)
-    project_budgets: dict[str, BaselineBudgetConfig] = field(default_factory=dict)
-    inbox_project_map: dict[str, str] = field(default_factory=dict)
+    project_budgets: dict[str, BaselineBudgetConfig] = field(default_factory=dict[str, BaselineBudgetConfig])
+    inbox_project_map: dict[str, str] = field(default_factory=dict[str, str])
     mounts: tuple[KnowledgeMountConfig, ...] = ()
     index_dir: str | None = None
     max_note_bytes: int = 16384
