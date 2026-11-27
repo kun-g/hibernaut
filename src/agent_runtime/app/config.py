@@ -720,6 +720,12 @@ def _parse_feishu_groups(
             raise ValueError(f"{where}.inbox_id {inbox!r} already has a group: an inbox takes one group")
         found[chat_id] = FeishuGroup(chat_id=chat_id, inbox_id=inbox, members=members, project=project,
                                      approvers=approvers)
+    for project in {g.project for g in found.values() if g.project is not None}:
+        # The project's inboxes no group is bound to are decided by who every one of its groups lets decide.
+        approvers = [g.approvers for g in found.values() if g.project == project]
+        if not frozenset.intersection(*approvers):
+            raise ValueError(f"feishu_groups of project '{project}' share no approver: nobody could decide the "
+                             "approvals of its other inboxes")
     return tuple(found.values())
 
 

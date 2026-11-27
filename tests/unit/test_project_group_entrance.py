@@ -27,7 +27,7 @@ FRUIT = FeishuGroup(chat_id=GROUP, inbox_id=CHAT, members=frozenset({KUN, PARTNE
                     approvers=frozenset({KUN}))
 HB = FeishuGroup(chat_id=HB_GROUP, inbox_id=OPS, members=frozenset({KUN}))
 PROJECTS = {CHAT: "fruit", MAIN: "fruit", SDE: "fruit", OTHER: "other"}
-ENTRANCES = GroupEntrances([FRUIT, HB], project_of=PROJECTS.get)
+ENTRANCES = GroupEntrances([FRUIT, HB], projects_of=lambda inbox: [PROJECTS[inbox]] if inbox in PROJECTS else [])
 
 
 def message(*, chat_id: str = GROUP, chat_type: str = "group", actor: str = PARTNER, scope: str = ASH) -> CanonicalEvent:
