@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from memory_hub import AuthPrincipal, MemoryHubHTTPServer, StaticTokenAuth
-from tests.support.memory_hub_fixtures import _make_hub, fast_memory_http_shutdown
+from tests.support.memory_hub_fixtures import _make_hub
+from tests.support.memory_hub_fixtures import fast_memory_http_shutdown  # noqa: F401 -- pytest fixture, requested by parameter name
 
 
 def _http_json(url: str, *, method: str = "GET", token: str | None = None, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:

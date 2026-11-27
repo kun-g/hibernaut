@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hmac
+import importlib
 import ipaddress
 import json
 import os
@@ -25,7 +26,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from agent_runtime.adapters.gdrive_contract import (
     ATTACHMENTS_FOLDER_NAME,
@@ -61,13 +62,16 @@ def _b64url(data: bytes) -> str:
 
 def sign_rs256(signing_input: bytes, private_key_pem: str) -> bytes:
     try:
-        from cryptography.hazmat.primitives import hashes, serialization  # pyright: ignore[reportMissingImports]
-        from cryptography.hazmat.primitives.asymmetric import padding, rsa  # pyright: ignore[reportMissingImports]
+        # cryptography is optional and has no stubs here, so its modules are typed Any.
+        hashes: Any = importlib.import_module("cryptography.hazmat.primitives.hashes")
+        serialization: Any = importlib.import_module("cryptography.hazmat.primitives.serialization")
+        padding: Any = importlib.import_module("cryptography.hazmat.primitives.asymmetric.padding")
+        rsa: Any = importlib.import_module("cryptography.hazmat.primitives.asymmetric.rsa")
 
         key = serialization.load_pem_private_key(private_key_pem.encode("utf-8"), password=None)
         if not isinstance(key, rsa.RSAPrivateKey):
             raise TypeError("Service Account private key must be an RSA key")
-        return key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+        return cast(bytes, key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256()))
     except ImportError:
         pass
 
@@ -464,7 +468,7 @@ class DriveQueueGuard:
         if op == "subfolders":
             if _drive_id(args, "parent_id") != self._root:
                 raise ProxyRefused(403, "'parent_id' is not the task queue root")
-            folders = dict(zip(QUEUE_FOLDER_NAMES, self._queue_ids(), strict=True))
+            folders: dict[str, str] = dict(zip(QUEUE_FOLDER_NAMES, self._queue_ids(), strict=True))
             if self.folders().attachments_id:
                 folders[ATTACHMENTS_FOLDER_NAME] = self.folders().attachments_id
             return {"folders": folders}
@@ -535,7 +539,8 @@ class _ProxyServer(ThreadingHTTPServer):
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
-    server: _ProxyServer
+    # socketserver hands every handler the server that built it, always a _ProxyServer here.
+    server: _ProxyServer  # pyright: ignore[reportIncompatibleVariableOverride]
     server_version = "hibernaut-drive-proxy"
     sys_version = ""
 
@@ -619,13 +624,14 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if raw is None:
             return
         try:
-            args = json.loads(raw.decode("utf-8")) if raw else {}
+            body: object = json.loads(raw.decode("utf-8")) if raw else {}
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._refuse(400, "body must be a JSON object", op)
             return
-        if not isinstance(args, dict):
+        if not isinstance(body, dict):
             self._refuse(400, "body must be a JSON object", op)
             return
+        args = cast(dict[str, Any], body)
         try:
             if op in ("download", "source_download"):
                 guard = self.server.guard

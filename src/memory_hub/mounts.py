@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path, PurePosixPath
-from typing import Iterator
+from collections.abc import Iterator
 
 from memory_hub.models import KnowledgeMountConfig, MemoryDoc, estimate_tokens, sha256_text
 from memory_hub.partition import safe_join
@@ -89,7 +89,7 @@ class KnowledgeMountRegistry:
         if max_bytes is not None and len(raw.encode("utf-8")) > max_bytes:
             raw = raw.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore") + "\n[TRUNCATED]"
             truncated = True
-        mtime = datetime.fromtimestamp(target.stat().st_mtime, tz=timezone.utc).replace(microsecond=0)
+        mtime = datetime.fromtimestamp(target.stat().st_mtime, tz=UTC).replace(microsecond=0)
         return MemoryDoc(
             uri=f"kb://{mount_name}/{rel_path.lstrip('/')}",
             content=raw,

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from agent_runtime.adapters.executor_whitebox import LLMMessage, LLMReply, ToolCallRequest
 from agent_runtime.app.main import build_daemon
-from agent_runtime.core.models import Emit, Event
+from agent_runtime.core.models import Emit
 from tests.support.fakes import RecordingChannel
 
 

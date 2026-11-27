@@ -4,7 +4,7 @@ import json
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 from memory_hub.hub import MemoryHub
@@ -238,7 +238,7 @@ class MemoryHubHTTPServer:
                 if not isinstance(data, dict):
                     self._send_json(HTTPStatus.BAD_REQUEST, {"error": "JSON object required"})
                     return None
-                return data
+                return cast(dict[str, Any], data)
 
             def do_GET(self) -> None:
                 parsed_url = urlparse(self.path)
@@ -293,7 +293,7 @@ class MemoryHubHTTPServer:
                     if parsed_url.path == "/mcp":
                         req_id = body.get("id")
                         method = body.get("method")
-                        params = body.get("params") or {}
+                        params: dict[str, Any] = body.get("params") or {}
                         if method == "tools/list":
                             self._send_json(
                                 HTTPStatus.OK,
@@ -302,7 +302,7 @@ class MemoryHubHTTPServer:
                             return
                         if method == "tools/call":
                             name = str(params.get("name", ""))
-                            args = params.get("arguments") or {}
+                            args: dict[str, Any] = params.get("arguments") or {}
                             code, result = outer._dispatch_mcp_tool(principal, name, args)
                             if code != HTTPStatus.OK:
                                 self._send_json(

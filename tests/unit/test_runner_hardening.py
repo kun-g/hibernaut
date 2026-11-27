@@ -4,12 +4,12 @@ from pathlib import Path
 import pytest
 from runner.supervisor import ProcessSupervisor
 from tests.support.runner_safety import PY
-from datetime import datetime, timedelta, timezone  # noqa: E402
+from datetime import datetime, timedelta, UTC
 
 
 def test_no_process_is_left_when_the_run_log_cannot_be_opened(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     logs = tmp_path / "logs"
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for day in (now, now + timedelta(days=1)):
         (logs / day.strftime("%Y-%m-%d") / "run_nolog.log").mkdir(parents=True)  # opening it for writing fails
     supervisor = ProcessSupervisor(runner_id="r", logs_dir=logs)

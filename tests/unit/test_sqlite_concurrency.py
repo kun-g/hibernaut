@@ -7,7 +7,7 @@ import unittest
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import datetime, timedelta, tzinfo, UTC
 from pathlib import Path
 from unittest import mock
 
@@ -32,7 +32,7 @@ class _ReclaimClock:
     # Reclaim staleness is judged on this clock: claims and renewals are stamped with it and the
     # stale cutoff is read from it, so a test moves past the stale window instead of sleeping.
     def __init__(self) -> None:
-        self._now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self._now = datetime(2026, 1, 1, tzinfo=UTC)
         self._lock = threading.Lock()
 
     def now(self, tz: tzinfo | None = None) -> datetime:

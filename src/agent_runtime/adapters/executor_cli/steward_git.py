@@ -4,7 +4,7 @@ import os
 import posixpath
 import re
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -139,7 +139,7 @@ def _without_filters(checkout: Path, env: dict[str, str]) -> dict[str, str]:
     try:
         listed = subprocess.run(
             ["git", "config", "--name-only", "-z", "--get-regexp", r"^filter\."], cwd=checkout, env=env,
-            stdin=subprocess.DEVNULL, capture_output=True, timeout=_GIT_TIMEOUT,
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=_GIT_TIMEOUT, check=False,
         )
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise ToolError(f"git: {exc}") from exc
@@ -160,7 +160,7 @@ def run_git(checkout: Path, args: Sequence[str], ok: Sequence[int] = (0,)) -> by
     try:
         done = subprocess.run(
             ["git", "--no-pager", *(part for item in _GIT_CONFIG for part in ("-c", item)), *args],
-            cwd=checkout, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=_GIT_TIMEOUT,
+            cwd=checkout, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=_GIT_TIMEOUT, check=False,
         )
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise ToolError(f"git: {exc}") from exc

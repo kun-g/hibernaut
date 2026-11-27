@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 from agent_runtime.adapters.storage_sqlite import SQLiteSessionStoreAdapter, SQLiteTimerAdapter
 from agent_runtime.core.models import Emit, Suspend, to_utc_iso
@@ -23,7 +23,7 @@ class TestDeliveryRetry(SDEDeliveryCase):
         self.inbox.append(event(self.payload()))
 
     async def advance_retry(self, minutes):
-        start = datetime.now(timezone.utc)
+        start = datetime.now(UTC)
         [report] = await self.worker.process_inbox("proj:x")
         assert isinstance(report.outcome, Suspend)
         assert not [m for m in self.outbox.fetch_pending() if m.metadata.get("kind") == "approval_request"], \
@@ -31,7 +31,7 @@ class TestDeliveryRetry(SDEDeliveryCase):
         assert self.lock.acquire("proj:x", "another-worker", 60)
         self.lock.release("proj:x", "another-worker")
         assert self.scheduler.tick(to_utc_iso(start + timedelta(minutes=minutes, seconds=-1))) == 0
-        assert self.scheduler.tick(to_utc_iso(datetime.now(timezone.utc) + timedelta(minutes=minutes))) == 1
+        assert self.scheduler.tick(to_utc_iso(datetime.now(UTC) + timedelta(minutes=minutes))) == 1
 
     async def test_two_transient_failures_then_merge_without_approval(self):
         self.start_delivery(2, "Could not resolve host: github.com")

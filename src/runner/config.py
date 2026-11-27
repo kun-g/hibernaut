@@ -4,7 +4,8 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Mapping, cast
+from typing import Any, Final, cast
+from collections.abc import Mapping
 
 from runner.protocol import InteractiveSurfaceKind, WorktreeBackendKind
 

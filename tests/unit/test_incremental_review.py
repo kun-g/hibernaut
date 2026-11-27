@@ -22,7 +22,7 @@ class TestReviewScope(unittest.TestCase):
             (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.root / rel).write_text("x\n")
 
-    def scope(self, previous=(block("calc.py:2"),), changed=("pkg/mod.py",), workdir=None):
+    def scope(self, previous=(block("calc.py:2"),), changed=("pkg/mod.py",), workdir=None):  # noqa: B008 -- read, never mutated
         return ReviewScope(root=self.root, workdir=workdir or self.root, previous=tuple(previous), changed=tuple(changed))
 
     def kept(self, *items, **scope):
@@ -326,7 +326,7 @@ class TestFollowUpSection(unittest.TestCase):
 
     def test_notes_are_one_line_each_and_ping_or_close_nothing(self):
         section = self.body("first\nline", "use @property; fixes #12").split("## 跟进\n")[1].split("\n\n## ")[0]
-        self.assertEqual(section, "- first line\n- use @​property; fixes #​12")
+        self.assertEqual(section, "- first line\n- use @\u200bproperty; fixes #\u200b12")
 
     def section(self, body):
         return body.split("## 跟进\n")[1].split("\n\n## ")[0]

@@ -7,7 +7,7 @@ import asyncio
 import json
 import os
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from functools import partial
 from pathlib import Path
 
@@ -47,7 +47,7 @@ if __name__ == "__main__":
             try:
                 return datetime.fromisoformat(Path(clock_file).read_text())
             except FileNotFoundError:
-                return datetime.now(timezone.utc)
+                return datetime.now(UTC)
 
         hibernaut_main.OutboxDispatcher = partial(hibernaut_main.OutboxDispatcher, utc_clock=outbox_now)
     hibernaut_main.main()

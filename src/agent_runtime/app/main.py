@@ -10,7 +10,7 @@ import ssl
 import sys
 import threading
 from collections import deque
-from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, MutableMapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, MutableMapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -2204,6 +2204,8 @@ def main() -> None:
     # Before anything can start a subprocess: the descriptor numbers leave os.environ here.
     listeners = ListenerHandover.from_environ(os.environ)
     board: SwitchboardHandle | None = None
+    cfg: HibernautConfig | None = None
+    runner_pilot: RunnerPilotRelay | None = None
     if args.config:
         reloads = ReloadStatus()
         cfg = load_config(args.config, reloads=reloads)
@@ -2217,7 +2219,6 @@ def main() -> None:
             if args.mcp_stdio
             else start_switchboard(cfg.switchboard, audit=ledger.switchboard_audit() if ledger is not None else None)
         )
-        runner_pilot: RunnerPilotRelay | None = None
         if not args.mcp_stdio:
             try:
                 runner_pilot = open_runner_pilot(cfg.runner_pilot)
@@ -2273,7 +2274,7 @@ def main() -> None:
             except NotImplementedError:
                 pass
         try:
-            if args.config:
+            if cfg is not None:
                 await serve_configured(
                     Path(args.config),
                     cfg,

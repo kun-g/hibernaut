@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 import secrets
 import time
 from types import MappingProxyType
@@ -69,7 +69,7 @@ def new_ledger_id(prefix: Literal["aud", "run", "trc", "pm"]) -> str:
 
 def utc_now_iso() -> str:
     """Return a fixed-width RFC3339 UTC timestamp with millisecond precision."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def truncate_summary(text: str | None, limit: int = MAX_ERROR_SUMMARY_LEN) -> str | None:

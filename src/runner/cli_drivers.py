@@ -6,7 +6,8 @@ import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Mapping, Protocol, Sequence, TypeAlias, cast
+from typing import Any, Literal, Protocol, TypeAlias, cast
+from collections.abc import Mapping, Sequence
 
 from runner.protocol import (
     DriverKind,

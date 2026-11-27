@@ -5,7 +5,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from typing import Any, cast
 
 from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
@@ -345,7 +345,7 @@ class SQLiteTimerAdapter:
 
     def reconcile(self, declarations: Sequence[ConfiguredTimer]) -> None:
         desired = {timer.timer_id: timer for timer in declarations if timer.enabled}
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         with self._db.transaction() as conn:
             existing = {row[0] for row in conn.execute(
                 "SELECT timer_id FROM timers WHERE timer_id GLOB ?", (CONFIG_TIMER_PREFIX + "*",),
@@ -504,7 +504,7 @@ class SQLiteOutboxAdapter:
             ORDER BY seq ASC
             LIMIT ?
             """,
-            (now_iso or to_utc_iso(datetime.now(timezone.utc)), limit),
+            (now_iso or to_utc_iso(datetime.now(UTC)), limit),
         )
         return [
             OutboxMessage(

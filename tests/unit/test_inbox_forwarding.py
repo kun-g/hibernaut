@@ -674,7 +674,7 @@ class InboxOwnershipTests(ForwardCase):
         await self.run_inbox()
         self.assertEqual(self.sessions.get(session.session_id), session)
         self.assertEqual([e.status for e in self.inbox.all_events() if e.event_id == event.event_id], ["failed"])
-        own, _ = self.inbox.append(Event(
+        _own, _ = self.inbox.append(Event(
             inbox_id=SDE, source="test", external_id="c", payload={"action": "close_session",
                                                                    "session_id": session.session_id}))
         await self.run_inbox(SDE)

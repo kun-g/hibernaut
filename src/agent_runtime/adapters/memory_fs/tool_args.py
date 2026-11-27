@@ -59,7 +59,7 @@ def write_proposal(uri: str, args: Mapping[str, Any], *, author: str | None) -> 
     content = args.get("content")
     if not isinstance(content, str):
         raise ValueError("content must be a string")
-    supersedes = args.get("supersedes") or []
+    supersedes: object = args.get("supersedes") or []
     if not isinstance(supersedes, list) or not all(isinstance(s, str) for s in cast(list[object], supersedes)):
         raise ValueError("supersedes must be an array of strings")
     # The author is whoever calls, never what the arguments claim.

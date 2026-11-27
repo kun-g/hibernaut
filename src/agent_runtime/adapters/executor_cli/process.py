@@ -50,7 +50,7 @@ async def terminate(proc: asyncio.subprocess.Process, grace_seconds: float = 2.0
     try:
         proc.terminate()
         await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
-    except (ProcessLookupError, asyncio.TimeoutError):
+    except (TimeoutError, ProcessLookupError):
         try:
             proc.kill()
             await proc.wait()

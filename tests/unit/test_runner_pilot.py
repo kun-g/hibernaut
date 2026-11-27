@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import http.client
 import json
+import re
 import sqlite3
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 import pytest
 
@@ -40,7 +41,7 @@ from runner.registry import NoEligibleRunnerError
 from runner.transport.relay_hub import RunnerConnectionLostError
 from tests.support.fakes import InMemoryPermission, RecordingChannel
 from tests.support.runner_pilot_support import ROOT, RUNNER_ID
-from tests.support.runner_pilot import KEY, OTHER, PILOT, _relay, pilot
+from tests.support.runner_pilot import KEY, OTHER, PILOT, _relay
 
 
 COMMIT = "a" * 40
@@ -91,11 +92,11 @@ def test_unusable_settings_are_refused(change: dict[str, Any]) -> None:
 def test_the_pilot_inbox_must_be_its_own_and_the_executor_name_is_reserved() -> None:
     raw = _raw()
     raw["projects"]["hibernaut"]["inbox_id"] = PILOT
-    with pytest.raises(ValueError, match="primary inbox of projects.hibernaut"):
+    with pytest.raises(ValueError, match=re.escape("primary inbox of projects.hibernaut")):
         parse_config(raw)
     raw = _raw()
     raw["gdrive"] = {"default_inbox_id": PILOT}
-    with pytest.raises(ValueError, match="gdrive.default_inbox_id"):
+    with pytest.raises(ValueError, match=re.escape("gdrive.default_inbox_id")):
         parse_config(raw)
     raw = _raw(enabled=False)
     raw["executors"][PROTOCOL_CHECK_EXECUTOR_ID] = {"command": "true"}
@@ -126,7 +127,7 @@ def test_the_relay_port_must_not_be_the_one_of_the_general_runner() -> None:
     raw = _raw(port=8790)
     raw["executors"]["claude"] = {"command": "claude"}
     raw["runner"] = {"enabled": True, "mode": "relay", "executors": ["claude"], "listen_port": 8790}
-    with pytest.raises(ValueError, match="runner_pilot.port is runner.listen_port"):
+    with pytest.raises(ValueError, match=re.escape("runner_pilot.port is runner.listen_port")):
         parse_config(raw)
     for change in ({"mode": "in_process"}, {"enabled": False}, {"listen_port": 8795}):
         other = {**raw, "runner": raw["runner"] | change}
@@ -136,7 +137,7 @@ def test_the_relay_port_must_not_be_the_one_of_the_general_runner() -> None:
 def test_the_relay_port_must_not_be_the_one_of_the_memory_service() -> None:
     http = {"enabled": True, "listen_port": 8790, "tokens": {"a": {"token_env": "T"}}}
     raw = _raw(port=8790)
-    with pytest.raises(ValueError, match="runner_pilot.port is memory_hub.http.listen_port"):
+    with pytest.raises(ValueError, match=re.escape("runner_pilot.port is memory_hub.http.listen_port")):
         parse_config({**raw, "memory_hub": {"http": http}})
     for change in ({"enabled": False}, {"listen_port": 8795}):
         assert parse_config({**raw, "memory_hub": {"http": http | change}}).runner_pilot.port == 8790

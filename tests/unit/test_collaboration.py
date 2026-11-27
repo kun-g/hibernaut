@@ -16,7 +16,6 @@ from collaboration import (
     CloseoutStore,
     CollaborationHubServer,
     CollaborationMCPTools,
-    DigestAssembler,
     ExpertPoolRegistry,
     NotificationPolicyEngine,
     RoleSkillMemoryStore,
