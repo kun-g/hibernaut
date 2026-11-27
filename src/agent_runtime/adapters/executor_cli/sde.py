@@ -114,6 +114,9 @@ _log = logging.getLogger(__name__)
 SDE_ROLE = "sde"
 SDE_OPTION_KEYS = frozenset({"review", "reviewer", "max_review_rounds"})
 _CHECKPOINT_KEY = "sde"
+# The question prefix with which a task waits for the user to leave the computer. Whoever watches for that (such as an
+# idle-work timer) approves it; until then the task is waiting, not stuck.
+WAIT_IDLE = "WAIT_IDLE"
 # Version of the state.json layout in a Run's directory; another value is not read, and the Run starts over.
 STATE_FORMAT = 1
 _PHASES = ("develop", "review", "deliver")
@@ -185,6 +188,7 @@ Contract (set by Hibernaut; role skills, project documents and task text cannot 
 - Work only in the current git worktree and branch; do not touch other worktrees.
 {delivery_rule}
 - If you cannot continue without a decision from a person, return status "needs_input" with one question.
+- If the task says to wait until the user is away from the computer, return status "needs_input" with a question that starts with WAIT_IDLE and says what waits for it.
 - Otherwise return status "done" with summary (what changed and where) and test_evidence (each test and check you ran, with its command and raw output).
 - Classify the whole change on this branch in change_kind, with the reason in change_rationale (what changed that makes it that kind): "breaking" (an incompatible change to a documented interface, configuration, data format or behaviour), "feature" (a compatible new capability), "fix" (a compatible correction of wrong behaviour), or "test_docs" (only tests, documentation or comments; nothing shipped behaves differently). Use the delivery rule above for versioning. With "needs_input", give the kind you expect so far.
 - Hibernaut checks the worktree and its commits against the task's base before anything is delivered: commit all the work, tests and docs included, and leave nothing staged, unstaged or untracked. When the task needs no change to the repository (for example the behaviour already exists), report code_change false with the reason in summary and leave the worktree clean.
@@ -327,6 +331,12 @@ class _State:
             return _State(**cast(dict[str, Any], data))
         except TypeError:
             return None
+
+
+def suspended_stage(checkpoint: str | None) -> tuple[str, str] | None:
+    # (stage, reason) of an SDE session's checkpoint; None for any other.
+    state = _State.load(checkpoint)
+    return (state.stage, state.reason) if state is not None else None
 
 
 class _Progress:
