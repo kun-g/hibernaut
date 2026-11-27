@@ -65,6 +65,8 @@
 
 **C5 写配置前整份校验，有备份，写入不会留下半份；人同时改了就放弃并说明。** 来自：运行稳定。
 
+工具先校验候选配置，再备份、原子替换并等待热加载确认。人工修改可在替换前后用 `python -m agent_runtime.app.main --config hibernaut.toml --check` 校验。热加载拒绝时，查 `runtime_status.config_reload` 里的字段错误和当前生效版本。
+
 **C6 能到系统 Steward 的只有三种：单聊经全局 Steward 转来的、绑定群里名单上的人发的、本机运营者投的。** 来自：系统安全。
 
 **C7 Ash 建仓库只用专门的 `create_repo` 工具，仍然没有命令行；GitHub 和 Drive 的凭据不进它的上下文。** 来自：系统安全。
