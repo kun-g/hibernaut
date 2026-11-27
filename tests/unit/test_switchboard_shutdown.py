@@ -407,7 +407,7 @@ class TimeoutTests(ShutdownHarness):
         board = self.board(timeout=0.2)
         before = set(threading.enumerate())
         with socket.create_connection(("127.0.0.1", board.http.port), timeout=5) as sock:
-            sock.sendall(b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+            sock.sendall(b"POST /mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-mcp-bearer\r\nContent-Length: 100\r\n\r\n{")
             self.assertTrue(wait_until(lambda: bool(board.http._server._active)))
             stderr = io.StringIO()
             with contextlib.redirect_stderr(stderr):

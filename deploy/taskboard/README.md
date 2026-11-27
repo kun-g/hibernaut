@@ -252,12 +252,14 @@ consumer_id = "hibernaut"
 
 ## 数据与停用
 
-- 升级前备份数据卷（卷名以 `docker volume ls` 为准）：
+- 升级前在 Compose 项目目录执行以下命令。脚本在运行中的容器内用 SQLite 在线备份 API 生成一致快照（容器临时目录需容得下一个数据库），再把压缩包写回宿主机。Dokploy 可将 `docker compose exec -T taskboard` 换成 `docker exec -i <运行中的容器名>`，并指定本机脚本路径。
 
   ```bash
-  docker run --rm -v <taskboard 数据卷>:/data -v "$PWD":/backup python:3.12-slim \
-    tar czf /backup/taskboard-data-$(date +%Y%m%d%H%M).tgz -C /data .
+  script="$(git rev-parse --show-toplevel)/scripts/backup_sqlite.py"
+  tmp=$(mktemp ./taskboard-data-XXXXXXXX) &&
+    docker compose exec -T taskboard python - /data/taskboard.db < "$script" > "$tmp" &&
+    mv "$tmp" "$tmp.tgz"
   ```
 
-- 回滚版本：把 `TASKBOARD_REF` 改回上一个可用的 commit 再部署；新版本改过表结构时，连同数据卷一起恢复到升级前的备份。
+- 回滚时停服务，保留原卷，把升级前的 `.tgz` 解到新的空数据卷，确认 `taskboard.db` 归 UID 10001 所有，再用该卷和原 `TASKBOARD_REF` 启动。空卷可避免旧 WAL 被重放。
 - `docker compose down` 保留数据卷；`docker compose down -v` 会删除两个服务的数据库与 Caddy 证书，谨慎使用。

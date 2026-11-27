@@ -144,15 +144,15 @@ class MCPInboundAdapter:
         self._replay = replay
         self._clock = clock
 
-    def _verify_bearer(self, headers: Mapping[str, str]) -> bool:
+    def authorized(self, headers: Mapping[str, str]) -> bool:
         expected = self._credentials.get_webhook_secret("mcp")
         supplied = lower_headers(headers).get("authorization", "")
         if not expected or not supplied.startswith("Bearer "):
             return False
-        return hmac.compare_digest(expected, supplied.removeprefix("Bearer ").strip())
+        return hmac.compare_digest(expected.encode(), supplied.removeprefix("Bearer ").strip().encode())
 
     def handle(self, headers: Mapping[str, str], raw_body: bytes) -> AdapterParseResult:
-        if not self._verify_bearer(headers):
+        if not self.authorized(headers):
             return reject(401, "invalid bearer token")
         request = parse_json_object(raw_body)
         if request is None:

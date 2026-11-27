@@ -228,15 +228,14 @@ GitHub 和飞书 Webhook 均投到 Switchboard。Hibernaut 通过 Relay 接收�
 
 - **单个入口**：GitHub Webhook 可切回此前可用的 Switchboard 监听地址。飞书事件订阅和卡片回调也需切到可用的 Switchboard。
 - **Hibernaut 侧**：`hibernaut.toml` 的 `[switchboard]` 改回原来的 `mode = "in_process"` 并设置原有 `config_path`，重启 Hibernaut，同时把 GitHub 与飞书 Webhook 切到该 Switchboard。`enabled = false` 会暂停这两个渠道。切换前先确认 VPS 上没有发给 `hibernaut` 的 `pending` 投递，否则这些事件要等重新连上才会推送。
-- **VPS 版本**：升级前先备份数据卷，回滚时检出上一个版本重新构建：
+- **VPS 版本**：升级前在 Compose 项目目录给运行中的 Switchboard 做 SQLite 在线快照。容器临时目录需容得下一个数据库。Dokploy 可将 `docker compose exec -T switchboard` 换成 `docker exec -i <运行中的容器名>`，并指定本机脚本路径。
 
   ```bash
-  docker compose stop switchboard
-  docker run --rm -v switchboard_switchboard_data:/data -v "$PWD":/backup python:3.12-slim \
-    tar czf /backup/switchboard-data-$(date +%Y%m%d%H%M).tgz -C /data .
-  git checkout <上一个可用的 commit>
-  docker compose up -d --build switchboard
+  script="$(git rev-parse --show-toplevel)/scripts/backup_sqlite.py"
+  tmp=$(mktemp ./switchboard-data-XXXXXXXX) &&
+    docker compose exec -T switchboard python - /data/switchboard.db < "$script" > "$tmp" &&
+    mv "$tmp" "$tmp.tgz"
   ```
 
-  新版本改过表结构时，回滚代码要连同数据卷一起恢复到升级前的备份。
+  若需回滚数据库，先停服务并保留原卷，把升级前的 `.tgz` 解到新的空数据卷，确认 `switchboard.db` 归 UID 10001 所有，再用该卷和上一个可用的 commit 重新部署。
 - **整体停用**：`docker compose down`（保留数据卷）；`docker compose down -v` 会删除数据库与 Caddy 证书，谨慎使用。
