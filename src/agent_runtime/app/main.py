@@ -130,6 +130,7 @@ from agent_runtime.app.config import (
     HibernautConfig,
     MemoryHTTPConfig,
     ProjectConfig,
+    RepoToolsConfig,
     RoleConfig,
     RunnerLinkConfig,
     RunnerPilotConfig,
@@ -417,26 +418,27 @@ class ForwardTargets:
     # What the configuration in force lets each inbox outside a project forward to. Shared by every generation: one that
     # a reload retired still runs what it started, but sends nothing to a project that was taken off the list since.
     def __init__(self, config: HibernautConfig) -> None:
-        self._in_force = config.runtime.workdir_binding
+        self._in_force = config
 
     def activate(self, config: HibernautConfig) -> None:
-        self._in_force = config.runtime.workdir_binding
+        self._in_force = config
 
     def allowed(self, inbox_id: str, own: tuple[str, ...]) -> tuple[str, ...]:
-        bound = self._in_force(inbox_id)
+        bound = self._in_force.runtime.workdir_binding(inbox_id)
         return tuple(target for target in own if bound is not None and target in bound.forward_to)
 
     def has_system_tools(self, inbox_id: str) -> bool:
-        bound = self._in_force(inbox_id)
+        bound = self._in_force.runtime.workdir_binding(inbox_id)
         return bound is not None and bound.system_tools
 
     def has_ops_tools(self, inbox_id: str) -> bool:
-        bound = self._in_force(inbox_id)
+        bound = self._in_force.runtime.workdir_binding(inbox_id)
         return bound is not None and bound.ops_tools
 
-    def has_repo_tools(self, inbox_id: str) -> bool:
-        bound = self._in_force(inbox_id)
-        return bound is not None and bound.repo_tools
+    def repo_tools(self, inbox_id: str) -> RepoToolsConfig | None:
+        config = self._in_force
+        bound = config.runtime.workdir_binding(inbox_id)
+        return config.repo_tools if bound is not None and bound.repo_tools else None
 
 
 @dataclass
@@ -1358,6 +1360,7 @@ def build_daemon_from_config(
                         inbox_id, bound.binding, tuple(config.agents.values()), listed(inbox_id),
                         config.runtime.default_agent, systems(inbox_id),
                         repo_owner=config.repo_tools.owner if bound.repo_tools else "",
+                        repo_owners=config.repo_tools.allowed_owners,
                     ),
                     readable=readable,
                     system=SystemToolbox(
@@ -1367,8 +1370,7 @@ def build_daemon_from_config(
                     ) if bound.system_tools else None,
                     status=None if bound.person_only else runtime_status,
                     repo=RepoCreator(
-                        owner=config.repo_tools.owner, drive=_drive_sources, max_bytes=config.repo_tools.max_bytes,
-                        allowed=lambda: targets.has_repo_tools(inbox),
+                        config=lambda: targets.repo_tools(inbox), drive=_drive_sources,
                     ) if bound.repo_tools else None,
                     ops=DokployTools(
                         script=config.ops_tools.dokploy_script, workdir=bound.workdir,

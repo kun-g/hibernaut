@@ -57,6 +57,7 @@ ops_tools = true
 
 [repo_tools]
 owner = "acme"
+allowed_owners = ["acme", "LambdaTheory"]
 
 [ops_tools]
 dokploy_script = "{root}/bin/dokploy-api.sh"
@@ -284,13 +285,14 @@ class NewProjectTests(ServedCase):
 
     async def test_an_existing_repository_stops_it_at_the_first_step(self) -> None:
         await self.serve()
-        (self.state / "github" / "acme" / "aura-desk.git").mkdir(parents=True)
-        self.set_plan([{"calls": [CREATE], **reply("停在第 1 步：acme/aura-desk 已存在，没有覆盖")}])
+        (self.state / "github" / "LambdaTheory" / "aura-desk.git").mkdir(parents=True)
+        self.set_plan([{"calls": [tool("create_repo", name="aura-desk", owner="lambdatheory")],
+                        **reply("停在第 1 步：LambdaTheory/aura-desk 已存在，没有覆盖")}])
         await self.message(REQUEST)
         await self.wait_for(lambda: any("停在第 1 步" in r for r in self.replies()), "the answer")
         refused, said = self.answers()[0]
         self.assertTrue(refused)
-        self.assertIn("exists on GitHub already", said)
+        self.assertIn("LambdaTheory/aura-desk exists on GitHub already", said)
         self.assertEqual(self.drive.downloads, [])
         self.assertEqual(self.events(FORWARD_SOURCE), [])
 

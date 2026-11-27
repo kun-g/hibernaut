@@ -69,8 +69,7 @@ class GitHubOutboundAdapter:
             if response.status >= 300 and response.status != 404:
                 return _failure("remove_labels", response)
 
-        text = f"**{msg.title}**\n\n{msg.body_md}" if msg.title else msg.body_md
-        body = f"{text}\n\n{GITHUB_OUTBOUND_MARKER}"
+        body = f"{msg.body_md}\n\n{GITHUB_OUTBOUND_MARKER}"
         response = self._http.request(
             "POST",
             f"{issue_url}/comments",

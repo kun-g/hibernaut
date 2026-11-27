@@ -281,7 +281,13 @@ class SwitchboardChannelAdapter:
             report |= {"outcome_kind": "done", "notification_channel": withheld}
         if reply := _chat_reply(metadata):
             report["chat_reply"] = reply
-        subject = metadata.get("title") or metadata.get("subject") or "Hibernaut update"
+        for field in ("title", "subject"):
+            subject = metadata.get(field)
+            if subject and str(subject).strip():
+                break
+        else:
+            # Older hubs require a nonempty subject even when the reply has no title.
+            subject = "待审批" if outcome == "suspend" else "Hibernaut update"
         return CanonicalEvent(
             source="hibernaut",
             event_type="execution.reported",

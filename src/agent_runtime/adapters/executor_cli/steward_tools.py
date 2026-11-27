@@ -70,9 +70,9 @@ class PlannedCall:
 
 
 class RepoTools(Protocol):
-    # create_repo: a private repository under the configured owner, its first commit the latest version in a Drive
+    # create_repo: a private repository under an allowed owner, its first commit the latest version in a Drive
     # folder. Blocks; a failure is raised as ToolError saying where it stopped and what it left behind.
-    def create(self, *, name: str, drive_folder: str | None, description: str | None) -> str: ...
+    def create(self, *, name: str, drive_folder: str | None, description: str | None, owner: str | None = None) -> str: ...
 
 
 class OpsTools(Protocol):
@@ -231,12 +231,13 @@ def _system_definitions() -> list[dict[str, Any]]:
 def _repo_definition() -> dict[str, Any]:
     return {
         "name": "create_repo",
-        "description": "Create a private GitHub repository under the owner in the routing manifest, with the latest "
+        "description": "Create a private GitHub repository under an allowed owner in the routing manifest, with the latest "
                        "version in a Google Drive folder as its first commit (the newest file there; an archive is "
                        "unpacked). It stops without changing anything when the repository exists already or the folder "
                        "is empty, and says where it stopped otherwise.",
         "inputSchema": {**_schema(
             ("name",), name={**_TEXT, "description": "The repository's name, e.g. aura-desk."},
+            owner={**_TEXT, "description": "GitHub account or organization. Omit to use the default owner."},
             drive_folder={**_TEXT, "description": "A Drive folder link or ID, as the person gave it. Leave it out to "
                                                   "use the folder of the same name in the configured sources folder."},
             description={**_TEXT, "description": "One sentence saying what the project is, in the person's words."},
@@ -466,8 +467,9 @@ class StewardTools:
         description = _optional(arguments, "description")
         repo = self.repo
         assert repo is not None
-        self._named("create_repo", arguments, "name", "drive_folder", "description")
-        return await asyncio.to_thread(repo.create, name=name, drive_folder=folder, description=description)
+        owner = _required(arguments, "owner") if "owner" in arguments else None
+        self._named("create_repo", arguments, "name", "drive_folder", "description", "owner")
+        return await asyncio.to_thread(repo.create, name=name, drive_folder=folder, description=description, owner=owner)
 
     async def _dokploy(self, arguments: dict[str, Any]) -> str:
         unknown = sorted(set(arguments) - {"action", "args"})
