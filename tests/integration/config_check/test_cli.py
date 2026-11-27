@@ -1,13 +1,19 @@
+import os
 import socket
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 
+SRC = Path(__file__).resolve().parents[3] / 'src'
+
+
 def check(path):
     return subprocess.run([sys.executable, '-m', 'agent_runtime.app.main', '--config', str(path), '--check'],
-                          cwd=path.parent, capture_output=True, text=True, timeout=10)
+                          cwd=path.parent, env={**os.environ, 'PYTHONPATH': str(SRC)},
+                          capture_output=True, text=True, timeout=10)
 
 
 def test_checks_without_starting_services(tmp_path):
