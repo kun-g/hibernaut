@@ -15,6 +15,7 @@ from switchboard.ports import DeliverStatus
 
 from agent_runtime.core.models import CLOSEOUT_SOURCE, TASK_CONTEXT_KEY, TASK_SYNC_KIND
 from agent_runtime.core.ports import ChannelPort
+from agent_runtime.engine.handler import ApprovalRefused
 
 SWITCHBOARD_SOURCE_PREFIX = "sb:"
 
@@ -76,7 +77,15 @@ class IngestSink(Protocol):
         payload: dict[str, Any],
         session_id: str | None = None,
         correlation_key: str | None = None,
+        decided_by: str | None = None,
     ) -> object: ...
+
+
+def decided_by(event: CanonicalEvent) -> str | None:
+    # The person whose card click this is: only Switchboard's verified Feishu webhook makes source "feishu".
+    if event.source == _FEISHU and event.event_type == "approval.decided" and event.actor:
+        return event.actor
+    return None
 
 
 def canonical_to_payload(event: CanonicalEvent) -> dict[str, Any]:
@@ -150,7 +159,13 @@ class SwitchboardInboundBridge:
                 payload=canonical_to_payload(event),
                 session_id=session_id if isinstance(session_id, str) and session_id else None,
                 correlation_key=event.correlation_key,
+                decided_by=decided_by(event),
             )
+        except ApprovalRefused as exc:
+            # Acked, like a stranger's message: delivering it again decides nothing either.
+            print(f"[hibernaut] [switchboard] {event.event_id} ({event.event_type}) from {event.actor or 'nobody'} "
+                  f"dropped: {exc}", file=sys.stderr, flush=True)
+            return "acked"
         except Exception as exc:  # noqa: BLE001
             print(
                 f"[hibernaut] [switchboard] ingest of {event.event_id} ({event.event_type}) failed: {exc!r}",
