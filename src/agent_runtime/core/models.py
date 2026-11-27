@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, TypeAlias
@@ -375,6 +375,21 @@ class DeliveryOutcome:
     # Why an authorized merge did not happen; "" when it happened or was not authorized.
     hold: MergeHold = ""
     hold_detail: str = ""
+
+
+def delivery_chat_reply(delivery: Mapping[str, object]) -> str:
+    match delivery.get("state"):
+        case "merged":
+            result = "改动已合并。"
+        case "pr_open":
+            result = {"ci": "PR 尚未合并，自动检查未通过。", "review": "PR 尚未合并，评审未通过。"}.get(
+                str(delivery.get("hold")), "PR 已创建，等待合并。")
+        case "local":
+            result = "改动已提交到本地，还没有创建 PR。"
+        case _:
+            return ""
+    url = delivery.get("pr_url")
+    return f"{result}\n{url}" if url else result
 
 
 @dataclass(frozen=True, slots=True)

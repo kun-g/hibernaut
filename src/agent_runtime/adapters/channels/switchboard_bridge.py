@@ -13,7 +13,7 @@ from switchboard.addressing import address_target, reply_target
 from switchboard.envelope import CanonicalEvent
 from switchboard.ports import DeliverStatus
 
-from agent_runtime.core.models import CLOSEOUT_SOURCE, TASK_CONTEXT_KEY, TASK_SYNC_KIND
+from agent_runtime.core.models import CLOSEOUT_SOURCE, TASK_CONTEXT_KEY, TASK_SYNC_KIND, delivery_chat_reply
 from agent_runtime.core.ports import ChannelPort
 
 SWITCHBOARD_SOURCE_PREFIX = "sb:"
@@ -191,19 +191,7 @@ def _chat_reply(metadata: Mapping[str, Any]) -> str:
     raw = _task_context(metadata).get("delivery")
     if not isinstance(raw, Mapping):
         return ""
-    delivery = cast(Mapping[str, Any], raw)
-    match delivery.get("state"):
-        case "merged":
-            result = "改动已合并。"
-        case "pr_open":
-            result = {"ci": "PR 尚未合并，自动检查未通过。", "review": "PR 尚未合并，评审未通过。"}.get(
-                str(delivery.get("hold")), "PR 已创建，等待合并。")
-        case "local":
-            result = "改动已提交到本地，还没有创建 PR。"
-        case _:
-            return ""
-    url = delivery.get("pr_url")
-    return f"{result}\n{url}" if url else result
+    return delivery_chat_reply(cast(Mapping[str, object], raw))
 
 
 def is_feishu_push(metadata: Mapping[str, Any]) -> bool:
