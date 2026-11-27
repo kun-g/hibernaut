@@ -49,6 +49,12 @@ class DriveProxyStartupTests(unittest.TestCase):
         self.assertEqual(cfg.service_name, "gdrive-queue")
         self.assertEqual(cfg.root_folder_id, "root-q")
 
+    def test_source_links_require_explicit_opt_in(self) -> None:
+        self.assertFalse(load_proxy_config(self._write()).allow_any_source_folder)
+        self.assertTrue(load_proxy_config(self._write(allow_any_source_folder=True)).allow_any_source_folder)
+        with self.assertRaisesRegex(ValueError, "must be a boolean"):
+            load_proxy_config(self._write(allow_any_source_folder="false"))
+
     def test_attachment_settings(self) -> None:
         cfg = load_proxy_config(self._write())
         self.assertEqual((cfg.attachments_folder_id, cfg.max_download_bytes), ("", 100 * 1024 * 1024))
