@@ -172,6 +172,12 @@ class FeishuInboundAdapter:
                 or value.get("approval_request_id") != approval_request_id
                 or value.get("session_id") != session_id):
             return reject(400, "approval card does not match the suspended request and session")
+        deciders = report.metadata.get("deciders")
+        if isinstance(deciders, list) and deciders and actor not in deciders:
+            # Turned away before it is stored: (source, external_id) stays free for a person who may decide.
+            return AdapterParseResult(event=None, http_status=200, response_body={
+                "toast": {"type": "error", "content": "你不在这条审批的处理名单上，本次点击未生效"},
+            })
         scope = report.scope
         correlation_key = report.correlation_key
         card = render_resolved_card(
@@ -197,6 +203,8 @@ class FeishuInboundAdapter:
                     "session_id": session_id,
                     "channel": "feishu",
                     "message_id": message_id,
+                    # The chat of the card that was clicked: the receiver may take decisions only from some chats.
+                    "chat_id": chat_id,
                 },
             ),
             http_status=200,

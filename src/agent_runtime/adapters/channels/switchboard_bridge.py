@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from typing import Any, Protocol, cast
 
 from collaboration import NotificationPolicyEngine
@@ -113,17 +113,29 @@ def canonical_to_payload(event: CanonicalEvent) -> dict[str, Any]:
     return payload
 
 
+class InboxChoice(Protocol):
+    # Where an event goes; None: nowhere.
+    def inbox_for(self, event: CanonicalEvent) -> str | None: ...
+
+
 class SwitchboardInboundBridge:
-    def __init__(self, handler: IngestSink) -> None:
+    def __init__(self, handler: IngestSink, *, groups: InboxChoice | None = None) -> None:
         self._handler = handler
+        self._groups = groups
 
     def handle_canonical_event(self, event: CanonicalEvent) -> DeliverStatus:
+        inbox_id = self._groups.inbox_for(event) if self._groups is not None else event.scope
+        if inbox_id is None:
+            # Acked, so it is not delivered again; nobody hears back.
+            print(f"[hibernaut] [switchboard] {event.event_id} ({event.event_type}) from {event.actor or 'nobody'} "
+                  "dropped: not a listed member of the group's inbox", file=sys.stderr, flush=True)
+            return "acked"
         session_id = event.metadata.get("session_id")
         try:
             # event_id is Switchboard's global fingerprint, so an at-least-once redelivery lands on the
             # inbox dedup key and is recorded as dropped.
             self._handler.ingest(
-                inbox_id=event.scope,
+                inbox_id=inbox_id,
                 source=f"{SWITCHBOARD_SOURCE_PREFIX}{event.source}",
                 external_id=event.event_id,
                 payload=canonical_to_payload(event),
@@ -199,10 +211,14 @@ class SwitchboardChannelAdapter:
         fallback: ChannelPort | None = None,
         # Decides what may be pushed to Feishu unasked (D8-B); None leaves every message as it is.
         push_policy: NotificationPolicyEngine | None = None,
+        # inbox_id -> (the Feishu chat its approval cards go to, the only people whose click counts); None for the
+        # Switchboard's own choice of chat and anybody who sees the card.
+        card_group: Callable[[str], tuple[str, Collection[str]] | None] | None = None,
     ) -> None:
         self._publish = publish
         self._fallback = fallback
         self.push_policy = push_policy
+        self._card_group = card_group
 
     def build_report(self, inbox_id: str, content: str, metadata: Mapping[str, Any]) -> CanonicalEvent | None:
         outcome = outcome_kind_for(metadata)
@@ -230,6 +246,12 @@ class SwitchboardChannelAdapter:
             # Taskboard's execution.reported schema requires both; a Run that lost them still reports a valid trace.
             report.setdefault("trace_id", report["run_id"])
             report.setdefault("hop_count", 1)
+        group = self._card_group(inbox_id) if self._card_group is not None and outcome == "suspend" else None
+        if group is not None:
+            # The card goes to the group, where alone it is decided; Switchboard turns other people's clicks away
+            # before storing them, so they cannot use the approval up.
+            chat_id, deciders = group
+            report |= {"approval_channel": _FEISHU, "approval_target": chat_id, "deciders": sorted(deciders)}
         legacy_request_id = metadata.get("request_id")
         if outcome == "suspend" and "approval_request_id" not in report and legacy_request_id:
             # Outbox rows written before the worker added approval_request_id carry only request_id.

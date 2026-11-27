@@ -321,6 +321,24 @@ class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
         self.assertIn("no more launches", self.emits()[-1])
         self.assertNotIn("delivered", self.emits()[-1])
 
+    async def test_r11_a_task_that_waits_for_the_user_to_leave_is_told_from_one_waiting_for_an_answer(self):
+        # The contract gives the developer the marker; the status reads the checkpoint the real suspension saved.
+        from agent_runtime.adapters.executor_cli.sde import _SDE_CONTRACT, WAIT_IDLE
+        from agent_runtime.adapters.storage_sqlite.ops_status import SQLiteOpsStatus
+
+        self.assertIn(f'question that starts with {WAIT_IDLE}', _SDE_CONTRACT)
+        status = SQLiteOpsStatus(self.db, timers=tuple, sde_agents=lambda: frozenset({"sde"}), delivers=lambda _i: True)
+
+        def waits() -> list[tuple[str, str]]:
+            return [(i["waits_for"], i["why"]) for i in status.report(hours=1, timer_runs=1)["suspended"]["items"]]
+
+        self.set_plan(sde=[dev(status="needs_input", question=f"{WAIT_IDLE} timing needs the user away")])
+        await self.task()
+        self.assertEqual(waits(), [("user_away", f"{WAIT_IDLE} timing needs the user away")])
+        self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?")])
+        await self.decide(True)
+        self.assertEqual(waits(), [("answer", "Raise or return None?")])
+
     async def test_declined_question_reports_stopped_not_delivered(self):
         self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?")])
         await self.task()

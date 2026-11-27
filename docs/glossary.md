@@ -69,8 +69,16 @@
   - **`agent_id` vs. `executor_id`**：代码与存储沿用的 `executor_id`（`ExecutorPort.executor_id`、`sessions.executor_id`、事件 payload 的旧键）取值就是 `agent_id`；`[executors.<id>]` 写了 `role` 或 `command` 时同时是同名 Agent（旧写法）。
 - **Steward（项目管家）**：`role = "steward"` 的 Agent，项目主 Inbox 的前台：读事件后自己答复、转投给别的 Agent，或汇总回投的结果。在项目主检出（或配置的 `workdir`）里只读运行，每轮在 Orca 终端里一次性执行，不建 worktree，不能编辑文件或执行命令，没有内置工具，读文件也经逐次过门禁的 MCP 工具；可读写所在 Inbox 的 Memory、只读查询本项目的会话与事件。能路由到哪些 Inbox 和 Agent 由 Runtime 每次唤醒时现拼的路由清单（routing manifest）给出。
 - **全局 Steward**：绑在非项目 Inbox（`[[runtime.inbox_bindings]]`，`checkout_access = "readonly"`）上的 `steward` Agent，不属于任何项目。在绑定的 `workdir` 里只读运行；可转投到绑定 `forward_to`（转投白名单）列出的项目主 Inbox，只读查询自己的 Inbox 与这些项目的会话和事件，看不到项目的文件。
-- **系统 Steward**：绑在系统 Inbox 上的 `steward` Agent（`sys:ops`），由全局 Steward 转交，用三个系统工具（`check_projects`、`onboard_project`、`complete_project`）接入项目、检查和补齐项目的 Steward 绑定、说明与转投白名单。同样只读、没有命令行，不能再转投；需求见 [`requirements/system-steward.md`](requirements/system-steward.md)。
-- **系统 Inbox**：写了 `system_tools = true` 的 `[[runtime.inbox_bindings]]`：单个精确 `sys:<name>`、`checkout_access = "readonly"`、Agent 全是 `steward`。只收全局 Steward 替人转来的、本机运营者投的，以及它自己审批的答复。
+- **系统 Steward**：绑在系统 Inbox 上的 `steward` Agent（`sys:ops`），由全局 Steward 转交或由群入口的名单成员直接说，用系统工具（`check_projects`、`onboard_project`、`complete_project`）接入项目、检查和补齐项目的 Steward 绑定、说明与转投白名单，用只读的 `runtime_status` 回答 hb 运转得怎样。同样只读、没有命令行，不能再转投；需求见 [`requirements/system-steward.md`](requirements/system-steward.md)。
+- **系统 Inbox**：写了 `system_tools = true` 的 `[[runtime.inbox_bindings]]`：单个精确 `sys:<name>`、`checkout_access = "readonly"`、Agent 全是 `steward`。只收全局 Steward 替人转来的、群入口名单上的人发的、本机运营者投的，以及它自己审批的答复。
+- **运维 Inbox**：写了 `ops_tools = true` 的 `[[runtime.inbox_bindings]]`（如 `sys:infra`，agent `infra`，不要与系统 Steward 的 `sys:ops` 混淆），限制和来路同系统 Inbox。它的 Steward 只有 `dokploy` 一个能动手的工具，在 Dokploy 上建项目的预发布和生产环境；没有通用命令行，不能转投。
+- **运维 agent**：绑在运维 Inbox 上的 `steward` Agent。预发布直接部署；生产上线、删除由代码判为 `deploy_production` / `delete_resource`，挂起等人批准。
+- **扣住的调用**（held call）：运维 Steward 的 `dokploy` 调用被门禁判为 `defer` 时不执行，记进本轮的 `deferred`，随挂起一起送审；批准后由 Hibernaut 按原参数重判再执行，Steward 再跑一轮报告结果。
+- **`create_repo`**：全局 Steward 在绑定写 `repo_tools = true` 时多出的工具：在 `[repo_tools] owner` 下建私有 GitHub 仓库，首次提交是来源文件夹里该项目最新的文件；仓库已存在就停。不是命令行。
+- **来源文件夹**（sources folder）：Drive 凭据代理配置的 `sources_folder_id`，下面每个项目一个子文件夹放各个版本；代理只让 `create_repo` 读这一层子文件夹里的文件。
+- **一句话开新项目**：单聊里一句话，由全局 Steward 依次 `create_repo`、转交系统 Steward 接入、转交运维 agent 配环境，每步结果回同一单聊；前一步回信 `done` 才能转下一步（回信带 `status`：`done` / `failed`）。
+- **群入口**：`[[feishu_groups]]` 把一个飞书群（`chat_id`）绑到一个系统 Inbox，并列出算数的人（`members`，飞书 open_id）。名单上的人在群里发的消息直接进该 Inbox，答复回群；名单外的人的消息丢弃不回。一个系统 Inbox 只绑一个群，它的审批卡发到这个群，只认名单上的人在这个群里的点击。
+- **运行状态**（`runtime_status`）：系统 Steward 和全局 Steward 共用的只读工具（同一份实现），给出一段时间内失败和挂起的任务（挂起带等什么：`approval` 审批、`answer` 人回答、`user_away` 用户离开电脑、`retry` 到点重试）、交付结果、发不出去的 Outbox 消息、各 `[[timers]]` 最近的触发和结果，以及查不到的范围；只有摘要，不带 payload 和密钥。
 - **Runner Relay**：Hibernaut 进程内的 Runner 反向 WebSocket 端点（`RunnerRelayHub`），Runner 主动连入，凭共享令牌鉴权后接单。`[runner]` 的 `relay` 模式与试点路由各开各的。与 Switchboard 的 relay 无关。
 - **Runner 试点路由**：`[runner_pilot]` 配置的一条默认关闭的路由：只把一个任务级 Inbox 交给一台单槽位的独立 Runner，执行器固定为 `runner-protocol-check`（无工具的协议文件校验）。关闭时该 Inbox 按原路由执行。
 - **远端 Agent 节点**：经 `[runner]` 的 `relay` 模式连入的单槽位、单项目、只读 Runner（`python -m runner.agent_service`），只带一个 CLI 执行器，只执行显式指名该 agent 的事件。与只带协议校验程序的试点节点是两种服务，配置互不通用。

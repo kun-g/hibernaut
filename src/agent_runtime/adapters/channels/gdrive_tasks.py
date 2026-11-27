@@ -7,7 +7,7 @@ import re
 import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from agent_runtime.adapters.channels.gdrive_attachments import (
     ATTACHMENTS_FOLDER_NAME,
@@ -326,12 +326,25 @@ class ProxiedDriveClient:
         self._call("move", {"file_id": file_id, "add_parent": add_parent, "remove_parent": remove_parent})
 
     def download(self, file_meta: DriveFileMeta) -> DriveDownload:
+        return self._download("download", file_meta)
+
+    def source_folder(self, *, name: str | None = None, folder_id: str | None = None) -> tuple[str, list[DriveFileMeta]]:
+        # (the folder's name, the files directly inside it) of a folder in the proxy's sources folder.
+        data = self._call("source_folder", {"folder_id": folder_id} if folder_id else {"name": name or ""})
+        folder = data.get("folder") if isinstance(data.get("folder"), dict) else {}
+        return str(cast(dict[str, Any], folder).get("name", "")), [
+            _meta_from_json(item) for item in data.get("files", [])]
+
+    def download_source(self, file_meta: DriveFileMeta) -> DriveDownload:
+        return self._download("source_download", file_meta)
+
+    def _download(self, op: str, file_meta: DriveFileMeta) -> DriveDownload:
         # The body is the file itself; name and types come back in headers. The proxy enforces the folder and size.
         resp = self._proxy.call_service_bytes(
-            service_name=self._service, method="POST", path="download", payload={"file_id": file_meta.file_id}
+            service_name=self._service, method="POST", path=op, payload={"file_id": file_meta.file_id}
         )
         if resp.status_code != 200:
-            raise DriveProxyError("download", resp.status_code, _error_reason(resp.body))
+            raise DriveProxyError(op, resp.status_code, _error_reason(resp.body))
         headers = {k.lower(): v for k, v in resp.headers.items()}
         return DriveDownload(
             name=urllib.parse.unquote(headers.get("x-drive-file-name", "")) or file_meta.name,

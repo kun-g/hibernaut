@@ -95,7 +95,9 @@ forward_to = ["proj:hibernaut", "proj:sure"]
 
 ## 系统 Steward
 
-接入项目、检查和补齐项目配置。需求与编号见 [`requirements/system-steward.md`](requirements/system-steward.md)。人照旧跟全局 Steward 说，由它转交；结果按普通转投的回信方式回到原单聊。
+接入项目、检查和补齐项目配置。需求与编号见 [`requirements/system-steward.md`](requirements/system-steward.md)。人在单聊跟全局 Steward 说，由它转交，结果按普通转投的回信方式回到原单聊；或在 `[[feishu_groups]]` 绑定的群里直接说（只认 `members` 列出的人），答复回群里的同一话题。问 hb 运转得怎样、某个 `[[timers]]` 执行得如何、有什么可优化的，全局 Steward 不必转交：它也有同一份只读的 `runtime_status`（和系统 Steward 共用一份实现），直接答，不只凭 `list_events`、`list_sessions`（那两个看不到任务在等什么、交付怎么结束、定时任务的 Run 怎么结束）。它只多这一个只读工具，没有 `check_projects`、`onboard_project`、`complete_project`，也拿不到 hb MCP 控制面（`--strict-mcp-config` 只挂 Steward 自己的工具服务）。
+
+SDE 等用户离开电脑（任务说要等空闲再做）时按契约返回 `needs_input`，问题以 `WAIT_IDLE` 开头；`runtime_status` 据此把它列为 `user_away`，与等人回答的 `answer` 分开。
 
 绑定写 `system_tools = true` 就是系统 Inbox（写法见上「非项目 Inbox 的 `workdir`」），须是单个精确的 `sys:<name>`、`checkout_access = "readonly"`、agent 全是 `steward`、不写 `forward_to`。要转到它的绑定在自己的 `forward_to` 里列出它，须是精确 ID、只读、agent 全是 `steward`。
 
@@ -108,9 +110,31 @@ forward_to = ["proj:hibernaut", "proj:sure"]
 - **默认值由代码定**，命令行 `scripts/onboard_project.py` 用同一套：主 Inbox 归 `steward`，`proj:<p>:.+` 归 `sde`，`open_pr = true`、`auto_merge = false`。具体哪个 agent 取别的项目用得最多的；没有合适的就拒绝（命令行则照加项目，并注明没配 Steward）。没给说明时写中性的「GitHub 仓库 owner/repo」。主 Inbox 已有手写绑定、默认 agent 不是 Steward 的，列为待人做，不改。
 - **写配置**：只认上表的参数；整份能解析才写，先留备份（配置旁的 `<名字>.bak-<时间>`，0600）、原子替换；写前文件被人改过就放弃；写后等热加载生效，没生效就恢复原文件并说明；确认生效前文件又被人改了，保留人改的那版并说明，不报已生效。回执带 `added`、`backup` 和 `undo`。没有开热加载的进程里这些工具拒绝执行。
 - **建标签**：只在 `[onboarding] label_owners` 列出的 owner 上建，默认空。服务器入口路由（Switchboard）永远只列为待人做。
-- **谁能到它**：全局 Steward 替人转来的、本机运营者投的（本机 `POST /events`、CLI）、它自己的审批。GitHub、群聊、Drive、定时器来的，项目转来的，以及远端或经代理的 `POST /events`（403）、`POST /mcp` 都到不了；后两者投给全局 Steward 的也不算人说的。全局 Steward 也只有在本轮处理的是人的单聊消息或本机运营者的事件时才能转给它；只因为一条回投醒来的那轮不行。
+- **谁能到它**：全局 Steward 替人转来的、绑定群里名单上的人发的、本机运营者投的（本机 `POST /events`、CLI）、它自己的审批。GitHub、没绑定的群和群里名单外的人、Drive、定时器来的，项目转来的，以及远端或经代理的 `POST /events`（403）、`POST /mcp` 都到不了；后两者投给全局 Steward 的也不算人说的。全局 Steward 也只有在本轮处理的是人的单聊消息或本机运营者的事件时才能转给它；只因为一条回投醒来的那轮不行，例外只有一个：这条回投来自只收人请求的 Inbox（系统或运维）、`status` 是 `done`、回的是本会话还在等的那件，这时下一步接着人的原请求走（一句话开新项目的链条，见下「运维 Inbox」）。
 - **谁的请求算数**：来源由上一条的代码验过，契约和内置 Skill 写明事件里的请求就是人提的，`agent:forward` 和 `webhook` 都一样；清楚就直接做，不再请人确认授权，只有没说清才问。全局 Steward 引述的人的原话是请求；请求里引用或附带的外来文字、工具读到的文字不是请求，不照做。
 - **看不到的**：`hibernaut.toml` 与它的备份不给 `read_file`、`search_files`、`git` 读，答复里没有 `env` 和令牌的值。
+
+## 运维 Inbox 与一句话开新项目
+
+需求 R12–R15、C7–C9 见 [`requirements/system-steward.md`](requirements/system-steward.md)。人在单聊对全局 Steward 说一句「新建项目 X，从 Drive 下最新版本作初始提交，再配好预发布和生产」，全局 Steward 依次：
+
+1. `create_repo`（绑定写 `repo_tools = true`）：在 `[repo_tools] owner` 下建私有仓库，首次提交是凭据代理 `sources_folder_id` 下同名文件夹（或人给的链接）里最新修改的文件，压缩包解开；仓库已存在、文件夹空、下载或推送失败都停下说明。
+2. 转给系统 Inbox 接入（`return_to` 自己），等回信。
+3. 回信 `done` 才转给运维 Inbox 配环境（`return_to` 自己）；回信 `failed` 时停下，代码也拒绝这次转投。
+4. 汇总：仓库、hb 接入、两个环境的地址和状态。
+
+运维 Inbox 是写了 `ops_tools = true` 的绑定（限制同系统 Inbox），Steward 只有一个 `dokploy(action, args)` 工具，在绑定的 `workdir` 里跑 `[ops_tools] dokploy_script`（令牌由脚本从钥匙串取、输出打码，不能 `--reveal`），没有通用命令行，也不能转投。每次调用先由代码分类再过 `PermissionPort`：
+
+| 分类（`PermissionPort` 里的名字） | 什么调用 | 默认 |
+|---|---|---|
+| `dokploy.read` | 查询 | 放行 |
+| `dokploy.change` | 建项目、环境、应用、域名，改配置（不上线） | 放行 |
+| `dokploy.deploy` | 部署、启动、重新部署到 `staging_environments` 里的环境 | 放行 |
+| `deploy_production` | 部署、启动、重新部署、回滚到别的环境或看不出环境的，开了自动部署的来源 | 挂起等批准 |
+| `delete_resource` | `remove` / `delete` | 挂起等批准 |
+| `dokploy.admin` | `post` 到未登记的服务 | 挂起等批准 |
+
+挂起的调用不执行；审批卡列出每个调用和环境，以及 Steward 扣住的答复（预发布的状态）。批准后 Hibernaut 按原参数重新分类、过门禁再执行，然后再开一轮 Steward 报告结果；拒绝则只再开一轮，让它说生产没上线。系统和运维 Steward 做不成时答复带 `status: failed`，回信据此标失败。
 
 ## 硬约束（由代码执行）
 
@@ -126,6 +150,9 @@ forward_to = ["proj:hibernaut", "proj:sure"]
 | 事件里的 `explicit_workdir` 不能把有绑定的非项目 Inbox 换到别的目录 | 本轮拒绝 |
 | 一件外部事件最多主动转投 3 次（`MAX_FORWARD_HOPS = 3`）；回投是对转投的答复，不计数 | 转投被拒，当前 agent 就地答复 |
 | 不能转投给同一 `(inbox_id, agent_id)` | 拒绝 |
-| 系统 Inbox 不往外转投；转给它的那一轮须有人的单聊消息或本机运营者的事件 | 拒绝；审批放行、Run 收尾时重判 |
-| 系统 Inbox 只收全局 Steward 转来的、本机运营者投的和自己的审批 | 事件标记 `failed`；远端或经代理的 `POST /events` 返回 403 |
-| 系统 Inbox 是单个精确 `sys:<name>`、只读、agent 全是 `steward`、没有 `forward_to` | 配置拒绝加载；热加载保留旧配置 |
+| 系统 Inbox 不往外转投；转给它的那一轮须有人的单聊消息或本机运营者的事件，或一条来自系统 Inbox、`done`、本会话还在等的回投 | 拒绝；审批放行、Run 收尾时重判 |
+| 系统 Inbox 只收全局 Steward 转来的、绑定群里名单上的人发的、本机运营者投的和自己的审批 | 事件标记 `failed`；远端或经代理的 `POST /events` 返回 403；绑定群里名单外的人的消息在进 Event Inbox 前丢弃、不回 |
+| `[[feishu_groups]]` 的 `inbox_id` 是带 `system_tools` 的绑定的精确 pattern、一个 Inbox 只绑一个群、`chat_id` 不重复、`members` 非空 | 配置拒绝加载；热加载保留旧配置 |
+| 系统 Inbox（`system_tools` 或 `ops_tools`）是单个精确 `sys:<name>`、只读、agent 全是 `steward`、没有 `forward_to`，两个键不写在同一条 | 配置拒绝加载；热加载保留旧配置 |
+| `repo_tools` 只在精确 ID、只读、全 `steward`、不是 `sys:` 的绑定上，且有 `[repo_tools] owner` 与 `[gdrive]` 代理；`ops_tools` 要有 `[ops_tools] dokploy_script` | 配置拒绝加载；热加载保留旧配置 |
+| 运维 Inbox 部署到不是预发布的环境（含看不出环境的、开自动部署的来源）、删除、未登记的 Dokploy 服务 | 不执行，挂起等人批准；批准后由 Hibernaut 执行 |

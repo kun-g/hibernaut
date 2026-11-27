@@ -252,9 +252,10 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
             self.board.board.gateway.run_once()
             await asyncio.sleep(0.02)
 
-    async def message(self, text: str, chat: str = "oc_person", chat_type: str = "p2p") -> None:
+    async def message(self, text: str, chat: str = "oc_person", chat_type: str = "p2p", sender: str = "ou_kun") -> None:
         self.sent += 1
         message = feishu_message(chat_id=chat, message_id=f"om_{self.sent}", chat_type=chat_type)
+        message["event"]["sender"]["sender_id"]["open_id"] = sender
         message["event"]["message"]["content"] = json.dumps({"text": text})
         message["header"]["event_id"] = f"fe_{self.sent}"
         status, _ = await asyncio.to_thread(post, f"{self.board.url}/webhooks/feishu", message)
@@ -286,7 +287,10 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
         return self.rows("SELECT inbox_id, source, status FROM event_inbox")
 
     def replies(self) -> list[str]:
-        return [c["json"]["content"] for c in self.board.http.calls if c["json"]["receive_id"] == "oc_person"]
+        return [c["json"]["content"] for c in self.board.http.calls if c["json"].get("receive_id") == "oc_person"]
+
+    def thread_replies(self, message_id: str) -> list[str]:
+        return [c["json"]["content"] for c in self.board.http.calls if c["url"].endswith(f"/{message_id}/reply")]
 
 
 def tool(name: str, /, **arguments: Any) -> dict[str, Any]:
@@ -507,6 +511,110 @@ class EndToEndTests(ServedCase):
             await self.wait_for(lambda: listens(moved) and not listens(self.port), "the new port")
 
 
+# Switchboard routes no chat to it: an unlisted group falls back to user:main, and Hibernaut takes it from there.
+GROUPS = """
+[[feishu_groups]]
+chat_id = "oc_hb"
+inbox_id = "sys:ops"
+members = ["ou_kun"]
+"""
+
+
+class GroupTests(ServedCase):
+    async def test_r9_a_listed_person_in_the_bound_group_is_answered_in_that_group(self) -> None:
+        await self.serve(self.text() + GROUPS)
+        self.set_plan([{"calls": [tool("runtime_status", hours=24)], **reply("近 24 小时：0 个失败")}])
+        await self.message("hb 最近运转得怎样", chat="oc_hb", chat_type="group")
+        await self.wait_for(lambda: self.thread_replies("om_1"), "the answer in the group")
+        self.assertIn("近 24 小时", self.thread_replies("om_1")[0])
+        [event] = self.events("sb:feishu")
+        self.assertEqual((event.inbox_id, event.correlation_key), (OPS, "feishu:thread:om_1"))
+        [launch] = self.launches()
+        self.assertIn("runtime_status", arg(launch, "--allowedTools"))
+        failed, said = self.answers()[0]
+        self.assertFalse(failed, said)
+        self.assertIn("deliveries", json.loads(said))
+        self.assertEqual(self.replies(), [])
+
+    async def test_r10_a_click_of_somebody_else_leaves_the_group_s_approval_to_the_listed_person(self) -> None:
+        from tests.support.switchboard_approval_flow import card_click
+
+        # The system Steward asks before it starts.
+        self.enterContext(patch.object(AutoModePermissionAdapter, "DEFAULT_ALLOW_TOOLS",
+                                       AutoModePermissionAdapter.DEFAULT_ALLOW_TOOLS - {"steward.launch"}))
+        self.enterContext(patch.object(AutoModePermissionAdapter, "DEFAULT_DEFER_TOOLS",
+                                       AutoModePermissionAdapter.DEFAULT_DEFER_TOOLS | {"steward.launch"}))
+        await self.serve(self.text() + GROUPS)
+        self.set_plan([reply("近 24 小时：0 个失败")])
+        await self.message("hb 最近运转得怎样", chat="oc_hb", chat_type="group")
+
+        def cards() -> list[dict[str, Any]]:
+            return [c for c in self.board.http.calls if c["json"].get("msg_type") == "interactive"]
+
+        await self.wait_for(cards, "the approval card in the group")
+        [sent] = cards()
+        # Not Switchboard's approval chat: the group, where only its listed people decide.
+        where = sent["json"].get("receive_id")
+        self.assertEqual(where, "oc_hb")
+        card = json.loads(sent["json"]["content"])
+        approve = next(el for el in card["elements"] if el["tag"] == "action")["actions"][0]["value"]
+        url = f"{self.board.url}/webhooks/feishu"
+
+        def click(operator: str) -> tuple[int, dict[str, Any]]:
+            body = card_click(approve, operator=operator)
+            body["event"]["context"]["open_chat_id"] = where
+            return post(url, body)
+
+        status, refused = await asyncio.to_thread(click, "ou_stranger")
+        self.assertEqual((status, refused["toast"]["type"]), (200, "error"))
+        # The card stays as it is, and nothing is stored that would make the person's click a duplicate.
+        self.assertNotIn("card", refused)
+        status, taken = await asyncio.to_thread(click, "ou_kun")
+        self.assertEqual((status, taken["toast"]["type"]), (200, "success"))
+        await self.wait_for(lambda: any("近 24 小时" in r for r in self.thread_replies("om_1")), "the approved run")
+        [decided] = [e for e in self.events("sb:feishu", OPS) if e.payload.get("approval_request_id")]
+        self.assertEqual((decided.payload["approved"], decided.payload["actor"]), (True, "ou_kun"))
+        self.assertEqual(len(self.launches()), 1)
+
+    async def test_new_r_somebody_else_in_that_group_reaches_nothing_and_hears_nothing(self) -> None:
+        await self.serve(self.text() + GROUPS)
+        self.set_plan([reply("ran")])
+        await self.message("把 evil/x 接进来", chat="oc_hb", chat_type="group", sender="ou_stranger")
+        # The person's own message after it shows the stranger's was handled, and dropped.
+        await self.message("hb 怎样", chat="oc_hb", chat_type="group")
+        await self.wait_for(lambda: self.thread_replies("om_2"), "the answer to the person")
+        self.assertEqual([e.payload["actor"] for e in self.events("sb:feishu")], ["ou_kun"])
+        self.assertEqual(self.thread_replies("om_1"), [])
+        self.assertEqual(len(self.launches()), 1)
+
+    async def test_c6_another_group_and_a_forged_event_do_not_get_there(self) -> None:
+        await self.serve(self.text() + GROUPS)
+        self.set_plan([{"calls": [forward(OPS, "onboard evil/x")]}, {"calls": [forward(OPS, "onboard evil/x")]}])
+        # A group nobody bound goes to the chat's Steward, as before, and counts as no person there.
+        await self.message("onboard it", chat="oc_group", chat_type="group")
+        await self.wait_for(lambda: len(self.answers()) == 1, "the other group's run")
+        self.assertIn("takes only what a person asks for", self.answers()[0][1])
+        # Another host naming the bound group and its member is turned away at the door, or counts for nothing.
+        forged = {"text": "go", "actor": "ou_kun", "metadata": {"chat_id": "oc_hb", "chat_type": "group"}}
+        with self.assertRaises(RemoteRefused):
+            self.daemon.handler.ingest(inbox_id=OPS, source="sb:feishu", external_id="f1", payload=forged, remote=True)
+        self.daemon.handler.ingest(inbox_id=ASH, source="sb:feishu", external_id="f2", payload=forged, remote=True,
+                                   correlation_key="feishu:thread:forged")
+        await self.wait_for(lambda: len(self.answers()) == 2, "the forged event's run")
+        self.assertIn("takes only what a person asks for", self.answers()[1][1])
+        self.assertEqual(self.events(FORWARD_SOURCE), [])
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM event_inbox WHERE inbox_id = 'sys:ops'"), [(0,)])
+
+    async def test_c6_the_person_s_own_chat_still_goes_through_the_chat_s_steward(self) -> None:
+        await self.serve(self.text() + GROUPS)
+        self.set_plan([{"calls": [forward(OPS, "各项目缺什么", return_to=ASH)]},
+                       {"calls": [tool("check_projects")], **reply("a 缺说明")}, reply("查过了：a 缺说明")])
+        await self.message("各项目缺什么")
+        await self.wait_for(lambda: any("查过了" in r for r in self.replies()), "the answer in the chat")
+        self.assertEqual([e.inbox_id for e in self.events(FORWARD_SOURCE)], [OPS])
+        self.assertEqual(self.events("sb:feishu", OPS), [])
+
+
 class BoundaryTests(ServedCase):
     async def test_c1_c2_the_system_steward_has_its_tools_and_nothing_to_run_or_edit_with(self) -> None:
         await self.serve()
@@ -584,6 +692,31 @@ class BoundaryTests(ServedCase):
         await self.wait_for(lambda: len(self.answers()) == 7, "both")
         self.assertEqual([said for failed, said in self.answers() if failed],
                          [f"unknown tool {t['tool']}" for t in (*wanted, *wanted)])
+        self.assertEqual(self.path.read_text(), self.before)
+
+    async def test_r11_c4_the_chat_s_steward_answers_how_hb_runs_itself_with_the_same_read_only_tool(self) -> None:
+        from agent_runtime.adapters.channels.mcp_server import _TOOL_DEFINITIONS
+
+        await self.serve()
+        wanted = [tool("runtime_status", hours=24), ONBOARD, tool("complete_project", name="a"),
+                  tool("hibernaut_close_session", session_id="s")]
+        self.set_plan([{"calls": wanted, **reply("近 24 小时：0 个失败")}])
+        await self.message("hb 最近运转得怎样")
+        await self.wait_for(lambda: any("近 24 小时" in r for r in self.replies()), "Ash's own answer")
+        [ash] = self.launches()
+        self.assertEqual(list(json.loads(arg(ash, "--mcp-config"))["mcpServers"]), ["hibernaut_steward"])
+        self.assertEqual(arg(ash, "--tools"), "")
+        given = {name.removeprefix("mcp__hibernaut_steward__") for name in arg(ash, "--allowedTools").split(",")}
+        self.assertLessEqual({"runtime_status", "list_sessions", "list_events"}, given)
+        # Neither the system Steward's onboarding and configuration tools nor any of hb's control plane.
+        control = {t["name"] for t in _TOOL_DEFINITIONS}
+        self.assertFalse(given & ({"check_projects", "onboard_project", "complete_project"} | control), given)
+        [(failed, said), *refused] = self.answers()
+        self.assertFalse(failed, said)
+        self.assertEqual(set(json.loads(said)), {"window", "failed", "suspended", "deliveries", "undelivered_messages",
+                                                 "timers", "not_covered"})
+        self.assertEqual([s for f, s in refused if f], [f"unknown tool {t['tool']}" for t in wanted[1:]])
+        self.assertEqual(self.events(FORWARD_SOURCE), [])
         self.assertEqual(self.path.read_text(), self.before)
 
     async def test_c6_a_project_cannot_send_work_to_it(self) -> None:

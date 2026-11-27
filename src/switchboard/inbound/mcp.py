@@ -96,6 +96,9 @@ TOOLS: Final[list[dict[str, Any]]] = [
                         "session_id": {"type": "string", "minLength": 1},
                         "approval_request_id": {"type": "string", "minLength": 1},
                         "outcome_kind": {"type": "string", "enum": ["emit", "suspend", "error", "done"]},
+                        "deciders": {"type": "array", "items": {"type": "string"},
+                                     "description": "For a suspend: the only Feishu open_ids whose click on its "
+                                                    "approval card counts; left out, anybody who sees the card."},
                     },
                     "required": ["run_id", "session_id", "outcome_kind"],
                 },
