@@ -211,13 +211,14 @@ class SwitchboardChannelAdapter:
         fallback: ChannelPort | None = None,
         # Decides what may be pushed to Feishu unasked (D8-B); None leaves every message as it is.
         push_policy: NotificationPolicyEngine | None = None,
-        # inbox_id -> the only people whose click on its approval card counts; None for anybody who sees it.
-        deciders: Callable[[str], Collection[str] | None] | None = None,
+        # inbox_id -> (the Feishu chat its approval cards go to, the only people whose click counts); None for the
+        # Switchboard's own choice of chat and anybody who sees the card.
+        card_group: Callable[[str], tuple[str, Collection[str]] | None] | None = None,
     ) -> None:
         self._publish = publish
         self._fallback = fallback
         self.push_policy = push_policy
-        self._deciders = deciders
+        self._card_group = card_group
 
     def build_report(self, inbox_id: str, content: str, metadata: Mapping[str, Any]) -> CanonicalEvent | None:
         outcome = outcome_kind_for(metadata)
@@ -245,10 +246,12 @@ class SwitchboardChannelAdapter:
             # Taskboard's execution.reported schema requires both; a Run that lost them still reports a valid trace.
             report.setdefault("trace_id", report["run_id"])
             report.setdefault("hop_count", 1)
-        allowed = self._deciders(inbox_id) if self._deciders is not None and outcome == "suspend" else None
-        if allowed:
-            # Switchboard turns other clicks away before storing them, so they cannot use the approval up.
-            report["deciders"] = sorted(allowed)
+        group = self._card_group(inbox_id) if self._card_group is not None and outcome == "suspend" else None
+        if group is not None:
+            # The card goes to the group, where alone it is decided; Switchboard turns other people's clicks away
+            # before storing them, so they cannot use the approval up.
+            chat_id, deciders = group
+            report |= {"approval_channel": _FEISHU, "approval_target": chat_id, "deciders": sorted(deciders)}
         legacy_request_id = metadata.get("request_id")
         if outcome == "suspend" and "approval_request_id" not in report and legacy_request_id:
             # Outbox rows written before the worker added approval_request_id carry only request_id.

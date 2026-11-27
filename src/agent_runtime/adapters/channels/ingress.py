@@ -33,13 +33,13 @@ class GroupEntrances:
     # source "feishu", and an event another host sends in is marked remote whatever it claims.
     def __init__(self, groups: Iterable[FeishuGroup] = ()) -> None:
         self._by_chat = {group.chat_id: group for group in groups}
-        self._members_of: dict[str, frozenset[str]] = {}
-        for group in self._by_chat.values():
-            self._members_of[group.inbox_id] = self._members_of.get(group.inbox_id, frozenset()) | group.members
+        # The configuration binds at most one group to an inbox.
+        self._by_inbox = {group.inbox_id: group for group in self._by_chat.values()}
 
-    def members_of(self, inbox_id: str) -> frozenset[str] | None:
-        # The people whose decisions count in this inbox; None where no group is bound to it.
-        return self._members_of.get(inbox_id)
+    def card_group(self, inbox_id: str) -> tuple[str, frozenset[str]] | None:
+        # (the chat its approval cards go to, the people who decide them); None where no group is bound to it.
+        group = self._by_inbox.get(inbox_id)
+        return (group.chat_id, group.members) if group is not None else None
 
     def _group(self, metadata: Mapping[str, object]) -> FeishuGroup | None:
         if metadata.get("chat_type") == "p2p":
@@ -53,8 +53,12 @@ class GroupEntrances:
             return event.scope
         actor = event.actor or ""
         if event.event_type == "approval.decided":
-            members = self._members_of.get(event.scope)
-            return event.scope if members is None or actor in members else None
+            bound = self._by_inbox.get(event.scope)
+            if bound is None:
+                return event.scope
+            # Only a click in the inbox's own group, by one of its people: not the same person in another chat.
+            clicked = event.metadata.get("chat_id")
+            return event.scope if clicked == bound.chat_id and actor in bound.members else None
         group = self._group(event.metadata)
         if group is None:
             return event.scope

@@ -26,11 +26,13 @@ def message(*, chat_id: str = GROUP, chat_type: str = "group", actor: str = KUN,
     )
 
 
-def decision(*, actor: str, scope: str = OPS) -> CanonicalEvent:
+def decision(*, actor: str, scope: str = OPS, chat_id: str | None = GROUP) -> CanonicalEvent:
+    where = {"chat_id": chat_id} if chat_id is not None else {}
     return CanonicalEvent(
         source="feishu", event_type="approval.decided", external_id="approval:req_1", scope=scope,
         correlation_key="feishu:thread:om_1", actor=actor, body="approve",
-        metadata={"approval_request_id": "req_1", "decision": "approve", "session_id": "s1", "channel": "feishu"},
+        metadata={"approval_request_id": "req_1", "decision": "approve", "session_id": "s1", "channel": "feishu",
+                  **where},
     )
 
 
@@ -82,6 +84,10 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "chat_id"):
             parse_config(self.raw({"chat_id": GROUP, "inbox_id": OPS, "members": [KUN]},
                                   {"chat_id": GROUP, "inbox_id": OPS, "members": [STRANGER]}))
+        # Its approval cards go to its one group, and only there are they decided.
+        with self.assertRaisesRegex(ValueError, "one group"):
+            parse_config(self.raw({"chat_id": GROUP, "inbox_id": OPS, "members": [KUN]},
+                                  {"chat_id": OTHER_GROUP, "inbox_id": OPS, "members": [KUN]}))
 
 
 class BridgeTests(unittest.TestCase):
@@ -122,6 +128,16 @@ class BridgeTests(unittest.TestCase):
         self.bridge.handle_canonical_event(decision(actor=STRANGER, scope=ASH))
         self.assertEqual(self.inboxes(), [OPS, ASH])
 
+    def test_r10_c6_a_decision_on_the_group_s_inbox_counts_only_from_that_group(self) -> None:
+        for chat_id in (OTHER_GROUP, "oc_person", None):
+            with self.subTest(chat_id=chat_id):
+                self.assertEqual(self.bridge.handle_canonical_event(decision(actor=KUN, chat_id=chat_id)), "acked")
+        self.assertEqual(self.handler.ingested, [])
+        self.bridge.handle_canonical_event(decision(actor=KUN))
+        # An inbox no group is bound to takes decisions from wherever its card is, as before.
+        self.bridge.handle_canonical_event(decision(actor=STRANGER, scope=ASH, chat_id=None))
+        self.assertEqual(self.inboxes(), [OPS, ASH])
+
     def test_without_groups_nothing_changes(self) -> None:
         bridge = SwitchboardInboundBridge(self.handler)
         bridge.handle_canonical_event(message(actor=STRANGER))
@@ -132,18 +148,19 @@ class DecidersTests(unittest.TestCase):
     def report(self, inbox_id: str, outcome: str = "suspend") -> dict[str, Any]:
         from agent_runtime.adapters.channels.switchboard_bridge import SwitchboardChannelAdapter
 
-        adapter = SwitchboardChannelAdapter(lambda _e: None, deciders=ENTRANCES.members_of)
+        adapter = SwitchboardChannelAdapter(lambda _e: None, card_group=ENTRANCES.card_group)
         metadata = {"outcome_kind": outcome, "session_id": "s1", "approval_request_id": "req_1",
                     "correlation_key": "feishu:thread:om_1"}
         report = adapter.build_report(inbox_id, "Start?", metadata)
         assert report is not None
         return dict(report.metadata)
 
-    def test_r10_a_card_of_the_group_s_inbox_names_the_listed_people_as_its_deciders(self) -> None:
-        self.assertEqual(self.report(OPS)["deciders"], [KUN])
-        self.assertNotIn("deciders", self.report(ASH))
-        self.assertNotIn("deciders", self.report(OPS, outcome="emit"))
-        self.assertIsNone(GroupEntrances().members_of(OPS))
+    def test_r10_a_card_of_the_group_s_inbox_goes_to_that_group_for_its_listed_people(self) -> None:
+        card = self.report(OPS)
+        self.assertEqual((card["approval_channel"], card["approval_target"], card["deciders"]), ("feishu", GROUP, [KUN]))
+        for other in (self.report(ASH), self.report(OPS, outcome="emit")):
+            self.assertFalse({"approval_target", "deciders"} & set(other))
+        self.assertIsNone(GroupEntrances().card_group(OPS))
 
 
 class OriginTests(unittest.TestCase):

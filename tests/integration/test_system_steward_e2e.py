@@ -539,7 +539,7 @@ class GroupTests(ServedCase):
     async def test_r10_a_click_of_somebody_else_leaves_the_group_s_approval_to_the_listed_person(self) -> None:
         from tests.support.switchboard_approval_flow import card_click
 
-        # The system Steward asks before it starts; whoever sees the card can click it.
+        # The system Steward asks before it starts.
         self.enterContext(patch.object(AutoModePermissionAdapter, "DEFAULT_ALLOW_TOOLS",
                                        AutoModePermissionAdapter.DEFAULT_ALLOW_TOOLS - {"steward.launch"}))
         self.enterContext(patch.object(AutoModePermissionAdapter, "DEFAULT_DEFER_TOOLS",
@@ -553,7 +553,9 @@ class GroupTests(ServedCase):
 
         await self.wait_for(cards, "the approval card in the group")
         [sent] = cards()
-        where = sent["json"].get("receive_id") or "oc_hb"
+        # Not Switchboard's approval chat: the group, where only its listed people decide.
+        where = sent["json"].get("receive_id")
+        self.assertEqual(where, "oc_hb")
         card = json.loads(sent["json"]["content"])
         approve = next(el for el in card["elements"] if el["tag"] == "action")["actions"][0]["value"]
         url = f"{self.board.url}/webhooks/feishu"

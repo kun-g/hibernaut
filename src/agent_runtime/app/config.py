@@ -656,6 +656,9 @@ def _parse_feishu_groups(raw: object, runtime: RuntimeConfig) -> tuple[FeishuGro
         names = cast(list[object], members) if isinstance(members, list) else []
         if not names or not all(isinstance(m, str) and m.strip() and m == m.strip() for m in names):
             raise ValueError(f"{where}.members must list the Feishu open ids (ou_...) whose messages count")
+        if any(other.inbox_id == inbox for other in found.values()):
+            # Its approval cards go to that one group, and a decision counts only from there.
+            raise ValueError(f"{where}.inbox_id {inbox!r} already has a group: a system inbox takes one group")
         found[chat_id] = FeishuGroup(chat_id=chat_id, inbox_id=inbox, members=frozenset(cast(list[str], names)))
     return tuple(found.values())
 

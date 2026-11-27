@@ -203,6 +203,8 @@ class FeishuInboundAdapter:
                     "session_id": session_id,
                     "channel": "feishu",
                     "message_id": message_id,
+                    # The chat of the card that was clicked: the receiver may take decisions only from some chats.
+                    "chat_id": chat_id,
                 },
             ),
             http_status=200,

@@ -186,6 +186,8 @@ class DecidersTests(unittest.TestCase):
         self.h.board.worker.run_once()
         (decision,) = [e for e in self.hibernaut if e.event_type == "approval.decided"]
         self.assertEqual((decision.actor, decision.metadata["decision"]), ("ou_kun", "approve"))
+        # The chat of the card that was clicked, for the receiver to check against where it may be decided.
+        self.assertEqual(decision.metadata["chat_id"], "oc_approvals")
         status, again = post(url, card_click(value, operator="ou_stranger"))
         self.assertEqual(again["toast"]["type"], "error")
 

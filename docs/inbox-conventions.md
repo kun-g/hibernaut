@@ -130,5 +130,5 @@ SDE 等用户离开电脑（任务说要等空闲再做）时按契约返回 `ne
 | 不能转投给同一 `(inbox_id, agent_id)` | 拒绝 |
 | 系统 Inbox 不往外转投；转给它的那一轮须有人的单聊消息或本机运营者的事件 | 拒绝；审批放行、Run 收尾时重判 |
 | 系统 Inbox 只收全局 Steward 转来的、绑定群里名单上的人发的、本机运营者投的和自己的审批 | 事件标记 `failed`；远端或经代理的 `POST /events` 返回 403；绑定群里名单外的人的消息在进 Event Inbox 前丢弃、不回 |
-| `[[feishu_groups]]` 的 `inbox_id` 是带 `system_tools` 的绑定的精确 pattern、`chat_id` 不重复、`members` 非空 | 配置拒绝加载；热加载保留旧配置 |
+| `[[feishu_groups]]` 的 `inbox_id` 是带 `system_tools` 的绑定的精确 pattern、一个 Inbox 只绑一个群、`chat_id` 不重复、`members` 非空 | 配置拒绝加载；热加载保留旧配置 |
 | 系统 Inbox 是单个精确 `sys:<name>`、只读、agent 全是 `steward`、没有 `forward_to` | 配置拒绝加载；热加载保留旧配置 |

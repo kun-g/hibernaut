@@ -71,7 +71,7 @@
 - **全局 Steward**：绑在非项目 Inbox（`[[runtime.inbox_bindings]]`，`checkout_access = "readonly"`）上的 `steward` Agent，不属于任何项目。在绑定的 `workdir` 里只读运行；可转投到绑定 `forward_to`（转投白名单）列出的项目主 Inbox，只读查询自己的 Inbox 与这些项目的会话和事件，看不到项目的文件。
 - **系统 Steward**：绑在系统 Inbox 上的 `steward` Agent（`sys:ops`），由全局 Steward 转交或由群入口的名单成员直接说，用系统工具（`check_projects`、`onboard_project`、`complete_project`）接入项目、检查和补齐项目的 Steward 绑定、说明与转投白名单，用只读的 `runtime_status` 回答 hb 运转得怎样。同样只读、没有命令行，不能再转投；需求见 [`requirements/system-steward.md`](requirements/system-steward.md)。
 - **系统 Inbox**：写了 `system_tools = true` 的 `[[runtime.inbox_bindings]]`：单个精确 `sys:<name>`、`checkout_access = "readonly"`、Agent 全是 `steward`。只收全局 Steward 替人转来的、群入口名单上的人发的、本机运营者投的，以及它自己审批的答复。
-- **群入口**：`[[feishu_groups]]` 把一个飞书群（`chat_id`）绑到一个系统 Inbox，并列出算数的人（`members`，飞书 open_id）。名单上的人在群里发的消息直接进该 Inbox，答复回群；名单外的人的消息丢弃不回。
+- **群入口**：`[[feishu_groups]]` 把一个飞书群（`chat_id`）绑到一个系统 Inbox，并列出算数的人（`members`，飞书 open_id）。名单上的人在群里发的消息直接进该 Inbox，答复回群；名单外的人的消息丢弃不回。一个系统 Inbox 只绑一个群，它的审批卡发到这个群，只认名单上的人在这个群里的点击。
 - **运行状态**（`runtime_status`）：系统 Steward 和全局 Steward 共用的只读工具（同一份实现），给出一段时间内失败和挂起的任务（挂起带等什么：`approval` 审批、`answer` 人回答、`user_away` 用户离开电脑、`retry` 到点重试）、交付结果、发不出去的 Outbox 消息、各 `[[timers]]` 最近的触发和结果，以及查不到的范围；只有摘要，不带 payload 和密钥。
 - **Runner Relay**：Hibernaut 进程内的 Runner 反向 WebSocket 端点（`RunnerRelayHub`），Runner 主动连入，凭共享令牌鉴权后接单。`[runner]` 的 `relay` 模式与试点路由各开各的。与 Switchboard 的 relay 无关。
 - **Runner 试点路由**：`[runner_pilot]` 配置的一条默认关闭的路由：只把一个任务级 Inbox 交给一台单槽位的独立 Runner，执行器固定为 `runner-protocol-check`（无工具的协议文件校验）。关闭时该 Inbox 按原路由执行。

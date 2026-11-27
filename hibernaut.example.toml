@@ -234,6 +234,7 @@ system_tools = true             # 默认 false。只能写在 pattern 为单个�
 # 没绑定的群照旧（进 Switchboard 路由到的 Inbox，不算人说的）。群里要 @机器人（Switchboard [feishu] group_require_mention）。
 # chat_id 从 Switchboard 收到的群消息里取（oc_ 开头）；members 是 open_id（ou_ 开头，单聊事件的 actor）。
 # inbox_id 须是上面某条带 system_tools 的绑定的精确 pattern；一个群只能绑一个 Inbox。系统 Steward 改不了这一节。
+# 一个系统 Inbox 只绑一个群；它的审批卡发到这个群，只认 members 在这个群里的点击。
 # [[feishu_groups]]
 # chat_id = "oc_xxx"
 # inbox_id = "sys:ops"
