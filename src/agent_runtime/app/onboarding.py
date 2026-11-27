@@ -11,9 +11,10 @@ from collections import Counter
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from agent_runtime.adapters.executor_cli.steward import STEWARD_ROLE
+from agent_runtime.app.config_redaction import scrub
 from agent_runtime.app.config import HibernautConfig, ProjectConfig, parse_config
 from agent_runtime.app.config_edit import ConfigChanged, ConfigFile, EditRefused, TomlEdit, toml_key, toml_value
 from agent_runtime.app.projects import SYSTEM_INBOX_PREFIX, WorkdirBinding
@@ -26,10 +27,6 @@ _MAX_DESCRIPTION = 200
 _COMMAND_TIMEOUT_SECONDS = 60.0
 _CLONE_TIMEOUT_SECONDS = 900.0
 _MAX_OUTPUT = 500
-_REMOTE_LOGIN = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@]+@")
-_TOKEN = re.compile(r"\b(?:gh[a-z]_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,})")
-_SECRET_NAME = re.compile(r"(?i)(?:token|secret|password|passwd|api_?key|credential|_key)")
-_MIN_SECRET = 6
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 # (file, what it held, what it is to hold) -> the backup. Raises when the new version is not in force afterwards.
@@ -63,35 +60,6 @@ def run_command(
         proc.communicate()
         return subprocess.CompletedProcess(args, 124, "", f"{args[0]} did not finish within {timeout:g} seconds")
     return subprocess.CompletedProcess(args, proc.returncode, out, err)
-
-
-def _secret_values(raw: Mapping[str, Any]) -> set[str]:
-    found: set[str] = set()
-
-    def walk(node: object, secret: bool) -> None:
-        if isinstance(node, dict):
-            for key, value in cast(dict[str, object], node).items():
-                # Keys such as token_env and token_file name where a secret is, not the secret.
-                named = bool(_SECRET_NAME.search(key)) and not key.endswith(("_env", "_file"))
-                walk(value, secret or key == "env" or named)
-        elif isinstance(node, list):
-            for item in cast(list[object], node):
-                walk(item, secret)
-        elif secret and isinstance(node, str):
-            found.add(node)
-
-    walk(raw, False)
-    return found
-
-
-def scrub(text: str, raw: Mapping[str, Any] | None = None) -> str:
-    # Text of commands and parsers, before it reaches an agent, an answer or a log.
-    secrets = {value for name, value in os.environ.items() if _SECRET_NAME.search(name)}
-    if raw is not None:
-        secrets |= _secret_values(raw)
-    for value in sorted((s for s in secrets if len(s) >= _MIN_SECRET), key=len, reverse=True):
-        text = text.replace(value, "***")
-    return _TOKEN.sub("***", _REMOTE_LOGIN.sub(r"\1***@", text))
 
 
 def split_repo(repo: str) -> tuple[str, str]:
