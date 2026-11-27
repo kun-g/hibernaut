@@ -75,9 +75,10 @@
 - **运维 agent**：绑在运维 Inbox 上的 `steward` Agent。预发布直接部署；生产上线、删除由代码判为 `deploy_production` / `delete_resource`，挂起等人批准。
 - **扣住的调用**（held call）：运维 Steward 的 `dokploy` 调用被门禁判为 `defer` 时不执行，记进本轮的 `deferred`，随挂起一起送审；批准后由 Hibernaut 按原参数重判再执行，Steward 再跑一轮报告结果。
 - **`create_repo`**：全局 Steward 在绑定写 `repo_tools = true` 时多出的工具：在配置允许的账号或组织下建私有 GitHub 仓库，未指定时用 `[repo_tools] owner`，首次提交是来源文件夹里该项目最新的文件；仓库已存在就停。不是命令行。
-- **来源文件夹**（sources folder）：Drive 凭据代理配置的 `sources_folder_id`，下面每个项目一个子文件夹放各个版本；代理只让 `create_repo` 读这一层子文件夹里的文件。
+- **来源文件夹**（sources folder）：Drive 凭据代理配置的 `sources_folder_id`，下面每个项目一个子文件夹放各个版本；`create_repo` 按项目名查找时使用。代理显式开启 `allow_any_source_folder` 后，也可用共享的项目文件夹链接直接取其文件。
 - **一句话开新项目**：单聊里一句话，由全局 Steward 依次 `create_repo`、转交系统 Steward 接入、转交运维 agent 配环境，每步结果回同一单聊；前一步回信 `done` 才能转下一步（回信带 `status`：`done` / `failed`）。
-- **群入口**：`[[feishu_groups]]` 把一个飞书群（`chat_id`）绑到一个系统 Inbox，并列出算数的人（`members`，飞书 open_id）。名单上的人在群里发的消息直接进该 Inbox，答复回群；名单外的人的消息丢弃不回。一个系统 Inbox 只绑一个群，它的审批卡发到这个群，只认名单上的人在这个群里的点击。
+- **群入口**：`[[feishu_groups]]` 把一个飞书群（`chat_id`）绑到一个系统 Inbox 或一个项目 Inbox，并列出算数的人（`members`，飞书 open_id）。名单上的人在群里发的消息直接进该 Inbox，答复回群；名单外的人的消息丢弃不回。一个 Inbox 只绑一个群。系统 Inbox 的审批卡发到这个群，只认名单上的人在这个群里的点击。
+- **项目群**：绑到项目 Inbox 的群入口，名单可含**合作方**（不是 Kun 的人）。群里谁说的都只算对这个项目的请求，转不出项目；群 Inbox（默认 `proj:<p>:chat`）只由项目 Steward 处理、只收这个群。项目所有 Inbox 的审批只认 **`approvers`**（一般是 Kun），卡片发到 Switchboard 的审批聊天，不发群里。需求见 [`requirements/project-group.md`](requirements/project-group.md)。
 - **运行状态**（`runtime_status`）：系统 Steward 和全局 Steward 共用的只读工具（同一份实现），给出一段时间内失败和挂起的任务（挂起带等什么：`approval` 审批、`answer` 人回答、`user_away` 用户离开电脑、`retry` 到点重试）、交付结果、发不出去的 Outbox 消息、各 `[[timers]]` 最近的触发和结果，以及查不到的范围；只有摘要，不带 payload 和密钥。
 - **Runner Relay**：Hibernaut 进程内的 Runner 反向 WebSocket 端点（`RunnerRelayHub`），Runner 主动连入，凭共享令牌鉴权后接单。`[runner]` 的 `relay` 模式与试点路由各开各的。与 Switchboard 的 relay 无关。
 - **Runner 试点路由**：`[runner_pilot]` 配置的一条默认关闭的路由：只把一个任务级 Inbox 交给一台单槽位的独立 Runner，执行器固定为 `runner-protocol-check`（无工具的协议文件校验）。关闭时该 Inbox 按原路由执行。

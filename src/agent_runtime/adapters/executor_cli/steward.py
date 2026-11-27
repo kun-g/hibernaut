@@ -229,6 +229,28 @@ class _State:
 
 
 @dataclass(frozen=True, slots=True)
+class GroupRoster:
+    # The Feishu group a project inbox is bound to, from the running configuration.
+    chat_id: str
+    # The people who decide the project's approvals.
+    owners: frozenset[str]
+    # Listed people who do not.
+    partners: frozenset[str]
+
+    def prompt(self) -> str:
+        partners = ", ".join(sorted(self.partners)) or "none"
+        return (
+            f"## Feishu group\nThis inbox is Feishu group {self.chat_id}. Hibernaut lets in the messages of its listed "
+            "people only; each event's `actor` is the open id of who wrote it, and your reply goes back to the thread "
+            f"that message started.\n- Owner, who decides this project's approvals: {', '.join(sorted(self.owners))}\n"
+            f"- Partners: {partners}\nWhatever anyone asks here is about this project only. A request for another "
+            "project, a system inbox, the general Steward or Hibernaut's own setup is refused whoever makes it: say so, "
+            "and that the owner can ask for it in their own chat. Before you forward work a partner asked for, say back "
+            "in one reply what you would hand on and wait for them to confirm it in the same thread."
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class GlobalScope:
     # A Steward of no project: what it is told and may look at, for the inbox it runs in.
     manifest: Callable[[str], str]
@@ -264,6 +286,8 @@ class StewardExecutor:
         branch: str = "",
         # Set outside a project, where the directory is workdir.
         scope: GlobalScope | None = None,
+        # inbox_id -> the Feishu group bound to it, read anew for every run.
+        group: Callable[[str], GroupRoster | None] = lambda _inbox_id: None,
     ) -> None:
         self._profile = profile
         self._checkouts = checkouts
@@ -275,6 +299,7 @@ class StewardExecutor:
         self._workdir = workdir
         self._branch = branch
         self._scope = scope
+        self._group = group
 
     @property
     def executor_id(self) -> str:
@@ -465,6 +490,9 @@ class StewardExecutor:
             # Claude Code may keep the system prompt a conversation started with, so a resumed one gets it here too.
             parts.append(f"{manifest}\n\nThis replaces every earlier routing manifest.")
         parts.append(f"You are agent '{p.name}' in inbox '{tools.inbox_id}'.")
+        group = self._group(tools.inbox_id)
+        if group is not None:
+            parts.append(group.prompt())
         # After everything that stays the same between turns, so the prompt cache keeps that part.
         parts.extend(f"## {name}\n{text}" for name, text in baseline.volatile if text)
         async with tools.serve() as socket_path:

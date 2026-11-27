@@ -12,12 +12,8 @@ import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from agent_runtime.adapters.channels.gdrive_tasks import DriveClientProtocol, DriveFileMeta
-
-ATTACHMENTS_FOLDER_NAME = "附件"
+from agent_runtime.adapters.gdrive_contract import ATTACHMENTS_FOLDER_NAME, DriveClientProtocol, DriveFileMeta
 
 _DRIVE_ID = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
 _ID_CHARS = "A-Za-z0-9_-"

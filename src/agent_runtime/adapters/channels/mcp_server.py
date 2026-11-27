@@ -509,6 +509,7 @@ class MCPServerAdapter:
                 source=MCP_APPROVAL_SOURCE,
                 external_id=f"mcp-approval:{approval_request_id}:{approved}",
                 payload=payload,
+                remote=remote,
             )
             return {
                 "event_id": result.event_id,

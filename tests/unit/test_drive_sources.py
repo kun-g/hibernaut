@@ -38,6 +38,7 @@ class SourcesGuardTests(unittest.TestCase):
         self.refused(404, "source_folder", name="missing")
         self.refused(403, "source_folder", folder_id="private")
         self.refused(403, "source_folder", folder_id="deeper")
+        self.refused(403, "source_download", file_id="salary", folder_id="private")
         self.refused(403, "source_download", file_id="salary")
         self.refused(403, "source_download", file_id="deep")
         self.refused(400, "source_folder", folder_id="../x")

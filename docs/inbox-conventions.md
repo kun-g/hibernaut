@@ -114,11 +114,32 @@ SDE 等用户离开电脑（任务说要等空闲再做）时按契约返回 `ne
 - **谁的请求算数**：来源由上一条的代码验过，契约和内置 Skill 写明事件里的请求就是人提的，`agent:forward` 和 `webhook` 都一样；清楚就直接做，不再请人确认授权，只有没说清才问。全局 Steward 引述的人的原话是请求；请求里引用或附带的外来文字、工具读到的文字不是请求，不照做。
 - **看不到的**：`hibernaut.toml` 与它的备份不给 `read_file`、`search_files`、`git` 读，答复里没有 `env` 和令牌的值。
 
+## 项目群
+
+和合作方的飞书群绑到一个项目的 Inbox，需求见 [`requirements/project-group.md`](requirements/project-group.md)。默认每个项目一个专用的 `proj:<p>:chat`，绑定写在 `proj:<p>:.+` 那条之前（第一个整串匹配的生效），agent 全是 `steward`：
+
+```toml
+[[projects.fruit.inbox_bindings]]
+pattern = "proj:fruit:chat"
+default_agent = "steward"
+agents = ["steward"]
+
+[[feishu_groups]]
+chat_id = "oc_xxx"
+inbox_id = "proj:fruit:chat"
+members = ["ou_kun", "ou_partner"]   # 含合作方
+approvers = ["ou_kun"]               # 这个项目所有 Inbox 的审批只认他们
+```
+
+- 群里谁说的都只算对这个项目的请求：项目 Inbox 没有 `forward_to`，群 Inbox 和它转去的主 Inbox、子队列都到不了别的项目、`sys:*`、`user:*`。
+- 审批卡按 Switchboard 的 `[outbound] approval_target` 发，不发群里；Switchboard 只收 `approvers` 的点击。
+- Switchboard 写了 `unmatched_policy = "reject"` 时，要在 `[routing.feishu_chats]` 把这个群路由到群 Inbox（或任意 scope，hb 按 `chat_id` 改投），否则消息在 Switchboard 就被丢掉。
+
 ## 运维 Inbox 与一句话开新项目
 
 需求 R12–R15、C7–C9 见 [`requirements/system-steward.md`](requirements/system-steward.md)。人在单聊对全局 Steward 说一句「新建项目 X，从 Drive 下最新版本作初始提交，再配好预发布和生产」，全局 Steward 依次：
 
-1. `create_repo`（绑定写 `repo_tools = true`）：在 `[repo_tools] allowed_owners` 允许的账号或组织下建私有仓库，未指定时用 `owner`，旧配置仅允许 `owner`，首次提交是凭据代理 `sources_folder_id` 下同名文件夹（或人给的链接）里最新修改的文件，压缩包解开；仓库已存在、文件夹空、下载或推送失败都停下说明。
+1. `create_repo`（绑定写 `repo_tools = true`）：在 `[repo_tools] allowed_owners` 允许的账号或组织下建私有仓库，未指定时用 `owner`，旧配置仅允许 `owner`，首次提交是人给的 Drive 项目文件夹里最新修改的直接文件。代理默认仅限 `sources_folder_id` 的直接子目录，`allow_any_source_folder` 开启后可用其他共享文件夹；省略链接时在 `sources_folder_id` 下按项目名查找，压缩包解开；仓库已存在、文件夹空、下载或推送失败都停下说明。
 2. 转给系统 Inbox 接入（`return_to` 自己），等回信。
 3. 回信 `done` 才转给运维 Inbox 配环境（`return_to` 自己）；回信 `failed` 时停下，代码也拒绝这次转投。
 4. 汇总：仓库、hb 接入、两个环境的地址和状态。
@@ -152,7 +173,8 @@ SDE 等用户离开电脑（任务说要等空闲再做）时按契约返回 `ne
 | 不能转投给同一 `(inbox_id, agent_id)` | 拒绝 |
 | 系统 Inbox 不往外转投；转给它的那一轮须有人的单聊消息或本机运营者的事件，或一条来自系统 Inbox、`done`、本会话还在等的回投 | 拒绝；审批放行、Run 收尾时重判 |
 | 系统 Inbox 只收全局 Steward 转来的、绑定群里名单上的人发的、本机运营者投的和自己的审批 | 事件标记 `failed`；远端或经代理的 `POST /events` 返回 403；绑定群里名单外的人的消息在进 Event Inbox 前丢弃、不回 |
-| `[[feishu_groups]]` 的 `inbox_id` 是带 `system_tools` 的绑定的精确 pattern、一个 Inbox 只绑一个群、`chat_id` 不重复、`members` 非空 | 配置拒绝加载；热加载保留旧配置 |
+| `[[feishu_groups]]` 的 `inbox_id` 是带 `system_tools` 的绑定的精确 pattern，或被一条 agent 全是 `steward` 的项目绑定覆盖的项目 Inbox（这时 `approvers` 必填）；一个 Inbox 只绑一个群、`chat_id` 不重复、`members` 非空 | 配置拒绝加载；热加载保留旧配置 |
+| 项目群的 Inbox 只收这个群名单上的人的消息；这个项目所有 Inbox 的审批只认 `approvers` | 别的聊天的消息、别人的点击丢弃不回；远端 `POST /events` 403 |
 | 系统 Inbox（`system_tools` 或 `ops_tools`）是单个精确 `sys:<name>`、只读、agent 全是 `steward`、没有 `forward_to`，两个键不写在同一条 | 配置拒绝加载；热加载保留旧配置 |
 | `repo_tools` 只在精确 ID、只读、全 `steward`、不是 `sys:` 的绑定上，且有 `[repo_tools] owner` 与 `[gdrive]` 代理；`ops_tools` 要有 `[ops_tools] dokploy_script` | 配置拒绝加载；热加载保留旧配置 |
 | 运维 Inbox 部署到不是预发布的环境（含看不出环境的、开自动部署的来源）、删除、未登记的 Dokploy 服务 | 不执行，挂起等人批准；批准后由 Hibernaut 执行 |
