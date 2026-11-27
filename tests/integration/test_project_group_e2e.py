@@ -92,8 +92,13 @@ class GroupTests(ProjectGroupCase):
         await self.serve()
         self.set_plan(
             [{"calls": [forward("proj:a:sde", "订单页加导出（郭勇已确认）")]}],
-            [{"output": {"status": "needs_input", "summary": "", "test_evidence": "", "question": "CSV 还是 Excel？",
-                         "change_kind": "feature", "change_rationale": "x"}},
+            [{"output": {"status": "needs_input", "summary": "", "test_evidence": "",
+                         "question": "订单导出采用 CSV（逗号分隔的表格文件）吗？",
+                         "decision": {"background": "订单页需要提供导出功能，目前在确认文件格式。",
+                                      "reason": "合作方确认了要导出订单，具体格式需要项目负责人决定。",
+                                      "approve": "按逗号分隔的表格格式继续处理订单导出",
+                                      "reject": "保留订单页现有的导出方式", "recommendation": "批准"},
+                         "change_kind": "feature", "change_rationale": "订单导出新增格式选择"}},
              {"output": {"status": "done", "summary": "导出已经有了，不用改", "test_evidence": "pytest: 3 passed",
                          "change_kind": "test_docs", "change_rationale": "nothing changed", "code_change": False}}],
         )
