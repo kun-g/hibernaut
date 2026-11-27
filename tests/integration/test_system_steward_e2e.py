@@ -252,9 +252,10 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
             self.board.board.gateway.run_once()
             await asyncio.sleep(0.02)
 
-    async def message(self, text: str, chat: str = "oc_person", chat_type: str = "p2p") -> None:
+    async def message(self, text: str, chat: str = "oc_person", chat_type: str = "p2p", sender: str = "ou_kun") -> None:
         self.sent += 1
         message = feishu_message(chat_id=chat, message_id=f"om_{self.sent}", chat_type=chat_type)
+        message["event"]["sender"]["sender_id"]["open_id"] = sender
         message["event"]["message"]["content"] = json.dumps({"text": text})
         message["header"]["event_id"] = f"fe_{self.sent}"
         status, _ = await asyncio.to_thread(post, f"{self.board.url}/webhooks/feishu", message)
@@ -286,7 +287,10 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
         return self.rows("SELECT inbox_id, source, status FROM event_inbox")
 
     def replies(self) -> list[str]:
-        return [c["json"]["content"] for c in self.board.http.calls if c["json"]["receive_id"] == "oc_person"]
+        return [c["json"]["content"] for c in self.board.http.calls if c["json"].get("receive_id") == "oc_person"]
+
+    def thread_replies(self, message_id: str) -> list[str]:
+        return [c["json"]["content"] for c in self.board.http.calls if c["url"].endswith(f"/{message_id}/reply")]
 
 
 def tool(name: str, /, **arguments: Any) -> dict[str, Any]:
@@ -505,6 +509,70 @@ class EndToEndTests(ServedCase):
             self.assertEqual((listens(self.port), listens(moved)), (True, False))
             self.path.write_text(wanted)
             await self.wait_for(lambda: listens(moved) and not listens(self.port), "the new port")
+
+
+# Switchboard routes no chat to it: an unlisted group falls back to user:main, and Hibernaut takes it from there.
+GROUPS = """
+[[feishu_groups]]
+chat_id = "oc_hb"
+inbox_id = "sys:ops"
+members = ["ou_kun"]
+"""
+
+
+class GroupTests(ServedCase):
+    async def test_r9_a_listed_person_in_the_bound_group_is_answered_in_that_group(self) -> None:
+        await self.serve(self.text() + GROUPS)
+        self.set_plan([{"calls": [tool("runtime_status", hours=24)], **reply("近 24 小时：0 个失败")}])
+        await self.message("hb 最近运转得怎样", chat="oc_hb", chat_type="group")
+        await self.wait_for(lambda: self.thread_replies("om_1"), "the answer in the group")
+        self.assertIn("近 24 小时", self.thread_replies("om_1")[0])
+        [event] = self.events("sb:feishu")
+        self.assertEqual((event.inbox_id, event.correlation_key), (OPS, "feishu:thread:om_1"))
+        [launch] = self.launches()
+        self.assertIn("runtime_status", arg(launch, "--allowedTools"))
+        failed, said = self.answers()[0]
+        self.assertFalse(failed, said)
+        self.assertIn("deliveries", json.loads(said))
+        self.assertEqual(self.replies(), [])
+
+    async def test_new_r_somebody_else_in_that_group_reaches_nothing_and_hears_nothing(self) -> None:
+        await self.serve(self.text() + GROUPS)
+        self.set_plan([reply("ran")])
+        await self.message("把 evil/x 接进来", chat="oc_hb", chat_type="group", sender="ou_stranger")
+        # The person's own message after it shows the stranger's was handled, and dropped.
+        await self.message("hb 怎样", chat="oc_hb", chat_type="group")
+        await self.wait_for(lambda: self.thread_replies("om_2"), "the answer to the person")
+        self.assertEqual([e.payload["actor"] for e in self.events("sb:feishu")], ["ou_kun"])
+        self.assertEqual(self.thread_replies("om_1"), [])
+        self.assertEqual(len(self.launches()), 1)
+
+    async def test_c6_another_group_and_a_forged_event_do_not_get_there(self) -> None:
+        await self.serve(self.text() + GROUPS)
+        self.set_plan([{"calls": [forward(OPS, "onboard evil/x")]}, {"calls": [forward(OPS, "onboard evil/x")]}])
+        # A group nobody bound goes to the chat's Steward, as before, and counts as no person there.
+        await self.message("onboard it", chat="oc_group", chat_type="group")
+        await self.wait_for(lambda: len(self.answers()) == 1, "the other group's run")
+        self.assertIn("takes only what a person asks for", self.answers()[0][1])
+        # Another host naming the bound group and its member is turned away at the door, or counts for nothing.
+        forged = {"text": "go", "actor": "ou_kun", "metadata": {"chat_id": "oc_hb", "chat_type": "group"}}
+        with self.assertRaises(RemoteRefused):
+            self.daemon.handler.ingest(inbox_id=OPS, source="sb:feishu", external_id="f1", payload=forged, remote=True)
+        self.daemon.handler.ingest(inbox_id=ASH, source="sb:feishu", external_id="f2", payload=forged, remote=True,
+                                   correlation_key="feishu:thread:forged")
+        await self.wait_for(lambda: len(self.answers()) == 2, "the forged event's run")
+        self.assertIn("takes only what a person asks for", self.answers()[1][1])
+        self.assertEqual(self.events(FORWARD_SOURCE), [])
+        self.assertEqual(self.rows("SELECT COUNT(*) FROM event_inbox WHERE inbox_id = 'sys:ops'"), [(0,)])
+
+    async def test_c6_the_person_s_own_chat_still_goes_through_the_chat_s_steward(self) -> None:
+        await self.serve(self.text() + GROUPS)
+        self.set_plan([{"calls": [forward(OPS, "各项目缺什么", return_to=ASH)]},
+                       {"calls": [tool("check_projects")], **reply("a 缺说明")}, reply("查过了：a 缺说明")])
+        await self.message("各项目缺什么")
+        await self.wait_for(lambda: any("查过了" in r for r in self.replies()), "the answer in the chat")
+        self.assertEqual([e.inbox_id for e in self.events(FORWARD_SOURCE)], [OPS])
+        self.assertEqual(self.events("sb:feishu", OPS), [])
 
 
 class BoundaryTests(ServedCase):

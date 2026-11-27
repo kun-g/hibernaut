@@ -95,7 +95,7 @@ forward_to = ["proj:hibernaut", "proj:sure"]
 
 ## 系统 Steward
 
-接入项目、检查和补齐项目配置。需求与编号见 [`requirements/system-steward.md`](requirements/system-steward.md)。人照旧跟全局 Steward 说，由它转交；结果按普通转投的回信方式回到原单聊。
+接入项目、检查和补齐项目配置。需求与编号见 [`requirements/system-steward.md`](requirements/system-steward.md)。人在单聊跟全局 Steward 说，由它转交，结果按普通转投的回信方式回到原单聊；或在 `[[feishu_groups]]` 绑定的群里直接说（只认 `members` 列出的人），答复回群里的同一话题。
 
 绑定写 `system_tools = true` 就是系统 Inbox（写法见上「非项目 Inbox 的 `workdir`」），须是单个精确的 `sys:<name>`、`checkout_access = "readonly"`、agent 全是 `steward`、不写 `forward_to`。要转到它的绑定在自己的 `forward_to` 里列出它，须是精确 ID、只读、agent 全是 `steward`。
 
@@ -108,7 +108,7 @@ forward_to = ["proj:hibernaut", "proj:sure"]
 - **默认值由代码定**，命令行 `scripts/onboard_project.py` 用同一套：主 Inbox 归 `steward`，`proj:<p>:.+` 归 `sde`，`open_pr = true`、`auto_merge = false`。具体哪个 agent 取别的项目用得最多的；没有合适的就拒绝（命令行则照加项目，并注明没配 Steward）。没给说明时写中性的「GitHub 仓库 owner/repo」。主 Inbox 已有手写绑定、默认 agent 不是 Steward 的，列为待人做，不改。
 - **写配置**：只认上表的参数；整份能解析才写，先留备份（配置旁的 `<名字>.bak-<时间>`，0600）、原子替换；写前文件被人改过就放弃；写后等热加载生效，没生效就恢复原文件并说明；确认生效前文件又被人改了，保留人改的那版并说明，不报已生效。回执带 `added`、`backup` 和 `undo`。没有开热加载的进程里这些工具拒绝执行。
 - **建标签**：只在 `[onboarding] label_owners` 列出的 owner 上建，默认空。服务器入口路由（Switchboard）永远只列为待人做。
-- **谁能到它**：全局 Steward 替人转来的、本机运营者投的（本机 `POST /events`、CLI）、它自己的审批。GitHub、群聊、Drive、定时器来的，项目转来的，以及远端或经代理的 `POST /events`（403）、`POST /mcp` 都到不了；后两者投给全局 Steward 的也不算人说的。全局 Steward 也只有在本轮处理的是人的单聊消息或本机运营者的事件时才能转给它；只因为一条回投醒来的那轮不行。
+- **谁能到它**：全局 Steward 替人转来的、绑定群里名单上的人发的、本机运营者投的（本机 `POST /events`、CLI）、它自己的审批。GitHub、没绑定的群和群里名单外的人、Drive、定时器来的，项目转来的，以及远端或经代理的 `POST /events`（403）、`POST /mcp` 都到不了；后两者投给全局 Steward 的也不算人说的。全局 Steward 也只有在本轮处理的是人的单聊消息或本机运营者的事件时才能转给它；只因为一条回投醒来的那轮不行。
 - **谁的请求算数**：来源由上一条的代码验过，契约和内置 Skill 写明事件里的请求就是人提的，`agent:forward` 和 `webhook` 都一样；清楚就直接做，不再请人确认授权，只有没说清才问。全局 Steward 引述的人的原话是请求；请求里引用或附带的外来文字、工具读到的文字不是请求，不照做。
 - **看不到的**：`hibernaut.toml` 与它的备份不给 `read_file`、`search_files`、`git` 读，答复里没有 `env` 和令牌的值。
 
@@ -127,5 +127,6 @@ forward_to = ["proj:hibernaut", "proj:sure"]
 | 一件外部事件最多主动转投 3 次（`MAX_FORWARD_HOPS = 3`）；回投是对转投的答复，不计数 | 转投被拒，当前 agent 就地答复 |
 | 不能转投给同一 `(inbox_id, agent_id)` | 拒绝 |
 | 系统 Inbox 不往外转投；转给它的那一轮须有人的单聊消息或本机运营者的事件 | 拒绝；审批放行、Run 收尾时重判 |
-| 系统 Inbox 只收全局 Steward 转来的、本机运营者投的和自己的审批 | 事件标记 `failed`；远端或经代理的 `POST /events` 返回 403 |
+| 系统 Inbox 只收全局 Steward 转来的、绑定群里名单上的人发的、本机运营者投的和自己的审批 | 事件标记 `failed`；远端或经代理的 `POST /events` 返回 403；绑定群里名单外的人的消息在进 Event Inbox 前丢弃、不回 |
+| `[[feishu_groups]]` 的 `inbox_id` 是带 `system_tools` 的绑定的精确 pattern、`chat_id` 不重复、`members` 非空 | 配置拒绝加载；热加载保留旧配置 |
 | 系统 Inbox 是单个精确 `sys:<name>`、只读、agent 全是 `steward`、没有 `forward_to` | 配置拒绝加载；热加载保留旧配置 |

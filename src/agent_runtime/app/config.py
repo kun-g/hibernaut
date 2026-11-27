@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
+from agent_runtime.adapters.channels.ingress import FeishuGroup
 from agent_runtime.adapters.delivery import DeliveryConfig, parse_delivery
 from agent_runtime.adapters.executor_cli.claude_code import (
     AGENT_PROFILE_KEYS,
@@ -584,6 +585,8 @@ class HibernautConfig:
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
     timers: tuple[ConfiguredTimer, ...] = ()
+    # Feishu groups whose listed people talk to a system inbox directly.
+    feishu_groups: tuple[FeishuGroup, ...] = ()
 
     def expert_plan(self, inbox_id: str) -> MemoryMountPlan | None:
         return next((e.plan for p in self.projects.values() for e in p.expert_bindings if e.rule.matches(inbox_id)), None)
@@ -626,6 +629,35 @@ def _parse_timers(raw: object, runtime: RuntimeConfig, projects: Mapping[str, Pr
             raise ValueError(f"{where}.payload must contain JSON values") from exc
         result[name] = ConfiguredTimer(name, inbox, interval, payload, enabled)
     return tuple(result.values())
+
+
+_FEISHU_GROUP_KEYS = frozenset({"chat_id", "inbox_id", "members"})
+
+
+def _parse_feishu_groups(raw: object, runtime: RuntimeConfig) -> tuple[FeishuGroup, ...]:
+    if not isinstance(raw, list):
+        raise ValueError("feishu_groups must be an array of tables")
+    found: dict[str, FeishuGroup] = {}
+    for i, item in enumerate(cast(list[object], raw)):
+        where = f"feishu_groups[{i}]"
+        if not isinstance(item, dict) or cast(dict[str, Any], item).keys() - _FEISHU_GROUP_KEYS:
+            raise ValueError(f"{where} must be a table with the known keys {', '.join(sorted(_FEISHU_GROUP_KEYS))}")
+        group = cast(dict[str, Any], item)
+        chat_id = group.get("chat_id")
+        if not isinstance(chat_id, str) or not chat_id.strip() or chat_id != chat_id.strip() or chat_id in found:
+            raise ValueError(f"{where}.chat_id must be a unique, non-blank Feishu chat id")
+        inbox = group.get("inbox_id")
+        bound = runtime.workdir_binding(inbox) if isinstance(inbox, str) else None
+        # Only a system inbox, which admits nothing else from a chat: an ordinary one would take anybody's message.
+        if bound is None or not bound.system_tools or bound.rule.literal != inbox:
+            raise ValueError(f"{where}.inbox_id must be the exact pattern of a [[runtime.inbox_bindings]] entry with "
+                             f"system_tools, got {inbox!r}")
+        members = group.get("members")
+        names = cast(list[object], members) if isinstance(members, list) else []
+        if not names or not all(isinstance(m, str) and m.strip() and m == m.strip() for m in names):
+            raise ValueError(f"{where}.members must list the Feishu open ids (ou_...) whose messages count")
+        found[chat_id] = FeishuGroup(chat_id=chat_id, inbox_id=inbox, members=frozenset(cast(list[str], names)))
+    return tuple(found.values())
 
 
 def _resolve_path(raw: str, base_dir: Path | None) -> str:
@@ -1562,6 +1594,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
 
     config = HibernautConfig(
         timers=_parse_timers(raw.get("timers", []), runtime, projects),
+        feishu_groups=_parse_feishu_groups(raw.get("feishu_groups", []), runtime),
         runtime=runtime,
         channels=channels,
         executors=executors,

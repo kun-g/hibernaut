@@ -721,7 +721,8 @@ class AgentWorker:
         if self._is_approval_decision(event):
             pending = self._sessions.find_by_request_id(str(event.payload["approval_request_id"]))
             return pending is not None and pending.inbox_id == inbox_id
-        return self._origin(event) == "operator"
+        # A one-to-one chat reaches a system inbox only through the general Steward.
+        return self._origin(event) in ("operator", "group")
 
     def _claim(self, inbox_id: str) -> list[Event]:
         if self._hold is None:

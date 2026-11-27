@@ -51,10 +51,15 @@ class SystemTools(Protocol):
 
     def complete(self, *, name: str, description: str | None) -> str: ...
 
+    # Read only: a summary of failures, suspensions, deliveries, undelivered messages and timer firings.
+    def status(self, *, hours: int, timer_runs: int) -> str: ...
+
     # Whether a path must not be shown to it: the deployment file and what is written beside it.
     def hides(self, path: Path) -> bool: ...
 
 
+_STATUS_HOURS, _MAX_STATUS_HOURS = 24, 24 * 30
+_TIMER_RUNS, _MAX_TIMER_RUNS = 5, 20
 _MATCH = re.compile(rb"([^\0]+)\0(\d+)[\0:]([^\n]*)\n")
 
 
@@ -145,6 +150,13 @@ def _count(arguments: dict[str, Any], key: str, default: int) -> int:
     return value
 
 
+def _bounded(arguments: dict[str, Any], key: str, default: int, most: int) -> int:
+    value = _count(arguments, key, default)
+    if value > most:
+        raise ToolError(f"{key} must be at most {most}")
+    return value
+
+
 def _strings(arguments: dict[str, Any], key: str) -> list[str]:
     value = arguments.get(key)
     if value is None:
@@ -183,6 +195,17 @@ def _system_definitions() -> list[dict[str, Any]]:
          "description": "Add what a project lacks according to check_projects, and nothing else: values that are set stay.",
          "inputSchema": _schema(
              ("name",), name={**_TEXT, "description": "The project's name, from check_projects."}, description=description,
+         )},
+        {"name": "runtime_status",
+         "description": "How Hibernaut has been running, read only: failed tasks, suspended tasks and what each waits "
+                        "for (approval, an answer, the user to leave the computer, a retry), delivery results, Outbox "
+                        "messages that did not go out, and the last firings of each [[timers]] entry with their "
+                        "results. Summaries only; it also says which time it covers and what it cannot see.",
+         "inputSchema": _schema(
+             hours={"type": "integer", "minimum": 1, "maximum": _MAX_STATUS_HOURS,
+                    "description": f"How far back to look; default {_STATUS_HOURS}."},
+             timer_runs={"type": "integer", "minimum": 1, "maximum": _MAX_TIMER_RUNS,
+                         "description": f"Firings to show per timer; default {_TIMER_RUNS}."},
          )},
     ]
     for tool in found:
@@ -302,7 +325,7 @@ class StewardTools:
         if self.system is not None:
             del handlers["forward_to_inbox"]
             handlers |= {"check_projects": self._check_projects, "onboard_project": self._onboard_project,
-                         "complete_project": self._complete_project}
+                         "complete_project": self._complete_project, "runtime_status": self._runtime_status}
         handler = handlers.get(name) if isinstance(name, str) else None
         if handler is None:
             return f"unknown tool {name}", True
@@ -341,6 +364,12 @@ class StewardTools:
         name, description = _required(arguments, "name"), _optional(arguments, "description")
         system = self._system("complete_project", arguments, "name", "description")
         return await asyncio.to_thread(system.complete, name=name, description=description)
+
+    async def _runtime_status(self, arguments: dict[str, Any]) -> str:
+        hours = _bounded(arguments, "hours", _STATUS_HOURS, _MAX_STATUS_HOURS)
+        timer_runs = _bounded(arguments, "timer_runs", _TIMER_RUNS, _MAX_TIMER_RUNS)
+        system = self._system("runtime_status", arguments, "hours", "timer_runs")
+        return await asyncio.to_thread(system.status, hours=hours, timer_runs=timer_runs)
 
     def _readable(self, path: str) -> bool:
         # Every way a file's content is shown passes the gate as a read of that file.

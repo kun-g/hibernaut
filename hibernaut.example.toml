@@ -227,7 +227,17 @@ agents = ["hibernaut-ops"]
 workdir = "/absolute/path/to/your/hibernaut"   # 主检出
 checkout_access = "readonly"
 system_tools = true             # 默认 false。只能写在 pattern 为单个精确 sys:<name>、readonly、agent 全是 steward 的绑定上，否则拒绝加载；
-#                               # 这样的 Inbox 不能再转投，只收全局 Steward 替人转来的、本机运营者投的和它自己的审批
+#                               # 这样的 Inbox 不能再转投，只收全局 Steward 替人转来的、绑定群里名单上的人发的、本机运营者投的和它自己的审批
+# 系统 Steward 还有只读工具 runtime_status：最近失败和挂起的任务（带等什么）、交付结果、发不出去的消息、各 [[timers]] 最近几次触发和结果。
+
+# 可选：把一个飞书群绑到系统 Inbox，名单上的人在群里发的消息直接进它，答复回群里的同一话题。名单外的人的消息丢弃、不回；
+# 没绑定的群照旧（进 Switchboard 路由到的 Inbox，不算人说的）。群里要 @机器人（Switchboard [feishu] group_require_mention）。
+# chat_id 从 Switchboard 收到的群消息里取（oc_ 开头）；members 是 open_id（ou_ 开头，单聊事件的 actor）。
+# inbox_id 须是上面某条带 system_tools 的绑定的精确 pattern；一个群只能绑一个 Inbox。系统 Steward 改不了这一节。
+# [[feishu_groups]]
+# chat_id = "oc_xxx"
+# inbox_id = "sys:ops"
+# members = ["ou_xxx"]
 
 # 全局 Steward：接个人对话（如飞书单聊），能答的自己答，新活转投到 forward_to 列出的项目。目录以这里的 workdir 为准（Orca 已登记的 Git 检出），
 # agent 自己写了 workdir 须是同一个目录。同一个对话派出的每件活各有会话与 worktree。

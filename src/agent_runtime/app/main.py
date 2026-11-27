@@ -10,7 +10,7 @@ import ssl
 import sys
 import threading
 from collections import deque
-from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, MutableMapping
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, MutableMapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -33,7 +33,7 @@ from agent_runtime.adapters.channels import (
     local_events_url,
 )
 from agent_runtime.adapters.channels.channels import webhook_request_handler
-from agent_runtime.adapters.channels.ingress import event_origin
+from agent_runtime.adapters.channels.ingress import FeishuGroup, GroupEntrances, event_origin_for
 from agent_runtime.adapters.channels.switchboard_bridge import SwitchboardChannelAdapter, SwitchboardInboundBridge
 from agent_runtime.adapters.channels.switchboard_relay import SwitchboardBus, SwitchboardRelayLink
 from agent_runtime.adapters.collaboration_bridge import (
@@ -161,7 +161,10 @@ from agent_runtime.engine import (
     TimerScheduler,
 )
 from agent_runtime.engine.worker import ExecutorFailed
+from agent_runtime.adapters.executor_cli.role_skills import canonical_role
+from agent_runtime.adapters.executor_cli.sde import SDE_ROLE
 from agent_runtime.adapters.ledger_bridge import RunLedger
+from agent_runtime.adapters.storage_sqlite.ops_status import RunSummary, SQLiteOpsStatus
 from collaboration import CloseoutCoordinator, NotificationPolicyEngine
 from memory_hub import MemoryHubConfig
 from runner.protocol_check import PROTOCOL_CHECK_EXECUTOR_ID
@@ -1278,6 +1281,21 @@ def build_daemon_from_config(
                 branch=role.branch,
             )
 
+        def _delivers(inbox_id: str) -> bool:
+            try:
+                project = router.resolve(inbox_id)
+            except AmbiguousProjectMatch:
+                return False
+            return project is not None and project.delivery is not None
+
+        ops_status = SQLiteOpsStatus(
+            daemon.db, timers=lambda: config.timers, delivers=_delivers, runs=ledger_runs(daemon.ledger),
+            sde_agents=lambda: frozenset(
+                name for name, agent in config.agents.items()
+                if agent.role is not None and canonical_role(agent.role) == SDE_ROLE
+            ),
+        )
+
         def _bound_steward(role: RoleConfig, bound: WorkdirBinding) -> StewardExecutor:
             def listed(inbox_id: str) -> tuple[ProjectConfig, ...]:
                 route = _route(inbox_id)
@@ -1319,6 +1337,7 @@ def build_daemon_from_config(
                     system=SystemToolbox(
                         reloads=daemon.reloads,
                         allowed=lambda: targets.has_system_tools(bound.rule.literal or ""),
+                        status=ops_status,
                     ) if bound.system_tools else None,
                 ),
             )
@@ -1533,6 +1552,7 @@ def build_daemon_from_config(
             return LimitRoute(project=project.name, default_executor=project.default_agent,
                               binding=project.route(inbox_id).binding)
 
+        origin = event_origin_for(GroupEntrances(config.feishu_groups))
         limit_keys = LimitKeyResolver(
             inbox=daemon.inbox, sessions=daemon.sessions, open_runs=daemon.open_runs, route=_cli_route,
             global_default_executor=config.runtime.default_agent,
@@ -1566,7 +1586,7 @@ def build_daemon_from_config(
                 executors={PROTOCOL_CHECK_EXECUTOR_ID: executor},
                 project_default_executor=PROTOCOL_CHECK_EXECUTOR_ID,
                 routes=_route,
-                origin=event_origin,
+                origin=origin,
                 on_forward=daemon.pool.wake,
                 # The runner reclaims its own read-only worktrees; no worktree of this process is involved.
                 on_worktree_reclaim=None,
@@ -1609,7 +1629,7 @@ def build_daemon_from_config(
                 project_default_executor=project.default_agent if project is not None else None,
                 global_default_executor=config.runtime.default_agent,
                 routes=_route,
-                origin=event_origin,
+                origin=origin,
                 on_forward=daemon.pool.wake,
                 on_worktree_reclaim=reclaim,
                 hold=executor_quota_hold(inbox_id, pool=daemon.pool, limits=limits, keys=limit_keys,
@@ -1681,7 +1701,7 @@ def build_daemon_from_config(
         )
 
     if switchboard is not None and attach:
-        attach_switchboard(daemon, switchboard, config.switchboard.consumer_id)
+        attach_switchboard(daemon, switchboard, config.switchboard.consumer_id, config.feishu_groups)
 
     coordinator: CloseoutCoordinator | None = None
     if collaboration is not None:
@@ -1802,9 +1822,25 @@ def open_switchboard_relay(link: SwitchboardLinkConfig, credentials: EnvCredenti
     return relay
 
 
-def attach_switchboard(daemon: AlwaysOnDaemon, board: SwitchboardHandle, consumer_id: str) -> SwitchboardInboundBridge:
+def ledger_runs(ledger: RunLedger | None) -> Callable[[str], RunSummary | None] | None:
+    if ledger is None:
+        return None
+
+    def latest(event_id: str) -> RunSummary | None:
+        found = ledger.store.list_runs(event_id=event_id, limit=1)
+        if not found:
+            return None
+        run = found[0]
+        return RunSummary(result=run.outcome_kind, error=run.error_summary or "", seconds=run.duration_ms / 1000)
+
+    return latest
+
+
+def attach_switchboard(
+    daemon: AlwaysOnDaemon, board: SwitchboardHandle, consumer_id: str, groups: Sequence[FeishuGroup] = (),
+) -> SwitchboardInboundBridge:
     # Subscribing again replaces the previous handler, so a config reload re-points delivery at the new daemon.
-    bridge = SwitchboardInboundBridge(daemon.handler)
+    bridge = SwitchboardInboundBridge(daemon.handler, groups=GroupEntrances(groups))
     switchboard_bus(board).subscribe(consumer_id, bridge.handle_canonical_event)
     daemon.switchboard_bridge = bridge
     return bridge
@@ -1961,7 +1997,8 @@ async def serve_configured(
                                                halt=stop)
                 generations = [g for g in generations if g.runs is not None and not g.runs.done()] + [generation]
                 if switchboard is not None:
-                    attach_switchboard(replacement, switchboard, candidate.switchboard.consumer_id)
+                    attach_switchboard(replacement, switchboard, candidate.switchboard.consumer_id,
+                                       candidate.feishu_groups)
                 # From here every wake reaching the old pool, from its in-flight requests or released leases,
                 # is forwarded to the new one.
                 previous.retire_pool(wake_current)

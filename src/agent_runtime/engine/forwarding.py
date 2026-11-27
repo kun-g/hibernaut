@@ -30,8 +30,9 @@ from agent_runtime.core.ports import PermissionPort, SessionStorePort
 from agent_runtime.engine.attempts import ATTEMPT_NOTES_KEY
 
 _AGENT_SOURCES = (FORWARD_SOURCE, RETURN_SOURCE)
-# Who put an event here: a person in their own one-to-one chat, or somebody on this host.
-EventOrigin = Literal["chat", "operator"]
+# Who put an event here: a person in their own one-to-one chat, a listed person in the group bound to this inbox, or
+# somebody on this host.
+EventOrigin = Literal["chat", "group", "operator"]
 # Which project documents the task needs, and the goal it is recorded under, travel with it; everything else the receiver
 # learns from the text.
 _INHERITED_KEYS = ("activities", "base_ref", ATTEMPT_NOTES_KEY)

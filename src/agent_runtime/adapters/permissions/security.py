@@ -41,6 +41,7 @@ class AutoModePermissionAdapter:
             "check_projects",
             "onboard_project",
             "complete_project",
+            "runtime_status",
             # Each is granted per project in [projects.<name>.delivery] (open_pr, auto_merge); move one to the
             # defer list to also ask a person every time.
             "delivery.open_pr",

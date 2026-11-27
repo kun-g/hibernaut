@@ -113,17 +113,29 @@ def canonical_to_payload(event: CanonicalEvent) -> dict[str, Any]:
     return payload
 
 
+class InboxChoice(Protocol):
+    # Where an event goes; None: nowhere.
+    def inbox_for(self, event: CanonicalEvent) -> str | None: ...
+
+
 class SwitchboardInboundBridge:
-    def __init__(self, handler: IngestSink) -> None:
+    def __init__(self, handler: IngestSink, *, groups: InboxChoice | None = None) -> None:
         self._handler = handler
+        self._groups = groups
 
     def handle_canonical_event(self, event: CanonicalEvent) -> DeliverStatus:
+        inbox_id = self._groups.inbox_for(event) if self._groups is not None else event.scope
+        if inbox_id is None:
+            # Acked, so it is not delivered again; nobody hears back.
+            print(f"[hibernaut] [switchboard] {event.event_id} ({event.event_type}) from {event.actor or 'nobody'} "
+                  "dropped: not a listed member of the group's inbox", file=sys.stderr, flush=True)
+            return "acked"
         session_id = event.metadata.get("session_id")
         try:
             # event_id is Switchboard's global fingerprint, so an at-least-once redelivery lands on the
             # inbox dedup key and is recorded as dropped.
             self._handler.ingest(
-                inbox_id=event.scope,
+                inbox_id=inbox_id,
                 source=f"{SWITCHBOARD_SOURCE_PREFIX}{event.source}",
                 external_id=event.event_id,
                 payload=canonical_to_payload(event),
