@@ -319,6 +319,7 @@ class DeliveryRecord:
     merge_hold_detail: str = ""
     # Recoverable: approving a retry runs the step again from the recorded state.
     problem: str = ""
+    problem_summary: str = ""
     transient: bool = False
     # The permission tool that deferred to a person in this attempt.
     approval: str = ""
@@ -388,33 +389,53 @@ class DeliveryDetached(Exception):
 
 
 class _Problem(Exception):
-    pass
+    def __init__(self, detail: str, summary: str) -> None:
+        super().__init__(detail)
+        self.summary = summary
 
 
 class _TransientRemoteError(_Problem):
     pass
 
 
+_DISCONNECT = (r"\b(?:unexpected EOF|connection (?:was )?closed|broken pipe)\b|"
+               r"""(?:https?://[^\s"']+["']?|\bHTTP request(?: failed)?): EOF[ \t\r]*$""")
 _REMOTE_TRANSIENT = re.compile(
+    rf"{_DISCONNECT}|"
     r"could not resolve (?:host(?:name)?|proxy)|temporary failure in name resolution|no such host|"
     r"name or service not known|nodename nor servname provided|connection (?:timed out|timeout|reset)|"
     r"error connecting to (?:api\.)?github\.com|"
     r"(?:i/o|tls handshake) timeout|operation timed out|timed out (?:while |after )?connect|"
     r"(?:http(?:/\d(?:\.\d)?)?|returned error:|status code[: ]+)\s*(?:429|5\d\d)\b|"
     r"(?:api |secondary )?rate limit exceeded|exceeded (?:a |the |your )?(?:secondary )?rate limit|"
-    r"rate[- ]limited|too many requests", re.I,
+    r"rate[- ]limited|too many requests", re.I | re.M,
 )
+
+
+def _operation(argv: Sequence[str]) -> str:
+    if argv[1] == "pr":
+        return {"checks": "查询合并前的检查状态", "create": "创建 PR", "edit": "更新 PR", "list": "查询 PR",
+                "view": "核对 PR 状态", "merge": "合并 PR"}.get(argv[2], "访问 GitHub")
+    return {"push": "推送任务分支", "fetch": "获取最新基线", "ls-remote": "核对远端分支"}.get(argv[1], "准备交付")
 
 
 def _remote_problem(prefix: str, proc: subprocess.CompletedProcess[str]) -> _Problem:
     output = proc.stderr or proc.stdout
     error = _TransientRemoteError if _REMOTE_TRANSIENT.search(output) else _Problem
-    return error(f"{prefix}: {_tail(output, 800)}")
+    if re.search(_DISCONNECT, output, re.I | re.M):
+        why = "与远端的连接中断了"
+    elif error is _TransientRemoteError:
+        why = "远端服务暂时不可用"
+    elif re.search(r"HTTP (?:401|403)\b|permission denied|authentication failed", output, re.I):
+        why = "远端拒绝了访问，请核对账号权限"
+    else:
+        why = "远端返回了错误"
+    return error(f"{prefix}: {_tail(output, 800)}", f"{_operation(proc.args)}时，{why}")
 
 
 class _Handback(_Problem):
     def __init__(self, message: str, detail: dict[str, Any]) -> None:
-        super().__init__(message)
+        super().__init__(message, "合入最新基线时出现了冲突" if detail["kind"] == "conflict" else "推送前的仓库检查未通过")
         self.detail = detail
 
 
@@ -562,6 +583,7 @@ class PRDelivery:
 
         rec.notes, rec.problem, rec.approval, rec.handback = [], "", "", {}
         rec.merge_hold, rec.merge_hold_detail = "", ""
+        rec.problem_summary = ""
         rec.transient = False
         rec.attempts += 1
         if rec.state == "merged":
@@ -574,6 +596,7 @@ class PRDelivery:
                 self._delete_remote_branch(req, rec)
         except _Problem as exc:
             rec.problem = str(exc)
+            rec.problem_summary = exc.summary
             rec.transient = isinstance(exc, _TransientRemoteError)
             if isinstance(exc, _Handback):
                 rec.handback = exc.detail
@@ -587,7 +610,8 @@ class PRDelivery:
     ) -> None:
         cfg = self._config
         if req.change_kind not in BUMP_FOR_KIND:
-            raise _Problem(f"unknown change kind {req.change_kind!r} (expected {', '.join(CHANGE_KINDS)})")
+            raise _Problem(f"unknown change kind {req.change_kind!r} (expected {', '.join(CHANGE_KINDS)})",
+                           "准备交付时无法识别改动类型")
         rec.change_kind, rec.bump = req.change_kind, BUMP_FOR_KIND[req.change_kind]
         if not cfg.open_pr:
             rec.notes.append("not pushed: this project does not authorize opening pull requests "
@@ -642,6 +666,7 @@ class PRDelivery:
             return True
         if decision.action == "defer":
             rec.approval = tool
+            rec.problem_summary = "合并 PR 需要你的授权" if tool == MERGE_TOOL else "推送分支并创建 PR 需要你的授权"
             rec.problem = f"{tool} needs approval: {decision.reason}"
             return False
         rec.notes.append(f"{tool} blocked: {decision.reason}")
@@ -653,18 +678,21 @@ class PRDelivery:
         try:
             return subprocess.run(argv, cwd=cwd, env=self._env, capture_output=True, text=True, timeout=timeout)
         except FileNotFoundError:
-            raise _Problem(f"{argv[0]} is not installed or not on PATH") from None
+            raise _Problem(f"{argv[0]} is not installed or not on PATH",
+                           f"{_operation(argv)}所需的工具未安装或找不到") from None
         except subprocess.TimeoutExpired:
             remote = argv[0] == self._config.gh_command or argv[1] in ("fetch", "ls-remote", "push")
             error = _TransientRemoteError if remote else _Problem
-            raise error(f"`{shlex.join(argv[:3])} ...` timed out after {timeout:g}s") from None
+            raise error(f"`{shlex.join(argv[:3])} ...` timed out after {timeout:g}s",
+                        f"{_operation(argv)}超时了") from None
 
     def _git(self, cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         proc = self._run([self._config.git_command, *args], cwd)
         if check and proc.returncode != 0:
             if args[0] in ("fetch", "ls-remote"):
                 raise _remote_problem(f"git {args[0]} failed", proc)
-            raise _Problem(f"git {args[0]} failed: {_tail(proc.stderr or proc.stdout, 800)}")
+            raise _Problem(f"git {args[0]} failed: {_tail(proc.stderr or proc.stdout, 800)}",
+                           "准备交付时，本地 Git 操作失败了")
         return proc
 
     def _gh(self, cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -726,13 +754,16 @@ class PRDelivery:
         dirty = self._git(cwd, "status", "--porcelain", "--untracked-files=all").stdout
         if dirty.strip():
             raise _Problem("the worktree has uncommitted changes; commit or remove them, then approve to retry:\n"
-                           + _tail(dirty, 1500))
+                           + _tail(dirty, 1500),
+                           "推送前发现工作区还有未提交的改动")
         head_ref = self._git(cwd, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
         branch = head_ref.stdout.strip()
         if head_ref.returncode != 0 or not branch:
-            raise _Problem("the worktree is on a detached HEAD; check out the task branch, then approve to retry")
+            raise _Problem("the worktree is on a detached HEAD; check out the task branch, then approve to retry",
+                           "准备推送时发现工作区没有切到任务分支")
         if branch == cfg.base_branch:
-            raise _Problem(f"the worktree is on {cfg.base_branch}; delivery needs a task branch")
+            raise _Problem(f"the worktree is on {cfg.base_branch}; delivery needs a task branch",
+                           "准备推送时发现工作区还在基线分支")
         rec.branch = branch
         with self._repo_lock(cwd):
             base_sha = self._fetch_base(cwd)
@@ -790,17 +821,20 @@ class PRDelivery:
     def _read_version(self, text: str, where: str) -> tuple[str, re.Match[str]]:
         m = self._pattern.search(text)
         if m is None:
-            raise _Problem(f"no version matching version_pattern in {where}")
+            raise _Problem(f"no version matching version_pattern in {where}",
+                           "设置交付版本时找不到匹配的版本号")
         version = m.group("version")
         if _SEMVER.fullmatch(version) is None:
-            raise _Problem(f"version {version!r} in {where} is not MAJOR.MINOR.PATCH")
+            raise _Problem(f"version {version!r} in {where} is not MAJOR.MINOR.PATCH",
+                           "设置交付版本时发现版本号格式有误")
         return version, m
 
     def _version_at(self, cwd: Path, sha: str) -> str:
         cfg = self._config
         shown = self._git(cwd, "show", f"{sha}:{cfg.version_file}", check=False)
         if shown.returncode != 0:
-            raise _Problem(f"{cfg.version_file} is missing on {cfg.remote}/{cfg.base_branch} ({sha[:12]})")
+            raise _Problem(f"{cfg.version_file} is missing on {cfg.remote}/{cfg.base_branch} ({sha[:12]})",
+                           "设置交付版本时找不到基线的版本文件")
         return self._read_version(shown.stdout, f"{cfg.version_file} on {cfg.remote}/{cfg.base_branch}")[0]
 
     def _apply_version(self, req: DeliveryRequest, rec: DeliveryRecord, base_sha: str) -> None:
@@ -815,7 +849,8 @@ class PRDelivery:
         try:
             text = path.read_text(encoding="utf-8")
         except OSError as exc:
-            raise _Problem(f"cannot read {cfg.version_file} in the worktree ({exc.strerror})") from None
+            raise _Problem(f"cannot read {cfg.version_file} in the worktree ({exc.strerror})",
+                           "设置交付版本时无法读取工作区的版本文件") from None
         current, m = self._read_version(text, f"{cfg.version_file} on {rec.branch}")
         if current != target:
             path.write_text(text[: m.start("version")] + target + text[m.end("version"):], encoding="utf-8")
@@ -850,7 +885,7 @@ class PRDelivery:
             message = f"repository checks failed on {rec.head_sha[:12]}; nothing was pushed:\n{detail}"
             if all(r["exit_code"] == 127 for r in failed):
                 # A missing check command is the host's to fix, not the developer's.
-                raise _Problem(message)
+                raise _Problem(message, "推送前的仓库检查因找不到命令而失败")
             raise _Handback(message, {"kind": "checks", "base": label, "base_sha": rec.base_sha,
                                       "branch": rec.branch, "head": rec.head_sha, "failed": detail})
 
@@ -930,9 +965,11 @@ class PRDelivery:
         try:
             data: object = json.loads(proc.stdout or "[]")
         except json.JSONDecodeError:
-            raise _Problem(f"gh pr list returned no JSON: {_tail(proc.stdout, 300)}") from None
+            raise _Problem(f"gh pr list returned no JSON: {_tail(proc.stdout, 300)}",
+                           "查询 PR 时无法读取 GitHub 返回的列表") from None
         if not isinstance(data, list):
-            raise _Problem("gh pr list returned no list")
+            raise _Problem("gh pr list returned no list",
+                           "查询 PR 时无法读取 GitHub 返回的列表")
         return [cast(dict[str, Any], p) for p in cast(list[object], data) if isinstance(p, dict)]
 
     @staticmethod
@@ -972,7 +1009,8 @@ class PRDelivery:
         url = next((line.strip() for line in reversed(proc.stdout.splitlines()) if line.strip()), "")
         number = url.rstrip("/").rsplit("/", 1)[-1]
         if not number.isdigit():
-            raise _Problem(f"gh pr create did not return a PR URL: {_tail(proc.stdout, 300)}")
+            raise _Problem(f"gh pr create did not return a PR URL: {_tail(proc.stdout, 300)}",
+                           "创建 PR 后没有收到 GitHub 返回的链接")
         rec.pr_number, rec.pr_url, rec.state = int(number), url, "pr_open"
         rec.history.append(f"PR #{rec.pr_number} created")
 
@@ -986,7 +1024,8 @@ class PRDelivery:
         try:
             data = cast(dict[str, Any], json.loads(view.stdout))
         except (json.JSONDecodeError, TypeError):
-            raise _Problem(f"gh pr view returned no JSON: {_tail(view.stdout, 300)}") from None
+            raise _Problem(f"gh pr view returned no JSON: {_tail(view.stdout, 300)}",
+                           "核对 PR 时无法读取 GitHub 返回的状态") from None
         head = str(data.get("headRefOid") or "")
         if rec.state == "merged":
             head = head or rec.pushed_sha
@@ -994,7 +1033,8 @@ class PRDelivery:
             rec.verified_sha = ""
             raise _Problem(
                 f"PR #{rec.pr_number} is not at the pushed commit: expected {rec.pushed_sha[:12]}, "
-                f"{self._config.remote}/{rec.branch} is {remote[:12] or '(missing)'}, the PR head is {head[:12] or '(unknown)'}"
+                f"{self._config.remote}/{rec.branch} is {remote[:12] or '(missing)'}, the PR head is {head[:12] or '(unknown)'}",
+                "核对 PR 时发现远端提交与本次推送不一致",
             )
         rec.verified_sha = head
 
@@ -1027,9 +1067,11 @@ class PRDelivery:
                     try:
                         data = cast(dict[str, Any], json.loads(view.stdout))
                     except (json.JSONDecodeError, TypeError):
-                        raise _Problem(f"gh pr view returned no JSON: {_tail(view.stdout, 300)}") from None
+                        raise _Problem(f"gh pr view returned no JSON: {_tail(view.stdout, 300)}",
+                                       "核对 PR 时无法读取 GitHub 返回的状态") from None
                     if data.get("state") != "MERGED":
-                        raise _Problem(f"PR #{rec.pr_number} is {data.get('state')} after merging")
+                        raise _Problem(f"PR #{rec.pr_number} is {data.get('state')} after merging",
+                                       "请求合并后，GitHub 尚未确认 PR 已合并")
                     rec.state, rec.merge_sha = "merged", self._merge_oid(data)
                     rec.verified_sha = rec.pushed_sha
                     rec.history.append(f"PR #{rec.pr_number} merged as {rec.merge_sha[:12]}")
@@ -1042,7 +1084,8 @@ class PRDelivery:
             self._confirm(req, rec)
             if rec.state == "merged":
                 return
-        raise _Problem(f"{cfg.remote}/{cfg.base_branch} kept changing its version; approve to retry the merge")
+        raise _Problem(f"{cfg.remote}/{cfg.base_branch} kept changing its version; approve to retry the merge",
+                       "合并前基线版本多次变化，需要重新核对")
 
     def _delete_remote_branch(self, req: DeliveryRequest, rec: DeliveryRecord) -> None:
         # Runs only once GitHub reports the PR MERGED. A failure never undoes the merge: it is a note in the message.
@@ -1146,7 +1189,8 @@ class PRDelivery:
                 # An approved retry waits a full period again.
                 rec.ci_since = 0.0
                 raise _Problem(f"CI has not finished for PR #{rec.pr_number} after {cfg.ci_timeout_seconds:g}s "
-                               f"({waiting}); approve to check again")
+                               f"({waiting}); approve to check again",
+                               "等待合并时，CI 未在规定时间内给出结果")
             # In slices of at most a second, each a checkpoint, so a stop does not wait out a whole poll interval.
             left = min(cfg.ci_poll_seconds, remaining)
             while left > 0:

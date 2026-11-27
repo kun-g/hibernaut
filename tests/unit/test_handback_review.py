@@ -138,7 +138,7 @@ class TestHandBackReview(ReviewFlowCase):
         return outcome
 
     def persistent_conflict(self, limit):
-        record = DeliveryRecord(problem="merging origin/main into hb/task-1 conflicts in calc.py",
+        record = DeliveryRecord(problem="merging origin/main into hb/task-1 conflicts in calc.py", problem_summary="合入最新基线时出现了冲突",
                                 handback=CONFLICT.handback)
         self.delivery.config.max_handbacks = limit
         self.delivery.record.return_value = record
@@ -152,7 +152,7 @@ class TestHandBackReview(ReviewFlowCase):
                                       reviews=[PASS] * 3, deliveries=[conflict] * 3)
         self.assertIsInstance(outcome, Suspend)
         self.assertEqual((self.develop.await_count, self.delivery.deliver.call_count), (3, 3))
-        for part in ("[sde] delivery pending: merging origin/main into hb/task-1 conflicts in calc.py",
+        for part in ("合入最新基线时出现了冲突", "merging origin/main into hb/task-1 conflicts in calc.py",
                      "Handed back to the developer 2 time(s) already (limit 2); a person decides now.",
                      "Delivery hand-back 1 of 2", "Delivery hand-back 2 of 2"):
             self.assertIn(part, outcome.prompt)

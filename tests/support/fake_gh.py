@@ -43,7 +43,7 @@ def run(command, *, env, cwd):
     if len(argv) < 2 or argv[0] != "pr":
         return result(code=2, stderr="fake gh: unsupported\n")
     cmd = argv[1]
-    if cmd in ("create", "edit", "merge") and state.get("fail", {}).get(cmd, 0):
+    if state.get("fail", {}).get(cmd, 0):
         state["fail"][cmd] -= 1
         save()
         return result(code=1, stderr=state.get("fail_error", f"fake gh: {cmd} failed (injected)\n"))
