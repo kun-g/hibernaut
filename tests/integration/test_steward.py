@@ -59,6 +59,7 @@ from tests.support.sde_executor import make_base_repo
 from tests.support.terminal_processes import alive, until
 from tests.support.visible_roles import FakeOrcaTerminals
 from tests.support.steward import DaemonCase, MAIN, SDE, arg, git_state
+from tests.support.jsonl import read_jsonl
 
 
 class Caps:
@@ -125,7 +126,7 @@ class StewardCase(unittest.IsolatedAsyncioTestCase):
         self.plan.write_text(json.dumps({"steward": list(steps)}))
 
     def calls(self) -> list[dict[str, Any]]:
-        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return read_jsonl(self.log)
 
     def launches(self) -> list[dict[str, Any]]:
         # Without the session checks, which start the launcher with no tools and stop it at its first message.

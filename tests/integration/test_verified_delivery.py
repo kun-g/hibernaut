@@ -24,6 +24,7 @@ from tests.support.fakes import InMemoryPermission
 from tests.support.coder_reviewer import fake_command
 from tests.support.pr_delivery import DeliveryCase, git
 from tests.support.verified_delivery import ReclaimCase
+from tests.support.jsonl import read_jsonl
 
 
 EVIDENCE = "red: test_zero FAILED\ngreen: 4 passed"
@@ -110,7 +111,7 @@ class SDECase(DeliveryCase, unittest.IsolatedAsyncioTestCase):
                 "explicit_workdir": str(self.wt), "base_ref": "origin/main"}
 
     def sde_calls(self):
-        rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        rows = read_jsonl(self.log)
         return [r for r in rows if r["role"] == "sde"]
 
 

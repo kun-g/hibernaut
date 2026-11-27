@@ -29,24 +29,31 @@ log = os.environ.get("FAKE_CLAUDE_LOG")
 def write_log(**extra):
     if not log:
         return
-    with open(log, "a", encoding="utf-8") as stream:
-        record = {
-            "role": role,
-            "mode": "interactive" if interactive else "print",
-            "argv": argv,
-            "prompt": prompt,
-            "cwd": os.getcwd(),
-            "paid_env": sorted(k for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_OAUTH_TOKEN") if k in os.environ),
-            "orca_env": sorted(k for k in os.environ if k.startswith("ORCA_")),
-            "api_key": os.environ.get("ANTHROPIC_API_KEY"),
-            "auth_token": os.environ.get("ANTHROPIC_AUTH_TOKEN"),
-            "base_url": os.environ.get("ANTHROPIC_BASE_URL"),
-            "launcher": os.environ.get("FAKE_LAUNCHER"),
-            "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"),
-            "mark": os.environ.get("FAKE_MARK"),
-            **extra,
-        }
-        stream.write(json.dumps(record) + "\n")
+    record = {
+        "role": role,
+        "mode": "interactive" if interactive else "print",
+        "argv": argv,
+        "prompt": prompt,
+        "cwd": os.getcwd(),
+        "paid_env": sorted(k for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_OAUTH_TOKEN") if k in os.environ),
+        "orca_env": sorted(k for k in os.environ if k.startswith("ORCA_")),
+        "api_key": os.environ.get("ANTHROPIC_API_KEY"),
+        "auth_token": os.environ.get("ANTHROPIC_AUTH_TOKEN"),
+        "base_url": os.environ.get("ANTHROPIC_BASE_URL"),
+        "launcher": os.environ.get("FAKE_LAUNCHER"),
+        "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"),
+        "mark": os.environ.get("FAKE_MARK"),
+        **extra,
+    }
+    # One write on an O_APPEND descriptor: fakes running side by side never interleave inside a record.
+    data = (json.dumps(record) + "\n").encode("utf-8")
+    fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        written = os.write(fd, data)
+        while written < len(data):
+            written += os.write(fd, data[written:])
+    finally:
+        os.close(fd)
 
 
 if not interactive:

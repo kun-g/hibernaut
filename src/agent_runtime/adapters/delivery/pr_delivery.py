@@ -50,7 +50,13 @@ _MIN_FOLLOWUPS = 2_000
 _SHRINKABLE = (("evidence", 500), ("summary", 1_000), ("review", 1_000), ("rationale", 500))
 # No CI result for this long while the base has moved past the PR: GitHub may never run CI for it.
 _EMPTY_CHECKS_GRACE = 300.0
-CIResult = Literal["passed", "failed", "stale"]
+CIResult = Literal["passed", "stale"]
+_RUN_ID = re.compile(r"/actions/runs/([0-9]+)")
+# gh run view --log-failed prefixes each line with the job, the step and a timestamp.
+_LOG_PREFIX = re.compile(r"^[^\t\n]*\t[^\t\n]*\t[0-9TZ:.-]+ ?", re.M)
+_FAILED_TEST = re.compile(r"^(?:FAILED|ERROR) (\S+)", re.M)
+_NO_RERUN = re.compile(r"HTTP 403\b|admin rights|not accessible|permission", re.I)
+_MAX_TESTS = 20
 
 
 def bump_version(version: str, bump: Bump) -> str:
@@ -310,6 +316,10 @@ class DeliveryRecord:
     # When the wait for CI on ci_head began (epoch seconds), so a wait resumed after a restart keeps its deadline.
     ci_head: str = ""
     ci_since: float = 0.0
+    # The one re-run of failed CI jobs a head gets: which head, the failed links it replaced, and what happened.
+    ci_rerun_head: str = ""
+    ci_rerun_links: list[str] = field(default_factory=_strs)
+    ci_rerun: str = ""
     merge_sha: str = ""
     attempts: int = 0
     # Per attempt: final outcomes that a retry cannot change (not authorized, review not passed, CI failed).
@@ -435,9 +445,13 @@ def _remote_problem(prefix: str, proc: subprocess.CompletedProcess[str]) -> _Pro
     return error(f"{prefix}: {_tail(output, 800)}", f"{_operation(proc.args)}时，{why}")
 
 
+_HANDBACK_SUMMARY = {"conflict": "合入最新基线时出现了冲突", "checks": "推送前的仓库检查未通过",
+                     "ci": "合并前的 CI 检查未通过"}
+
+
 class _Handback(_Problem):
     def __init__(self, message: str, detail: dict[str, Any]) -> None:
-        super().__init__(message, "合入最新基线时出现了冲突" if detail["kind"] == "conflict" else "推送前的仓库检查未通过")
+        super().__init__(message, _HANDBACK_SUMMARY[detail["kind"]])
         self.detail = detail
 
 
@@ -479,6 +493,11 @@ def _followup_list(notes: Sequence[str], room: int) -> str:
 def _tail(text: str, limit: int = _TAIL) -> str:
     text = text.strip()
     return text if len(text) <= limit else "..." + text[-limit:]
+
+
+def _runs(checks: Sequence[Mapping[str, Any]]) -> list[str]:
+    # The GitHub Actions runs behind failed checks, from their links; checks of other CI systems name none.
+    return sorted({m.group(1) for c in checks if (m := _RUN_ID.search(str(c.get("link") or "")))})
 
 
 def _never() -> bool:
@@ -1055,8 +1074,6 @@ class PRDelivery:
             return
         for _ in range(_MAX_MAIN_MOVES):
             ci = self._wait_for_ci(req, rec, cwd, is_interrupted)
-            if ci == "failed":
-                return
             with self._repo_lock(cwd):
                 base_sha = self._fetch_base(cwd)
                 moved = ci == "stale" or (
@@ -1122,7 +1139,7 @@ class PRDelivery:
             rec.notes.append(f"branch kept: {exc}")
 
     def _pr_checks(self, cwd: Path, number: int) -> list[dict[str, Any]]:
-        proc = self._gh(cwd, "pr", "checks", str(number), "--json", "name,state,bucket", check=False)
+        proc = self._gh(cwd, "pr", "checks", str(number), "--json", "name,state,bucket,link", check=False)
         try:
             data: object = json.loads(proc.stdout) if proc.stdout.strip() else None
         except json.JSONDecodeError:
@@ -1149,6 +1166,48 @@ class PRDelivery:
             base_sha = self._fetch_base(cwd)
         return self._git(cwd, "merge-base", "--is-ancestor", base_sha, "HEAD", check=False).returncode != 0
 
+    def _rerun(self, req: DeliveryRequest, rec: DeliveryRecord, cwd: Path, failed: list[dict[str, Any]]) -> bool:
+        # A failure may be a flaky test: each head gets one re-run of its failed jobs before anyone is asked to fix it.
+        if rec.ci_rerun_head == rec.head_sha:
+            return False
+        rec.ci_rerun_head, rec.ci_rerun_links = rec.head_sha, []
+        runs = _runs(failed)
+        rec.ci_rerun = "not re-run: the failed checks name no GitHub Actions run"
+        for run in runs:
+            proc = self._gh(cwd, "run", "rerun", run, "--failed", check=False)
+            if proc.returncode != 0:
+                output = _tail(proc.stderr or proc.stdout, 300)
+                why = "no permission to re-run" if _NO_RERUN.search(output) else "re-run failed for"
+                rec.ci_rerun = f"not re-run: {why} run {run} with this gh account ({output})"
+                runs = []
+                break
+        if runs:
+            rec.ci_rerun_links = [str(c.get("link") or "") for c in failed]
+            rec.ci_rerun = f"re-ran the failed jobs of run {', '.join(runs)} once on {rec.head_sha[:12]}"
+            # The re-run gets a full wait of its own.
+            rec.ci_since = self._clock()
+        rec.history.append(rec.ci_rerun)
+        self._store.save(req.work_key, rec.to_dict())
+        return bool(rec.ci_rerun_links)
+
+    def _ci_failure(self, rec: DeliveryRecord, cwd: Path, failed: list[dict[str, Any]]) -> dict[str, Any]:
+        cfg = self._config
+        tests: list[str] = []
+        excerpts: list[str] = []
+        for run in _runs(failed)[:3]:
+            proc = self._gh(cwd, "run", "view", run, "--log-failed", check=False)
+            if proc.returncode != 0:
+                continue
+            text = _LOG_PREFIX.sub("", proc.stdout)
+            tests += [t for t in _FAILED_TEST.findall(text) if t not in tests]
+            start = text.find("= FAILURES =")
+            excerpts.append(text[text.rfind("\n", 0, start) + 1:][:_TAIL] if start >= 0 else _tail(text))
+        return {"kind": "ci", "base": f"{cfg.remote}/{cfg.base_branch}", "base_sha": rec.base_sha,
+                "branch": rec.branch, "head": rec.head_sha, "pr": rec.pr_url,
+                "checks": [{"name": str(c.get("name")), "link": str(c.get("link") or "")} for c in failed],
+                "tests": tests[:_MAX_TESTS], "rerun": "done" if rec.ci_rerun_links else "skipped",
+                "rerun_note": rec.ci_rerun, "failed": "\n\n".join(excerpts)}
+
     def _wait_for_ci(
         self, req: DeliveryRequest, rec: DeliveryRecord, cwd: Path, is_interrupted: Callable[[], bool]
     ) -> CIResult:
@@ -1167,11 +1226,20 @@ class PRDelivery:
         while True:
             self._checkpoint(is_interrupted)
             checks = self._pr_checks(cwd, rec.pr_number)
-            failed = [str(c.get("name")) for c in checks if c.get("bucket") in ("fail", "cancel")]
+            # A job that was re-run still shows its old failure until GitHub registers the new attempt.
+            replaced = set(rec.ci_rerun_links) if rec.ci_rerun_head == rec.head_sha else set[str]()
+            failed = [c for c in checks
+                      if c.get("bucket") in ("fail", "cancel") and str(c.get("link") or "") not in replaced]
             if failed:
-                rec.ci = f"failed on {rec.head_sha[:12]}: {', '.join(failed)}"
-                self._hold(rec, "ci", f"CI failed ({', '.join(failed)})")
-                return "failed"
+                if self._rerun(req, rec, cwd, failed):
+                    deadline = rec.ci_since + cfg.ci_timeout_seconds
+                    continue
+                names = ", ".join(str(c.get("name")) for c in failed)
+                rec.ci = f"failed on {rec.head_sha[:12]}: {names}"
+                self._hold(rec, "ci", f"CI failed ({names})")
+                raise _Handback(f"CI failed on {rec.head_sha[:12]} for PR #{rec.pr_number} ({names}); "
+                                f"{rec.ci_rerun}; handed back to the developer to fix",
+                                self._ci_failure(rec, cwd, failed))
             # GitHub runs no pull_request CI for a PR that conflicts with its base: waiting would only time out.
             if self._conflicting(cwd, rec.pr_number):
                 rec.history.append(f"PR #{rec.pr_number} conflicts with {label} while waiting for CI; "

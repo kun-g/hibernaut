@@ -17,6 +17,7 @@ from agent_runtime.core.models import Emit, Suspend
 from tests.support.coder_reviewer import _Capture, fake_command, git
 from tests.support.sde_executor import FIXED, PASS, dev, event, make_base_repo
 from tests.support.visible_roles import FakeOrcaTerminals, VisibleCase, build_terminal_daemon
+from tests.support.jsonl import read_jsonl
 
 
 class TestInteractiveWithoutTerminal(VisibleCase):
@@ -141,7 +142,7 @@ class TestTerminalBackendThroughDaemon(unittest.TestCase):
             return [row[0] for row in conn.execute("SELECT content FROM outbox ORDER BY seq")]
 
     def calls(self, role=None):
-        rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        rows = read_jsonl(self.log)
         return [r for r in rows if role is None or r["role"] == role]
 
     def run_events(self, events, done):
