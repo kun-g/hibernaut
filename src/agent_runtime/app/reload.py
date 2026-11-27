@@ -20,6 +20,8 @@ class ReloadStatus:
         self._latest = ""
         self._settled = ""
         self._error: str | None = None
+        self._active = ""
+        self._rejection: tuple[str, str] | None = None
 
     @staticmethod
     def _digest(contents: bytes) -> str:
@@ -61,7 +63,19 @@ class ReloadStatus:
         # That version is in force, or was refused for this reason.
         with self._changed:
             self._settled, self._error = version, error
+            if error is None:
+                self._active, self._rejection = version, None
+            else:
+                self._rejection = (version, error)
             self._changed.notify_all()
+
+    def rejection(self) -> dict[str, str] | None:
+        with self._changed:
+            if self._watched is None or self._rejection is None:
+                return None
+            version, error = self._rejection
+            return {"path": str(self._watched), "active_sha256": self._active,
+                    "rejected_sha256": version, "error": error}
 
     def wait(self, contents: bytes, timeout: float = RELOAD_TIMEOUT_SECONDS) -> None:
         wanted = self._digest(contents)
