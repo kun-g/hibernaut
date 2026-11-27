@@ -66,7 +66,7 @@ class MemoryDrive:
             raise DriveProxyError("source_folder", 404, f"the sources folder has no folder named '{name}'")
         return self.entries[found].meta.name, self.list_files(found)
 
-    def download_source(self, file_meta: DriveFileMeta) -> DriveDownload:
+    def download_source(self, file_meta: DriveFileMeta, *, folder_id: str | None = None) -> DriveDownload:
         return self.download(file_meta)
 
 
