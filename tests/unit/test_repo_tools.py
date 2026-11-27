@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from agent_runtime.adapters.executor_cli.steward_git import ToolError
+from agent_runtime.app.config import RepoToolsConfig
 from agent_runtime.app.repo_tools import RepoCreator, folder_ref
 from tests.support.new_project import FakeGitHub, MemoryDrive, tarred, zipped
 
@@ -20,9 +21,10 @@ class CreateRepoTests(unittest.TestCase):
         self.drive.folder("folder-aura", "aura-desk")
         self.github = FakeGitHub()
 
-    def creator(self, **kwargs: object) -> RepoCreator:
-        return RepoCreator(owner=OWNER, drive=lambda: self.drive, max_bytes=1 << 20, run=self.github,
-                           scratch=self.scratch, **kwargs)  # type: ignore[arg-type]
+    def creator(self, *, max_bytes: int = 1 << 20, allowed: bool = True) -> RepoCreator:
+        config = RepoToolsConfig(owner=OWNER, allowed_owners=(OWNER,), max_bytes=max_bytes)
+        return RepoCreator(config=lambda: config if allowed else None, drive=lambda: self.drive,
+                           run=self.github, scratch=self.scratch)
 
     def create(self, name: str = "aura-desk", folder: str | None = None) -> dict[str, object]:
         return json.loads(self.creator().create(name=name, drive_folder=folder, description="桌面助手"))
@@ -100,8 +102,7 @@ class CreateRepoTests(unittest.TestCase):
 
     def test_a_first_version_larger_than_allowed_is_refused(self) -> None:
         self.drive.file("big", "big.zip", zipped({"a.bin": b"0" * 4096}), "folder-aura", "2026-11-20T00:00:00Z")
-        small = RepoCreator(owner=OWNER, drive=lambda: self.drive, max_bytes=1024, run=self.github,
-                            scratch=self.scratch)
+        small = self.creator(max_bytes=1024)
         with self.assertRaises(ToolError) as caught:
             small.create(name="aura-desk", drive_folder=None, description=None)
         self.assertIn("max_bytes", str(caught.exception))
@@ -127,7 +128,7 @@ class CreateRepoTests(unittest.TestCase):
 
     def test_a_binding_that_lost_the_tool_refuses(self) -> None:
         with self.assertRaises(ToolError):
-            self.creator(allowed=lambda: False).create(name="aura-desk", drive_folder=None, description=None)
+            self.creator(allowed=False).create(name="aura-desk", drive_folder=None, description=None)
         self.assertEqual(self.github.calls, [])
 
 

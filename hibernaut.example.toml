@@ -273,13 +273,14 @@ agents = ["steward"]
 workdir = "/absolute/path/to/your/workspace"
 checkout_access = "readonly"
 forward_to = ["proj:hibernaut", "sys:ops", "sys:infra"]   # 可选：每项是某个项目的主 inbox（inbox_id 的第一个精确 ID）或带 system_tools / ops_tools 的 Inbox，否则拒绝加载；省略则不能转投出本绑定
-# repo_tools = true             # 可选，默认 false：多一个 create_repo 工具，在 [repo_tools] owner 下建私有仓库，首次提交是 Drive 来源文件夹里
+# repo_tools = true             # 可选，默认 false：多一个 create_repo 工具，在允许的 owner 下建私有仓库，首次提交是 Drive 来源文件夹里
 #                               # 最新的文件（压缩包解开）；仓库已存在就停下不覆盖。只能写在精确 ID、readonly、全 steward、不是 sys: 的绑定上
 
 # 写了 repo_tools 时必填，连同下面的 [gdrive] proxy_url、proxy_token_file。gh 用本机的登录，Drive 经凭据代理读，
 # 代理配置里须有 sources_folder_id（各项目版本文件夹的上级）。
 # [repo_tools]
-# owner = "your-github-name"
+# owner = "kun-g"              # 未指定账号或组织时的默认值
+# allowed_owners = ["kun-g", "LambdaTheory"]  # 须包含默认值。省略时只允许 owner
 # max_bytes = 536870912         # 首个版本（下载与解开后）的上限
 
 # 可选：接入项目时可以建标签的仓库 owner。默认空 = 不建，列为待人做
