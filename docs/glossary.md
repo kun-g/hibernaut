@@ -74,7 +74,7 @@
 - **运维 Inbox**：写了 `ops_tools = true` 的 `[[runtime.inbox_bindings]]`（如 `sys:infra`，agent `infra`，不要与系统 Steward 的 `sys:ops` 混淆），限制和来路同系统 Inbox。它的 Steward 只有 `dokploy` 一个能动手的工具，在 Dokploy 上建项目的预发布和生产环境；没有通用命令行，不能转投。
 - **运维 agent**：绑在运维 Inbox 上的 `steward` Agent。预发布直接部署；生产上线、删除由代码判为 `deploy_production` / `delete_resource`，挂起等人批准。
 - **扣住的调用**（held call）：运维 Steward 的 `dokploy` 调用被门禁判为 `defer` 时不执行，记进本轮的 `deferred`，随挂起一起送审；批准后由 Hibernaut 按原参数重判再执行，Steward 再跑一轮报告结果。
-- **`create_repo`**：全局 Steward 在绑定写 `repo_tools = true` 时多出的工具：在 `[repo_tools] owner` 下建私有 GitHub 仓库，首次提交是来源文件夹里该项目最新的文件；仓库已存在就停。不是命令行。
+- **`create_repo`**：全局 Steward 在绑定写 `repo_tools = true` 时多出的工具：在配置允许的账号或组织下建私有 GitHub 仓库，未指定时用 `[repo_tools] owner`，首次提交是来源文件夹里该项目最新的文件；仓库已存在就停。不是命令行。
 - **来源文件夹**（sources folder）：Drive 凭据代理配置的 `sources_folder_id`，下面每个项目一个子文件夹放各个版本；代理只让 `create_repo` 读这一层子文件夹里的文件。
 - **一句话开新项目**：单聊里一句话，由全局 Steward 依次 `create_repo`、转交系统 Steward 接入、转交运维 agent 配环境，每步结果回同一单聊；前一步回信 `done` 才能转下一步（回信带 `status`：`done` / `failed`）。
 - **群入口**：`[[feishu_groups]]` 把一个飞书群（`chat_id`）绑到一个系统 Inbox 或一个项目 Inbox，并列出算数的人（`members`，飞书 open_id）。名单上的人在群里发的消息直接进该 Inbox，答复回群；名单外的人的消息丢弃不回。一个 Inbox 只绑一个群。系统 Inbox 的审批卡发到这个群，只认名单上的人在这个群里的点击。

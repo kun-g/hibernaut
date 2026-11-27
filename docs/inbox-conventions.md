@@ -139,7 +139,7 @@ approvers = ["ou_kun"]               # 这个项目所有 Inbox 的审批只认�
 
 需求 R12–R15、C7–C9 见 [`requirements/system-steward.md`](requirements/system-steward.md)。人在单聊对全局 Steward 说一句「新建项目 X，从 Drive 下最新版本作初始提交，再配好预发布和生产」，全局 Steward 依次：
 
-1. `create_repo`（绑定写 `repo_tools = true`）：在 `[repo_tools] owner` 下建私有仓库，首次提交是凭据代理 `sources_folder_id` 下同名文件夹（或人给的链接）里最新修改的文件，压缩包解开；仓库已存在、文件夹空、下载或推送失败都停下说明。
+1. `create_repo`（绑定写 `repo_tools = true`）：在 `[repo_tools] allowed_owners` 允许的账号或组织下建私有仓库，未指定时用 `owner`，旧配置仅允许 `owner`，首次提交是凭据代理 `sources_folder_id` 下同名文件夹（或人给的链接）里最新修改的文件，压缩包解开；仓库已存在、文件夹空、下载或推送失败都停下说明。
 2. 转给系统 Inbox 接入（`return_to` 自己），等回信。
 3. 回信 `done` 才转给运维 Inbox 配环境（`return_to` 自己）；回信 `failed` 时停下，代码也拒绝这次转投。
 4. 汇总：仓库、hb 接入、两个环境的地址和状态。

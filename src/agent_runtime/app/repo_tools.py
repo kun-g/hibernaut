@@ -17,6 +17,7 @@ from typing import IO, Protocol
 from agent_runtime.adapters.channels.gdrive_tasks import DriveDownload, DriveFileMeta, DriveProxyError
 from agent_runtime.adapters.delivery.pr_delivery import remote_env
 from agent_runtime.adapters.executor_cli.steward_git import ToolError
+from agent_runtime.app.config import RepoToolsConfig
 from agent_runtime.app.onboarding import OnboardError, Runner, description_text, run_command, scrub, split_repo
 
 _PUSH_TIMEOUT_SECONDS = 900.0
@@ -170,34 +171,35 @@ class RepoCreator:
     def __init__(
         self,
         *,
-        owner: str,
+        config: Callable[[], RepoToolsConfig | None],
         drive: Callable[[], DriveSources],
-        max_bytes: int,
-        # Whether the configuration in force still gives this inbox the tool.
-        allowed: Callable[[], bool] = lambda: True,
         run: Runner | None = None,
         scratch: Path | None = None,
         scrubbed: Callable[[str], str] = scrub,
     ) -> None:
-        self._owner = owner
+        self._config = config
         self._drive = drive
-        self._max_bytes = max_bytes
-        self._allowed = allowed
         # Tokens in the daemon's environment reach no command: gh and git use the host's own credentials.
         self._run: Runner = run or (lambda argv: run_command(argv, remote_env(os.environ), timeout=_PUSH_TIMEOUT_SECONDS))
         self._scratch = scratch
         self._scrubbed = scrubbed
 
-    def create(self, *, name: str, drive_folder: str | None, description: str | None) -> str:
-        if not self._allowed():
+    def create(self, *, name: str, drive_folder: str | None, description: str | None, owner: str | None = None) -> str:
+        config = self._config()
+        if config is None:
             raise ToolError("this inbox has no repo_tools any more")
         try:
-            return json.dumps(self._create(name, folder_ref(drive_folder), description), ensure_ascii=False, indent=1)
+            requested = config.owner if owner is None else owner
+            selected = next((item for item in config.allowed_owners if item.lower() == requested.lower()), None)
+            if selected is None:
+                raise ToolError(f"owner {requested!r} is not allowed. Allowed owners: {', '.join(config.allowed_owners)}")
+            return json.dumps(self._create(selected, name, folder_ref(drive_folder), description, config.max_bytes),
+                              ensure_ascii=False, indent=1)
         except (ToolError, OnboardError, DriveProxyError, OSError, ValueError) as exc:
             raise ToolError(self._scrubbed(str(exc))) from exc
 
-    def _create(self, name: str, folder_id: str | None, description: str | None) -> dict[str, object]:
-        repo = f"{self._owner}/{name}"
+    def _create(self, owner: str, name: str, folder_id: str | None, description: str | None, max_bytes: int) -> dict[str, object]:
+        repo = f"{owner}/{name}"
         split_repo(repo)
         about = description_text(description, repo)
         self._check_absent(repo)
@@ -214,7 +216,7 @@ class RepoCreator:
                 got = self._drive().download_source(latest)
             except DriveProxyError as exc:
                 raise ToolError(f"stopped at Drive, before anything was created: {latest.name}: {exc.reason}") from exc
-            unpacked = unpack(got, work, self._max_bytes)
+            unpacked = unpack(got, work, max_bytes)
             commit = self._commit(unpacked.root, latest)
             self._publish(repo, about, unpacked.root)
         return {

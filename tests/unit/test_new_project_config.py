@@ -72,6 +72,7 @@ class ConfigTests(unittest.TestCase):
         # An operations inbox takes a person's work only and passes none on, like a system inbox.
         self.assertTrue(infra.route().system)
         self.assertEqual(config.repo_tools.owner, "kun-g")
+        self.assertEqual(config.repo_tools.allowed_owners, ("kun-g",))
         self.assertEqual(config.ops_tools.staging_environments, ("staging",))
 
     def test_an_operations_inbox_is_kept_as_narrow_as_a_system_inbox(self) -> None:
@@ -90,6 +91,9 @@ class ConfigTests(unittest.TestCase):
         self.refused("needs \\[repo_tools\\] owner", sections={"repo_tools": {}})
         self.refused("needs \\[gdrive\\] proxy_url and proxy_token_file", sections={"gdrive": {}})
         self.refused("is not a GitHub owner", sections={"repo_tools": {"owner": "Kun G"}})
+        self.refused("must include", sections={"repo_tools": {"owner": "kun-g", "allowed_owners": ["other"]}})
+        self.refused("is not a GitHub owner", sections={"repo_tools": {"owner": "kun-g",
+                                                                      "allowed_owners": ["kun-g", "bad/org"]}})
         self.refused("repo_tools must be true or false", ash={"repo_tools": "yes"})
 
     def test_no_timer_and_no_group_reaches_an_operations_inbox(self) -> None:
@@ -102,11 +106,12 @@ class ConfigTests(unittest.TestCase):
         config = self.parse()
         ash, ops, infra = config.runtime.inbox_bindings
         manifest = build_global_manifest(ASH, ash.binding, tuple(config.agents.values()), (), "ash", (ops, infra),
-                                         repo_owner="kun-g")
+                                         repo_owner="kun-g", repo_owners=("kun-g", "LambdaTheory"))
         self.assertIn("`sys:ops`: agent `hibernaut-ops`. Onboards projects", manifest)
         self.assertIn("`sys:infra`: agent `infra`. Operations: sets up and deploys", manifest)
         self.assertIn("waits for a person's approval", manifest)
-        self.assertIn("private repository under `kun-g`", manifest)
+        self.assertIn("private repository under `kun-g` by default", manifest)
+        self.assertIn("Allowed GitHub owners: kun-g, LambdaTheory", manifest)
         self.assertIn("an operations inbox", build_system_manifest(INFRA, infra.binding, (), ops=True))
 
 
@@ -117,6 +122,9 @@ class ToolListTests(unittest.TestCase):
 
     def test_the_chat_s_steward_has_create_repo_and_no_command_line(self) -> None:
         offered = self.tools(status=True, repo=True)
+        create = next(t for t in StewardTools.definitions(projectless=True, repo=True) if t["name"] == "create_repo")
+        self.assertIn("owner", create["inputSchema"]["properties"])
+        self.assertNotIn("owner", create["inputSchema"]["required"])
         self.assertIn("create_repo", offered)
         self.assertIn("forward_to_inbox", offered)
         for name in COMMAND_LINE:
