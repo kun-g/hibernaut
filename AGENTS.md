@@ -45,19 +45,21 @@
 - **空类写法**：无字段的数据类或标记类使用 `pass`（如 `class Silent: pass`）。
 - **只留高信号注释**：仅在需要解释非显而易见的约束、并发不变量、安全边界或因果顺序时写简短行内注释。
 
-## 5. 提交前必跑的三道门禁命令
+## 5. 提交前必跑的四道门禁命令
 
 每次提交代码前，必须在仓库根目录依次运行并全绿通过：
 
 ```bash
 lint-imports
+ruff check
 pytest -n auto --dist worksteal -v
 pyright
 ```
 
 - `lint-imports`：验证 `.importlinter` 全部架构分层与反向依赖契约（0 broken）。
+- `ruff check`：按 `pyproject.toml` 的 `[tool.ruff.lint]` 查 bug 类问题（pyflakes、bugbear、pyupgrade、pylint 的错误与警告等），覆盖 `src/`、`tests/`、`scripts/`；不查格式。豁免写在规则表或行内 `# noqa: <code>`，并注明原因。
 - `pytest -n auto --dist worksteal -v`：并行跑全量，验证 AST 静态边界测试、Port 契约测试、多 `inbox_id` 并发隔离及 `NewEventPolicy`（`defer`/`fold`/`interrupt`）场景。
-- `pyright`：对 `src/agent_runtime/core`、`src/agent_runtime/engine`、`src/switchboard`、`src/ccpeer`、`src/taskboard`、`src/runner`、`src/ledger`、`src/dashboard` 与 `src/collaboration` 执行 strict 静态类型检查（0 errors, 0 warnings）。
+- `pyright`：对 `src/` 下全部包执行 strict 静态类型检查（0 errors, 0 warnings）；`pythonPlatform` 固定为 Linux，与 CI 一致。新增包须加入 `pyrightconfig.json` 的 `include`（`tests/unit/static_gates/` 校验）。
 
 新增测试按单个用例分目录（含夹具准备与清理）。全程在进程内运行的放 `tests/unit/`，启动外部进程的放 `tests/integration/`；共用假对象、脚本和建仓工具放 `tests/support/`。从用户入口走真实服务的端到端测试预留，定义见 [`docs/glossary.md`](docs/glossary.md#测试分层)。
 
@@ -74,7 +76,8 @@ pytest -p no:xdist tests/integration
 
 - **需求文档**：系统 Steward（`sys:ops`，接入项目、检查和补齐项目配置）的需求在 [`docs/requirements/system-steward.md`](docs/requirements/system-steward.md)，编号（R/C）不改。
   按额度切评审（评审候选、可用表、额度报错换人）的需求在 [`docs/requirements/model-switching.md`](docs/requirements/model-switching.md)，编号（R/C）同样不改。
+  项目群（飞书群绑到项目 Inbox，合作方的话只作用于该项目）的需求在 [`docs/requirements/project-group.md`](docs/requirements/project-group.md)，编号（R/C）同样不改。
 
 - **Drive 基准只读**：Google Drive 原基准设计文档《Always-on Agent 整洁架构设计方案（Task 交接文档）》保持只读不动，不直接覆写。
 - **增量追踪**：新增架构讨论与待落地改动先记录在 Google Drive《Always-on Agent 架构增量变更（待落地）》。
-- **Git 文档同步与闭环清理**：**代码落地时必须同步更新仓库内的 `docs/architecture.md` 与 `README.md`**；待三道门禁全绿、推送至 `main` 并经确认后，再从 Drive《Always-on Agent 架构增量变更（待落地）》中清空已落地条目。
+- **Git 文档同步与闭环清理**：**代码落地时必须同步更新仓库内的 `docs/architecture.md` 与 `README.md`**；待四道门禁全绿、推送至 `main` 并经确认后，再从 Drive《Always-on Agent 架构增量变更（待落地）》中清空已落地条目。

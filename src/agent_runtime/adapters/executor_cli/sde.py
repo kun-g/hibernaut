@@ -1216,6 +1216,8 @@ class SDEExecutor:
             *([f"版本：{record.version}"] if record.version else []),
             *([f"CI：{record.ci}"] if record.ci else []),
             *(f"仓库检查：{c['command']}（退出码 {c['exit_code']}）" for c in record.checks),
+            *(_ci_card(record.handback, state.handbacks, self._delivery.config.max_handbacks)
+              if self._delivery is not None and record.handback.get("kind") == "ci" else []),
             f"错误记录：{state.reason}", *record.history[-5:],
             "等待期间如有补充需求，批准后先处理补充需求，再继续交付。",
         ])
@@ -1550,7 +1552,28 @@ def _handback_summary(handback: Mapping[str, Any]) -> str:
     base = str(handback.get("base", "the base branch"))
     if handback.get("kind") == "conflict":
         return f"merging {base} conflicts in {', '.join(_strs(handback.get('files'))) or '(unknown files)'}"
+    if handback.get("kind") == "ci":
+        return f"CI failed on {str(handback.get('head', ''))[:12]} ({', '.join(n for n, _ in _ci_links(handback)) or 'unknown'})"
     return f"repository checks failed on {str(handback.get('head', ''))[:12]} with {base} merged"
+
+
+def _ci_links(handback: Mapping[str, Any]) -> list[tuple[str, str]]:
+    found = handback.get("checks")
+    checks = cast(list[object], found) if isinstance(found, list) else []
+    return [(str(cast(dict[str, Any], c).get("name", "")), str(cast(dict[str, Any], c).get("link", "")))
+            for c in checks if isinstance(c, dict)]
+
+
+def _ci_card(handback: Mapping[str, Any], handbacks: int, limit: int) -> list[str]:
+    lines = [f"失败的检查：{name}" + (f"（日志：{link}）" if link else "") for name, link in _ci_links(handback)]
+    tests = _strs(handback.get("tests"))
+    lines.append(f"失败的用例：{'、'.join(tests)}" if tests else "失败的用例：日志里没有找到，请看日志链接")
+    if handback.get("rerun") == "done":
+        lines.append("重跑：已在同一提交上重跑失败的检查一次，仍失败")
+    else:
+        lines.append(f"重跑：没有重跑（{handback.get('rerun_note', '')}）")
+    lines.append(f"已交回开发 {handbacks} 次（上限 {limit}），仍未通过，需要你决定。")
+    return lines
 
 
 def _handback_prompt(handback: Mapping[str, Any]) -> str:
@@ -1574,6 +1597,21 @@ def _handback_prompt(handback: Mapping[str, Any]) -> str:
             f"Hibernaut aborted its merge, so the worktree is clean. Merge {base} into {branch} yourself "
             f"(`git merge {base}`), resolve every conflict so both sides' changes keep working (read what those "
             "commits changed, and carry this task's change onto any code paths they added), and commit the merge. "
+            + report
+        )
+    if handback.get("kind") == "ci":
+        checks = "\n".join(f"- {name}: {link or '(no log link)'}" for name, link in _ci_links(handback))
+        tests = "\n".join(f"- {t}" for t in _strs(handback.get("tests"))) or "- (none found in the log)"
+        rerun = ("Hibernaut re-ran the failed jobs once on the same commit and they failed again"
+                 if handback.get("rerun") == "done" else f"The failed jobs were {handback.get('rerun_note', '')}")
+        return (
+            "## Delivery handed back: CI failed on the pull request\n"
+            f"Hibernaut merged {base} (at {sha}) into {branch}, pushed it at {str(handback.get('head', ''))[:12]} and "
+            f"opened {handback.get('pr', 'the pull request')}. CI failed there. {rerun}.\n\n"
+            f"Failed checks:\n{checks}\n\nFailed tests:\n{tests}\n\n"
+            f"From the failed log:\n```text\n{handback.get('failed', '') or '(no log could be read)'}\n```\n\n"
+            "Find the cause and fix it on this branch. A test that fails only sometimes is a bug in the test or the "
+            "code: make it deterministic instead of retrying it. Run the same checks in parallel the way CI does. "
             + report
         )
     return (

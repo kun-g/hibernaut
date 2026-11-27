@@ -32,7 +32,7 @@ ToolHandler = Callable[[dict[str, Any], RunCapabilities], str]
 @dataclass(frozen=True, slots=True)
 class ToolCallRequest:
     tool_name: str
-    args: dict[str, Any] = field(default_factory=dict)
+    args: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_runtime.adapters.channels.gdrive_tasks import DriveDownload, DriveFileMeta
+from tests.support.jsonl import read_jsonl
 
 FOLDER = "application/vnd.google-apps.folder"
 SOURCES = "sources-root"
@@ -66,7 +67,7 @@ class MemoryDrive:
             raise DriveProxyError("source_folder", 404, f"the sources folder has no folder named '{name}'")
         return self.entries[found].meta.name, self.list_files(found)
 
-    def download_source(self, file_meta: DriveFileMeta) -> DriveDownload:
+    def download_source(self, file_meta: DriveFileMeta, *, folder_id: str | None = None) -> DriveDownload:
         return self.download(file_meta)
 
 
@@ -172,7 +173,7 @@ def _python() -> str:
 
 def dokploy_calls(state: Path) -> list[list[str]]:
     log = state / "dokploy-calls.jsonl"
-    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    return read_jsonl(log)
 
 
 def environments(state: Path, apps: dict[str, str]) -> None:

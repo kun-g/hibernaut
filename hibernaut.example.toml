@@ -233,12 +233,44 @@ system_tools = true             # 默认 false。只能写在 pattern 为单个�
 # 可选：把一个飞书群绑到系统 Inbox，名单上的人在群里发的消息直接进它，答复回群里的同一话题。名单外的人的消息丢弃、不回；
 # 没绑定的群照旧（进 Switchboard 路由到的 Inbox，不算人说的）。群里要 @机器人（Switchboard [feishu] group_require_mention）。
 # chat_id 从 Switchboard 收到的群消息里取（oc_ 开头）；members 是 open_id（ou_ 开头，单聊事件的 actor）。
-# inbox_id 须是上面某条带 system_tools 的绑定的精确 pattern；一个群只能绑一个 Inbox。系统 Steward 改不了这一节。
+# inbox_id 须是上面某条带 system_tools 的绑定的精确 pattern（或下面的项目群 Inbox）；一个群只能绑一个 Inbox。系统 Steward 改不了这一节。
 # 一个系统 Inbox 只绑一个群；它的审批卡发到这个群，只认 members 在这个群里的点击。
 # [[feishu_groups]]
 # chat_id = "oc_xxx"
 # inbox_id = "sys:ops"
 # members = ["ou_xxx"]
+
+# 可选：把和合作方的飞书群绑到一个项目的专用群 Inbox（需求见 docs/requirements/project-group.md）。members 可含合作方；
+# 群里谁说的都只算对这个项目的请求：这个 Inbox 和项目里别的 Inbox 都转不出项目（到不了别的项目、sys:*、user:*），
+# 也改不了 hb 配置。approvers（必填，一般只写你自己）决定这个项目所有 Inbox 的审批：卡片不发群里，发到 Switchboard
+# 配的审批聊天（[outbound] approval_target，务必配好），别人点了不算。这个 Inbox 只收这个群：别的聊天被路由到它也丢弃，
+# 远端 POST /events 返回 403。它须被本项目一条绑定覆盖，且那条绑定的 agents 全是 steward（没有 Shell 的项目 Steward）；
+# 写在 proj:<p>:.+ 那条之前，否则会被 SDE 的绑定先匹配到。交付默认只开 PR 不合并（[projects.<p>.delivery] auto_merge = false），
+# 要合并时你自己合，或把 auto_merge 改成 true（等于长期批准）。
+# [projects.fruit]
+# inbox_id = ["proj:fruit", "proj:fruit:.+"]
+# repo = "partner/fruit-machine-orders"
+# default_agent = "steward"
+# [[projects.fruit.inbox_bindings]]
+# pattern = "proj:fruit:chat"
+# default_agent = "steward"
+# agents = ["steward"]
+# [[projects.fruit.inbox_bindings]]
+# pattern = "proj:fruit:.+"
+# default_agent = "sde"
+# agents = ["sde", "code-reviewer"]
+# [projects.fruit.delivery]
+# open_pr = true
+# auto_merge = false
+#
+# [[feishu_groups]]
+# chat_id = "oc_yyy"
+# inbox_id = "proj:fruit:chat"
+# members = ["ou_you", "ou_partner"]   # 群里算数的人，含合作方
+# approvers = ["ou_you"]               # 审批只认这些人；只用于项目群
+#
+# Switchboard 那边：[routing] unmatched_policy = "reject" 时要加 [routing.feishu_chats] "oc_yyy" = "proj:fruit:chat"，
+# 否则群消息在 Switchboard 就被丢掉；群里要 @机器人（[feishu] group_require_mention）。
 
 # 可选：运维 Inbox，给新项目在 Dokploy 上建预发布和生产环境。agent 照样是只读 steward，能力来自绑定的 ops_tools：
 # 只有一个 dokploy 工具（跑 [ops_tools] dokploy_script，令牌由脚本从钥匙串取，输出默认打码，不能 --reveal），没有通用命令行。
@@ -277,7 +309,8 @@ forward_to = ["proj:hibernaut", "sys:ops", "sys:infra"]   # 可选：每项是�
 #                               # 最新的文件（压缩包解开）；仓库已存在就停下不覆盖。只能写在精确 ID、readonly、全 steward、不是 sys: 的绑定上
 
 # 写了 repo_tools 时必填，连同下面的 [gdrive] proxy_url、proxy_token_file。gh 用本机的登录，Drive 经凭据代理读，
-# 代理配置里须有 sources_folder_id（各项目版本文件夹的上级）。
+# 代理 config.toml 配 sources_folder_id 时可按项目名查找。要直接用共享的项目文件夹链接，
+# 在代理 config.toml 设 allow_any_source_folder = true（默认 false）。
 # [repo_tools]
 # owner = "kun-g"              # 未指定账号或组织时的默认值
 # allowed_owners = ["kun-g", "LambdaTheory"]  # 须包含默认值。省略时只允许 owner
@@ -335,7 +368,7 @@ remote = "origin"
 version_file = "src/agent_runtime/__init__.py"   # 版本唯一来源；breaking→major，feature→minor，fix→patch，test_docs→不变
 version_pattern = '__version__\s*=\s*"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)"'
 title_template = "Hibernaut {version}: {title}"  # 版本未变时只用 title
-checks = [["lint-imports"], ["pytest", "-n", "auto", "--dist", "worksteal", "-v"], ["pyright"]]   # 仓库门禁，按序在任务 worktree 运行，任一失败则不推送
+checks = [["lint-imports"], ["ruff", "check"], ["pytest", "-n", "auto", "--dist", "worksteal", "-v"], ["pyright"]]   # 仓库门禁，按序在任务 worktree 运行，任一失败则不推送
 check_timeout_seconds = 1800.0
 require_review = true           # 合并前要求独立评审 pass
 require_ci = true               # 合并前要求 PR 的 CI 全部通过（gh pr checks）

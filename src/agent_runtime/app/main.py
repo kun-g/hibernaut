@@ -10,7 +10,7 @@ import ssl
 import sys
 import threading
 from collections import deque
-from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, MutableMapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, MutableMapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -33,7 +33,7 @@ from agent_runtime.adapters.channels import (
     local_events_url,
 )
 from agent_runtime.adapters.channels.channels import webhook_request_handler
-from agent_runtime.adapters.channels.ingress import FeishuGroup, GroupEntrances, event_origin_for
+from agent_runtime.adapters.channels.ingress import GroupEntrances, event_origin_for
 from agent_runtime.adapters.channels.switchboard_bridge import SwitchboardChannelAdapter, SwitchboardInboundBridge
 from agent_runtime.adapters.channels.switchboard_relay import SwitchboardBus, SwitchboardRelayLink
 from agent_runtime.adapters.collaboration_bridge import (
@@ -64,7 +64,7 @@ from agent_runtime.adapters.executor_cli.orca import (
     default_transcript_roots,
 )
 from agent_runtime.adapters.executor_cli.attempt_notes import AttemptNotes
-from agent_runtime.adapters.executor_cli.steward import GlobalScope
+from agent_runtime.adapters.executor_cli.steward import GlobalScope, GroupRoster
 from agent_runtime.adapters.executor_cli.reviewer_pool import ReviewerPool, SwitchNotice
 from agent_runtime.adapters.executor_cli.reclaim_sweep import (
     DEFAULT_SWEEP_INTERVAL_SECONDS,
@@ -1116,13 +1116,14 @@ def build_daemon_from_config(
     # and an inbox matching two projects raises AmbiguousProjectMatch instead of picking one.
     router = ProjectRouter(config.projects.values())
     inbox_checkout_map = router.inbox_map(lambda p: p.checkout)
+    entrances = group_entrances(config)
 
     resolved_channel = channel if channel is not None else ConsoleChannelAdapter(echo=not config.channels.outbox_dir)
     if switchboard is not None:
         resolved_channel = SwitchboardChannelAdapter(
             switchboard_bus(switchboard).publish, fallback=resolved_channel,
             push_policy=NotificationPolicyEngine() if config.collaboration.enabled else None,
-            card_group=GroupEntrances(config.feishu_groups).card_group,
+            card_group=entrances.card_group,
         )
 
     mcp_token = (
@@ -1292,7 +1293,15 @@ def build_daemon_from_config(
                 terminal=cli_terminal if no_terminal is None else TerminalUnavailable(no_terminal),
                 workdir=role.workdir,
                 branch=role.branch,
+                group=_project_group,
             )
+
+        def _project_group(inbox_id: str) -> GroupRoster | None:
+            group = entrances.group_of(inbox_id)
+            if group is None or group.project is None:
+                return None
+            return GroupRoster(chat_id=group.chat_id, owners=group.approvers,
+                               partners=group.members - group.approvers)
 
         def _delivers(inbox_id: str) -> bool:
             try:
@@ -1590,7 +1599,7 @@ def build_daemon_from_config(
             return LimitRoute(project=project.name, default_executor=project.default_agent,
                               binding=project.route(inbox_id).binding)
 
-        origin = event_origin_for(GroupEntrances(config.feishu_groups))
+        origin = event_origin_for(entrances)
         limit_keys = LimitKeyResolver(
             inbox=daemon.inbox, sessions=daemon.sessions, open_runs=daemon.open_runs, route=_cli_route,
             global_default_executor=config.runtime.default_agent,
@@ -1723,9 +1732,14 @@ def build_daemon_from_config(
             memory=MemoryControlPlane(memory_hub, daemon.ledger),
         )
 
+    grouped = frozenset(group.inbox_id for group in config.feishu_groups)
+    # Another host cannot speak for a group's people, nor put anything else into the inbox their group is bound to.
     daemon.handler.keep_local(
-        lambda inbox_id: (bound := config.runtime.workdir_binding(inbox_id)) is not None and bound.system_tools
+        lambda inbox_id: inbox_id in grouped
+        or ((bound := config.runtime.workdir_binding(inbox_id)) is not None and bound.system_tools)
     )
+    # C3: an inbox of a project with a group takes a decision only from its approvers' own Feishu click.
+    daemon.handler.reserve_approvals(entrances.deciders)
     if resolved_gdrive_client is not None:
         daemon.gdrive_poller = DriveTaskPoller(
             daemon.handler,
@@ -1739,7 +1753,7 @@ def build_daemon_from_config(
         )
 
     if switchboard is not None and attach:
-        attach_switchboard(daemon, switchboard, config.switchboard.consumer_id, config.feishu_groups)
+        attach_switchboard(daemon, switchboard, config.switchboard.consumer_id, entrances)
 
     coordinator: CloseoutCoordinator | None = None
     if collaboration is not None:
@@ -1874,11 +1888,18 @@ def ledger_runs(ledger: RunLedger | None) -> Callable[[str], RunSummary | None] 
     return latest
 
 
+def group_entrances(config: HibernautConfig) -> GroupEntrances:
+    router = ProjectRouter(config.projects.values())
+    # Every project an inbox matches: the entrances refuse every approval of an inbox matching two.
+    return GroupEntrances(config.feishu_groups,
+                          projects_of=lambda inbox_id: [p.name for p in router.matching(inbox_id)])
+
+
 def attach_switchboard(
-    daemon: AlwaysOnDaemon, board: SwitchboardHandle, consumer_id: str, groups: Sequence[FeishuGroup] = (),
+    daemon: AlwaysOnDaemon, board: SwitchboardHandle, consumer_id: str, groups: GroupEntrances | None = None,
 ) -> SwitchboardInboundBridge:
     # Subscribing again replaces the previous handler, so a config reload re-points delivery at the new daemon.
-    bridge = SwitchboardInboundBridge(daemon.handler, groups=GroupEntrances(groups))
+    bridge = SwitchboardInboundBridge(daemon.handler, groups=groups or GroupEntrances())
     switchboard_bus(board).subscribe(consumer_id, bridge.handle_canonical_event)
     daemon.switchboard_bridge = bridge
     return bridge
@@ -2036,7 +2057,7 @@ async def serve_configured(
                 generations = [g for g in generations if g.runs is not None and not g.runs.done()] + [generation]
                 if switchboard is not None:
                     attach_switchboard(replacement, switchboard, candidate.switchboard.consumer_id,
-                                       candidate.feishu_groups)
+                                       group_entrances(candidate))
                 # From here every wake reaching the old pool, from its in-flight requests or released leases,
                 # is forwarded to the new one.
                 previous.retire_pool(wake_current)
@@ -2144,6 +2165,7 @@ async def _close_server(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hibernaut multi-inbox Always-on Agent daemon")
     parser.add_argument("--config", default=None, help="Path to hibernaut.toml")
+    parser.add_argument("--check", action="store_true", help="Validate --config and exit")
     parser.add_argument(
         "--demo",
         action="store_true",
@@ -2167,11 +2189,26 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=banner)
     args = parser.parse_args()
 
+    if args.check:
+        if not args.config:
+            parser.error("--check requires --config")
+        try:
+            cfg = load_config(args.config)
+        except (OSError, ValueError) as exc:
+            print(f"{args.config}: {exc}", file=sys.stderr)
+            raise SystemExit(1) from None
+        bindings = len(cfg.runtime.inbox_bindings) + sum(len(p.inbox_bindings) for p in cfg.projects.values())
+        print(f"OK projects={len(cfg.projects)} bindings={bindings} timers={len(cfg.timers)}")
+        return
+
     # Before anything can start a subprocess: the descriptor numbers leave os.environ here.
     listeners = ListenerHandover.from_environ(os.environ)
     board: SwitchboardHandle | None = None
+    cfg: HibernautConfig | None = None
+    runner_pilot: RunnerPilotRelay | None = None
     if args.config:
-        cfg = load_config(args.config)
+        reloads = ReloadStatus()
+        cfg = load_config(args.config, reloads=reloads)
         ledger_path = run_ledger_path(cfg.runtime.db_path, cfg.runtime.ledger_db_path)
         # Opened before the Switchboard, whose in-process audits it records; the daemon owns and closes it.
         ledger = RunLedger(ledger_path) if ledger_path is not None else None
@@ -2182,7 +2219,6 @@ def main() -> None:
             if args.mcp_stdio
             else start_switchboard(cfg.switchboard, audit=ledger.switchboard_audit() if ledger is not None else None)
         )
-        runner_pilot: RunnerPilotRelay | None = None
         if not args.mcp_stdio:
             try:
                 runner_pilot = open_runner_pilot(cfg.runner_pilot)
@@ -2191,7 +2227,8 @@ def main() -> None:
                 print(f"[runner_pilot] {exc}; the pilot inbox stays held.", file=sys.stderr, flush=True)
         companion = companion_config(cfg, os.environ) if args.mcp_stdio else cfg
         daemon = build_daemon_from_config(
-            companion, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot, attach=not args.mcp_stdio
+            companion, demo=args.demo, switchboard=board, ledger=ledger, runner_pilot=runner_pilot,
+            attach=not args.mcp_stdio, reloads=reloads,
         )
         host = cfg.channels.host
         port = cfg.channels.port
@@ -2237,7 +2274,7 @@ def main() -> None:
             except NotImplementedError:
                 pass
         try:
-            if args.config:
+            if cfg is not None:
                 await serve_configured(
                     Path(args.config),
                     cfg,

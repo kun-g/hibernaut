@@ -9,7 +9,7 @@ import re
 import sys
 import tomllib
 import warnings
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -37,8 +37,10 @@ from agent_runtime.adapters.executor_cli.reclaim_sweep import DEFAULT_SWEEP_INTE
 from agent_runtime.adapters.executor_cli.worktree import WorktreeBackend
 from agent_runtime.adapters.memory_bridge import DEFAULT_GC_INTERVAL_SECONDS
 from agent_runtime.adapters.permissions.security import proxy_service_url
+from agent_runtime.app.config_redaction import scrub
 from agent_runtime.app.projects import (
     AgentConfig,
+    AmbiguousProjectMatch,
     ExpertBinding,
     InboxRule,
     ProjectBinding,
@@ -233,7 +235,7 @@ def _parse_role(
     base_dir: Path | None, extra_keys: frozenset[str] = frozenset(),
 ) -> RoleConfig:
     raw_role = item["role"]
-    if raw_role not in ROLES and raw_role not in ROLE_ALIASES:
+    if not isinstance(raw_role, str) or (raw_role not in ROLES and raw_role not in ROLE_ALIASES):
         raise ValueError(f"executors.{name}: unsupported role '{raw_role}' (supported: {', '.join(ROLES)})")
     role = canonical_role(str(raw_role))
     profile = parse_profile(
@@ -287,7 +289,7 @@ def _parse_agent(
                          f"(declared: {', '.join(sorted({*bases, *templates})) or 'none'})")
     if role is None:
         raise ValueError(f"executors.{name}: executor '{driver}' needs a role (supported: {', '.join(ROLES)})")
-    if role in ROLES or role in ROLE_ALIASES:
+    if isinstance(role, str) and (role in ROLES or role in ROLE_ALIASES):
         unknown = sorted(set(item) - _AGENT_KEYS - AGENT_PROFILE_KEYS - _role_options(canonical_role(str(role))))
         if unknown:
             raise ValueError(f"executors.{name}: {', '.join(unknown)} not supported for role '{role}'; "
@@ -582,15 +584,15 @@ class RunnerPilotConfig:
 class HibernautConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     channels: ChannelsConfig = field(default_factory=ChannelsConfig)
-    executors: dict[str, CLITemplate] = field(default_factory=dict)
-    launchers: dict[str, ClaudeCodeLauncher] = field(default_factory=dict)
+    executors: dict[str, CLITemplate] = field(default_factory=dict[str, CLITemplate])
+    launchers: dict[str, ClaudeCodeLauncher] = field(default_factory=dict[str, ClaudeCodeLauncher])
     credential_proxy: CredentialProxyConfig = field(default_factory=CredentialProxyConfig)
-    roles: dict[str, RoleConfig] = field(default_factory=dict)
+    roles: dict[str, RoleConfig] = field(default_factory=dict[str, RoleConfig])
     # Every agent an inbox can run: [agents], plus [executors] that carry a role or a command (the old form).
-    agents: dict[str, AgentConfig] = field(default_factory=dict)
+    agents: dict[str, AgentConfig] = field(default_factory=dict[str, AgentConfig])
     # max_concurrency of the [executors.<id>] that are neither, and only run through agents.
-    driver_limits: dict[str, int] = field(default_factory=dict)
-    projects: dict[str, ProjectConfig] = field(default_factory=dict)
+    driver_limits: dict[str, int] = field(default_factory=dict[str, int])
+    projects: dict[str, ProjectConfig] = field(default_factory=dict[str, ProjectConfig])
     gdrive: GDriveConfig = field(default_factory=GDriveConfig)
     switchboard: SwitchboardLinkConfig = field(default_factory=SwitchboardLinkConfig)
     peer: PeerHandoffConfig = field(default_factory=PeerHandoffConfig)
@@ -605,7 +607,7 @@ class HibernautConfig:
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
     timers: tuple[ConfiguredTimer, ...] = ()
-    # Feishu groups whose listed people talk to a system inbox directly.
+    # Feishu groups whose listed people talk to a system inbox, or to an inbox of one project, directly.
     feishu_groups: tuple[FeishuGroup, ...] = ()
 
     def expert_plan(self, inbox_id: str) -> MemoryMountPlan | None:
@@ -617,10 +619,9 @@ def _parse_timers(raw: object, runtime: RuntimeConfig, projects: Mapping[str, Pr
         raise ValueError("timers must be an array of tables")
     result: dict[str, ConfiguredTimer] = {}
     router = ProjectRouter(projects.values())
-    for i, item in enumerate(raw):
+    for i, entry in enumerate(cast(list[object], raw)):
         where = f"timers[{i}]"
-        if not isinstance(item, dict) or item.keys() - {"name", "inbox_id", "interval_seconds", "enabled", "payload"}:
-            raise ValueError(f"{where} must be a timer table with known keys")
+        item = _Table(entry, where, frozenset({"name", "inbox_id", "interval_seconds", "enabled", "payload"})).raw
         name = item.get("name")
         if not isinstance(name, str) or not name.strip() or name != name.strip() or name in result:
             raise ValueError(f"{where}.name must be a unique, non-blank name without surrounding whitespace")
@@ -647,14 +648,46 @@ def _parse_timers(raw: object, runtime: RuntimeConfig, projects: Mapping[str, Pr
             json.dumps(payload, allow_nan=False)
         except (ValueError, TypeError) as exc:
             raise ValueError(f"{where}.payload must contain JSON values") from exc
-        result[name] = ConfiguredTimer(name, inbox, interval, payload, enabled)
+        result[name] = ConfiguredTimer(name, inbox, interval, cast(dict[str, Any], payload), enabled)
     return tuple(result.values())
 
 
-_FEISHU_GROUP_KEYS = frozenset({"chat_id", "inbox_id", "members"})
+_FEISHU_GROUP_KEYS = frozenset({"chat_id", "inbox_id", "members", "approvers"})
 
 
-def _parse_feishu_groups(raw: object, runtime: RuntimeConfig) -> tuple[FeishuGroup, ...]:
+def _open_ids(where: str, raw: object, what: str) -> frozenset[str]:
+    names = cast(list[object], raw) if isinstance(raw, list) else []
+    if not names or not all(isinstance(m, str) and m.strip() and m == m.strip() for m in names):
+        raise ValueError(f"{where} must list the Feishu open ids (ou_...) {what}")
+    return frozenset(cast(list[str], names))
+
+
+def _group_project(
+    where: str, inbox: object, runtime: RuntimeConfig, projects: Mapping[str, ProjectConfig],
+    agents: Mapping[str, AgentConfig],
+) -> str | None:
+    # The project whose inbox a group may be bound to; None for no inbox of a project. Its people include partners, so
+    # the inbox is one a project Steward alone runs: no shell, and forwards only inside the project.
+    if not isinstance(inbox, str) or runtime.workdir_binding(inbox) is not None:
+        return None
+    try:
+        project = ProjectRouter(projects.values()).resolve(inbox)
+    except AmbiguousProjectMatch:
+        return None
+    if project is None:
+        return None
+    sanitize_segment(inbox, field_name=f"{where}.inbox_id")
+    binding = project.route(inbox).binding
+    named = (binding.default_agent, *binding.agents) if binding is not None and binding.agents else ()
+    if not named or any(name not in agents or agents[name].role != STEWARD_ROLE for name in named):
+        raise ValueError(f"{where}.inbox_id {inbox!r} must be covered by an inbox binding of project "
+                         f"'{project.name}' whose agents are all listed and all have role = \"{STEWARD_ROLE}\"")
+    return project.name
+
+
+def _parse_feishu_groups(
+    raw: object, runtime: RuntimeConfig, projects: Mapping[str, ProjectConfig], agents: Mapping[str, AgentConfig],
+) -> tuple[FeishuGroup, ...]:
     if not isinstance(raw, list):
         raise ValueError("feishu_groups must be an array of tables")
     found: dict[str, FeishuGroup] = {}
@@ -668,18 +701,31 @@ def _parse_feishu_groups(raw: object, runtime: RuntimeConfig) -> tuple[FeishuGro
             raise ValueError(f"{where}.chat_id must be a unique, non-blank Feishu chat id")
         inbox = group.get("inbox_id")
         bound = runtime.workdir_binding(inbox) if isinstance(inbox, str) else None
-        # Only a system inbox, which admits nothing else from a chat: an ordinary one would take anybody's message.
-        if bound is None or not bound.system_tools or bound.rule.literal != inbox:
+        system = bound is not None and bound.system_tools and bound.rule.literal == inbox
+        project = None if system else _group_project(where, inbox, runtime, projects, agents)
+        # A system inbox admits nothing else from a chat, and a project inbox passes nothing out of its project: an
+        # inbox of no project that is no system inbox would take a stranger's words wherever its forward_to reaches.
+        if not system and project is None:
             raise ValueError(f"{where}.inbox_id must be the exact pattern of a [[runtime.inbox_bindings]] entry with "
-                             f"system_tools, got {inbox!r}")
-        members = group.get("members")
-        names = cast(list[object], members) if isinstance(members, list) else []
-        if not names or not all(isinstance(m, str) and m.strip() and m == m.strip() for m in names):
-            raise ValueError(f"{where}.members must list the Feishu open ids (ou_...) whose messages count")
+                             f"system_tools, or an inbox of a project, got {inbox!r}")
+        assert isinstance(inbox, str)
+        members = _open_ids(f"{where}.members", group.get("members"), "whose messages count")
+        if system and "approvers" in group:
+            raise ValueError(f"{where}.approvers is only for a project group: a system group's members decide")
+        # Who decides the approvals of the project's inboxes, outside the group: never a partner just for being in it.
+        approvers = (_open_ids(f"{where}.approvers", group.get("approvers"), "who decide the project's approvals")
+                     if project is not None else frozenset[str]())
         if any(other.inbox_id == inbox for other in found.values()):
-            # Its approval cards go to that one group, and a decision counts only from there.
-            raise ValueError(f"{where}.inbox_id {inbox!r} already has a group: a system inbox takes one group")
-        found[chat_id] = FeishuGroup(chat_id=chat_id, inbox_id=inbox, members=frozenset(cast(list[str], names)))
+            # A system inbox's cards go to its one group, and a decision counts only from there.
+            raise ValueError(f"{where}.inbox_id {inbox!r} already has a group: an inbox takes one group")
+        found[chat_id] = FeishuGroup(chat_id=chat_id, inbox_id=inbox, members=members, project=project,
+                                     approvers=approvers)
+    for project in {g.project for g in found.values() if g.project is not None}:
+        # The project's inboxes no group is bound to are decided by who every one of its groups lets decide.
+        approvers = [g.approvers for g in found.values() if g.project == project]
+        if not approvers[0].intersection(*approvers[1:]):
+            raise ValueError(f"feishu_groups of project '{project}' share no approver: nobody could decide the "
+                             "approvals of its other inboxes")
     return tuple(found.values())
 
 
@@ -768,12 +814,11 @@ def parse_switchboard_link(raw: Any, *, base_dir: Path | None = None) -> Switchb
         return SwitchboardLinkConfig()
     if not isinstance(raw, dict):
         raise ValueError("[switchboard] must be a table")
-    section = cast(dict[str, Any], raw)
-    enabled = section.get("enabled", False)
-    if not isinstance(enabled, bool):
-        raise ValueError("switchboard.enabled must be true or false")
+    link = _Table(raw, "switchboard", frozenset(f.name for f in dataclasses.fields(SwitchboardLinkConfig)))
+    section = link.raw
+    enabled = link.flag("enabled", False)
     mode_raw = str(section.get("mode", "in_process")).strip()
-    mode = next((m for m in _SWITCHBOARD_MODES if m == mode_raw), None)
+    mode: SwitchboardMode | None = next((m for m in _SWITCHBOARD_MODES if m == mode_raw), None)
     if mode is None:
         raise ValueError('switchboard.mode must be "in_process" or "relay"')
     consumer_id = str(section.get("consumer_id", "hibernaut")).strip()
@@ -960,7 +1005,7 @@ def parse_runner_link(
         raise ValueError("runner.readonly_only must be true or false")
     if "token_env" in item and "token_file" in item:
         raise ValueError("runner.token_env and runner.token_file cannot both be set")
-    mode = next((m for m in _RUNNER_MODES if m == item.get("mode", defaults.mode)), None)
+    mode: RunnerMode | None = next((m for m in _RUNNER_MODES if m == item.get("mode", defaults.mode)), None)
     if mode is None:
         raise ValueError('runner.mode must be "in_process" or "relay"')
     backend = item.get("worktree_backend", defaults.worktree_backend)
@@ -1068,6 +1113,12 @@ class _Table:
     def tables(self, keys: frozenset[str] | None = None) -> dict[str, _Table]:
         return {str(name): self.table(name, keys) for name in self.raw}
 
+    def string(self, key: str, default: str = "") -> str:
+        value = self.raw.get(key, default)
+        if not isinstance(value, str):
+            raise ValueError(f"{self.where}.{key} must be a string")
+        return value
+
     def text(self, key: str, default: str | None = None) -> str:
         value = self.raw.get(key, default)
         if not isinstance(value, str) or not value.strip():
@@ -1088,6 +1139,15 @@ class _Table:
         if isinstance(value, bool) or not isinstance(value, int) or value < least:
             raise ValueError(f"{self.where}.{key} must be an integer of at least {least}")
         return value
+
+    def number(self, key: str, default: float) -> float:
+        value = self.raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{self.where}.{key} must be a number")
+        try:
+            return float(value)
+        except OverflowError as exc:
+            raise ValueError(f"{self.where}.{key} is too large") from exc
 
     def names(self, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
         value = self.raw.get(key, list(default))
@@ -1125,7 +1185,7 @@ def _memory_http(table: _Table) -> MemoryHTTPConfig:
     tokens: list[MemoryHTTPToken] = []
     entries = table.table("tokens").tables(frozenset({"token_env", "role", "allowed_projects", "allow_kb"}))
     for subject, entry in entries.items():
-        role = next((r for r in _MEMORY_ROLES if r == entry.raw.get("role", "readonly")), None)
+        role: AccessRole | None = next((r for r in _MEMORY_ROLES if r == entry.raw.get("role", "readonly")), None)
         if role is None:
             raise ValueError(f"{entry.where}.role must be one of {', '.join(_MEMORY_ROLES)}")
         projects = entry.names("allowed_projects", ("*",))
@@ -1307,9 +1367,24 @@ def _validate_collaboration(config: HibernautConfig) -> None:
             raise ValueError(f"collaboration.hub.listen_port is {where}")
 
 
-def load_config(path: str | Path) -> HibernautConfig:
-    raw = tomllib.loads(Path(path).read_text(encoding="utf-8"))
-    return parse_config(raw, base_dir=Path(path).resolve().parent)
+def _parse_contents(contents: bytes, path: Path) -> HibernautConfig:
+    raw = tomllib.loads(contents.decode("utf-8"))
+    if not raw:
+        raise ValueError("empty configuration")
+    try:
+        return parse_config(raw, base_dir=path.resolve().parent)
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, RuntimeError, OSError) as exc:
+        # Scrub against these exact bytes. The watched file may already be a different revision.
+        raise ValueError(scrub(str(exc), raw)) from None
+
+
+def load_config(path: str | Path, *, reloads: ReloadStatus | None = None) -> HibernautConfig:
+    path = Path(path)
+    contents = path.read_bytes()
+    config = _parse_contents(contents, path)
+    if reloads is not None:
+        reloads.settle(reloads.seen(contents))
+    return config
 
 
 async def config_changes(
@@ -1317,7 +1392,7 @@ async def config_changes(
     stop: asyncio.Event,
     interval: float = 1.0,
     reloads: ReloadStatus | None = None,
-) -> AsyncIterator[HibernautConfig]:
+) -> AsyncGenerator[HibernautConfig, None]:
     # What is yielded is settled in `reloads` by whoever activates it.
     previous: bytes | None = None
     missing = False
@@ -1346,14 +1421,10 @@ async def config_changes(
         error = ""
         config: HibernautConfig | None = None
         try:
-            raw = tomllib.loads(contents.decode("utf-8"))
-            if not raw:
-                raise ValueError("empty configuration")
-            # Off the event loop: a project without a checkout is looked up through the Orca command.
-            config = await asyncio.to_thread(parse_config, raw, base_dir=path.resolve().parent)
-        except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
-            detail = f": {exc}" if type(exc) is ValueError else ""
-            error = f"{type(exc).__name__}{detail}"
+            # Resolving an implicit project checkout queries the local Orca registry.
+            config = await asyncio.to_thread(_parse_contents, contents, path)
+        except ValueError as exc:
+            error = str(exc)
         # Parsing takes a while, and an editor knows no lock: a version that is gone by now is not used.
         try:
             replaced = path.read_bytes() != contents
@@ -1376,7 +1447,14 @@ async def config_changes(
 
 def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> HibernautConfig:
     # base_dir anchors relative paths such as role skills; load_config passes the config file's directory.
-    rt_raw = raw.get("runtime", {})
+    root = _Table(raw, "hibernaut", frozenset({
+        "runtime", "channels", "credential_proxy", "launchers", "executors", "agents", "projects", "gdrive",
+        "timers", "feishu_groups", "switchboard", "peer", "runner", "memory_hub", "collaboration", "experts",
+        "runner_pilot", "onboarding", "repo_tools", "ops_tools", "availability",
+    }))
+    rt = root.table("runtime", frozenset(f.name for f in dataclasses.fields(RuntimeConfig)) |
+                    {"poll_mode", "poll_interval_seconds"})
+    rt_raw = rt.raw
     policy = str(rt_raw.get("new_event_policy", "defer"))
     if policy not in ("defer", "fold", "interrupt"):
         raise ValueError(f"Unsupported new_event_policy: {policy}")
@@ -1384,40 +1462,42 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
 
     runtime_default = _default_agent("runtime", rt_raw, "default_executor") or "claude"
     runtime = RuntimeConfig(
-        db_path=str(rt_raw.get("db_path", "./hibernaut.db")),
-        ledger_db_path=str(rt_raw.get("ledger_db_path", "") or ""),
-        memory_root=str(rt_raw.get("memory_root", "./agent_memory")),
-        max_concurrency=int(rt_raw.get("max_concurrency", 4)),
-        new_event_policy=cast(NewEventPolicy, policy),
+        db_path=rt.string("db_path", "./hibernaut.db"),
+        ledger_db_path=rt.string("ledger_db_path"),
+        memory_root=rt.string("memory_root", "./agent_memory"),
+        max_concurrency=rt.count("max_concurrency", 4),
+        new_event_policy=policy,
         default_agent=runtime_default,
         default_executor=runtime_default,
-        worktree_sweep_interval_seconds=float(
-            rt_raw.get("worktree_sweep_interval_seconds", DEFAULT_SWEEP_INTERVAL_SECONDS)
-        ),
+        worktree_sweep_interval_seconds=rt.number("worktree_sweep_interval_seconds", DEFAULT_SWEEP_INTERVAL_SECONDS),
     )
 
-    if runtime.max_concurrency < 1:
-        raise ValueError("runtime.max_concurrency must be at least 1")
     sweep = runtime.worktree_sweep_interval_seconds
     if not math.isfinite(sweep) or sweep < 0:
         raise ValueError("runtime.worktree_sweep_interval_seconds must be finite and not negative (0 turns it off)")
 
-    ch_raw = raw.get("channels", {})
+    ch = root.table("channels", frozenset(f.name for f in dataclasses.fields(ChannelsConfig)) | {
+        "github_webhook_secret_env", "github_token_env", "feishu_app_id_env", "feishu_app_secret_env",
+        "feishu_verification_token_env", "feishu_default_chat_id",
+    })
+    ch_raw = ch.raw
     _warn_obsolete(ch_raw, "channels", "GitHub ingress", "github_webhook_secret_env", "github_token_env")
     _warn_obsolete(ch_raw, "channels", "Feishu", "feishu_app_id_env", "feishu_app_secret_env",
                    "feishu_verification_token_env", "feishu_default_chat_id")
     channels = ChannelsConfig(
-        host=str(ch_raw.get("host", "127.0.0.1")),
-        port=int(ch_raw.get("port", 8080)),
-        mcp_enabled=bool(ch_raw.get("mcp_enabled", False)),
-        mcp_token_env=str(ch_raw.get("mcp_token_env", "HIBERNAUT_MCP_TOKEN")),
+        host=ch.string("host", "127.0.0.1"),
+        port=ch.count("port", 8080, least=0),
+        mcp_enabled=ch.flag("mcp_enabled", False),
+        mcp_token_env=ch.string("mcp_token_env", "HIBERNAUT_MCP_TOKEN"),
         outbox_dir=_outbox_dir(ch_raw.get("outbox_dir"), base_dir),
     )
 
-    proxy_raw = raw.get("credential_proxy", {})
+    if channels.port > 65535:
+        raise ValueError("channels.port must be at most 65535")
+    proxy = root.table("credential_proxy", frozenset({"url", "anthropic_service"}))
     credential_proxy = CredentialProxyConfig(
-        url=str(proxy_raw.get("url", "")).strip(),
-        anthropic_service=str(proxy_raw.get("anthropic_service", "anthropic")).strip(),
+        url=proxy.string("url").strip(),
+        anthropic_service=proxy.string("anthropic_service", "anthropic").strip(),
     )
     if credential_proxy.url and not credential_proxy.url.startswith(("http://", "https://")):
         raise ValueError("credential_proxy.url must be an http(s) URL")
@@ -1427,10 +1507,10 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         proxy_service_url(credential_proxy.url, credential_proxy.anthropic_service) if credential_proxy.url else ""
     )
     # Launchers come only from this trusted deployment file; events cannot name a command.
-    launchers = parse_launchers(raw.get("launchers", {}))
+    launchers = parse_launchers(root.table("launchers").raw)
 
     for table in ("executors", "agents"):
-        if PROTOCOL_CHECK_EXECUTOR_ID in raw.get(table, {}):
+        if PROTOCOL_CHECK_EXECUTOR_ID in root.table(table).raw:
             raise ValueError(f"{table}.{PROTOCOL_CHECK_EXECUTOR_ID}: the name is reserved for [runner_pilot]")
 
     executors: dict[str, CLITemplate] = {}
@@ -1438,7 +1518,8 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
     # Pure drivers: no role and no command, so nothing to run until an agent picks them.
     bases: dict[str, dict[str, Any]] = {}
     base_limits: dict[str, int] = {}
-    for name, item in raw.get("executors", {}).items():
+    for name, table_entry in root.table("executors").tables().items():
+        item = table_entry.raw
         if item.get("role") is not None:
             roles[str(name)] = _parse_role(str(name), item, launchers=launchers, anthropic_url=anthropic_url,
                                            base_dir=base_dir, extra_keys=EXECUTOR_LIMIT_KEYS)
@@ -1455,12 +1536,18 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             if base_limit is not None:
                 base_limits[str(name)] = base_limit
             continue
-        env_raw = item.get("env", {})
-        resume_raw = item.get("resume_args")
+        cli_keys = frozenset(f.name for f in dataclasses.fields(CLITemplate)) - {"name"}
+        table_entry = _Table(item, f"executors.{name}", cli_keys)
+        env_raw = table_entry.table("env").raw
+        args = item.get("args", [])
+        resume = item.get("resume_args", [])
+        for key, values in (("args", args), ("resume_args", resume)):
+            if not isinstance(values, list) or not all(isinstance(arg, str) for arg in cast(list[object], values)):
+                raise ValueError(f"executors.{name}.{key} must be an array of strings")
         orca_agent = item.get("orca_agent")
         if orca_agent is not None and (not isinstance(orca_agent, str) or not orca_agent.strip()):
             raise ValueError(f"Invalid orca_agent for '{name}'")
-        timeout = float(item.get("timeout_seconds", 300.0))
+        timeout = table_entry.number("timeout_seconds", 300.0)
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError(f"Invalid timeout_seconds for '{name}'")
         cli_terminal = item.get("terminal", "none")
@@ -1470,11 +1557,9 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             )
         executors[str(name)] = CLITemplate(
             name=str(name),
-            command=str(item["command"]),
-            args=tuple(str(a) for a in item.get("args", ())),
-            resume_args=(
-                tuple(str(a) for a in resume_raw) if resume_raw is not None else ()
-            ),
+            command=table_entry.text("command"),
+            args=tuple(args),
+            resume_args=tuple(resume),
             env={str(k): str(v) for k, v in env_raw.items()},
             timeout_seconds=timeout,
             orca_agent=orca_agent,
@@ -1538,7 +1623,13 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             )
 
     projects: dict[str, ProjectConfig] = {}
-    for name, item in raw.get("projects", {}).items():
+    project_keys = frozenset({
+        "repo", "checkout", "inbox_id", "inbox_bindings", "default_agent", "executor", "description", "max_concurrency",
+        "worktree_backend", "terminal_backend", "orca_create_terminal", "handoff", "delivery", "experts",
+        "expert_readonly_projects", "github_poll", "poll_labels", "feishu_chat_id",
+    })
+    for name, table_entry in root.table("projects").tables(project_keys).items():
+        item = table_entry.raw
         _warn_obsolete(item, f"projects.{name}", "GitHub ingress", "github_poll", "poll_labels")
         _warn_obsolete(item, f"projects.{name}", "Feishu", "feishu_chat_id")
         backend = str(item.get("worktree_backend", "orca"))
@@ -1555,7 +1646,7 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         default_agent = _default_agent(f"projects.{name}", item, "executor")
         if "default_agent" in item and default_agent not in agents:
             raise ValueError(f"projects.{name}.default_agent '{default_agent}' is not declared in [agents]")
-        repo = str(item["repo"])
+        repo = table_entry.text("repo")
         # Authorization to publish comes only from this deployment file, never from the repository under change.
         delivery = (
             parse_delivery(f"projects.{name}.delivery", item["delivery"], repo=repo) if "delivery" in item else None
@@ -1568,10 +1659,10 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             rules=rules,
             repo=repo,
             checkout=_project_checkout(str(name), item, repo),
-            worktree_backend=cast(Literal["orca", "git"], backend),
+            worktree_backend=backend,
             terminal_backend=terminal,
-            orca_create_terminal=bool(item.get("orca_create_terminal", False)),
-            handoff=cast(Handoff, handoff),
+            orca_create_terminal=table_entry.flag("orca_create_terminal", False),
+            handoff=handoff,
             default_agent=default_agent,
             delivery=delivery,
             inbox_bindings=parse_inbox_bindings(str(name), item.get("inbox_bindings"), inbox_rules=rules,
@@ -1608,8 +1699,9 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
                 where, limit, runtime.max_concurrency,
             )
 
-    gd_raw = raw.get("gdrive", {})
-    gd_interval = float(gd_raw.get("poll_interval_seconds", 30.0))
+    gd = root.table("gdrive", frozenset(f.name for f in dataclasses.fields(GDriveConfig)) | {"service_account_key_env"})
+    gd_raw = gd.raw
+    gd_interval = gd.number("poll_interval_seconds", 30.0)
     if not math.isfinite(gd_interval) or gd_interval <= 0:
         raise ValueError("gdrive.poll_interval_seconds must be finite and positive")
     if "service_account_key_env" in gd_raw:
@@ -1620,9 +1712,9 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
     gd_enabled = gd_raw.get("enabled", False)
     if not isinstance(gd_enabled, bool):
         raise ValueError("gdrive.enabled must be true or false")
-    gd_proxy_url = str(gd_raw.get("proxy_url", "")).strip() or credential_proxy.url
-    gd_service = str(gd_raw.get("proxy_service", "gdrive-queue")).strip()
-    gd_token_raw = str(gd_raw.get("proxy_token_file", "")).strip()
+    gd_proxy_url = gd.string("proxy_url").strip() or credential_proxy.url
+    gd_service = gd.string("proxy_service", "gdrive-queue").strip()
+    gd_token_raw = gd.string("proxy_token_file").strip()
     gd_token_file = ""
     if gd_token_raw:
         token_path = Path(gd_token_raw).expanduser()
@@ -1638,26 +1730,26 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
             raise ValueError("gdrive.enabled needs gdrive.proxy_token_file (the local client token for the Drive queue proxy)")
         if not gd_service:
             raise ValueError("gdrive.proxy_service must not be empty")
-    gd_attachments_dir = str(gd_raw.get("attachments_dir", "")).strip()
+    gd_attachments_dir = gd.string("attachments_dir").strip()
     gdrive = GDriveConfig(
         enabled=gd_enabled,
         proxy_url=gd_proxy_url,
         proxy_service=gd_service,
         proxy_token_file=gd_token_file,
-        root_folder_id=str(gd_raw.get("root_folder_id", "")).strip(),
-        pending_folder_id=str(gd_raw.get("pending_folder_id", "")).strip(),
-        in_progress_folder_id=str(gd_raw.get("in_progress_folder_id", "")).strip(),
-        done_folder_id=str(gd_raw.get("done_folder_id", "")).strip(),
-        failed_folder_id=str(gd_raw.get("failed_folder_id", "")).strip(),
-        attachments_folder_id=str(gd_raw.get("attachments_folder_id", "")).strip(),
+        root_folder_id=gd.string("root_folder_id").strip(),
+        pending_folder_id=gd.string("pending_folder_id").strip(),
+        in_progress_folder_id=gd.string("in_progress_folder_id").strip(),
+        done_folder_id=gd.string("done_folder_id").strip(),
+        failed_folder_id=gd.string("failed_folder_id").strip(),
+        attachments_folder_id=gd.string("attachments_folder_id").strip(),
         attachments_dir=_resolve_path(gd_attachments_dir, base_dir) if gd_attachments_dir else "",
         poll_interval_seconds=gd_interval,
-        default_inbox_id=str(gd_raw.get("default_inbox_id", "default")).strip() or "default",
+        default_inbox_id=gd.string("default_inbox_id", "default").strip() or "default",
     )
 
     config = HibernautConfig(
         timers=_parse_timers(raw.get("timers", []), runtime, projects),
-        feishu_groups=_parse_feishu_groups(raw.get("feishu_groups", []), runtime),
+        feishu_groups=_parse_feishu_groups(raw.get("feishu_groups", []), runtime, projects, agents),
         runtime=runtime,
         channels=channels,
         executors=executors,

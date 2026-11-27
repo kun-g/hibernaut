@@ -34,6 +34,7 @@ from tests.support.coder_reviewer import (
     launcher_env,
     make_repo,
 )
+from tests.support.jsonl import read_jsonl
 
 
 PROXY_URL = "http://127.0.0.1:9/proxy/anthropic"
@@ -317,7 +318,7 @@ class TestDispatchAndHotReload(unittest.TestCase):
                 conn.close()
 
         def calls():
-            return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            return read_jsonl(log)
 
         def outbox():
             with sqlite3.connect(db_path) as conn:

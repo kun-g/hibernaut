@@ -4,7 +4,7 @@ import json
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from typing import Any, cast
 
 from agent_runtime.adapters.executor_cli.sde import WAIT_IDLE, suspended_stage
@@ -75,7 +75,7 @@ class SQLiteOpsStatus:
         self._runs = runs
 
     def report(self, *, hours: int, timer_runs: int, now: datetime | None = None) -> dict[str, Any]:
-        end = now or datetime.now(timezone.utc)
+        end = now or datetime.now(UTC)
         since = to_utc_iso(end - timedelta(hours=hours))
         results = self._results(since)
         not_covered = [

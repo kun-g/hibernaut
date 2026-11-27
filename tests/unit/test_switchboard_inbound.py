@@ -295,7 +295,7 @@ class FeishuInboundTests(unittest.TestCase):
         self.assertEqual(event.external_id, "msg:om_1")
 
     def test_group_requires_mention_and_uses_thread_key(self) -> None:
-        status, body = post(self.url, feishu_message(chat_type="group"))
+        _status, body = post(self.url, feishu_message(chat_type="group"))
         self.assertEqual(body["status"], "ignored")
         mention = [{"key": "@_user_1", "id": {"open_id": "ou_bot"}}]
         _, body = post(self.url, feishu_message(chat_type="group", message_id="om_2", root_id="om_root", mentions=mention))

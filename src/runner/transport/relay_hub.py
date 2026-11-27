@@ -5,7 +5,8 @@ import hmac
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Mapping, cast
+from typing import Any, cast
+from collections.abc import Callable, Mapping
 
 from runner.protocol import (
     InterruptRequest,
@@ -510,7 +511,7 @@ class RunnerRelayHub:
                     continue
                 self._dispatch_inbound(runner_id, epoch, frame)
         except (
-            WSConnectionClosed, WSProtocolError, asyncio.TimeoutError, KeyError, ValueError, OSError,
+            WSConnectionClosed, WSProtocolError, TimeoutError, KeyError, ValueError, OSError,
             # A peer that hangs up mid-frame or sends an endless header.
             EOFError, asyncio.LimitOverrunError,
         ):

@@ -33,7 +33,7 @@ class DriveSources(Protocol):
     # The proxy's sources folder: one folder per project, each holding its versions.
     def source_folder(self, *, name: str | None = None, folder_id: str | None = None) -> tuple[str, list[DriveFileMeta]]: ...
 
-    def download_source(self, file_meta: DriveFileMeta) -> DriveDownload: ...
+    def download_source(self, file_meta: DriveFileMeta, *, folder_id: str | None = None) -> DriveDownload: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +213,7 @@ class RepoCreator:
         with tempfile.TemporaryDirectory(prefix="hb-repo-", dir=self._scratch) as tmp:
             work = Path(tmp)
             try:
-                got = self._drive().download_source(latest)
+                got = self._drive().download_source(latest, folder_id=folder_id)
             except DriveProxyError as exc:
                 raise ToolError(f"stopped at Drive, before anything was created: {latest.name}: {exc.reason}") from exc
             unpacked = unpack(got, work, max_bytes)

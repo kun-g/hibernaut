@@ -280,7 +280,7 @@ class MCPServerAdapter:
                 status_code=400,
                 body=self._error_response(None, -32600, "Invalid Request"),
             )
-        reply = self.handle_rpc(message, remote=remote)
+        reply = self.handle_rpc(cast(dict[str, Any], message), remote=remote)
         if reply is None:
             return WebhookResponse(status_code=202, body={})
         return WebhookResponse(status_code=200, body=reply)
@@ -302,7 +302,7 @@ class MCPServerAdapter:
                 stdout.write(json.dumps(err, ensure_ascii=False) + "\n")
                 stdout.flush()
                 continue
-            reply = self.handle_rpc(message)
+            reply = self.handle_rpc(cast(dict[str, Any], message))
             if reply is not None:
                 stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
                 stdout.flush()
@@ -310,7 +310,8 @@ class MCPServerAdapter:
     def handle_rpc(self, request: dict[str, Any], *, remote: bool = False) -> dict[str, Any] | None:
         method = request.get("method")
         req_id = request.get("id")
-        params = request.get("params") if isinstance(request.get("params"), dict) else {}
+        raw_params = request.get("params")
+        params = cast(dict[str, Any], raw_params) if isinstance(raw_params, dict) else {}
 
         if method == "notifications/initialized":
             return None
@@ -338,7 +339,8 @@ class MCPServerAdapter:
 
     def _handle_tool_call(self, req_id: Any, params: dict[str, Any], remote: bool) -> dict[str, Any]:
         tool_name = str(params.get("name") or "")
-        args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        raw_args = params.get("arguments")
+        args = cast(dict[str, Any], raw_args) if isinstance(raw_args, dict) else {}
         try:
             payload = self._dispatch_tool(tool_name, args, remote)
         except KeyError:
@@ -365,10 +367,11 @@ class MCPServerAdapter:
         if tool_name == "hibernaut_ingest_event":
             inbox_id = str(args["inbox_id"])
             source = str(args["source"])
-            payload = args["payload"]
-            if not isinstance(payload, dict):
+            raw_payload: object = args["payload"]
+            if not isinstance(raw_payload, dict):
                 raise ValueError("payload must be a JSON object")
-            check_payload(payload)
+            event_payload = cast(dict[str, Any], raw_payload)
+            check_payload(event_payload)
             external_id = str(args.get("external_id") or new_id("mcp"))
             correlation_key = (
                 str(args["correlation_key"]) if args.get("correlation_key") is not None else None
@@ -378,7 +381,7 @@ class MCPServerAdapter:
                 inbox_id=inbox_id,
                 source=source,
                 external_id=external_id,
-                payload=payload,
+                payload=event_payload,
                 session_id=session_id,
                 correlation_key=correlation_key,
                 remote=remote,
@@ -506,6 +509,7 @@ class MCPServerAdapter:
                 source=MCP_APPROVAL_SOURCE,
                 external_id=f"mcp-approval:{approval_request_id}:{approved}",
                 payload=payload,
+                remote=remote,
             )
             return {
                 "event_id": result.event_id,

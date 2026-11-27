@@ -12,7 +12,8 @@ import pytest
 from agent_runtime.adapters.runner_pilot import RunnerPilotRelay
 from runner.protocol_check import PROTOCOL_CHECK_EXECUTOR_ID, PROTOCOL_FILES
 from tests.support.runner_pilot_support import RUNNER_ID, alive, commit, git, recomputed_manifest
-from tests.support.runner_pilot import Deployment, KEY, OTHER, PILOT, _relay, _runner_run, pilot
+from tests.support.runner_pilot import Deployment, KEY, OTHER, PILOT, _relay, _runner_run
+from tests.support.runner_pilot import pilot  # noqa: F401 -- pytest fixture, requested by parameter name
 
 
 def test_relay_listens_on_loopback_only_and_reports_a_taken_port(tmp_path: Path) -> None:

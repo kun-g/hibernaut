@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Collection, Sequence
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from agent_runtime.adapters.storage_sqlite import EventDiagnostics
@@ -239,7 +239,7 @@ class InMemoryOutbox:
         return msg
 
     def fetch_pending(self, limit: int = 20, *, now_iso: str | None = None) -> list[OutboxMessage]:
-        now = datetime.fromisoformat(now_iso) if now_iso else datetime.now(timezone.utc)
+        now = datetime.fromisoformat(now_iso) if now_iso else datetime.now(UTC)
         pending = [
             self._messages[mid]
             for mid in self._order

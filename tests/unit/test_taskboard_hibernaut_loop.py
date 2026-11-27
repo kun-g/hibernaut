@@ -286,7 +286,7 @@ class WorkerTaskLifecycleTests(_WorkerCase):
     async def test_executor_failure_releases_the_task(self) -> None:
         self.deliver(work_ready())
         self.executor.outcomes.append(RuntimeError("boom"))
-        with self.assertRaises(Exception):
+        with self.assertRaises(RuntimeError):
             await self.worker.process_inbox(SCOPE)
         claim, release = self.queued()
         self.assert_claim(claim)
@@ -478,7 +478,7 @@ class SupersededTaskTests(_SupersedeMixin):
         session = await self.suspend_task_a()
         self.deliver(work_ready("tb_tsk_b"))
         self.executor.outcomes.append(RuntimeError("boom"))
-        with self.assertRaises(Exception):
+        with self.assertRaises(RuntimeError):
             await self.worker.process_inbox(SCOPE)
         actions = [(m.metadata["task_action"], m.metadata["task_id"]) for m in self.queued()]
         self.assertEqual(actions, [("release", "tb_tsk_a"), ("claim", "tb_tsk_b"), ("release", "tb_tsk_b")])
@@ -696,7 +696,7 @@ class TaskboardClosedLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_failure_releases_the_task_back_to_ready(self) -> None:
         task_id = self.create()
         self.executor.outcomes.append(RuntimeError("boom"))
-        with self.assertRaises(Exception):
+        with self.assertRaises(RuntimeError):
             await self.worker.process_inbox(SCOPE)
         await self.flush()
         # The claim set stage "running"; release returns the task to ready and leaves the stage as it was.

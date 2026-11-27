@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
-from typing import Iterator
+from collections.abc import Iterator
 
 from memory_hub.models import (
     BaselineBlock,
@@ -234,7 +234,7 @@ class MarkdownFileStore:
         if max_bytes is not None and len(selected.encode("utf-8")) > max_bytes:
             selected = selected.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore") + "\n[TRUNCATED]"
             truncated = True
-        mtime = datetime.fromtimestamp(target.stat().st_mtime, tz=timezone.utc).replace(microsecond=0)
+        mtime = datetime.fromtimestamp(target.stat().st_mtime, tz=UTC).replace(microsecond=0)
         return MemoryDoc(
             uri=uri,
             content=selected,

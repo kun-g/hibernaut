@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import importlib
 import re
 from collections import deque
 from collections.abc import Sequence
-from re import _constants as _c  # type: ignore[attr-defined]
-from re import _parser  # type: ignore[attr-defined]
 from typing import Any
+
+# The private modules behind re.compile have no type stubs, so they are typed Any.
+_c: Any = importlib.import_module("re._constants")
+_parser: Any = importlib.import_module("re._parser")
 
 _MAX_STATES = 1000
 _MAX_PAIRS = 200_000

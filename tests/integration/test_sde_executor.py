@@ -24,6 +24,7 @@ from tests.support.empty_guidance import empty_project_guidance
 from tests.support.fakes import InMemoryPermission
 from tests.support.coder_reviewer import CHANGES_REQUESTED, FAKE_LAUNCHER, _Capture, fake_command, git, launcher_env
 from tests.support.sde_executor import BUGGY, EVIDENCE, FIXED, PASS, PROXY, dev, event, make_base_repo
+from tests.support.jsonl import read_jsonl
 
 
 class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
@@ -67,7 +68,7 @@ class TestSDEExecutor(unittest.IsolatedAsyncioTestCase):
         )
 
     def calls(self, role=None):
-        rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        rows = read_jsonl(self.log)
         return [r for r in rows if role is None or r["role"] == role]
 
     def payload(self, **extra):
@@ -246,7 +247,7 @@ class TestSDEDispatchAndHotReload(unittest.TestCase):
                 conn.close()
 
         def calls(role=None):
-            rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            rows = read_jsonl(log)
             return [r for r in rows if role is None or r["role"] == role]
 
         def outbox():

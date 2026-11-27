@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 import re
 from typing import Literal
@@ -70,7 +70,7 @@ class LocalLogStore:
     def allocate_path(self, run_id: str, *, date_str: str | None = None) -> tuple[Path, str]:
         if not _SAFE_SEGMENT_RE.match(run_id):
             raise ValueError(f"unsafe run_id for log path: {run_id!r}")
-        day = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        day = date_str or datetime.now(UTC).strftime("%Y-%m-%d")
         if not _DATE_RE.match(day):
             raise ValueError(f"date_str must be YYYY-MM-DD, got {day!r}")
         day_dir = self._root / day
@@ -128,7 +128,7 @@ class LocalLogStore:
         now_utc: datetime | None = None,
     ) -> list[Path]:
         """Remove logs older than max_age_days, then oldest logs exceeding max_total_bytes."""
-        now = now_utc or datetime.now(timezone.utc)
+        now = now_utc or datetime.now(UTC)
         cutoff_day = (now - timedelta(days=max_age_days)).strftime("%Y-%m-%d")
         removed: list[Path] = []
         remaining: list[tuple[float, int, Path]] = []

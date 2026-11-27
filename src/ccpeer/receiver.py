@@ -211,7 +211,8 @@ class Receiver:
     # --- registration ----------------------------------------------------------------------------------------
 
     def _acquire_lock(self) -> None:
-        lock = open(self.dir / "receiver.lock", "a+", encoding="utf-8")
+        # Held open for the receiver's lifetime: closing it releases the flock.
+        lock = open(self.dir / "receiver.lock", "a+", encoding="utf-8")  # noqa: SIM115
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

@@ -10,7 +10,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any, cast
 
@@ -39,7 +39,7 @@ class RemoteProbeCache:
 
 
 def _iso_now() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
 
 
 def _read_tb_token(env_file: Path) -> str:
@@ -605,7 +605,7 @@ def _read_hb_data(cfg: DashboardConfig, proc_info: dict[str, Any]) -> dict[str, 
                     try:
                         dt = datetime.fromisoformat(started_at)
                         elapsed_s = max(
-                            0, int((datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds())
+                            0, int((datetime.now(UTC) - dt.astimezone(UTC)).total_seconds())
                         )
                     except Exception:
                         pass
@@ -890,7 +890,7 @@ def _read_hb_data(cfg: DashboardConfig, proc_info: dict[str, Any]) -> dict[str, 
                             "task_id": task_id,
                             "status": status,
                             "summary": summary,
-                            "ts_iso": datetime.fromtimestamp(float(r["ts"]), timezone.utc)
+                            "ts_iso": datetime.fromtimestamp(float(r["ts"]), UTC)
                             .astimezone()
                             .isoformat(timespec="seconds"),
                             "consumed_at": r["consumed_at"],
@@ -921,7 +921,7 @@ def _read_hb_data(cfg: DashboardConfig, proc_info: dict[str, Any]) -> dict[str, 
                     "filename": f.name,
                     "title": first_line[:120] or f.name,
                     "size": stat.st_size,
-                    "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+                    "mtime": datetime.fromtimestamp(stat.st_mtime, UTC)
                     .astimezone()
                     .isoformat(timespec="seconds"),
                 }

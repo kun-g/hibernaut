@@ -40,6 +40,20 @@ def run(command, *, env, cwd):
     if "-R" in argv:
         state["repo_flag"] = opt(argv, "-R")
     save()
+    if argv[:2] == ["run", "rerun"]:
+        if state.get("rerun_error"):
+            return result(code=1, stderr=state["rerun_error"])
+        # The re-run jobs report under new links; what the checks show next is set up by the test.
+        state.setdefault("reruns", []).append(argv[2])
+        if "after_rerun" in state:
+            state["checks_sequence"] = state.pop("after_rerun")
+        save()
+        return result()
+    if argv[:2] == ["run", "view"]:
+        logs = state.get("run_logs", {})
+        if argv[2] not in logs:
+            return result(code=1, stderr=f"fake gh: no log for run {argv[2]}\n")
+        return result(logs[argv[2]])
     if len(argv) < 2 or argv[0] != "pr":
         return result(code=2, stderr="fake gh: unsupported\n")
     cmd = argv[1]

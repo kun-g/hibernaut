@@ -21,7 +21,7 @@ from runner.workspace_guard import workspace_read_refusal
 from tests.support.runner_pilot_support import ROOT, write_token
 from tests.support.runner_composition import raw_config, relay
 from tests.support.runner_tool_gate import Node, request
-from tests.support.runner_remote import AGENT, _first_order, _first_order_query, remote
+from tests.support.runner_remote import AGENT, _first_order, _first_order_query
 
 
 @pytest.fixture

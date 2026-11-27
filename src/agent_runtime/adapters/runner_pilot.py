@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from agent_runtime.adapters.runner_bridge import RunnerExecutorBridge, lost_run_telemetry, run_telemetry
-from agent_runtime.core.models import Emit, Event, RunOutcome, RunTelemetry, SessionRef
+from agent_runtime.core.models import Emit, Event, RunOutcome, RunTelemetry, SessionRef, new_id
 from agent_runtime.core.ports import RunCapabilities
 from runner.protocol import (
     InterruptRequest,
@@ -175,7 +175,8 @@ class ProtocolCheckExecutor(RunnerExecutorBridge):
         )
         self._inbox_id = inbox_id
 
-    async def execute(self, events: Sequence[Event], session: SessionRef, caps: RunCapabilities) -> RunOutcome:
+    async def execute(self, events: Sequence[Event], session: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
+        session = _session_of(events, session)
         if session.inbox_id != self._inbox_id:
             return _failed(session, f"Inbox {session.inbox_id} 不在试点路由内", "permission_denied")
         try:
@@ -238,10 +239,17 @@ class ClosedRouteExecutor:
     # pilot end with a notice, and the inbox is free for its original executor.
     executor_id = PROTOCOL_CHECK_EXECUTOR_ID
 
-    async def execute(self, events: Sequence[Event], session: SessionRef, caps: RunCapabilities) -> RunOutcome:
+    async def execute(self, events: Sequence[Event], session: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
         return _failed(
-            session, "试点路由未对本 Inbox 开放，未执行。重新启用后可用 hibernaut_replay_event(force=true) 重放", "config_error"
+            _session_of(events, session), "试点路由未对本 Inbox 开放，未执行。重新启用后可用 hibernaut_replay_event(force=true) 重放", "config_error"
         )
+
+
+def _session_of(events: Sequence[Event], session: SessionRef | None) -> SessionRef:
+    # The worker always passes the batch's session; ExecutorPort allows none, as RunnerExecutorBridge handles.
+    if session is not None:
+        return session
+    return SessionRef(session_id=new_id("sess"), inbox_id=events[0].inbox_id, correlation_key=events[0].correlation_key)
 
 
 def _failed(

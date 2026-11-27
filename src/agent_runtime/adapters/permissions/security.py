@@ -5,7 +5,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from agent_runtime.core.models import PermissionDecision
 
@@ -75,7 +75,7 @@ class AutoModePermissionAdapter:
         }
     )
     # Old tool name -> current name: a rule written for the old name applies to the new one.
-    TOOL_ALIASES: dict[str, str] = {"coder_reviewer.launch": "code_reviewer.launch"}
+    TOOL_ALIASES: ClassVar[dict[str, str]] = {"coder_reviewer.launch": "code_reviewer.launch"}
     DANGEROUS_SUBSTRINGS: tuple[str, ...] = (
         "rm -rf",
         "DROP TABLE",

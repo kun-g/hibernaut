@@ -26,6 +26,7 @@ from agent_runtime.core.models import Emit, Event, SessionRef, Suspend
 from tests.support.fakes import InMemoryPermission
 from tests.support.coder_reviewer import CHANGES_REQUESTED, _Capture, fake_command, git
 from tests.support.role_skills_and_project_guidance import write_skill
+from tests.support.jsonl import read_jsonl
 
 
 PASS = {"verdict": "pass", "summary": "ok", "blocking": []}
@@ -105,7 +106,7 @@ class _Harness(unittest.IsolatedAsyncioTestCase):
         self.plan.write_text(json.dumps({"sde": list(sde), "reviewer": list(reviewer)}))
 
     def calls(self, role=None):
-        rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        rows = read_jsonl(self.log)
         return [r for r in rows if role is None or r["role"] == role]
 
     def reviewer(self, skills=()):
@@ -374,7 +375,7 @@ class TestTwoProjectsThroughTheDaemon(unittest.TestCase):
                 conn.close()
 
         def calls():
-            return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            return read_jsonl(log)
 
         def delivered():
             with sqlite3.connect(db_path) as conn:

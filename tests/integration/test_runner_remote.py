@@ -40,8 +40,8 @@ from tests.support.runner_remote import (
     _first_order,
     _first_order_query,
     agent_toml,
-    remote,
 )
+from tests.support.runner_remote import remote  # noqa: F401 -- pytest fixture, requested by parameter name
 
 
 def test_the_node_refuses_before_hibernaut_is_asked(tmp_path: Path) -> None:

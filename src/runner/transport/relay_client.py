@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import urllib.parse
-from typing import Any, Mapping, cast
+from typing import Any, cast
+from collections.abc import Mapping
 
 from runner.daemon import RunnerDaemon
 from runner.protocol import (

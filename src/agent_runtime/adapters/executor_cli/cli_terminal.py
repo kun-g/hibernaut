@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import IO, Any
@@ -57,7 +57,7 @@ def check_stop() -> None:
 
 
 @contextmanager
-def starting() -> Iterator[None]:
+def starting() -> Generator[None, None, None]:
     # A stop raised inside Popen would lose the process it just started, so it waits until the caller has recorded
     # it. The signals are not blocked for this: the started process would inherit the mask and ignore SIGTERM.
     global _starting
@@ -107,7 +107,7 @@ def exited(pid: int, seconds: float) -> bool:
 
 
 @contextmanager
-def _signals_held() -> Iterator[None]:
+def _signals_held() -> Generator[None, None, None]:
     # Reaping and recording the exit status must not be split by a signal, or the cleanup would see a live leader.
     signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
     try:
