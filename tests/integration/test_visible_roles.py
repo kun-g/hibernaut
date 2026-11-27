@@ -104,7 +104,7 @@ class TestVisibleSDE(VisibleCase):
         self.assertIn("+    if b == 0:", review2["prompt"])
 
     async def test_answer_after_suspend_resumes_the_closed_conversation(self):
-        self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?"), dev(FIXED)], reviewer=[PASS])
+        self.set_plan(sde=[dev(status="needs_input", question="除数为零时报错吗？"), dev(FIXED)], reviewer=[PASS])
         executor = self.sde()
         outcome = await executor.execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Suspend), outcome
@@ -124,7 +124,7 @@ class TestVisibleSDE(VisibleCase):
         self.assertEqual(resumed.executor_session_id, native)
 
     async def test_follow_up_event_reuses_the_live_terminal(self):
-        self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?"), dev(FIXED)])
+        self.set_plan(sde=[dev(status="needs_input", question="除数为零时报错吗？"), dev(FIXED)])
         executor = self.sde(review=False)
         outcome = await executor.execute([event(self.payload())], None, self.caps)
         assert isinstance(outcome, Suspend), outcome

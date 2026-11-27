@@ -221,7 +221,7 @@ class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
         return [r for r in self.history if role is None or r["role"] == role]
 
     async def test_follow_up_while_suspended_reaches_developer_and_reviewer_without_a_new_card(self):
-        self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?"), dev(FIXED)], reviewer=[PASS])
+        self.set_plan(sde=[dev(status="needs_input", question="除数为零时报错吗？"), dev(FIXED)], reviewer=[PASS])
         await self.task()
         self.assertEqual(len(self.cards()), 1)
         await self.send({"text": "Raise ValueError and mention b in the message"})
@@ -253,7 +253,7 @@ class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
         self.assertIn("review=pass", self.emits()[-1])
 
     async def test_follow_up_batched_with_the_approval_reaches_developer_and_reviewer(self):
-        self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?"), dev(FIXED)], reviewer=[PASS])
+        self.set_plan(sde=[dev(status="needs_input", question="除数为零时报错吗？"), dev(FIXED)], reviewer=[PASS])
         await self.task()
         request_id = self.cards()[0].metadata["request_id"]
         # Both arrive before the worker claims the inbox, so they run as one batch.
@@ -332,22 +332,22 @@ class TestSDEThroughWorker(unittest.IsolatedAsyncioTestCase):
         def waits() -> list[tuple[str, str]]:
             return [(i["waits_for"], i["why"]) for i in status.report(hours=1, timer_runs=1)["suspended"]["items"]]
 
-        self.set_plan(sde=[dev(status="needs_input", question=f"{WAIT_IDLE} timing needs the user away")])
+        self.set_plan(sde=[dev(status="needs_input", question=f"{WAIT_IDLE} 是否现在开始空闲计时？")])
         await self.task()
-        self.assertEqual(waits(), [("user_away", f"{WAIT_IDLE} timing needs the user away")])
-        self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?")])
+        self.assertEqual(waits(), [("user_away", f"{WAIT_IDLE} 是否现在开始空闲计时？")])
+        self.set_plan(sde=[dev(status="needs_input", question="除数为零时报错吗？")])
         await self.decide(True)
-        self.assertEqual(waits(), [("answer", "Raise or return None?")])
+        self.assertEqual(waits(), [("answer", "除数为零时报错吗？")])
 
     async def test_declined_question_reports_stopped_not_delivered(self):
-        self.set_plan(sde=[dev(status="needs_input", question="Raise or return None?")])
+        self.set_plan(sde=[dev(status="needs_input", question="除数为零时报错吗？")])
         await self.task()
         await self.decide(False)
         text = self.emits()[-1]
         self.assertIn("[sde] stopped: question declined", text)
         (last,) = [m for m in self.outbox.fetch_pending(100) if m.metadata.get("kind") == "emit"][-1:]
         self.assertEqual(last.metadata["task_context"]["status"], "stopped")
-        self.assertIn("Raise or return None?", text)
+        self.assertIn("除数为零时报错吗？", text)
         self.assertIn(str(self.repo), text)
         self.assertNotIn("delivered", text)
         self.assertNotIn("review=", text)

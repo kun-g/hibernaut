@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, UTC
 from typing import Any, Never, assert_never, cast
 
 from agent_runtime.core.models import (
+    ADVICE_SOURCE,
+    QUESTION_SOURCE,
     CLOSE_SOURCE,
     FORWARD_SOURCE,
     INTERNAL_SOURCES,
@@ -20,6 +22,7 @@ from agent_runtime.core.models import (
     Emit,
     Event,
     FailureRoute,
+    ForwardRefused,
     ForwardSpec,
     HeldReturn,
     InboxBinding,
@@ -53,6 +56,7 @@ from agent_runtime.core.ports import (
     OpenRunPort,
     OutboxPort,
     PermissionPort,
+    QuestionAdvisorPort,
     ResumableExecutorPort,
     RunCapabilities,
     RunLedgerPort,
@@ -101,7 +105,7 @@ class _ScopedCapabilities:
     permissions: PermissionPort
     _poll_folded: Callable[[], list[Event]]
     _is_interrupted: Callable[[], bool]
-    _forwards: ForwardStage
+    _forwards: ForwardStage | None
 
     def poll_folded_events(self) -> list[Event]:
         return self._poll_folded()
@@ -121,6 +125,8 @@ class _ScopedCapabilities:
         continues: str | None = None,
         approved_request_id: str | None = None,
     ) -> Event:
+        if self._forwards is None:
+            raise ForwardRefused("an advisory turn is read-only")
         return self._forwards.forward(
             target_inbox, text, title=title, tags=tags, target_agent=target_agent, return_to=return_to,
             continues=continues, approved_request_id=approved_request_id,
@@ -140,6 +146,7 @@ class RunReport:
     rejected: str | None = None
     # The Run handed the work to another agent or sent its result back to one: the external task is not finished.
     pending_elsewhere: bool = False
+    consulting_dispatcher: bool = False
 
 
 class ExecutorFailed(RuntimeError):
@@ -496,7 +503,11 @@ class AgentWorker:
                     results = [e for e in (*claimed, *self._inbox.fetch_pending(inbox_id)) if returned_piece(e)]
                     reports += [r for event in cancelled if (r := self._end_wait(inbox_id, event, results)) is not None]
                     claimed = [e for e in claimed if e.source != RETURN_CANCELLED_SOURCE]
-                claimed = self._without_settled(claimed)
+                for question in [e for e in claimed if e.source == QUESTION_SOURCE]:
+                    async with self._lease_heartbeat(inbox_id):
+                        await self._consult(question)
+                    self._inbox.mark_done([question.event_id])
+                claimed = self._without_settled([e for e in claimed if e.source != QUESTION_SOURCE])
                 if not claimed:
                     continue
 
@@ -806,6 +817,64 @@ class AgentWorker:
         _, duplicate = self._inbox.append(event)
         if not duplicate and self._on_forward is not None:
             self._on_forward(event.inbox_id)
+
+    def _dispatcher_question(self, sender: str, agent: str, payload: dict[str, Any], named: str | None = None) -> Event | None:
+        parents: list[str] = list(payload["parents"])
+        receiver: str | None = None
+        dispatch_session = ""
+        if parents:
+            parent = self._sessions.get(parents.pop(0))
+            if parent is None:
+                return None
+            dispatch_session = parent.session_id
+            target, receiver = parent.inbox_id, parent.executor_id
+            refused = return_refusal(ForwardSpec(target_inbox=sender, return_to=target), inbox_id=sender,
+                                     agent_id=agent, payload={"text": payload["question"], "status": "question"},
+                                     permissions=self._permissions, routes=self._routes)
+            if refused is not None:
+                return None
+        elif named:
+            target = named
+            if self._permissions.check("inbox.forward", {"inbox_id": sender, "agent_id": agent,
+                    "target_inbox": target, "text": payload["question"], "status": "question"}).action != "allow":
+                return None
+        else:
+            return None
+        route = self._route(target)
+        if route is None or route.system or (route.has_bindings and route.binding is None):
+            return None
+        if receiver and route.binding and not route.binding.allows(receiver):
+            return None
+        return Event(inbox_id=target, source=QUESTION_SOURCE,
+                                external_id=f"{payload['request']}:{len(parents)}",
+                                payload={**payload, "parents": parents, "agent_id": receiver, "dispatch_session": dispatch_session})
+
+    async def _consult(self, event: Event) -> None:
+        data = event.payload
+        asker = self._sessions.find_by_request_id(data["request"])
+        if asker is None or asker.session_id != data["asker"] or asker.status != "suspended":
+            return
+        action, message, recommendation = "upstream", "派活方当前无法回答。", ""
+        agent = event_agent_id(event)
+        try:
+            agent = self._agent_for(event.inbox_id, event, agent, None)
+            executor = self._executors.get(agent)
+            if isinstance(executor, QuestionAdvisorPort):
+                caps = _ScopedCapabilities(self._memory, self._timers, self._permissions, lambda: [],
+                                           lambda: self._retired, None)
+                action, message, recommendation = await executor.advise(event, caps)
+        except Exception:
+            logging.getLogger(__name__).exception("Consultation failed for %s", data["request"])
+        findings = "\n".join(filter(None, (data["findings"], message)))
+        if action == "upstream":
+            question = self._dispatcher_question(event.inbox_id, agent or "", {**data, "findings": findings})
+            if question is not None:
+                self._queue_event(question)
+                return
+        self._queue_event(Event(inbox_id=asker.inbox_id, source=ADVICE_SOURCE, session_id=asker.session_id,
+                                external_id=data["request"], payload={"approval_request_id": data["request"],
+                                    "comment": findings, "escalate": action != "answer",
+                                    "recommendation": recommendation}))
 
     def _close_with_parent(self, inbox_id: str, event: Event) -> RunReport | None:
         session = self._sessions.get(event.session_id) if event.session_id else None
@@ -1353,7 +1422,7 @@ class AgentWorker:
                 return []
             newly_folded: list[Event] = []
             for found in self._runnable(self._inbox.fetch_pending(inbox_id)):
-                if found.event_id in consumed_ids or found.source in (RETURN_CANCELLED_SOURCE, CLOSE_SOURCE):
+                if found.event_id in consumed_ids or found.source in (RETURN_CANCELLED_SOURCE, CLOSE_SOURCE, QUESTION_SOURCE):
                     continue
                 if not self._welcome(inbox_id, found):
                     continue
@@ -1579,7 +1648,9 @@ class AgentWorker:
             # The approval that resumes it carries no lineage of its own.
             final_spec = with_lineage(ForwardSpec(target_inbox=inbox_id), consumed, active_session)
         if isinstance(outcome, Suspend) and final_spec is not None:
-            final_spec = replace(final_spec, from_person=forwards.from_person())
+            named = next((e.payload["question_to"] for e in consumed if self._origin(e) == "operator"
+                          and isinstance(e.payload.get("question_to"), str)), final_spec.question_inbox)
+            final_spec = replace(final_spec, from_person=forwards.from_person(), question_inbox=named)
         awaiting = final_spec is not None and bool(final_spec.pending_returns)
         trace_id = _run_trace_id(consumed, active_session)
         report_metadata = self._report_metadata(
@@ -1616,6 +1687,13 @@ class AgentWorker:
         # Before the result is written, so a crash in between repeats the Run and its deduplicated forwards.
         for event in forwards.staged:
             self._queue_event(event)
+        consultation = None
+        if isinstance(outcome, Suspend) and outcome.question_brief and final_spec is not None:
+            consultation = self._dispatcher_question(inbox_id, executor.executor_id, {
+                "request": outcome.request_id, "asker": outcome.session_id or active_session.session_id,
+                "brief": outcome.question_brief, "question": outcome.prompt, "findings": "",
+                "parents": list(final_spec.question_parents),
+            }, final_spec.question_inbox)
         final_session_id = self._apply_outcome(
             inbox_id,
             active_session,
@@ -1632,7 +1710,7 @@ class AgentWorker:
             handed_over=handed_over,
             awaiting_returns=awaiting,
             returned=returned,
-            task_held=held is not None and bool(held_fields),
+            task_held=held is not None and bool(held_fields), consultation=consultation,
         )
         all_done_ids = batch_ids + [evt.event_id for evt in folded_events]
         if final_session_id is not None and final_session_id != active_session.session_id:
@@ -1650,6 +1728,7 @@ class AgentWorker:
             correlation_key=final_key,
             trace_id=trace_id,
             pending_elsewhere=bool(forwards.staged) or awaiting or returned or handed_on,
+            consulting_dispatcher=consultation is not None,
         )
         if isinstance(outcome, Emit) and outcome.close_session and final_session_id is not None:
             # After the result and its events are written, so the reclaim gates no longer see them.
@@ -1742,7 +1821,7 @@ class AgentWorker:
     ) -> None:
         while not exec_task.done():
             has_new = self._interruptible and any(
-                evt.event_id not in known_ids and evt.source not in (RETURN_CANCELLED_SOURCE, CLOSE_SOURCE)
+                evt.event_id not in known_ids and evt.source not in (RETURN_CANCELLED_SOURCE, CLOSE_SOURCE, QUESTION_SOURCE)
                 for evt in self._runnable(self._inbox.fetch_pending(inbox_id))
             )
             if has_new:
@@ -1964,7 +2043,7 @@ class AgentWorker:
         return isinstance(request_id, str) and bool(request_id)
 
     def _matches_pending_approval(self, event: Event) -> bool:
-        if (event.payload.get("event_type") != "approval.decided" and event.source != MCP_APPROVAL_SOURCE
+        if (event.payload.get("event_type") != "approval.decided" and event.source not in (MCP_APPROVAL_SOURCE, ADVICE_SOURCE)
                 and not is_timed_resume(event)):
             return True
         request_id = event.payload.get("approval_request_id")
@@ -2238,6 +2317,7 @@ class AgentWorker:
         awaiting_returns: bool = False,
         returned: bool = False,
         task_held: bool = False,
+        consultation: Event | None = None,
     ) -> str | None:
         extra: dict[str, Any] = dict(report_metadata or {})
         # Set while the task goes on with other agents: it moves to that stage instead of being completed.
@@ -2380,6 +2460,9 @@ class AgentWorker:
                     )
                 )
                 if repeated or outcome.resume_after_seconds is not None:
+                    return target_sid
+                if consultation is not None:
+                    self._queue_event(consultation)
                     return target_sid
                 self._outbox.enqueue(
                     inbox_id=inbox_id,

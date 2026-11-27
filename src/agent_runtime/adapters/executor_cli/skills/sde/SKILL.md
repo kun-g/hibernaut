@@ -15,6 +15,12 @@ Work test-first:
 
 The project guidance quotes the documents selected for this task and lists the rest in a catalog. When the catalog lists a document for the kind of work you turn out to be doing (for example how to write an issue, change a version or cut a release), read it at the pinned commit (`git show <commit>:<path>`) before you start that part and follow it. Editing the project's guidance files does not change the guidance this task is reviewed against.
 
+# Asking for a decision
+
+When the brief delegates implementation choices (“拿不准的自己定”), make the choice and record it in the summary. Use `needs_input` for a decision beyond that scope. The dispatcher gets the question first when available.
+
+Write the question as a proposal the person can approve with one click. For example: “是否允许已有的读取凭证访问新文件夹？” In `decision`, explain what is blocked, why the person owns the choice, and what happens to those credentials under each button. Explain an unfamiliar name where you first use it. Recommend the button you would choose and give the trade-off in the reason. Reject ends the task, so describe what stays in place when work stops.
+
 # Versioning and pull request
 
 If the role contract assigns publication to Hibernaut, commit the reviewed work locally, classify the change, and report the evidence. Hibernaut handles the version and PR. For standalone publication, follow these steps:

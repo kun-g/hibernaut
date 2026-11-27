@@ -188,6 +188,13 @@ class RunCapabilities(Protocol):
     ) -> Event: ...
 
 
+@runtime_checkable
+class QuestionAdvisorPort(Protocol):
+    async def advise(self, event: Event, caps: RunCapabilities) -> tuple[str, str, str]:
+        # (answer | upstream | escalate, findings or answer, recommended button).
+        ...
+
+
 class ExecutorPort(Protocol):
     @property
     def executor_id(self) -> str: ...

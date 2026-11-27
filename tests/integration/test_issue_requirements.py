@@ -11,6 +11,7 @@ from agent_runtime.adapters.storage_sqlite.workspaces import SQLiteWorkspaceStor
 from agent_runtime.core.models import Emit, Event, SessionRef, Silent, Suspend
 from agent_runtime.engine import EventHandler
 from switchboard.envelope import CanonicalEvent
+from tests.support.input_decision import DECISION
 from tests.support.fakes import InMemoryInbox
 from tests.support.coder_reviewer import fake_command
 from tests.support.sde_delivery import PASS, SDEDeliveryCase, dev
@@ -97,8 +98,8 @@ class TestSDEFromIssues(SDEIssueCase):
         self.assertIsInstance(await self.sde().execute(events, session, self.caps), Silent)
 
     async def test_a_queued_legacy_comment_on_a_suspended_task_keeps_the_open_request(self):
-        self.set_plan(sde=[{"write": {}, "output": {"status": "needs_input", "summary": "s", "test_evidence": "",
-                                                   "question": "Which browser versions?", "change_kind": "fix",
+        self.set_plan(sde=[{"write": {}, "output": {"status": "needs_input", "decision": DECISION, "summary": "s", "test_evidence": "",
+                                                   "question": "需要支持旧版浏览器吗？", "change_kind": "fix",
                                                    "change_rationale": "r"}}])
         executor = self.sde(review=False)
         first = await executor.execute(relayed_issue(), None, self.caps)

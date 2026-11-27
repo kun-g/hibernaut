@@ -50,7 +50,6 @@ def render_approval_card(
         "header": {"template": "orange", "title": {"tag": "plain_text", "content": title}},
         "elements": [
             {"tag": "markdown", "content": body_md},
-            {"tag": "note", "elements": [{"tag": "plain_text", "content": correlation_key}]},
             {
                 "tag": "action",
                 "actions": [
