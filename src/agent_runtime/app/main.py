@@ -150,6 +150,8 @@ from agent_runtime.app.projects import (
     project_memory_key,
 )
 from agent_runtime.app.reload import ReloadStatus
+from agent_runtime.app.ops_tools import DokployTools
+from agent_runtime.app.repo_tools import DriveSources, RepoCreator
 from agent_runtime.app.system_tools import RuntimeStatus, SystemToolbox
 from agent_runtime.core.models import Event, InboxBinding, InboxRoute, NewEventPolicy
 from agent_runtime.core.ports import ChannelPort, ExecutorPort, OutboxPort, RunCapabilities
@@ -427,6 +429,14 @@ class ForwardTargets:
     def has_system_tools(self, inbox_id: str) -> bool:
         bound = self._in_force(inbox_id)
         return bound is not None and bound.system_tools
+
+    def has_ops_tools(self, inbox_id: str) -> bool:
+        bound = self._in_force(inbox_id)
+        return bound is not None and bound.ops_tools
+
+    def has_repo_tools(self, inbox_id: str) -> bool:
+        bound = self._in_force(inbox_id)
+        return bound is not None and bound.repo_tools
 
 
 @dataclass
@@ -1300,6 +1310,15 @@ def build_daemon_from_config(
         # The chat's Steward reads the same status as the system Steward, without any system tool.
         runtime_status = RuntimeStatus(ops_status, daemon.reloads)
 
+        def _drive_sources() -> DriveSources:
+            # Read anew for each repository: the proxy's client token, never a Google credential.
+            gdrive = config.gdrive
+            return ProxiedDriveClient(
+                CredentialProxyClient(gdrive.proxy_url, timeout_seconds=300.0,
+                                      token=read_private_token(Path(gdrive.proxy_token_file))),
+                service_name=gdrive.proxy_service,
+            )
+
         def _bound_steward(role: RoleConfig, bound: WorkdirBinding) -> StewardExecutor:
             def listed(inbox_id: str) -> tuple[ProjectConfig, ...]:
                 route = _route(inbox_id)
@@ -1309,7 +1328,9 @@ def build_daemon_from_config(
             def systems(inbox_id: str) -> tuple[WorkdirBinding, ...]:
                 route = _route(inbox_id)
                 return tuple(b for b in config.runtime.inbox_bindings
-                             if b.system_tools and route is not None and b.rule.literal in route.forward_to)
+                             if b.person_only and route is not None and b.rule.literal in route.forward_to)
+
+            inbox = bound.rule.literal or ""
 
             def readable(inbox_id: str, asked: str) -> bool:
                 if any(b.rule.literal == asked for b in systems(inbox_id)):
@@ -1332,18 +1353,28 @@ def build_daemon_from_config(
                 branch=role.branch,
                 scope=GlobalScope(
                     manifest=lambda inbox_id: build_system_manifest(
-                        inbox_id, bound.binding, tuple(config.agents.values())
-                    ) if bound.system_tools else build_global_manifest(
+                        inbox_id, bound.binding, tuple(config.agents.values()), ops=bound.ops_tools,
+                    ) if bound.person_only else build_global_manifest(
                         inbox_id, bound.binding, tuple(config.agents.values()), listed(inbox_id),
                         config.runtime.default_agent, systems(inbox_id),
+                        repo_owner=config.repo_tools.owner if bound.repo_tools else "",
                     ),
                     readable=readable,
                     system=SystemToolbox(
                         reloads=daemon.reloads,
-                        allowed=lambda: targets.has_system_tools(bound.rule.literal or ""),
+                        allowed=lambda: targets.has_system_tools(inbox),
                         status=ops_status,
                     ) if bound.system_tools else None,
-                    status=None if bound.system_tools else runtime_status,
+                    status=None if bound.person_only else runtime_status,
+                    repo=RepoCreator(
+                        owner=config.repo_tools.owner, drive=_drive_sources, max_bytes=config.repo_tools.max_bytes,
+                        allowed=lambda: targets.has_repo_tools(inbox),
+                    ) if bound.repo_tools else None,
+                    ops=DokployTools(
+                        script=config.ops_tools.dokploy_script, workdir=bound.workdir,
+                        staging=config.ops_tools.staging_environments, timeout=config.ops_tools.timeout_seconds,
+                        allowed=lambda: targets.has_ops_tools(inbox),
+                    ) if bound.ops_tools else None,
                 ),
             )
 

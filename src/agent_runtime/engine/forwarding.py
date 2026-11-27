@@ -585,7 +585,7 @@ class ForwardStage:
         binding_route = self._check_inbox("target_inbox", target, crossing)
         if binding_route is not None and binding_route.system and not self.from_person():
             raise ForwardRefused(f"'{target}' takes only what a person asks for in this turn, in their own chat or on "
-                                 "this host; ask them")
+                                 "this host, or the next step after a system inbox finished their request; ask them")
         relayed = target == self.inbox_id
         agent = _text(target_agent)
         if crossing and agent is not None:
@@ -676,9 +676,23 @@ class ForwardStage:
     def from_person(self) -> bool:
         events = self.events()
         saved = self.session.forward
-        return any(self.origin(evt) is not None for evt in events) or (
-            saved is not None and saved.from_person and any(map(is_approval, events))
-        )
+        return any(self.origin(evt) is not None for evt in events) or (saved is not None and (
+            (saved.from_person and any(map(is_approval, events)))
+            or any(self._carries_request(evt, saved) for evt in events)
+        ))
+
+    def _carries_request(self, event: Event, saved: ForwardSpec) -> bool:
+        # A finished result of work this session still waits for, sent back by an inbox that takes nothing but a
+        # person's own request: the next step of that request goes on from it. A project's result does not, nor does a
+        # failed one, so a chain stops at the step that failed.
+        piece = returned_piece(event)
+        if piece is None or piece not in saved.pending_returns or self.routes is None or is_replay(event):
+            return False
+        if event.payload.get("status") != "done":
+            return False
+        sender = _text(event.payload.get("forwarded_from"))
+        route = self.routes(sender) if sender is not None else None
+        return route is not None and route.system
 
     def _crosses(self, target: str) -> bool:
         if self.routes is None:

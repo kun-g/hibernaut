@@ -43,13 +43,17 @@ class OnboardError(Exception):
         self.config_kept = config_kept
 
 
-def run_command(argv: Sequence[str], env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def run_command(
+    argv: Sequence[str], env: Mapping[str, str] | None = None, *, timeout: float | None = None, cwd: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     # A fixed argument list, never a shell; what it started ends with it.
     args = list(argv)
-    timeout = _CLONE_TIMEOUT_SECONDS if "clone" in args[:3] else _COMMAND_TIMEOUT_SECONDS
+    if timeout is None:
+        timeout = _CLONE_TIMEOUT_SECONDS if "clone" in args[:3] else _COMMAND_TIMEOUT_SECONDS
     try:
         proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                errors="replace", env=dict(env) if env is not None else None, start_new_session=True)
+                                errors="replace", env=dict(env) if env is not None else None, start_new_session=True,
+                                cwd=cwd)
     except OSError as exc:
         return subprocess.CompletedProcess(args, 127, "", f"{args[0]}: {exc.strerror}")
     try:
@@ -168,7 +172,7 @@ def project_agents(config: HibernautConfig) -> ProjectAgents:
     projects = list(config.projects.values())
     in_front = [_main_agent(config, p) for p in projects]
     elsewhere = {agent for b in config.runtime.inbox_bindings for agent in (*b.binding.agents, b.binding.default_agent)
-                 if b.system_tools or agent not in in_front}
+                 if b.person_only or agent not in in_front}
     stewards = [name for name, role in config.roles.items()
                 if role.role == STEWARD_ROLE and not role.workdir and name not in elsewhere]
     steward = _most_used(stewards, in_front, STEWARD_ROLE)

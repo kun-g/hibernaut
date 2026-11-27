@@ -98,6 +98,23 @@ class ChannelsConfig:
 TerminalBackend = Literal["orca", "none"]
 TERMINAL_BACKENDS: tuple[TerminalBackend, ...] = ("orca", "none")
 @dataclass(frozen=True, slots=True)
+class RepoToolsConfig:
+    # The GitHub owner create_repo makes private repositories under; "" when no inbox has repo_tools.
+    owner: str = ""
+    # Most bytes the unpacked first version may take on disk.
+    max_bytes: int = 512 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class OpsToolsConfig:
+    # The workspace's Dokploy script: it reads its token from the keychain and redacts what it prints.
+    dokploy_script: str = ""
+    # Environments that count as staging; every other one, and one that cannot be told, counts as production.
+    staging_environments: tuple[str, ...] = ("staging",)
+    timeout_seconds: float = 120.0
+
+
+@dataclass(frozen=True, slots=True)
 class OnboardingConfig:
     # Lower-cased GitHub owners in whose repositories the system tools may create the trigger label.
     label_owners: tuple[str, ...] = ()
@@ -581,6 +598,8 @@ class HibernautConfig:
     collaboration: CollaborationConfig = field(default_factory=CollaborationConfig)
     runner_pilot: RunnerPilotConfig = field(default_factory=RunnerPilotConfig)
     onboarding: OnboardingConfig = field(default_factory=OnboardingConfig)
+    repo_tools: RepoToolsConfig = field(default_factory=RepoToolsConfig)
+    ops_tools: OpsToolsConfig = field(default_factory=OpsToolsConfig)
     availability: AvailabilityConfig = field(default_factory=AvailabilityConfig)
     # The directory relative paths were resolved against (the config file's); "" when parsed without one.
     config_dir: str = ""
@@ -609,8 +628,8 @@ def _parse_timers(raw: object, runtime: RuntimeConfig, projects: Mapping[str, Pr
             raise ValueError(f"{where}.inbox_id must be a string")
         sanitize_segment(inbox, field_name=f"{where}.inbox_id")
         bound = runtime.workdir_binding(inbox)
-        if bound and bound.system_tools:
-            raise ValueError(f"{where}: {inbox} has system_tools")
+        if bound and bound.person_only:
+            raise ValueError(f"{where}: {inbox} has {'system_tools' if bound.system_tools else 'ops_tools'}")
         project = router.resolve(inbox)
         if not bound and (not project or (project.inbox_bindings and not project.route(inbox).binding)):
             raise ValueError(f"{where}.inbox_id {inbox!r} has no binding")
@@ -833,6 +852,40 @@ def parse_onboarding(raw: Any) -> OnboardingConfig:
         if not _OWNER_RE.fullmatch(owner):
             raise ValueError(f"onboarding.label_owners: {owner!r} is not a GitHub owner")
     return OnboardingConfig(label_owners=owners)
+
+
+def parse_repo_tools(raw: Any, runtime: RuntimeConfig, gdrive: GDriveConfig) -> RepoToolsConfig:
+    section = _Table(raw if raw is not None else {}, "repo_tools", frozenset({"owner", "max_bytes"}))
+    defaults = RepoToolsConfig()
+    owner = section.text("owner").lower() if "owner" in section.raw else ""
+    if owner and not _OWNER_RE.fullmatch(owner):
+        raise ValueError(f"repo_tools.owner: {owner!r} is not a GitHub owner")
+    found = RepoToolsConfig(owner=owner, max_bytes=section.count("max_bytes", defaults.max_bytes))
+    used = [b.rule.text for b in runtime.inbox_bindings if b.repo_tools]
+    if used and not owner:
+        raise ValueError(f"repo_tools = true ({', '.join(used)}) needs [repo_tools] owner")
+    if used and not (gdrive.proxy_url and gdrive.proxy_token_file):
+        # The first version comes from Drive through the credential proxy only; no Google credential is held here.
+        raise ValueError(f"repo_tools = true ({', '.join(used)}) needs [gdrive] proxy_url and proxy_token_file")
+    return found
+
+
+def parse_ops_tools(raw: Any, runtime: RuntimeConfig, base_dir: Path | None) -> OpsToolsConfig:
+    section = _Table(raw if raw is not None else {}, "ops_tools",
+                     frozenset({"dokploy_script", "staging_environments", "timeout_seconds"}))
+    defaults = OpsToolsConfig()
+    script = section.path("dokploy_script", base_dir) if "dokploy_script" in section.raw else ""
+    staging = section.names("staging_environments", defaults.staging_environments)
+    if not staging:
+        raise ValueError("ops_tools.staging_environments must name at least one environment")
+    timeout = section.raw.get("timeout_seconds", defaults.timeout_seconds)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout < math.inf:
+        raise ValueError("ops_tools.timeout_seconds must be a positive number")
+    used = [b.rule.text for b in runtime.inbox_bindings if b.ops_tools]
+    if used and not script:
+        raise ValueError(f"ops_tools = true ({', '.join(used)}) needs [ops_tools] dokploy_script")
+    return OpsToolsConfig(dokploy_script=script, staging_environments=tuple(dict.fromkeys(staging)),
+                          timeout_seconds=float(timeout))
 
 
 def _validate_runner_pilot(config: HibernautConfig) -> None:
@@ -1615,6 +1668,8 @@ def parse_config(raw: dict[str, Any], *, base_dir: Path | None = None) -> Hibern
         collaboration=collaboration,
         runner_pilot=parse_runner_pilot(raw.get("runner_pilot"), base_dir=base_dir),
         onboarding=parse_onboarding(raw.get("onboarding")),
+        repo_tools=parse_repo_tools(raw.get("repo_tools"), runtime, gdrive),
+        ops_tools=parse_ops_tools(raw.get("ops_tools"), runtime, base_dir),
         availability=parse_availability(raw.get("availability"), base_dir=base_dir),
         config_dir=str(base_dir) if base_dir is not None else "",
     )
