@@ -293,19 +293,21 @@ class ProxiedDriveClient:
         return self._download("download", file_meta)
 
     def source_folder(self, *, name: str | None = None, folder_id: str | None = None) -> tuple[str, list[DriveFileMeta]]:
-        # (the folder's name, the files directly inside it) of a folder in the proxy's sources folder.
         data = self._call("source_folder", {"folder_id": folder_id} if folder_id else {"name": name or ""})
         folder = data.get("folder") if isinstance(data.get("folder"), dict) else {}
         return str(cast(dict[str, Any], folder).get("name", "")), [
             _meta_from_json(item) for item in data.get("files", [])]
 
-    def download_source(self, file_meta: DriveFileMeta) -> DriveDownload:
-        return self._download("source_download", file_meta)
+    def download_source(self, file_meta: DriveFileMeta, *, folder_id: str | None = None) -> DriveDownload:
+        return self._download("source_download", file_meta, folder_id=folder_id)
 
-    def _download(self, op: str, file_meta: DriveFileMeta) -> DriveDownload:
+    def _download(self, op: str, file_meta: DriveFileMeta, *, folder_id: str | None = None) -> DriveDownload:
         # The body is the file itself; name and types come back in headers. The proxy enforces the folder and size.
+        payload = {"file_id": file_meta.file_id}
+        if folder_id is not None:
+            payload["folder_id"] = folder_id
         resp = self._proxy.call_service_bytes(
-            service_name=self._service, method="POST", path=op, payload={"file_id": file_meta.file_id}
+            service_name=self._service, method="POST", path=op, payload=payload
         )
         if resp.status_code != 200:
             raise DriveProxyError(op, resp.status_code, _error_reason(resp.body))

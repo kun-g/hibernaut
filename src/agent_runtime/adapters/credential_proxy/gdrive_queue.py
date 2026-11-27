@@ -123,6 +123,10 @@ class ServiceAccountTokenProvider:
     def __repr__(self) -> str:
         return f"ServiceAccountTokenProvider(client_email={self._client_email!r})"
 
+    @property
+    def client_email(self) -> str:
+        return self._client_email
+
     def get_token(self) -> str:
         with self._lock:
             return self._get_token_locked()
@@ -296,10 +300,6 @@ def _drive_id(args: Mapping[str, Any], key: str) -> str:
 
 
 class DriveQueueGuard:
-    # The allow-list: six operations on the four queue folders and the files directly inside them, plus 'list' and
-    # the read-only 'download' on the 附件/ folder and the files directly inside it. Apart from the queue, the read-only
-    # 'source_folder' and 'source_download' on the folders directly inside sources_folder_id and their files (the
-    # versions a new repository starts from); off when no sources folder is configured.
     OPS = ("subfolders", "list", "meta", "read", "append", "move", "download", "source_folder", "source_download")
 
     def __init__(
@@ -313,6 +313,8 @@ class DriveQueueGuard:
         failed_folder_id: str = "",
         attachments_folder_id: str = "",
         sources_folder_id: str = "",
+        allow_any_source_folder: bool = False,
+        client_email: str = "",
         max_read_bytes: int = 2 * 1024 * 1024,
         max_append_bytes: int = 256 * 1024,
         max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
@@ -322,6 +324,8 @@ class DriveQueueGuard:
         self._explicit = (pending_folder_id, in_progress_folder_id, done_folder_id, failed_folder_id)
         self._explicit_attachments = attachments_folder_id
         self._sources = sources_folder_id
+        self._allow_any_source_folder = allow_any_source_folder
+        self._service_account = f"the service account ({client_email})" if client_email else "the service account"
         self._max_read = max_read_bytes
         self._max_append = max_append_bytes
         self._max_download = max_download_bytes
@@ -370,17 +374,31 @@ class DriveQueueGuard:
 
     def _sources_root(self) -> str:
         if not self._sources:
-            raise ProxyRefused(403, "no sources folder is configured for this proxy")
+            if self._allow_any_source_folder:
+                raise ProxyRefused(400, f"Provide a Drive folder link and share the folder with {self._service_account}")
+            raise ProxyRefused(403, "No sources folder is configured. Configure sources_folder_id for name lookup, "
+                                   "or enable allow_any_source_folder, provide a Drive folder link and share the "
+                                   f"folder with {self._service_account}")
         return self._sources
 
     def _source_folder_meta(self, args: Mapping[str, Any]) -> tuple[str, str]:
-        # (id, name) of a folder directly inside the sources folder, by its name or its ID; nothing deeper, nothing else.
-        root = self._sources_root()
         if "folder_id" in args:
-            meta = self._drive.get_file_meta(_drive_id(args, "folder_id"))
-            if meta.mime_type != _GOOGLE_FOLDER_MIME or root not in meta.parents:
+            root = None if self._allow_any_source_folder else self._sources_root()
+            folder_id = _drive_id(args, "folder_id")
+            try:
+                meta = self._drive.get_file_meta(folder_id)
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (403, 404):
+                    raise
+                exc.close()
+                raise ProxyRefused(exc.code, f"Cannot access the Drive folder. Check the link and share the folder "
+                                             f"with {self._service_account}") from exc
+            if meta.mime_type != _GOOGLE_FOLDER_MIME:
+                raise ProxyRefused(400, "folder_id must identify a Drive folder")
+            if root is not None and root not in meta.parents:
                 raise ProxyRefused(403, "folder is not directly inside the sources folder")
             return meta.file_id, meta.name
+        root = self._sources_root()
         name = args.get("name")
         if not isinstance(name, str) or not name.strip():
             raise ProxyRefused(400, "'name' or 'folder_id' is required")
@@ -395,11 +413,15 @@ class DriveQueueGuard:
                 "files": [_meta_json(m) for m in self._drive.list_files(folder_id)]}
 
     def download_source(self, args: Mapping[str, Any]) -> DriveDownload:
-        root = self._sources_root()
+        if "folder_id" in args:
+            folder_id, _ = self._source_folder_meta(args)
+            folders = {folder_id}
+        else:
+            # Older clients send only file_id. Their scope stays within the configured sources root.
+            folders = set(self._drive.find_subfolders(self._sources_root()).values())
         meta = self._drive.get_file_meta(_drive_id(args, "file_id"))
-        folders = set(self._drive.find_subfolders(root).values())
-        if meta.mime_type == _GOOGLE_FOLDER_MIME or not folders & set(meta.parents):
-            raise ProxyRefused(403, "file is not in a folder directly inside the sources folder")
+        if meta.mime_type == _GOOGLE_FOLDER_MIME or folders.isdisjoint(meta.parents):
+            raise ProxyRefused(403, "file is not directly inside the source folder")
         if meta.mime_type.startswith(_GOOGLE_APPS_PREFIX) and meta.mime_type != _GOOGLE_DOC_MIME:
             raise ProxyRefused(415, "only Google Docs among Google files can be downloaded; export it to a file first")
         if meta.size is not None and meta.size > self._max_download:
@@ -664,6 +686,7 @@ _CONFIG_KEYS = frozenset(
         "failed_folder_id",
         "attachments_folder_id",
         "sources_folder_id",
+        "allow_any_source_folder",
         "max_download_bytes",
     }
 )
@@ -683,6 +706,7 @@ class DriveProxyConfig:
     failed_folder_id: str = ""
     attachments_folder_id: str = ""
     sources_folder_id: str = ""
+    allow_any_source_folder: bool = False
     max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES
 
 
@@ -705,6 +729,10 @@ def load_proxy_config(path: str | Path) -> DriveProxyConfig:
     max_download = raw.get("max_download_bytes", DEFAULT_MAX_DOWNLOAD_BYTES)
     if isinstance(max_download, bool) or not isinstance(max_download, int) or max_download <= 0:
         raise ValueError("max_download_bytes must be a positive integer")
+
+    allow_any = raw.get("allow_any_source_folder", False)
+    if not isinstance(allow_any, bool):
+        raise ValueError("allow_any_source_folder must be a boolean")
 
     ids: dict[str, str] = {}
     for key in ("root_folder_id", "pending_folder_id", "in_progress_folder_id", "done_folder_id", "failed_folder_id",
@@ -736,13 +764,15 @@ def load_proxy_config(path: str | Path) -> DriveProxyConfig:
         listen_port=port,
         service_name=service,
         max_download_bytes=max_download,
+        allow_any_source_folder=allow_any,
         **ids,
     )
 
 
 def build_guard(config: DriveProxyConfig, *, api_base: str = _GOOGLE_API_BASE) -> DriveQueueGuard:
+    tokens = ServiceAccountTokenProvider(key_path=config.service_account_key_file)
     drive = GoogleDriveHTTPClient(
-        token_provider=ServiceAccountTokenProvider(key_path=config.service_account_key_file),
+        token_provider=tokens,
         api_base=api_base,
     )
     return DriveQueueGuard(
@@ -754,6 +784,8 @@ def build_guard(config: DriveProxyConfig, *, api_base: str = _GOOGLE_API_BASE) -
         failed_folder_id=config.failed_folder_id,
         attachments_folder_id=config.attachments_folder_id,
         sources_folder_id=config.sources_folder_id,
+        allow_any_source_folder=config.allow_any_source_folder,
+        client_email=tokens.client_email,
         max_download_bytes=config.max_download_bytes,
     )
 

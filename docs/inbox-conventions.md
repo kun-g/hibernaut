@@ -118,7 +118,7 @@ SDE 等用户离开电脑（任务说要等空闲再做）时按契约返回 `ne
 
 需求 R12–R15、C7–C9 见 [`requirements/system-steward.md`](requirements/system-steward.md)。人在单聊对全局 Steward 说一句「新建项目 X，从 Drive 下最新版本作初始提交，再配好预发布和生产」，全局 Steward 依次：
 
-1. `create_repo`（绑定写 `repo_tools = true`）：在 `[repo_tools] allowed_owners` 允许的账号或组织下建私有仓库，未指定时用 `owner`，旧配置仅允许 `owner`，首次提交是凭据代理 `sources_folder_id` 下同名文件夹（或人给的链接）里最新修改的文件，压缩包解开；仓库已存在、文件夹空、下载或推送失败都停下说明。
+1. `create_repo`（绑定写 `repo_tools = true`）：在 `[repo_tools] allowed_owners` 允许的账号或组织下建私有仓库，未指定时用 `owner`，旧配置仅允许 `owner`，首次提交是人给的 Drive 项目文件夹里最新修改的直接文件。代理默认仅限 `sources_folder_id` 的直接子目录，`allow_any_source_folder` 开启后可用其他共享文件夹；省略链接时在 `sources_folder_id` 下按项目名查找，压缩包解开；仓库已存在、文件夹空、下载或推送失败都停下说明。
 2. 转给系统 Inbox 接入（`return_to` 自己），等回信。
 3. 回信 `done` 才转给运维 Inbox 配环境（`return_to` 自己）；回信 `failed` 时停下，代码也拒绝这次转投。
 4. 汇总：仓库、hb 接入、两个环境的地址和状态。
