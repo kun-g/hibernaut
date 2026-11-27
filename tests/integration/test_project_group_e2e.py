@@ -94,14 +94,14 @@ class GroupTests(ProjectGroupCase):
             [{"calls": [forward("proj:a:sde", "订单页加导出（郭勇已确认）")]},
              {"output": {"action": "escalate", "category": "改需求", "message": "导出格式将成为对客户的承诺。",
                          "recommendation": "批准"}}],
-            [{"output": {"status": "needs_input", "summary": "", "test_evidence": "",
+            [{"commit": False, "output": {"status": "needs_input", "summary": "", "test_evidence": "",
                          "question": "订单导出采用 CSV（逗号分隔的表格文件）吗？",
                          "decision": {"background": "订单页需要提供导出功能，目前在确认文件格式。",
                                       "reason": "合作方确认了要导出订单，具体格式需要项目负责人决定。",
                                       "approve": "按逗号分隔的表格格式继续处理订单导出",
                                       "reject": "保留订单页现有的导出方式", "recommendation": "批准"},
                          "change_kind": "feature", "change_rationale": "订单导出新增格式选择"}},
-             {"output": {"status": "done", "summary": "导出已经有了，不用改", "test_evidence": "pytest: 3 passed",
+             {"commit": False, "output": {"status": "done", "summary": "导出已经有了，不用改", "test_evidence": "pytest: 3 passed",
                          "change_kind": "test_docs", "change_rationale": "nothing changed", "code_change": False}}],
         )
         await self.say("确认，按你说的做")
@@ -124,7 +124,13 @@ class GroupTests(ProjectGroupCase):
         await asyncio.to_thread(post, f"{self.board.url}/webhooks/feishu",
                                 card_click(value["actions"][0]["value"], operator=KUN))
         # What the developer finally says goes back to the group's thread.
-        await self.wait_for(lambda: any("不用改" in r for r in self.thread_replies("om_1")), "the developer's answer")
+        await self.wait_for(lambda: self.thread_replies("om_1"), "the developer's answer")
+        [reply] = self.thread_replies("om_1")
+        self.assertEqual(json.loads(reply)["text"], "已核查，这次没有代码改动。")
+        [(report,)] = self.rows("SELECT content FROM outbox WHERE inbox_id = 'proj:a:sde' "
+                                "AND json_extract(metadata_json, '$.kind') = 'emit'")
+        self.assertIn("导出已经有了，不用改", report)
+        self.assertIn("pytest: 3 passed", report)
         self.assertEqual([e.inbox_id for e in self.events(FORWARD_SOURCE)], ["proj:a:sde"])
         self.assertEqual([launch["role"] for launch in self.launches()], ["steward", "sde", "steward", "sde"])
 

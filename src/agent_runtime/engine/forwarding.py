@@ -22,6 +22,7 @@ from agent_runtime.core.models import (
     Silent,
     Suspend,
     TaskLink,
+    delivery_chat_reply,
     explicit_trace_id,
     resolve_trace_id,
     resolve_trigger_event,
@@ -378,6 +379,33 @@ def return_session(sessions: SessionStorePort, spec: ForwardSpec) -> str | None:
 def _lineage_fields(spec: ForwardSpec) -> dict[str, str]:
     fields = {"trace_id": spec.trace_id, "parent_event_id": spec.parent_event_id}
     return {key: value for key, value in fields.items() if value}
+
+
+def returned_chat_reply(events: Sequence[Event], outcome: Emit) -> str:
+    if outcome.chat_reply or outcome.delivery or not outcome.messages:
+        return outcome.chat_reply
+    briefs: list[str] = []
+    text = "\n\n".join(outcome.messages).strip()
+    copied = False
+    for event in events:
+        if event.source != RETURN_SOURCE:
+            continue
+        payload = event.payload
+        brief = _text(payload.get("chat_reply"))
+        delivery = payload.get("delivery")
+        if not brief and isinstance(delivery, dict):
+            brief = delivery_chat_reply(cast(dict[str, object], delivery))
+        if brief:
+            briefs.append(brief)
+            original = _text(payload.get("text"))
+            copied |= original is not None and original in text
+    if not briefs:
+        return ""
+    # A steward may write its own short answer. A quoted, excerpted or lengthy report uses the child's view.
+    if copied or len(text) > 240 or any(label in text.casefold() for label in ("workdir:", "orca terminal:", "test evidence:")):
+        return "\n".join(dict.fromkeys(briefs))
+    links = dict.fromkeys(line for brief in briefs for line in brief.splitlines() if line.startswith("https://"))
+    return "\n".join([text, *(link for link in links if link not in text)])
 
 
 def return_payload(

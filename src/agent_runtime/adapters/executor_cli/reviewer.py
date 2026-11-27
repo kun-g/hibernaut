@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -61,6 +62,12 @@ _READ_ONLY_TOOLS = (
 )
 _WRITE_TOOLS = ("Edit", "Write", "NotebookEdit", "MultiEdit")
 _MAX_DIFF_CHARS = 200_000
+# A summary that says the review has not happened yet: a marker word first, or a verdict still to come. The bare word
+# "placeholder" elsewhere is real text (#33: "placeholder rules", #34: "the placeholder domain").
+_PLACEHOLDER_SUMMARY = re.compile(
+    r"^\W*(?:placeholder|todo|tbd|wip|pending)\b|\bbefore (?:a|the|my|any) (?:real|final|actual|proper) (?:verdict|review)\b",
+    re.IGNORECASE,
+)
 _REVIEW_TURN = "review"
 
 REVIEW_SCHEMA: dict[str, Any] = {
@@ -567,6 +574,11 @@ def validate_review(raw: object) -> dict[str, Any]:
         blocking.append(entry)
     if (verdict == "pass") == bool(blocking):
         raise ReviewAborted(f"verdict '{verdict}' contradicts {len(blocking)} blocking item(s)")
+    if verdict == "pass" and not re.search(r"\w", summary):
+        raise ReviewAborted("a pass verdict has an empty summary; say what was checked")
+    if verdict == "pass" and _PLACEHOLDER_SUMMARY.search(summary):
+        raise ReviewAborted(f"a pass verdict has a placeholder summary ({summary.strip()[:80]!r}); finish the review "
+                            "and give the final verdict")
     notes = [str(n) for n in cast(list[object], notes_raw)] if isinstance(notes_raw, list) else []
     exchange_raw = data.get("developer_messages", [])
     exchange = [str(m) for m in cast(list[object], exchange_raw)] if isinstance(exchange_raw, list) else []

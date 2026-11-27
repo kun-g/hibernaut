@@ -172,6 +172,8 @@ class OutboundGateway:
                 labels: Any = meta.get(label_key)
                 if isinstance(labels, list | tuple):
                     target[label_key] = [str(label) for label in cast(Sequence[Any], labels)]
+        chat_reply = meta.get("chat_reply") if channel == "feishu" else None
+        brief = chat_reply if isinstance(chat_reply, str) and chat_reply else None
         return OutboundMessage(
             msg_id=f"msg_{new_ulid()}",
             idempotency_key=idempotency_key,
@@ -179,8 +181,8 @@ class OutboundGateway:
             kind="comment" if channel == "github" else "text",
             target=target,
             correlation_key=key,
-            title=event.subject,
-            body_md=event.body,
+            title="" if brief else event.subject,
+            body_md=brief or event.body,
         )
 
     def _notify_fallback(self) -> tuple[str, dict[str, Any]] | None:

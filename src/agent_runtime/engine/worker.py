@@ -83,6 +83,7 @@ from agent_runtime.engine.forwarding import (
     return_event,
     return_payload,
     return_refusal,
+    returned_chat_reply,
     returned_piece,
     returned_pieces,
     run_lineage,
@@ -1177,6 +1178,7 @@ class AgentWorker:
         text: str,
         status: str,
         metadata: dict[str, Any],
+        chat_reply: str = "",
         delivery: DeliveryOutcome | None = None,
         task_fields: Mapping[str, Any] | None = None,
     ) -> tuple[str, Suspend] | None:
@@ -1191,6 +1193,8 @@ class AgentWorker:
             inbox_id=inbox_id, agent_id=agent_id, session_id=session_id, spec=spec, events=events, text=text,
             status=status, title=_task_title(events), delivery=delivery,
         )
+        if chat_reply:
+            payload["chat_reply"] = chat_reply
         refusal = return_refusal(spec, inbox_id=inbox_id, agent_id=agent_id, payload=payload,
                                  permissions=self._permissions, routes=self._routes)
         if refusal is None:
@@ -1270,7 +1274,7 @@ class AgentWorker:
         payload = held.payload
         if not approved:
             # Only that it was withheld: the result itself stays here.
-            payload = {k: v for k, v in payload.items() if k != "delivery"}
+            payload = {k: v for k, v in payload.items() if k not in ("delivery", "chat_reply")}
             payload |= {"status": "refused", "text": (
                 f"The result of agent '{held.agent_id}' in inbox '{inbox_id}' was withheld: a person declined to hand "
                 "it back."
@@ -1655,6 +1659,8 @@ class AgentWorker:
         # What is said about work handed on stays in the Run's own records.
         handed_on = final_spec is not None and final_spec.handed_on
         returned = handed_on and isinstance(outcome, Emit)
+        if isinstance(outcome, Emit) and (reply := returned_chat_reply(consumed, outcome)):
+            outcome = replace(outcome, chat_reply=reply)
         held: tuple[str, Suspend] | None = None
         held_fields: dict[str, Any] = {}
         if isinstance(outcome, Emit) and final_spec is not None and final_spec.return_to is not None:
@@ -1665,7 +1671,7 @@ class AgentWorker:
             held = self._give_back(
                 inbox_id, executor.executor_id, active_session, final_spec, consumed,
                 text="\n\n".join(outcome.messages), status=outcome.status, delivery=outcome.delivery,
-                metadata=report_metadata, task_fields=held_fields,
+                metadata=report_metadata, task_fields=held_fields, chat_reply=outcome.chat_reply,
             )
             returned = True
             # Queued or held, this session no longer owes it.
@@ -2379,6 +2385,7 @@ class AgentWorker:
                         content=text,
                         metadata={
                             **self._with_status(extra, emit_status, delivery),
+                            **({"chat_reply": outcome.chat_reply} if outcome.chat_reply else {}),
                             **(task_fields if last else {}),
                             "kind": "emit",
                             "outcome_kind": "emit",
