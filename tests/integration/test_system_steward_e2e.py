@@ -38,6 +38,7 @@ from tests.support.sde_executor import make_base_repo
 from tests.support.steward import arg
 from tests.support.switchboard_inbound import feishu_message
 from tests.support.visible_roles import FakeOrcaTerminals, poll_test_terminals
+from tests.support.jsonl import read_jsonl
 
 ASH, OPS, CHAT = "user:main", "sys:ops", "feishu:p2p:oc_person"
 # Placeholder, not a real credential.
@@ -248,7 +249,8 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
     async def wait_for(self, check: Callable[[], Any], what: str) -> None:
         deadline = time.monotonic() + 60
         while not check():
-            self.assertLess(time.monotonic(), deadline, f"{what}: {self.answers()} {self.statuses()}")
+            if time.monotonic() >= deadline:
+                self.fail(f"{what}: {self.answers()} {self.statuses()}")
             self.board.board.worker.run_once()
             self.board.board.gateway.run_once()
             await asyncio.sleep(0.02)
@@ -267,7 +269,7 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
             return conn.execute(sql).fetchall()
 
     def calls(self) -> list[dict[str, Any]]:
-        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return read_jsonl(self.log)
 
     def launches(self) -> list[dict[str, Any]]:
         return [c for c in self.calls() if "answers" not in c and c["role"] != "probe"]
@@ -277,7 +279,7 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
 
     def commands(self, *start: str) -> list[list[str]]:
         path = self.state / "calls.jsonl"
-        found = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        found = read_jsonl(path)
         return [c for c in found if c[: len(start)] == list(start)]
 
     def events(self, source: str, inbox: str | None = None) -> list[Event]:
@@ -331,7 +333,7 @@ class EndToEndTests(ServedCase):
 
         await self.message("acme/tool 的除法坏了")
         await self.wait_for(lambda: len(self.launches()) == 5, "the developer")
-        ash, ops, again, front, sde = self.launches()
+        ash, _ops, again, front, sde = self.launches()
         for launch in (ash, again):
             self.assertIn("`sys:ops`", arg(launch, "--append-system-prompt"))
             self.assertNotIn("onboard_project", arg(launch, "--allowedTools"))

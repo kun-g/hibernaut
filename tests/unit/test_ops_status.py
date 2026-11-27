@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -102,7 +102,7 @@ class OpsStatusTests(unittest.TestCase):
         self.outbox.schedule_retry(retrying.message_id, "timeout", "2099-01-01T00:00:00+00:00")
         self.timers.reconcile(TIMERS)
         scheduler = TimerScheduler(timers=self.timers, inbox=self.inbox)
-        start = datetime.now(timezone.utc)
+        start = datetime.now(UTC)
         # A timer fires again only once its last event has been taken.
         for n, end in enumerate(("done", "failed", None), start=1):
             scheduler.tick(to_utc_iso(start + timedelta(seconds=900 * n + 1)))
@@ -181,7 +181,7 @@ class OpsStatusTests(unittest.TestCase):
         self.assertEqual(report["window"]["hours"], 24)
         self.assertLess(report["window"]["from"], report["window"]["to"])
         self.assertTrue(report["not_covered"])
-        old = self.reader.report(hours=1, timer_runs=1, now=datetime.now(timezone.utc) + timedelta(hours=2))
+        old = self.reader.report(hours=1, timer_runs=1, now=datetime.now(UTC) + timedelta(hours=2))
         self.assertEqual((old["failed"]["count"], old["deliveries"]["by_result"]), (0, {}))
         # What waits now waits whenever it began.
         self.assertEqual(old["suspended"]["count"], 5)

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Final, Mapping
+from typing import Any, Final
+from collections.abc import Mapping
 
 # Claude Code's read tools and the arguments they are known to take; another argument could name another file.
 _TOOL_ARGS: Final[Mapping[str, frozenset[str]]] = {

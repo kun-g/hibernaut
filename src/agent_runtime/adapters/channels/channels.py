@@ -13,7 +13,7 @@ from typing import Any
 
 from agent_runtime.adapters.channels.mcp_server import MCPServerAdapter
 from agent_runtime.engine.attempts import check_payload
-from agent_runtime.engine.handler import EventHandler, RemoteRefused, ReservedSource
+from agent_runtime.engine.handler import ApprovalRefused, EventHandler, RemoteRefused, ReservedSource
 
 
 class WebhookHTTPServer(ThreadingHTTPServer):
@@ -237,7 +237,7 @@ def webhook_request_handler(
                         correlation_key=body.get("correlation_key"),
                         remote=self._remote(),
                     )
-                except RemoteRefused as exc:
+                except (RemoteRefused, ApprovalRefused) as exc:
                     self._write_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
                     return
                 except ReservedSource as exc:

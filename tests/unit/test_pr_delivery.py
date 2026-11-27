@@ -14,6 +14,7 @@ from agent_runtime.adapters.delivery import (
     parse_delivery,
     source_issue,
 )
+from agent_runtime.adapters.delivery.pr_delivery import _Handback
 from agent_runtime.core.models import DeliveryOutcome, Event, PermissionDecision
 from tests.support.fakes import InMemoryPermission
 from tests.support.pr_delivery import rendered_body
@@ -182,13 +183,16 @@ class TestMergePolicy(unittest.TestCase):
     def failed_ci(self):
         self.gh.side_effect = None
         self.gh.return_value = subprocess.CompletedProcess([], 1, '[{"name":"gates","state":"FAILURE","bucket":"fail"}]', "")
-        outcome = self.merge()
+        with self.assertRaises(_Handback) as raised:
+            self.merge()
+        # A check with no GitHub Actions run to re-run goes straight back to the developer.
         self.assertEqual([call.args[1:3] for call in self.gh.call_args_list], [("pr", "checks")])
-        return outcome
+        self.assertEqual(raised.exception.detail["kind"], "ci")
+        return self.delivery.outcome(self.record)
 
-    def test_failed_ci_does_not_merge(self):
+    def test_failed_ci_does_not_merge_and_is_handed_back(self):
         self.failed_ci()
-        self.assertEqual((self.record.state, self.record.problem), ("pr_open", ""))
+        self.assertEqual(self.record.state, "pr_open")
         self.assertIn("not merged: CI failed (gates)", self.record.notes)
 
     def test_outcome_names_why_an_authorized_merge_did_not_happen(self):

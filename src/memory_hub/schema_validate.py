@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
 class SchemaValidationError(ValueError):
@@ -51,7 +51,7 @@ def _validate(instance: Any, schema: dict[str, Any], root: dict[str, Any], path:
         if not _check_type(instance, expected_type):
             raise SchemaValidationError(f"{path}: expected {expected_type}, got {type(instance).__name__}")
     elif isinstance(expected_type, list):
-        if not any(_check_type(instance, t) for t in expected_type):
+        if not any(_check_type(instance, t) for t in cast(list[str], expected_type)):
             raise SchemaValidationError(f"{path}: expected one of {expected_type}, got {type(instance).__name__}")
 
     if isinstance(instance, str):
@@ -65,21 +65,22 @@ def _validate(instance: Any, schema: dict[str, Any], root: dict[str, Any], path:
             raise SchemaValidationError(f"{path}: {instance} < minimum {schema['minimum']}")
 
     if isinstance(instance, dict):
+        fields = cast(dict[str, Any], instance)
         for req in schema.get("required", ()):
-            if req not in instance:
+            if req not in fields:
                 raise SchemaValidationError(f"{path}: missing required field '{req}'")
         props = schema.get("properties", {})
         if schema.get("additionalProperties") is False:
-            extra = set(instance.keys()) - set(props.keys())
+            extra = set(fields.keys()) - set(props.keys())
             if extra:
                 raise SchemaValidationError(f"{path}: additionalProperties not allowed: {sorted(extra)}")
-        for k, v in instance.items():
+        for k, v in fields.items():
             if k in props:
                 _validate(v, props[k], root, f"{path}.{k}")
 
     if isinstance(instance, list) and "items" in schema:
         item_schema = schema["items"]
-        for idx, elem in enumerate(instance):
+        for idx, elem in enumerate(cast(list[Any], instance)):
             _validate(elem, item_schema, root, f"{path}[{idx}]")
 
 

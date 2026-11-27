@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -411,7 +411,7 @@ class SQLiteDatabase:
         )
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self) -> Generator[sqlite3.Connection, None, None]:
         with self._lock:
             if self._tx_depth:
                 self._tx_depth += 1

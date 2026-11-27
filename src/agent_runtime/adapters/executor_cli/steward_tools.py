@@ -629,7 +629,7 @@ class StewardTools:
 
     async def _list_sessions(self, arguments: dict[str, Any]) -> str:
         inbox_id, raw = self._inbox(arguments), _optional(arguments, "status")
-        status = next((s for s in _STATUSES if s == raw), None)
+        status: SessionStatus | None = next((s for s in _STATUSES if s == raw), None)
         if raw is not None and status is None:
             raise ToolError(f"status must be one of {', '.join(_STATUSES)}")
         self._allow("list_sessions", {"inbox_id": inbox_id, "status": status})

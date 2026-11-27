@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from typing import Any
 
@@ -33,16 +33,14 @@ from tests.support.collaboration_flow import (
     Board,
     CARD,
     MCP_TOKEN,
-    board,
     call,
     chief_events,
-    daemon,
     hub_call,
     refused,
     rpc,
     settings,
-    tokens,
 )
+from tests.support.collaboration_flow import board, daemon, tokens  # noqa: F401 -- pytest fixtures, requested by parameter name
 
 
 SKILLS = "role://architect/skills.md"
@@ -195,7 +193,7 @@ def test_the_digest_reads_taskboard_ledger_and_memory(daemon: AlwaysOnDaemon, bo
     ready = board.ingestion.tb_create_task("proj:hibernaut", "ready one", initial_status="ready")
     blocked = board.ingestion.tb_create_task("proj:hibernaut", "blocked one")
     board.ingestion.tb_manage_dependency("add", ready.task_id, blocked.task_id)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     daemon.ledger.store.append_run(ledger_run(1, ended=now))
     daemon.ledger.store.append_run(ledger_run(
         2, ended=now, outcome_kind="error", emit_status=None, error_kind="timeout"))
@@ -306,7 +304,7 @@ def test_taskboard_redirects_do_not_take_the_token_along(tmp_path: Path) -> None
 
 
 def test_finished_tasks_are_counted_for_a_day() -> None:
-    now = datetime(2026, 11, 24, 12, tzinfo=timezone.utc)
+    now = datetime(2026, 11, 24, 12, tzinfo=UTC)
 
     class Client:
         def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:

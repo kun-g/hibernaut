@@ -8,7 +8,7 @@ import re
 import socket
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -44,7 +44,7 @@ class _Clock:
 class _UtcNow:
     # Wall clock for OutboxDispatcher retries, moved past the backoff instead of sleeping.
     def __init__(self) -> None:
-        self.now = datetime(2026, 11, 22, 8, 0, 0, tzinfo=timezone.utc)
+        self.now = datetime(2026, 11, 22, 8, 0, 0, tzinfo=UTC)
 
     def __call__(self) -> datetime:
         return self.now

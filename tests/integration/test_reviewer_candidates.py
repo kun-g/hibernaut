@@ -45,7 +45,7 @@ class FlowCase(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.dict(os.environ, {"FAKE_CLAUDE_LOG": str(self.log), "FAKE_PLAN": str(self.plan)}))
         self.table = self.root / "availability.json"
         self.reviewers = {name: CLIPlan(self.root / name) for name in (*ORDER, "extra")}
-        for name, plan in self.reviewers.items():
+        for plan in self.reviewers.values():
             plan.plan.parent.mkdir()
             plan.set(json.dumps(PASS))
         self.develop(dev(FIXED))

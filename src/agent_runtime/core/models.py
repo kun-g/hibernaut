@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any, Literal, TypeAlias
 from uuid import uuid4
 
@@ -51,12 +51,12 @@ MCP_APPROVAL_SOURCE = "mcp:approval"
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 # Fixed-width UTC form, so stored retry times order correctly as plain strings (SQLite compares them as TEXT).
 def to_utc_iso(moment: datetime) -> str:
-    return moment.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    return moment.astimezone(UTC).isoformat(timespec="microseconds")
 
 
 def new_id(prefix: str) -> str:

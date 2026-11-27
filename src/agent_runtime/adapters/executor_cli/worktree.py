@@ -7,7 +7,7 @@ import subprocess
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from typing import Literal, cast
 
@@ -307,7 +307,7 @@ class OrcaWorktreeManager:
             return ReclaimResult(reclaimed=False, reason=refusal, workdir=record.workdir)
 
         stale_before = (
-            datetime.now(timezone.utc) - timedelta(seconds=self._reclaim_stale_after_seconds)
+            datetime.now(UTC) - timedelta(seconds=self._reclaim_stale_after_seconds)
         ).isoformat()
         claim = self._store.claim_for_reclaim(
             key,
@@ -388,7 +388,7 @@ class OrcaWorktreeManager:
             return refused(blocked)
 
         stale_before = (
-            datetime.now(timezone.utc) - timedelta(seconds=self._reclaim_stale_after_seconds)
+            datetime.now(UTC) - timedelta(seconds=self._reclaim_stale_after_seconds)
         ).isoformat()
         claim = self._store.claim_for_reclaim(key, seen_updated_at=record.updated_at, stale_before=stale_before)
         if claim is None:
@@ -540,7 +540,7 @@ class OrcaWorktreeManager:
             active_refs = self._session_store.count_active_by_work_key(work_key, owner)
             if active_refs > 0:
                 list_fn = getattr(self._session_store, "list_active_by_work_key", None)
-                occupying = list_fn(work_key, owner) if callable(list_fn) else []
+                occupying = cast(list[str], list_fn(work_key, owner)) if callable(list_fn) else []
                 suffix = f" ({', '.join(occupying)})" if occupying else f" ({active_refs} active)"
                 return f"Skipped reclaim for '{work_key}': active/suspended session(s) still referencing worktree{suffix}"
         return self._usage_gate(work_key, storage_key)

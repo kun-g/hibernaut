@@ -426,7 +426,7 @@ class DriveProxyUpgradeTests(unittest.TestCase):
         joined = "\n".join(commands)
         self.assertIn(f"+ cp -R {REPO_ROOT / 'src' / 'agent_runtime'} {self.PREFIX}/src.new/agent_runtime", joined)
         self.assertIn(f"chown -R root:root {self.PREFIX}/src.new", joined)
-        self.assertIn(f"/usr/local/bin/python3.12 -I -c", joined)
+        self.assertIn("/usr/local/bin/python3.12 -I -c", joined)
         self.assertIn(f"+ mv -f {self.PREFIX}/bin/hibernaut-drive-proxy.new {self.PREFIX}/bin/hibernaut-drive-proxy", joined)
         check = next(c for c in commands if c.endswith("--check"))
         self.assertIn("HTTPS_PROXY=http://127.0.0.1:7890", check)

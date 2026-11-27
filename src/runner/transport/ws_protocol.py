@@ -7,7 +7,8 @@ import json
 import os
 import struct
 from dataclasses import dataclass
-from typing import Any, Final, Mapping, cast
+from typing import Any, Final, cast
+from collections.abc import Mapping
 
 OP_CONTINUATION: Final = 0x0
 OP_TEXT: Final = 0x1

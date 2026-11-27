@@ -145,7 +145,7 @@ class TestPeerTaskAndResult(PeerCase):
 
     async def test_a_session_that_exits_without_a_result_is_reported(self):
         def quit_(session: FakeClaude, msg: Incoming) -> None:
-            for handle, term in self.orca.terminals.items():
+            for term in self.orca.terminals.values():
                 if term["session"] is session:
                     term["ended"] = True
         self.orca.scripts.append([quit_])

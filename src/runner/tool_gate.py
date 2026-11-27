@@ -10,7 +10,8 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Final, Mapping, cast
+from typing import Any, Final, cast
+from collections.abc import Callable, Mapping
 
 from runner.protocol import ToolAuthorizer, ToolCall, ToolDecision
 

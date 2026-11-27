@@ -341,7 +341,7 @@ class CoderReviewerExecutor:
         # A resumed review is judged against the worktree as it was when the reviewer started.
         recorded = saved.get("before") if saved is not None else None
         before = recorded if isinstance(recorded, str) else await asyncio.to_thread(worktree_fingerprint, request.workdir)
-        extra: dict[str, str] = {}
+        extra: dict[str, str | None] = {}
         if isinstance(terminal, OrcaVisibleRunner):
             # A fresh conversation every time: a re-review gets the earlier findings in its prompt, not its context.
             peer = request.peer.peer if request.peer is not None else None
@@ -543,7 +543,7 @@ def _review_guidance(request: ReviewRequest, changed: Sequence[str]) -> str:
 def validate_review(raw: object) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ReviewAborted("the reviewer returned no structured verdict")
-    data: dict[str, Any] = dict(raw)
+    data: dict[str, Any] = dict(cast(dict[str, Any], raw))
     verdict = data.get("verdict")
     summary = data.get("summary")
     blocking_raw = data.get("blocking")
@@ -551,11 +551,12 @@ def validate_review(raw: object) -> dict[str, Any]:
     if verdict not in ("pass", "changes_requested") or not isinstance(summary, str) or not isinstance(blocking_raw, list):
         raise ReviewAborted("the reviewer returned a malformed verdict")
     blocking: list[dict[str, str]] = []
-    for item in blocking_raw:
-        if not isinstance(item, dict):
+    for raw_item in cast(list[object], blocking_raw):
+        if not isinstance(raw_item, dict):
             raise ReviewAborted("a blocking item is not an object")
+        item = cast(dict[str, object], raw_item)
         entry = {str(k): str(v).strip() for k, v in item.items() if isinstance(v, str)}
-        number = _whole_number(cast(dict[str, object], item).get("previous_item"))
+        number = _whole_number(item.get("previous_item"))
         entry.pop("previous_item", None)
         if number:
             entry["previous_item"] = number
@@ -566,7 +567,7 @@ def validate_review(raw: object) -> dict[str, Any]:
         blocking.append(entry)
     if (verdict == "pass") == bool(blocking):
         raise ReviewAborted(f"verdict '{verdict}' contradicts {len(blocking)} blocking item(s)")
-    notes = [str(n) for n in notes_raw] if isinstance(notes_raw, list) else []
+    notes = [str(n) for n in cast(list[object], notes_raw)] if isinstance(notes_raw, list) else []
     exchange_raw = data.get("developer_messages", [])
     exchange = [str(m) for m in cast(list[object], exchange_raw)] if isinstance(exchange_raw, list) else []
     return {"verdict": verdict, "summary": summary.strip(), "blocking": blocking, "notes": notes,

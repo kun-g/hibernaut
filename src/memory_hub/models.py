@@ -4,7 +4,7 @@ import hashlib
 import math
 import secrets
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any, Literal
 
 SCHEMA_VERSION = "memory.v1"
@@ -27,7 +27,7 @@ AccessRole = Literal["readonly", "propose", "admin"]
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def estimate_tokens(text: str) -> int:
@@ -41,7 +41,7 @@ def sha256_text(text: str) -> str:
 
 
 def generate_id(prefix: str) -> str:
-    ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    ts_ms = int(datetime.now(UTC).timestamp() * 1000)
     return f"{prefix}_{ts_ms:012x}{secrets.token_hex(6)}"
 
 
@@ -384,8 +384,8 @@ class KnowledgeMountConfig:
 class MemoryHubConfig:
     memory_root: str
     default_budget: BaselineBudgetConfig = field(default_factory=BaselineBudgetConfig)
-    project_budgets: dict[str, BaselineBudgetConfig] = field(default_factory=dict)
-    inbox_project_map: dict[str, str] = field(default_factory=dict)
+    project_budgets: dict[str, BaselineBudgetConfig] = field(default_factory=dict[str, BaselineBudgetConfig])
+    inbox_project_map: dict[str, str] = field(default_factory=dict[str, str])
     mounts: tuple[KnowledgeMountConfig, ...] = ()
     index_dir: str | None = None
     max_note_bytes: int = 16384

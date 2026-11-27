@@ -24,6 +24,8 @@ def project(tmp_path: Path):
     drive.file("old", "old.txt", b"old", "project-folder", "2026-10-01")
     drive.file("new", "new.txt", b"new", "project-folder", "2026-11-01")
     guard = DriveQueueGuard(drive, root_folder_id="queue", allow_any_source_folder=True,
+                            pending_folder_id="pending", in_progress_folder_id="working",
+                            done_folder_id="done", failed_folder_id="failed",
                             client_email="reader@example.invalid", max_download_bytes=4)
     with build_proxy_server(guard, host="127.0.0.1", port=0, service_name="drive", client_token=CLIENT_TOKEN) as server:
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})

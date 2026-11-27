@@ -194,7 +194,7 @@ class InboundBridgeTests(_Stack):
         # [routing.event_consumers] can send work.* straight to Hibernaut (no Taskboard): an issue's work.opened
         # names the issue, a pull request's never does.
         cases = {"issue": "kun-g/hibernaut#42", "pull_request": ""}
-        for kind, expected in cases.items():
+        for kind in cases:
             work = CanonicalEvent(
                 source="github", event_type="work.opened", external_id=f"{kind}:kun-g/hibernaut#42:opened:t",
                 scope=SCOPE, correlation_key=KEY, subject="t", body="b",

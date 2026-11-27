@@ -14,7 +14,7 @@ from agent_runtime.core.models import DeliveryOutcome, Emit
 from tests.support.fakes import InMemoryPermission
 from tests.support.gdrive_tasks import _FakeDriveClient
 from tests.support.pr_delivery import VERSION_FILE
-from tests.support.sde_delivery import REPO, event
+from tests.support.sde_delivery import REPO
 
 
 class TestSDEDeliveryResult(unittest.IsolatedAsyncioTestCase):
@@ -99,7 +99,7 @@ class TestProjectAdoption(unittest.TestCase):
         self.assertFalse(delivery.auto_merge)
         self.assertEqual(delivery.version_file, "src/agent_runtime/__init__.py")
         pytest_gate = ("pytest", "-n", "auto", "--dist", "worksteal", "-v")
-        self.assertEqual(delivery.checks, (("lint-imports",), pytest_gate, ("pyright",)))
+        self.assertEqual(delivery.checks, (("lint-imports",), ("ruff", "check"), pytest_gate, ("pyright",)))
         version = (REPO / delivery.version_file).read_text(encoding="utf-8")
         PRDelivery(delivery, Mock())._read_version(version, "check")  # the pattern matches the real file
 

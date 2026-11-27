@@ -10,7 +10,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Final, Literal, Protocol, Sequence, cast
+from typing import Any, Final, Literal, Protocol, cast
+from collections.abc import Callable, Sequence
 
 from runner.config import NamespacePolicy, ProjectCheckout
 from runner.protocol import ReclaimResult, WorktreeRef, utc_now_iso

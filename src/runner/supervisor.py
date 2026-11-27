@@ -8,9 +8,10 @@ import re
 import signal
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
-from typing import Callable, Final, Mapping, Sequence
+from typing import Final
+from collections.abc import Callable, Mapping, Sequence
 
 from runner.protocol import CredentialLease, LogRef, MAX_STDOUT_EXCERPT_BYTES
 
@@ -174,7 +175,7 @@ async def terminate_process_group(proc: asyncio.subprocess.Process, *, grace_sec
                 pass
         try:
             await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             if not _signal_group(pgid, signal.SIGKILL):
                 try:
                     proc.kill()
@@ -222,7 +223,7 @@ class ProcessSupervisor:
         grace_seconds: float = 2.0,
         on_stdout_line: Callable[[str], None] | None = None,
     ) -> SupervisedRunOutput:
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        day = datetime.now(UTC).strftime("%Y-%m-%d")
         log_dir = self._logs_dir / day
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{run_id}.log"

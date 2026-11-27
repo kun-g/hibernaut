@@ -31,6 +31,7 @@ from tests.support.steward import arg, git_state
 from tests.support.switchboard_inbound import feishu_message
 from tests.support.visible_roles import FakeOrcaTerminals, poll_test_terminals
 from tests.support.global_steward import ASH, forward, reply
+from tests.support.jsonl import read_jsonl
 
 
 CHAT = "feishu:p2p:oc_kun"
@@ -176,7 +177,7 @@ class AshCase(unittest.IsolatedAsyncioTestCase):
             return conn.execute(sql).fetchall()
 
     def calls(self) -> list[dict[str, Any]]:
-        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+        return read_jsonl(self.log)
 
     def launches(self) -> list[dict[str, Any]]:
         return [c for c in self.calls() if "answers" not in c and c["role"] != "probe"]
@@ -419,7 +420,7 @@ class EndToEndTests(ChatCase):
     async def test_a_question_is_answered_in_the_chat(self) -> None:
         self.set_plan([reply("收到")])
         await self.chat("测试")
-        [(target, content)] = self.replies()
+        [(_target, content)] = self.replies()
         self.assertIn("收到", content)
         self.assertEqual(self.events(FORWARD_SOURCE), [])
 
@@ -427,7 +428,7 @@ class EndToEndTests(ChatCase):
         self.set_plan([{"calls": [forward("proj:a", "divide must reject zero", title="Zero")]}], [WORK])
         await self.chat("divide is broken")
         self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde"])
-        [(target, content)] = self.replies()
+        [(_target, content)] = self.replies()
         self.assertIn("implemented", content)
         [session] = self.daemon.sessions.list_sessions(inbox_id="proj:a")
         self.assertIn("divide must reject zero", self.launches()[1]["prompt"])
@@ -440,7 +441,7 @@ class EndToEndTests(ChatCase):
         self.assertEqual([c["role"] for c in self.launches()], ["steward", "sde", "steward"])
         self.assertIn("implemented", self.launches()[2]["prompt"])
         self.assertIn("--resume", self.launches()[2]["argv"])
-        [(target, content)] = self.replies()
+        [(_target, content)] = self.replies()
         self.assertIn("checked: all good", content)
         [back] = self.events(RETURN_SOURCE)
         self.assertEqual((back.inbox_id, back.payload["forwarded_from"]), (ASH, "proj:a"))

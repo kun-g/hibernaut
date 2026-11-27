@@ -141,7 +141,7 @@ class QuotedTests(unittest.TestCase):
                 self.assertEqual(tomllib.loads(f"x = {quoted(value)}")["x"], value)
 
     def test_c1_line_breaks_and_control_characters_are_refused(self) -> None:
-        for value in ("a\nb", "a\rb", "a\tb", "\0", "\x7f", "a b", "\x1b[0m", "\ud800", "a‮b"):
+        for value in ("a\nb", "a\rb", "a\tb", "\0", "\x7f", "a\u2028b", "\x1b[0m", "\ud800", "a\u202eb"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 quoted(value)
 

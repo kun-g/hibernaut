@@ -18,7 +18,8 @@ from agent_runtime.adapters.permissions import AutoModePermissionAdapter
 from agent_runtime.adapters.storage_sqlite import SQLiteMemoryGrantStore
 from agent_runtime.app.config import parse_config
 from agent_runtime.app.main import build_daemon_from_config, main
-from tests.support.sde_memory import PERMITTED, SERVER, TOOLS, World, _toml, servers, world
+from tests.support.sde_memory import PERMITTED, SERVER, TOOLS, World, _toml, servers
+from tests.support.sde_memory import world  # noqa: F401 -- pytest fixture, requested by parameter name
 
 
 def test_the_tools_are_those_of_the_steward(world: World) -> None:

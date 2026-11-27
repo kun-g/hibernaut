@@ -13,6 +13,7 @@ from agent_runtime.adapters.executor_cli.project_guidance import GuidancePin
 from agent_runtime.adapters.executor_cli.reviewer import ReviewRequest
 from tests.support.fakes import InMemoryPermission
 from tests.support.visible_roles import FakeOrcaTerminals
+from tests.support.jsonl import read_jsonl
 
 
 FAKE_CLI = Path(__file__).with_name("fake_cli_reviewer.py")
@@ -39,7 +40,7 @@ class CLIPlan:
         self.plan.write_text(json.dumps([s if isinstance(s, dict) else {"stdout": s} for s in steps]))
 
     def calls(self):
-        return [json.loads(ln) for ln in self.log.read_text().splitlines()] if self.log.exists() else []
+        return read_jsonl(self.log)
 
 
 _RUNNER = object()

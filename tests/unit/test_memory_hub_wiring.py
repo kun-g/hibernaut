@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -39,7 +39,7 @@ from agent_runtime.core.models import Emit, Event, SessionRef, Suspend
 from ledger import RunRecord
 from memory_hub import BaselineBudgetConfig, LegacyMemoryPortAdapter, MemoryHubConfig, SearchQuery, WriteProposal
 from tests.support.fakes import InMemoryMemoryStore
-from tests.support.memory_hub_fixtures import fast_memory_http_shutdown
+from tests.support.memory_hub_fixtures import fast_memory_http_shutdown  # noqa: F401 -- pytest fixture, requested by parameter name
 
 ROOT = Path(__file__).resolve().parents[2]
 PROJ = "proj:hibernaut"
@@ -860,7 +860,7 @@ def test_failures_without_a_summary_never_count_as_each_other(hub: GovernedMemor
 
 
 def _old(path: Path, days: int = 10) -> None:
-    stamp = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
+    stamp = (datetime.now(UTC) - timedelta(days=days)).timestamp()
     os.utime(path, (stamp, stamp))
 
 

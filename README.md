@@ -18,7 +18,7 @@ Hibernaut 是常驻型 Agent（Always-on Agent）的运行时：平时休眠、�
 | 一句话开新项目 | 在单聊对 Ash（全局 Steward，绑定写 `repo_tools = true`）说「新建项目 X，从 Drive 下最新版本作初始提交，再配好预发布和生产」：Ash 用 `create_repo` 在指定的 GitHub 账号或组织下建私有仓库（没说就用默认 owner，名单外会拒绝。首次提交是 Drive 来源文件夹里该项目最新的文件，压缩包解开；仓库已存在就停），转给系统 Steward 接入 hb，再转给运维 agent（`sys:infra`，绑定写 `ops_tools = true`）在 Dokploy 上建环境：预发布直接部署，生产配好后第一次上线发审批卡、批了才上线。每步结果回同一个单聊，哪步失败停在哪步。Ash 仍没有命令行；运维 agent 只有 `dokploy` 一个工具（跑 workspace 的 Dokploy 脚本，令牌从钥匙串取、输出打码），生产和删除由代码判定后挂起等批准 |
 | SDE 开发角色 | 在任务 worktree 里测试先行开发，送评审，按评审意见返工；派单写 `agent_id = "sde"`（Drive 任务 frontmatter 写 `agent_id: sde`，旧键 `executor_id: sde` 仍可用），项目或 Inbox 也可设为默认 Agent；GitHub Issue 以 `# 标题` + 正文为需求、标题为 PR 标题；整个任务期间能只读检索和打开本项目的记忆（`memory_search`、`memory_read`）；派单写 `attempt_notes = "<目标名>"` 时，任务结束后 hb 把试了什么、结果如何记进项目记忆 `notes/attempts/<目标名>.md`，下一个同目标的任务先读它 |
 | 代码评审 | 评审者可以是只读的 Claude Code 角色 `code-reviewer`，也可以是任意 CLI 执行器（如 grok，模板写 `terminal = "orca"` 可在 Orca 终端里旁观评审，命令结束、结果读回后立即关闭该终端，且不让 Orca 登记并续接这次会话，评审记录留终端句柄与 CLI 会话 ID）；按需求、实际 diff 和测试证据给出 `pass` / `changes_requested`；SDE 内置评审第 1 轮通审，第 2 轮起只做增量复核：只有上一轮没修好的项和之后改动引入的新问题能打回，其余由程序降为跟进，交付时列在 PR 正文「跟进」小节和完成消息里。评审者可写成有序列表（评审候选）：按可用表取第一个可用的，任务内不换；报额度用完（`quota_errors`）才自动换下一个重跑这一轮并通知一次，全不可用则挂起等人 |
-| PR 交付 | SDE 完成后由 Hibernaut 合入主干、按改动类型定版本号、跑检查、推分支、开 PR，可选在评审通过且 CI 绿后自动合并；合入主干冲突（版本号以外）或合入后检查失败时交回同一开发会话解决，开启评审时，手工解决冲突后一律复审上次通过的快照到合并结果的完整变更（含主干改动），检查失败后的修复按增量复审，超过次数上限才挂起等人；远端连接中断（含 HTTP EOF 和 TLS 握手中断）、其他网络故障、GitHub 查询服务内部错误、5xx 或限流时，依次等 1、5、15 分钟自动续交，仍失败再请人处理；合并后删除源分支并结案；与任务来源无关 |
+| PR 交付 | SDE 完成后由 Hibernaut 合入主干、按改动类型定版本号、跑检查、推分支、开 PR，可选在评审通过且 CI 绿后自动合并；合入主干冲突（版本号以外）或合入后检查失败时交回同一开发会话解决；PR 的 CI 失败时先用 hb 的 gh 身份在同一提交上重跑失败的检查一次，通过就合并，仍失败（或没有重跑权限）也交回同一开发会话，附失败的检查、用例与日志链接，开启评审时，手工解决冲突后一律复审上次通过的快照到合并结果的完整变更（含主干改动），检查失败后的修复按增量复审，超过次数上限才挂起等人；远端连接中断（含 HTTP EOF 和 TLS 握手中断）、其他网络故障、GitHub 查询服务内部错误、5xx 或限流时，依次等 1、5、15 分钟自动续交，仍失败再请人处理；合并后删除源分支并结案；与任务来源无关 |
 | 可见终端 | 运行在 Orca 终端里打开，人可以旁观、回答提问，后续事件回到同一对话；项目设 `handoff = "peer"` 时任务、返工与结果经 ccpeer 消息往来，结果落在 launchd 常驻接收端的收件箱，hb 重启不丢 |
 | 工作区管理 | 按任务自动建 `hb-*` worktree、复用，证据齐全（PR 已合并、无未提交改动等）后才回收；交付合并 PR 后自动关闭会话并回收 worktree 和本地分支；当时被排队事件或在线会话挡住的，由后台清扫（启动时一轮，之后默认每 5 分钟，`[runtime] worktree_sweep_interval_seconds`）在其结束后回收；目录已被人手或 Orca 删掉的记录，在没有排队事件、未结束的 Run 等占用时清除，并关闭引用它的会话、发一条告警 |
 | 项目规范注入 | 读取被改仓库的 `AGENTS.md` 与 `guidance.toml`，按任务类型挑选规范文档，从固定 commit 读取 |
@@ -85,8 +85,8 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 | :--- | :--- |
 | `[runtime]` | 数据库与记忆目录、全局并发上限 `max_concurrency`、新事件策略（`defer` / `fold` / `interrupt`）、全局默认 Agent（`default_agent`，旧键 `default_executor`）；`ledger_db_path` 是执行账本的独立数据库（默认 `db_path` 同目录的 `ledger.db`，运行日志在它旁边的 `logs/runs/`） |
 | `[[runtime.inbox_bindings]]` | 不属于项目的 Inbox（`sys:*` / `user:*`）：键同项目绑定，另须写启动目录 `workdir`，可选 `checkout_access`（`readwrite` / `readonly`）；可写目录只能给一个 Inbox，不能是项目检出或 Steward 的 `workdir`。可用 CLI agent；`checkout_access = "readonly"` 的绑定还可用 `steward`，可选 `forward_to` 列出它能转投的项目主 Inbox 或系统 Inbox；`system_tools = true` 把只读的单个精确 `sys:<name>` 变成系统 Inbox，`ops_tools = true` 变成运维 Inbox（同样只收人的请求）；`repo_tools = true` 给全局 Steward 加 `create_repo`。规范见 [`docs/inbox-conventions.md`](docs/inbox-conventions.md) |
-| `[[feishu_groups]]` | 把飞书群绑到系统 Inbox：`chat_id`（`oc_…`）、`inbox_id`（带 `system_tools` 的绑定的精确 pattern）、`members`（算数的人的 open_id `ou_…`）。名单上的人在群里 @机器人发的消息直接进该 Inbox，答复回群；名单外的人的消息丢弃不回；一个系统 Inbox 只绑一个群，它的审批卡发到这个群，只认名单上的人在这个群里点；没绑定的群照旧。也可绑项目 Inbox（项目群，默认 `proj:<p>:chat`）：`members` 可含合作方，另须 `approvers`（这个项目所有 Inbox 的审批只认他们，卡片发到 Switchboard 的审批聊天，不发群里）；群里谁说的都只算对这个项目的请求，转不出项目；该 Inbox 只由全是 `steward` 的绑定处理、只收这个群，远端 `POST /events` 403。需求见 [`docs/requirements/project-group.md`](docs/requirements/project-group.md) |
-| `[repo_tools]` | 全局 Steward 的 `create_repo`（绑定写 `repo_tools = true` 时必填）：`owner` 是默认账号，`allowed_owners` 是允许的账号和组织（例如 `["kun-g", "LambdaTheory"]`，须含默认账号，省略时只允许 `owner`）。`max_bytes` 首个版本的上限（默认 512 MiB）；gh 用守护进程的本机登录，每个目标都需要私有建仓及首次推送权限。Drive 经 `[gdrive]` 凭据代理读（按项目名查找需配置 `sources_folder_id`，代理开启 `allow_any_source_folder` 后可直接给共享的项目文件夹链接） |
+| `[[feishu_groups]]` | 把飞书群绑到系统 Inbox：`chat_id`（`oc_…`）、`inbox_id`（带 `system_tools` 的绑定的精确 pattern）、`members`（算数的人的 open_id `ou_…`）。名单上的人在群里 @机器人发的消息直接进该 Inbox，答复回群；名单外的人的消息丢弃不回；一个系统 Inbox 只绑一个群，它的审批卡发到这个群，只认名单上的人在这个群里点；没绑定的群照旧。也可绑项目 Inbox（项目群，默认 `proj:<p>:chat`）：`members` 可含合作方，另须 `approvers`（这个项目所有 Inbox 的审批只认他们在飞书审批卡上的点击：群 Inbox 认本群的 `approvers`，项目里其他 Inbox 认各群共同的 approver；本机或远端的 `POST /events`、MCP 审批工具都决定不了，返回 403 或报错；卡片发到 Switchboard 的审批聊天，不发群里）；群里谁说的都只算对这个项目的请求，转不出项目；该 Inbox 只由全是 `steward` 的绑定处理、只收这个群，远端 `POST /events` 403。需求见 [`docs/requirements/project-group.md`](docs/requirements/project-group.md) |
+| `[repo_tools]` | 全局 Steward 的 `create_repo`（绑定写 `repo_tools = true` 时必填）：`owner` 是默认账号，`allowed_owners` 是允许的账号和组织（例如 `["kun-g", "LambdaTheory"]`，须含默认账号，省略时只允许 `owner`）。`max_bytes` 首个版本的上限（默认 512 MiB）；gh 用守护进程的本机登录，每个目标都需要私有建仓及首次推送权限。Drive 经 `[gdrive]` 凭据代理读（按项目名查找需配置 `sources_folder_id`，代理开启 `allow_any_source_folder` 后可直接给共享的项目文件夹链接，四个任务队列文件夹、附件文件夹及其直接文件除外） |
 | `[ops_tools]` | 运维 Inbox 的 `dokploy` 工具（绑定写 `ops_tools = true` 时必填）：`dokploy_script` Dokploy 脚本路径，`staging_environments` 算预发布的环境名（默认 `["staging"]`，其余按生产、上线等批准），`timeout_seconds` |
 | `[onboarding]` | 系统 Steward 接入项目：`label_owners` 列出可以在其仓库上建标签的 GitHub owner，默认空 = 不建，列为待人做 |
 | `[channels]` | HTTP 端口、MCP 的密钥环境变量名；`outbox_dir` 设置后每条 Outbox 消息另存为该目录下一个带任务上下文的 Markdown 文件；配置了 `auto_merge` 却停在 PR 未合并时，状态为「待合并」并写明 PR 链接与未合并原因 |
@@ -97,7 +97,7 @@ Hibernaut 的配置在 `hibernaut.toml`，带注释的模板是 [`hibernaut.exam
 | `[projects.<name>]` | 仓库、检出路径（`checkout` 不写时按 `repo` 在 Orca 已登记的仓库里找主检出，找不到则加载报错）、服务的 `inbox_id`（字符串或正则数组；两个项目的范围有交集时拒绝加载，正则只用可比较的语法，见 `docs/architecture.md`）、`default_agent`（旧键 `executor`）、worktree 与终端后端；可选 `max_concurrency` 限制本项目同时在跑的 Inbox 数，可选 `description` 写进全局 Steward 的路由清单 |
 | `[[timers]]` | 按 `interval_seconds` 往绑定的 `inbox_id` 投 `timer:<name>`，由普通 CLI 执行器跑配置指定的脚本。睡眠或停机错过多次只补一次，上一次尚在排队或运行时跳过本次。白盒工具创建的周期任务也采用新的补跑规则。配置例见 [`hibernaut.example.toml`](hibernaut.example.toml)。 |
 | `[[projects.<name>.inbox_bindings]]` | Inbox 与 Agent 的绑定：`pattern`（整串匹配的正则）、`default_agent`、`agents` 白名单、`rules`（按 `source` / `event_type` / `tags` 选 Agent；具名定时器的来源是 `timer:<timer_name>`）。写了绑定的项目，转投只能到有绑定覆盖的 Inbox |
-| `[projects.<name>.delivery]` | PR 交付：开 PR、自动合并、版本文件、检查命令、是否要求评审和 CI、冲突与检查失败交回开发的次数上限（`max_handbacks`）、合并后是否删除源分支（`delete_branch`）、来自 GitHub Issue 的任务在 PR 正文里怎么写这个 Issue（`issue_link`：`closes` 合并后关闭 / `refs` 只关联，默认 / `none` 不写） |
+| `[projects.<name>.delivery]` | PR 交付：开 PR、自动合并、版本文件、检查命令、是否要求评审和 CI、冲突、检查失败与 CI 失败交回开发的次数上限（`max_handbacks`）、合并后是否删除源分支（`delete_branch`）、来自 GitHub Issue 的任务在 PR 正文里怎么写这个 Issue（`issue_link`：`closes` 合并后关闭 / `refs` 只关联，默认 / `none` 不写） |
 | `[gdrive]` | Drive 任务队列，部署见 [`deploy/gdrive-proxy/`](deploy/gdrive-proxy/README.md)。任务可引用队列根下 `附件/` 里的文件（frontmatter `attachments` 写文件 ID 或原名，逗号分隔、`[a, b]` 或逐行 `- a` 均可，或正文里写该文件的 Drive ID），Run 开始时下载到 `attachments_dir`（默认数据库旁的 `attachments/`，在 worktree 之外），任务正文末尾附上路径、大小和 sha256，会话结案后删除。上传 `.md` 任务文件时关掉 Drive「将上传的文件转换为 Google 文档格式」 |
 | `[memory_hub]` | 项目记忆：`[memory_hub.budget]` 基线预算（`[memory_hub.projects.<project_key>.budget]` 按项目覆盖）、`[memory_hub.mounts.<name>]` 只读知识库、`[memory_hub.inbox_projects]` 指定 Inbox 归哪个项目、`gc_interval_seconds` 清理周期、`[memory_hub.http]` 可选的 HTTP 与 MCP 服务。不写用默认值 |
 | `[collaboration]`、`[experts.<role>]` | 个人人机协作（默认关闭）：`chief_inbox` 幕僚长的 Inbox、`[collaboration.taskboard]` 后续任务与简报用的 Taskboard、`[collaboration.hub]` 看板与审批页；`[experts.<role>]` 声明共享专家，项目用 `experts = ["<role>"]` 抽调。见 `docs/architecture.md` §15 |
@@ -183,16 +183,17 @@ schemas/runner/v1/  # Runner 协议（capabilities、run_request、run_result、
 schemas/v1/         # 执行账本的 AuditRecord / RunRecord（ADR-0001）、Memory Hub 与协作（收口卡、专家、简报）的 JSON Schema（Draft 2020-12）
 ```
 
-测试按是否启动外部进程分在 `tests/unit/` 和 `tests/integration/`，共用工具在 `tests/support/`。串行计时命令见 [AGENTS.md](AGENTS.md#5-提交前必跑的三道门禁命令)。
+测试按是否启动外部进程分在 `tests/unit/` 和 `tests/integration/`，共用工具在 `tests/support/`。串行计时命令见 [AGENTS.md](AGENTS.md#5-提交前必跑的四道门禁命令)。
 
 Steward 路由测试在配置的工作目录启动模拟 CLI，通过 MCP 调用工具。要验证终端启动、账号检查和进程清理，见 [`test_terminal_processes.py`](tests/integration/test_terminal_processes.py)。
 
-提交前三道门禁必须全绿：
+提交前四道门禁必须全绿（CI 并行跑同样四道）：
 
 ```bash
 pip install -e ".[dev]"
 python -m agent_runtime.app.main --config hibernaut.toml --check   # 只校验部署配置
 lint-imports   # 分层与反向依赖检查
+ruff check     # 查 bug 类问题，规则在 pyproject.toml 的 [tool.ruff.lint]，不查格式
 pytest -n auto --dist worksteal -v   # 单元和集成测试全量（本地快检可用 pytest -n auto $(python scripts/select_tests.py)）
-pyright        # core/、engine/、switchboard/、ccpeer/、taskboard/、runner/、ledger/、dashboard/、collaboration/ 的 strict 类型检查
+pyright        # src/ 下全部包的 strict 类型检查
 ```

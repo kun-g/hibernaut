@@ -333,10 +333,14 @@ class StewardExecutor:
             result = await self._converse(None, prompt, caps, tools)
         except (_NotRun, ClaudeCodeError):
             return unavailable
-        data = result.get("structured_output")
-        if not isinstance(data, dict) or not isinstance(data.get("message"), str) or not data["message"].strip():
+        output: object = result.get("structured_output")
+        if not isinstance(output, dict):
             return unavailable
-        action, category, message = data.get("action"), data.get("category"), data["message"].strip()
+        data = cast(dict[str, object], output)
+        raw_message = data.get("message")
+        if not isinstance(raw_message, str) or not raw_message.strip():
+            return unavailable
+        action, category, message = data.get("action"), data.get("category"), raw_message.strip()
         if category == "派单范围内" and action in ("answer", "upstream"):
             return action, message, ""
         if category in _OWNER_CHOICES:

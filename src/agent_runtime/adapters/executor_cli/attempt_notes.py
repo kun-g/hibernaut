@@ -6,7 +6,7 @@ import subprocess
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 from agent_runtime.adapters.memory_fs import PartitionedMemoryAdapter
@@ -266,7 +266,7 @@ def _with_record(text: str, limit: int, row: AttemptRow) -> str:
 
 
 def _render(row: AttemptRow, limit: int) -> str:
-    when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    when = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
         f"<!-- attempt {row.attempt_id} -->",
         f"## {when} · {row.result} · {_line(row.title, _MAX_TITLE) or '(无标题)'}",

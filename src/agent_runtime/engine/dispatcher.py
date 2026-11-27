@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 
 from agent_runtime.core.models import OutboxMessage, to_utc_iso
 from agent_runtime.core.ports import ChannelPort, OutboxPort
@@ -13,7 +13,7 @@ DEFAULT_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (5.0, 15.0, 45.0, 135.0, 405.
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class OutboxDispatcher:
@@ -93,5 +93,5 @@ class OutboxDispatcher:
             await self.dispatch_once()
             try:
                 await asyncio.wait_for(stopper.wait(), timeout=interval_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue

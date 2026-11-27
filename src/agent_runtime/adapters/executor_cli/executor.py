@@ -7,7 +7,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
 from agent_runtime.adapters.executor_cli.orca import OrcaVisibleRunner
 from agent_runtime.adapters.executor_cli.process import (
@@ -272,7 +272,7 @@ class LocalCLIExecutor:
                 poll_interval=self._interrupt_poll_interval,
             )
         except ProcessTimeout:
-            return b"", f"CLI timed out after {timeout_seconds}s".encode("utf-8"), 124
+            return b"", f"CLI timed out after {timeout_seconds}s".encode(), 124
         return stdout, stderr, int(proc.returncode or 0)
 
     def _extract_explicit_workdir(self, events: Sequence[Event]) -> str | None:
@@ -311,11 +311,12 @@ class LocalCLIExecutor:
         if not stdout:
             return Silent()
         try:
-            parsed = json.loads(stdout)
+            decoded: object = json.loads(stdout)
         except json.JSONDecodeError:
             return Emit(messages=(stdout,), session_id=session_id)
 
-        if isinstance(parsed, dict):
+        if isinstance(decoded, dict):
+            parsed = cast(dict[str, Any], decoded)
             raw_exec_sid = parsed.get("executor_session_id") or parsed.get("session_id")
             native_sid = str(raw_exec_sid) if isinstance(raw_exec_sid, str) and raw_exec_sid else None
             kind = str(parsed.get("outcome", "")).lower()
@@ -333,14 +334,15 @@ class LocalCLIExecutor:
                 msgs = parsed.get("messages")
                 if isinstance(msgs, list) and msgs:
                     return Emit(
-                        messages=tuple(str(m) for m in msgs),
+                        messages=tuple(str(m) for m in cast(list[object], msgs)),
                         session_id=session_id,
                         executor_session_id=native_sid,
                     )
                 return Silent(executor_session_id=native_sid)
             # Support native Claude Code `--output-format json` envelope (`{"result": "...", "session_id": "..."}`).
-            if isinstance(parsed.get("result"), str):
-                text = parsed["result"].strip()
+            result = parsed.get("result")
+            if isinstance(result, str):
+                text = result.strip()
                 if text:
                     return Emit(
                         messages=(text,),

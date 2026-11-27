@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from pathlib import Path
 
 from agent_runtime.app.bootstrap import AgentRuntimeApp, build_runtime
@@ -437,7 +437,7 @@ class TestAlwaysOnAgentEndToEnd(unittest.IsolatedAsyncioTestCase):
     async def test_outbox_dispatcher_pacing_and_retry(self) -> None:
         flaky_channel = RecordingChannel(fail_times=1)
         now_box = [100.0]
-        epoch = datetime(2026, 11, 22, 8, 0, 0, tzinfo=timezone.utc)
+        epoch = datetime(2026, 11, 22, 8, 0, 0, tzinfo=UTC)
         dispatcher = OutboxDispatcher(
             outbox=self.app.outbox,
             channel=flaky_channel,
