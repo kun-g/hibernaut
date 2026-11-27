@@ -11,6 +11,13 @@ from agent_runtime.adapters.delivery.pr_delivery import _remote_problem, _Transi
     ("fatal: unexpected EOF", True),
     ("ssh: Connection closed by remote host", True),
     ("write: broken pipe", True),
+    ("GraphQL: Something went wrong while executing your query on 2026-11-27T11:24:45Z. "
+     "Please include `REQUEST-ID` when reporting this issue.", True),
+    ("fatal: unable to access 'https://github.com/example/repo.git/': "
+     "LibreSSL SSL_connect: SSL_ERROR_SYSCALL in connection to github.com:443", True),
+    ("GraphQL: Resource not accessible by integration", False),
+    ("GraphQL: Field 'checks' doesn't exist on type 'Query'", False),
+    ("SSL certificate problem: unable to get local issuer certificate", False),
     ("HTTP 403: Resource not accessible by integration", False),
     ("invalid configuration: EOF marker missing", False),
     ("failed to read local configuration: EOF", False),

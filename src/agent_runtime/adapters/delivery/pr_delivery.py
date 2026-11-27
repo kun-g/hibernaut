@@ -399,12 +399,14 @@ class _TransientRemoteError(_Problem):
 
 
 _DISCONNECT = (r"\b(?:unexpected EOF|connection (?:was )?closed|broken pipe)\b|"
+               r"\bSSL_connect: SSL_ERROR_SYSCALL in connection to\b|"
                r"""(?:https?://[^\s"']+["']?|\bHTTP request(?: failed)?): EOF[ \t\r]*$""")
 _REMOTE_TRANSIENT = re.compile(
     rf"{_DISCONNECT}|"
     r"could not resolve (?:host(?:name)?|proxy)|temporary failure in name resolution|no such host|"
     r"name or service not known|nodename nor servname provided|connection (?:timed out|timeout|reset)|"
     r"error connecting to (?:api\.)?github\.com|"
+    r"^GraphQL: Something went wrong while executing your query on \d{4}-\d{2}-\d{2}T|"
     r"(?:i/o|tls handshake) timeout|operation timed out|timed out (?:while |after )?connect|"
     r"(?:http(?:/\d(?:\.\d)?)?|returned error:|status code[: ]+)\s*(?:429|5\d\d)\b|"
     r"(?:api |secondary )?rate limit exceeded|exceeded (?:a |the |your )?(?:secondary )?rate limit|"
