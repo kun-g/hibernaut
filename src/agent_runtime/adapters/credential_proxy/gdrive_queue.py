@@ -385,7 +385,12 @@ class DriveQueueGuard:
                                    f"folder with {self._service_account}")
         return self._sources
 
-    def _source_folder_meta(self, args: Mapping[str, Any]) -> tuple[str, str]:
+    def _excluded_source_ids(self) -> set[str]:
+        if not self._allow_any_source_folder:
+            return set()
+        return {*self._queue_ids(), self.folders().attachments_id} - {""}
+
+    def _source_folder_meta(self, args: Mapping[str, Any], excluded: set[str]) -> tuple[str, str]:
         if "folder_id" in args:
             root = None if self._allow_any_source_folder else self._sources_root()
             folder_id = _drive_id(args, "folder_id")
@@ -401,29 +406,38 @@ class DriveQueueGuard:
                 raise ProxyRefused(400, "folder_id must identify a Drive folder")
             if root is not None and root not in meta.parents:
                 raise ProxyRefused(403, "folder is not directly inside the sources folder")
-            return meta.file_id, meta.name
-        root = self._sources_root()
-        name = args.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise ProxyRefused(400, "'name' or 'folder_id' is required")
-        found = self._drive.find_subfolders(root).get(name.strip())
-        if found is None:
-            raise ProxyRefused(404, f"the sources folder has no folder named '{name.strip()}'")
-        return found, name.strip()
+            folder_id, name = meta.file_id, meta.name
+        else:
+            root = self._sources_root()
+            name = args.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ProxyRefused(400, "'name' or 'folder_id' is required")
+            name = name.strip()
+            found = self._drive.find_subfolders(root).get(name)
+            if found is None:
+                raise ProxyRefused(404, f"the sources folder has no folder named '{name}'")
+            folder_id = found
+        if folder_id in excluded:
+            raise ProxyRefused(403, "task queue and attachment folders cannot be used as sources")
+        return folder_id, name
 
     def source_folder(self, args: Mapping[str, Any]) -> dict[str, Any]:
-        folder_id, name = self._source_folder_meta(args)
+        excluded = self._excluded_source_ids()
+        folder_id, name = self._source_folder_meta(args, excluded)
         return {"folder": {"id": folder_id, "name": name},
-                "files": [_meta_json(m) for m in self._drive.list_files(folder_id)]}
+                "files": [_meta_json(m) for m in self._drive.list_files(folder_id) if excluded.isdisjoint(m.parents)]}
 
     def download_source(self, args: Mapping[str, Any]) -> DriveDownload:
+        excluded = self._excluded_source_ids()
         if "folder_id" in args:
-            folder_id, _ = self._source_folder_meta(args)
+            folder_id, _ = self._source_folder_meta(args, excluded)
             folders = {folder_id}
         else:
             # Older clients send only file_id. Their scope stays within the configured sources root.
             folders = set(self._drive.find_subfolders(self._sources_root()).values())
         meta = self._drive.get_file_meta(_drive_id(args, "file_id"))
+        if not excluded.isdisjoint(meta.parents):
+            raise ProxyRefused(403, "task queue files and attachments cannot be used as sources")
         if meta.mime_type == _GOOGLE_FOLDER_MIME or folders.isdisjoint(meta.parents):
             raise ProxyRefused(403, "file is not directly inside the source folder")
         if meta.mime_type.startswith(_GOOGLE_APPS_PREFIX) and meta.mime_type != _GOOGLE_DOC_MIME:
