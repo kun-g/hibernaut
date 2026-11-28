@@ -302,9 +302,11 @@ class SDENotesCase(MemoryCase):
         return await self.sde(**options).execute([task or self.task()], session or self.session(), self.caps)
 
 
+TRIED = {"target": "tests/unit/test_calc.py::test_divide", "files": [{"path": "tests/unit/test_calc.py", "hash": "new"}],
+         "method": "run the suite under xdist", "before": "10s", "after": "10s", "kept": False}
 NO_COMMIT = {"write": {}, "commit": None, "output": {
     "status": "done", "summary": "xdist gains nothing", "test_evidence": "10s before, 10s after",
-    "change_kind": "test_docs", "change_rationale": "nothing changed", "code_change": False}}
+    "change_kind": "test_docs", "change_rationale": "nothing changed", "code_change": False, "attempt_records": [TRIED]}}
 
 
 class TestEnds(SDENotesCase):
@@ -312,7 +314,9 @@ class TestEnds(SDENotesCase):
         task = self.task()
         await self.execute(NO_COMMIT, task=task)
         self.assertEqual(self.recorded(), ["没有改动 · Faster tests"])
-        self.assertIn("> xdist gains nothing", self.text())
+        self.assertIn("> 1. 对象: tests/unit/test_calc.py::test_divide", self.text())
+        self.assertIn("> - 方法: run the suite under xdist", self.text())
+        self.assertNotIn("xdist gains nothing", self.text())
         self.assertIn(task.external_id, self.text())
 
     async def test_local_commits_are_not_merged(self) -> None:
@@ -349,7 +353,8 @@ class TestEnds(SDENotesCase):
         self.assertEqual(self.recorded(), [])
 
     async def test_a_suspended_task_is_recorded_once_a_person_stops_it(self) -> None:
-        asked = await self.execute(dev(FIXED, status="needs_input", question="采用哪种方式？", summary="looked at xdist"))
+        asked = await self.execute(dev(FIXED, status="needs_input", question="采用哪种方式？", summary="looked at xdist",
+                                     attempt_records=[{**TRIED, "method": "looked at xdist"}]))
         assert isinstance(asked, Suspend), asked
         self.assertEqual(self.recorded(), [])
         waiting = self.session(status="suspended", pending_request_id=asked.request_id,
@@ -359,7 +364,7 @@ class TestEnds(SDENotesCase):
             await self.execute(task=answer, session=waiting)
             self.assertEqual(self.recorded(), ["停止 · Faster tests"])
         self.assertIn("question declined", self.text())
-        self.assertIn("> looked at xdist", self.text())
+        self.assertIn("> - 方法: looked at xdist", self.text())
 
     async def test_a_task_without_the_field_behaves_as_before(self) -> None:
         plain = self.payload()
@@ -404,7 +409,7 @@ class TestRestart(SDERestartCase):
         self.assertFalse(kept.path(project).exists())
         developer = self.orca.session(0)
         [task] = self.tasks(developer)
-        committed(self.repo, "def divide(a, b):\n    return a / b if b else 0\n")(developer, task)
+        committed(self.repo, "def divide(a, b):\n    return a / b if b else 0\n", attempt_records=[TRIED])(developer, task)
         # The next process has the database, not the objects, of the first.
         self.sde_extra = {"attempts": AttemptNotes(store=SQLiteAttemptStore(kept.db), memory_for=kept.registry.memory_for)}
         worker, _, _ = self.restarted()
@@ -412,6 +417,7 @@ class TestRestart(SDERestartCase):
         self.assertIsInstance(report.outcome, Emit)
         self.assertEqual(kept.entries(project=project), ["没合并 · Reject zero"])
         self.assertIn("external_id: task-1", kept.text(project))
+        self.assertIn("> - 方法: run the suite under xdist", kept.text(project))
 
 
 class TestFirstPrompt(SDENotesCase):
@@ -422,7 +428,8 @@ class TestFirstPrompt(SDENotesCase):
 
     async def test_it_points_to_the_record_only_once_there_is_one(self) -> None:
         first = await self.prompt(text="one")
-        self.assertNotIn("attempts", first)
+        self.assertNotIn("## Earlier attempts", first)
+        self.assertIn("## Attempt record", first)
         second = await self.prompt(text="two")
         self.assertIn(f'memory_read (mcp__hibernaut_memory__memory_read), uri "{NOTE}"', second)
         self.assertNotIn("xdist gains nothing", second)
@@ -538,6 +545,6 @@ class TestTheNextTaskReadsIt(SDENotesCase):
         content = json.loads(read)["content"]
         self.assertEqual(headings(content), ["没有改动 · Round 1"])
         self.assertIn("external_id: order-1", content)
-        self.assertIn("> xdist gains nothing", content)
+        self.assertIn("> - 方法: run the suite under xdist", content)
         self.assertIn(NOTE, [c for c in second if "prompt" in c][-1]["prompt"])
         self.assertEqual(self.recorded(), ["没有改动 · Round 2", "没有改动 · Round 1"])

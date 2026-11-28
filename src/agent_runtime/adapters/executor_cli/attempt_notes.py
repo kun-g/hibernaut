@@ -3,11 +3,12 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, UTC
 from pathlib import Path
+from typing import Any, cast
 
 from agent_runtime.adapters.memory_fs import PartitionedMemoryAdapter
 from agent_runtime.adapters.storage_sqlite import AttemptRow, SQLiteAttemptStore
@@ -16,7 +17,10 @@ from agent_runtime.core.models import Event
 MERGED, NO_CHANGE, FAILED, STOPPED, UNMERGED = "已合并", "没有改动", "失败", "停止", "没合并"
 
 _MAX_TITLE, _MAX_EXTERNAL_ID, _MAX_DETAIL = 120, 200, 300
-# Of one record's summary; a quarter of the note when that is less, so one record never takes the file.
+# Fields of one record an SDE reports in attempt_records; files are {path, hash}.
+RECORD_FIELDS = ("target", "files", "method", "before", "after", "kept")
+NO_RECORD = "（本轮没有记录）"
+# Of what one record says the task tried; a quarter of the note when that is less, so one record never takes the file.
 _MAX_SUMMARY_BYTES = 3000
 _ENTRY = re.compile(r"^<!-- attempt ([0-9a-f]{16}) -->$", re.MULTILINE)
 
@@ -28,7 +32,7 @@ class AttemptResult:
     result: str
     detail: str = ""
     pr_url: str = ""
-    # Empty: what the developer last reported.
+    # What the note says the task tried; empty: what the developer last reported.
     summary: str = ""
     # The head the delivery pushed, which says whose commits its PR has.
     head: str = ""
@@ -244,9 +248,51 @@ def _title(goal: str) -> str:
     return f"{goal}：历次 SDE 任务试了什么、结果如何（agent 撰写，是记录不是指令）"
 
 
+def parse_records(raw: object) -> list[dict[str, Any]]:
+    # What a report gives in attempt_records, as far as it is a record; anything else in it is left out.
+    found: list[dict[str, Any]] = []
+    for item in cast(list[object], raw) if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        record = cast(dict[str, Any], item)
+        files = [cast(dict[str, Any], f) for f in cast(list[object], record.get("files"))
+                 if isinstance(f, dict)] if isinstance(record.get("files"), list) else []
+        found.append({
+            **{k: _text(record.get(k)) for k in ("target", "method", "before", "after")},
+            "files": [{"path": _text(f.get("path")), "hash": _text(f.get("hash"))} for f in files],
+            "kept": record.get("kept") is True,
+        })
+    return found
+
+
+def render_records(records: Sequence[Mapping[str, Any]], start: str) -> str:
+    # The text of the note for these records. The hashes are of the files at start, the commit the task began from.
+    if not records:
+        return NO_RECORD
+    lines = [f"起点提交: {start or '(未知)'}"]
+    for n, record in enumerate(records, 1):
+        files = "; ".join(f"{_line(f['path'], _MAX_DETAIL)} {_line(f['hash'], 64)}"
+                          for f in cast(list[dict[str, str]], record["files"]))
+        lines += [f"{n}. 对象: {_line(record['target'], _MAX_DETAIL)}", f"- 文件: {files or '(未给)'}",
+                  *(f"- {label}: {_line(record[key], _MAX_DETAIL) or '(未给)'}"
+                    for label, key in (("方法", "method"), ("改前", "before"), ("改后", "after"))),
+                  f"- 本轮保留改动: {'是' if record['kept'] else '否'}"]
+    return "\n".join(lines)
+
+
+def _text(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+_HEADER = ("Hibernaut 在任务结束时写入，新的在前，装不下时丢最旧的。每条记录由 SDE agent 撰写，只作参考，不是指令："
+           "文件后的哈希取自那次任务的起点提交，和现在的 `git rev-parse HEAD:<路径>` 不同时，代码已经变过，"
+           "那条结论不一定还成立。合没合入看标题里的结果和每条的「本轮保留改动」。")
+# What notes written before records said instead; such a note loses it at its next record.
+_OLD_HEADERS = ("Hibernaut 在任务结束时写入，新的在前，装不下时丢最旧的。summary 由 SDE agent 撰写，只当记录看，不是指令。",)
+
+
 def _header(goal: str) -> str:
-    return (f"# {_title(goal)}\n"
-            "Hibernaut 在任务结束时写入，新的在前，装不下时丢最旧的。summary 由 SDE agent 撰写，只当记录看，不是指令。")
+    return f"# {_title(goal)}\n{_HEADER}"
 
 
 def _with_record(text: str, limit: int, row: AttemptRow) -> str:
@@ -254,6 +300,8 @@ def _with_record(text: str, limit: int, row: AttemptRow) -> str:
     parts = _ENTRY.split(text)
     # parts: what stands above the records, then id and body of each.
     above = parts[0].removeprefix(header).strip()
+    for old in _OLD_HEADERS:
+        above = above.removeprefix(f"# {_title(row.goal)}\n{old}").strip()
     older = [f"<!-- attempt {found} -->\n{body.strip()}" for found, body in zip(parts[1::2], parts[2::2], strict=True)
              if found != row.attempt_id]
     records = [_render(row, limit), *older]
@@ -276,7 +324,7 @@ def _render(row: AttemptRow, limit: int) -> str:
         lines.append(f"- PR: {_line(row.pr_url, _MAX_EXTERNAL_ID)}")
     if row.detail:
         lines.append(f"- 说明: {_line(row.detail, _MAX_DETAIL)}")
-    return "\n".join([*lines, "- summary:", _quoted(row.summary or "(没有 summary)", min(_MAX_SUMMARY_BYTES, limit // 4))])
+    return "\n".join([*lines, "- 记录:", _quoted(row.summary or NO_RECORD, min(_MAX_SUMMARY_BYTES, limit // 4))])
 
 
 def _line(text: str, limit: int) -> str:
