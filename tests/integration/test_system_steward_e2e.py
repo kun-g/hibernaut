@@ -151,13 +151,12 @@ if name == "gh":
     if args[0] == "api":
         sys.exit(0 if args[1] == "repos/acme/tool" else 1)
     if args[:2] == ["repo", "clone"]:
-        run("git", "clone", "-q", str(state / "origin"), args[3])
-        run("git", "-C", args[3], "config", "url." + str(state / "origin") + ".insteadOf", "https://github.com/acme/tool.git")
-        run("git", "-C", args[3], "config", "remote.origin.url", "https://github.com/acme/tool.git")
-        # get-url would show the local path; the repository answers as GitHub's would.
-        run("git", "-C", args[3], "config", "--unset", "url." + str(state / "origin") + ".insteadOf")
-        for key, value in (("user.email", "t@example.invalid"), ("user.name", "t")):
-            run("git", "-C", args[3], "config", key, value)
+        url = f"https://github.com/{args[2]}.git"
+        origin = state / "origin"
+        run("git", "clone", "-q", str(origin), args[3])
+        for key, value in ((f"url.{origin}.insteadOf", url), ("remote.origin.url", url),
+                           ("user.email", "t@example.invalid"), ("user.name", "t")):
+            run("git", "-C", args[3], "config", "--local", key, value)
     sys.exit(0)
 if args[:2] == ["repo", "show"]:
     sys.exit(0 if flag("--repo")[5:] in known else 1)
@@ -187,9 +186,8 @@ class ServedCase(unittest.IsolatedAsyncioTestCase):
         origin.rename(self.state / "origin")
         self.home, self.repo, self.workspace = (self.root / n for n in ("hibernaut", "a", "workspace"))
         for path in (self.home, self.repo, self.workspace):
-            git(self.root, "clone", "-q", str(self.state / "origin"), str(path))
-            git(path, "config", "user.email", "t@example.invalid")
-            git(path, "config", "user.name", "t")
+            git(self.root, "clone", "-q", "-c", "user.email=t@example.invalid", "-c", "user.name=t",
+                str(self.state / "origin"), str(path))
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
         (bin_dir / "fake.py").write_text(COMMANDS)
@@ -332,6 +330,16 @@ class EndToEndTests(ServedCase):
         for line in self.before.splitlines():
             self.assertIn(line, lines)
 
+        # The developer's new worktree must include changes pushed since onboarding.
+        checkout = self.root / "tool"
+        origin = self.state / "origin"
+        url = "https://github.com/acme/tool.git"
+        for key, value in (("user.name", "t"), ("user.email", "t@example.invalid"),
+                           ("remote.origin.url", url), (f"url.{origin}.insteadOf", url)):
+            git(checkout, "config", "--local", "--get", "--fixed-value", key, value)
+        (origin / "upstream.txt").write_text("after onboarding")
+        git(origin, "add", "upstream.txt")
+        git(origin, "commit", "-qm", "after onboarding")
         await self.message("acme/tool 的除法坏了")
         await self.wait_for(lambda: len(self.launches()) == 5, "the developer")
         ash, _ops, again, front, sde = self.launches()
@@ -344,6 +352,7 @@ class EndToEndTests(ServedCase):
         # Orca opened the developer's worktree, beside the new checkout.
         self.assertEqual(sde["role"], "sde")
         self.assertEqual(Path(sde["cwd"]).resolve().parent, self.root)
+        self.assertTrue((Path(sde["cwd"]) / "upstream.txt").is_file())
         self.assertEqual(len(self.commands("orca", "worktree", "create")), 1)
         self.assertEqual([e.inbox_id for e in self.events(FORWARD_SOURCE)], [OPS, "proj:tool", "proj:tool:sde"])
 
