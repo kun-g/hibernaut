@@ -11,11 +11,14 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
+from switchboard import http_server
 from switchboard.app import Switchboard, build_switchboard
 from switchboard.config import SwitchboardConfig, parse_config
 from switchboard.http_client import HttpResponse
 from switchboard.ports import RecordingAuditSink
+from tests.support.http_listener import serve_with_short_poll
 
 # Test-only placeholders; not real credentials.
 GITHUB_SECRET = "test-github-secret"
@@ -133,7 +136,8 @@ def make_harness(*, start_http: bool = True, **sections: Mapping[str, Any]) -> H
         config, credentials=StaticCredentials(), audit=audit, http_client=http, clock=clock
     )
     if start_http:
-        board.http.start()
+        with patch.object(http_server._Server, "serve_forever", serve_with_short_poll):
+            board.http.start()
     return Harness(board=board, clock=clock, audit=audit, http=http, tmp=tmp)
 
 

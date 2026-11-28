@@ -9,16 +9,19 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
 from switchboard.envelope import CanonicalEvent, validate_envelope
 from switchboard.http_client import HttpResponse
 from switchboard.ports import ConsumerHandler, IngestResult
+from taskboard.adapters import http_server
 from taskboard.adapters.mcp_tools import TOOL_NAMES, TaskboardMCPServer, serve_stdio
 from taskboard.adapters.remote_bus import RemotePublishRejectedError, SwitchboardRemoteBus
 from taskboard.app.config import ConfigError, TaskboardConfig, load_config, parse_config, service_secrets
 from taskboard.app.main import TaskboardService, build_service
+from tests.support.http_listener import serve_with_short_poll
 from tests.support.switchboard_support import FakeHttpClient, StaticCredentials
 from tests.support.m7_service import REPO, SCOPE
 
@@ -217,7 +220,8 @@ def _config(tmp_path: Path, **http: Any) -> TaskboardConfig:
 def running(tmp_path: Path) -> Iterator[_Running]:
     bus = _Bus()
     service = build_service(_config(tmp_path, base_path="/taskboard/"), mcp_token=TOKEN, bus=bus)
-    service.start()
+    with patch.object(http_server._Server, "serve_forever", serve_with_short_poll):
+        service.start()
     try:
         yield _Running(service, bus)
     finally:
