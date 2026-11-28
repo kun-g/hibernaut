@@ -2,7 +2,9 @@ import asyncio
 import contextlib
 import io
 import json
+import os
 import socket
+import sys
 import tempfile
 import time
 import unittest
@@ -10,6 +12,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_runtime.adapters.channels.channels import WebhookHTTPServer
+from agent_runtime.adapters.storage_sqlite.db import SQLiteDatabase
 from agent_runtime.app.config import load_config, parse_config
 from agent_runtime.app.main import build_daemon, build_daemon_from_config, concurrency_limits, serve_configured
 from agent_runtime.app.projects import AmbiguousProjectMatch
@@ -25,6 +29,7 @@ from agent_runtime.core.models import (
     Silent,
 )
 from agent_runtime.engine import AgentWorker
+from tests.support.http_listener import serve_with_short_poll
 
 MAIN_LOGGER = "agent_runtime.app.main"
 
@@ -208,7 +213,7 @@ class Probe:
                     if text.startswith("block"):
                         await probe.gates[text].wait()
                     else:
-                        await asyncio.sleep(0.02)
+                        await asyncio.sleep(0)
                     if text in probe.broken:
                         raise RuntimeError(f"{text} is broken")
                 except asyncio.CancelledError:
@@ -231,11 +236,19 @@ class Probe:
 class PoolCase(unittest.IsolatedAsyncioTestCase):
     policy = "defer"
 
+    async def asyncSetUp(self):
+        self.loop = asyncio.get_running_loop()
+        # The loop clock jumps during observation windows; wall-time slow-callback traces would be misleading.
+        self.loop.set_debug(bool(os.environ.get("PYTHONASYNCIODEBUG")) or sys.flags.dev_mode)
+        monotonic = self.loop.time
+        self.elapsed = 0.0
+        self.enterContext(patch.object(self.loop, "time", lambda: monotonic() + self.elapsed))
+
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.probe = Probe()
         self.probe._inboxes = []
-        # Real configuration and composition root; only the CLI subprocess is replaced.
+        # Keep the real configuration, worker pool and executor routing.
         self.enterContext(patch(
             "agent_runtime.app.main.LocalCLIExecutor",
             lambda *, default_executor, **_: self.probe.executor(default_executor),
@@ -253,7 +266,7 @@ class PoolCase(unittest.IsolatedAsyncioTestCase):
 
     @contextlib.asynccontextmanager
     async def daemon(self, **limits):
-        daemon = build_daemon_from_config(parse_config(self.raw(**limits)))
+        daemon = build_daemon_from_config(parse_config(self.raw(**limits)), database=SQLiteDatabase())
         stop = asyncio.Event()
         runs = asyncio.create_task(daemon.pool.run_forever(stop))
         self._seq = 0
@@ -274,13 +287,24 @@ class PoolCase(unittest.IsolatedAsyncioTestCase):
 
     async def until(self, check, timeout=45.0):
         deadline = time.monotonic() + timeout
+        delay = 0
         while not check():
             if time.monotonic() > deadline:
                 self.fail(f"timed out: started={self.probe.started} active={self.probe.active}")
-            await asyncio.sleep(0.005)
+            await asyncio.sleep(delay)
+            delay = 0.001
 
-    async def settle(self):
-        await asyncio.sleep(0.1)
+    async def observe_for(self, seconds):
+        # Run ready callbacks and timers in deadline order, including timers they arm during the window.
+        end = self.loop.time() + seconds
+        finished = self.loop.create_future()
+        self.loop.call_at(end, finished.set_result, None)
+        while not finished.done():
+            if not self.loop._ready:
+                next_timer = min(h.when() for h in self.loop._scheduled if not h.cancelled())
+                self.elapsed += max(0.0, next_timer - self.loop.time())
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
     async def waiting_for_quota(self, daemon, *inboxes):
         # Keys are retained after the pool considered an inbox and could not admit it.
@@ -416,11 +440,12 @@ class TestExecutorLimit(PoolCase):
             for n in (1, 2, 3):
                 self.post(daemon, f"proj:a:issue-{n}", f"block-{n}", executor="sde")
             await self.until(lambda: self.probe.active_texts() == ["block-1"])
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:issue-2", "proj:a:issue-3")
             with patch.object(daemon.pool._limiter, "try_acquire", wraps=daemon.pool._limiter.try_acquire) as attempts:
-                await asyncio.sleep(0.3)
-                self.assertEqual(attempts.call_count, 0)
+                await self.observe_for(0.3)
+                before_release = attempts.call_count
                 self.probe.release("block-1", "block-2", "block-3")
+                self.assertEqual(before_release, 0)
                 await self.idle(daemon)
                 self.assertGreater(attempts.call_count, 0)
 
@@ -520,7 +545,7 @@ class TestOneInboxWithSeveralExecutors(PoolCase):
                 self.post(daemon, "proj:a", "lost", executor="nobody")
                 self.post(daemon, "proj:a", "behind", executor="sde")
                 await self.idle(daemon)
-                await self.settle()
+                await self.observe_for(0.1)
             self.assertLessEqual(len(logs.records), 2, logs.output)
             self.assertEqual([e.payload["text"] for e in daemon.inbox.fetch_pending("proj:a")], ["lost", "behind"])
             self.assertEqual(daemon.pool._limiter.active, 0)
@@ -588,6 +613,7 @@ class TestReplay(PoolCase):
         return first
 
     async def test_a_replay_re_keys_an_inbox_that_is_already_queued(self):
+        self.loop.set_debug(True)  # Detect off-loop access from the HTTP thread.
         for threaded in (False, True):
             with self.subTest(threaded=threaded):
                 self.probe.__init__()
@@ -610,8 +636,6 @@ class TestReplay(PoolCase):
                     await self.idle(daemon)
                     self.assertEqual(self.probe.peak("executor", "sde"), 1)
                     self.assertEqual(self.probe.started[-2:], ["first", "second"])
-                for path in self.root.glob("hb.db*"):
-                    path.unlink()
 
     async def test_a_replay_stored_before_its_wake_arrives_is_not_dispatched_under_the_old_key(self):
         async with self.daemon(**self.LIMITS) as daemon:
@@ -648,7 +672,7 @@ class TestInterruptPolicy(PoolCase):
             self.post(daemon, "proj:a", "block-chat")
             await self.until(lambda: self.probe.active_texts() == ["block-chat", "block-sde"])
             self.post(daemon, "proj:a", "chat-sde", executor="sde")
-            await self.settle()
+            await self.observe_for(0.1)
             self.assertEqual(self.probe.cancelled, [])
             self.probe.release("block-chat", "block-sde")
             await self.idle(daemon)
@@ -740,7 +764,6 @@ class TestLifecycle(PoolCase):
             self.assertFalse(daemon.pool._idle_event.is_set())
             self.probe.release("block-1")
             await self.idle(daemon)
-            await self.settle()
             # The finished inbox goes too, once its lease is released; nothing waiting ran here.
             self.assertEqual(handed[3:], ["proj:a:issue-1"])
             self.assertEqual(self.probe.started, ["block-1"])
@@ -770,7 +793,6 @@ class TestLifecycle(PoolCase):
             self.assertEqual(len(daemon.pool._queue), 0)
             self.probe.release("block-1")
             await self.idle(daemon)
-            await self.settle()
             self.assertEqual(self.probe.started, ["block-1"])
             for n in (2, 3):
                 (event,) = daemon.inbox.fetch_pending(f"proj:a:issue-{n}")
@@ -784,7 +806,7 @@ class TestLifecycle(PoolCase):
         runs = asyncio.create_task(daemon.pool.run_forever(stop))
         await self.three_sde(daemon)
         stop.set()
-        await self.settle()
+        await self.observe_for(0.1)
         self.assertFalse(runs.done())
         self.probe.release("block-1", "block-2", "block-3")
         await asyncio.wait_for(runs, 5)
@@ -796,15 +818,20 @@ class TestLifecycle(PoolCase):
         self.addCleanup(daemon.close)
         stop = asyncio.Event()
         runs = asyncio.create_task(daemon.pool.run_forever(stop))
-        await asyncio.sleep(0.05)
+        await self.until(lambda: daemon.pool._loop is asyncio.get_running_loop())
         stop.set()
         await asyncio.wait_for(runs, 1)
 
     async def test_wait_until_idle_waits_for_inboxes_held_back_by_a_limit(self):
         async with self.daemon(**self.LIMITS) as daemon:
             await self.three_sde(daemon)
+            waiting = asyncio.create_task(daemon.pool.wait_until_idle(timeout_seconds=1))
+            await self.observe_for(0.75)
+            self.assertFalse(waiting.done())
+            await self.observe_for(0.3)
+            self.assertTrue(waiting.done())
             with self.assertRaises(TimeoutError):
-                await daemon.pool.wait_until_idle(timeout_seconds=0.1)
+                waiting.result()
             self.probe.release("block-1", "block-2", "block-3")
             await self.idle(daemon)
             self.assertEqual(len(self.probe.finished), 3)
@@ -820,6 +847,10 @@ class TestLifecycle(PoolCase):
 
 
 class TestReload(PoolCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.enterClassContext(patch.object(WebhookHTTPServer, "serve_forever", serve_with_short_poll))
+
     def write(self, **limits):
         raw = self.raw(**limits)
         raw["channels"] = {"host": "127.0.0.1", "port": self.port}
@@ -840,27 +871,27 @@ class TestReload(PoolCase):
         self._seq = 0
         self.write(projects={"a": {**TASKS, "max_concurrency": 1}})
         config = load_config(self.path)
-        daemon = build_daemon_from_config(config)
+        daemon = build_daemon_from_config(config, database=SQLiteDatabase())
         self.addCleanup(daemon.close)
         stop = asyncio.Event()
         with contextlib.redirect_stderr(stderr):
-            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02,
+            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.005,
                                                            outbox_interval_seconds=0.02))
             try:
                 for n in range(4):
                     self.post(daemon, f"proj:a:issue-{n}", f"block-{n}")
                 await self.until(lambda: self.probe.active_texts() == ["block-0"])
-                await self.settle()
+                await self.observe_for(0.1)
                 self.assertEqual(self.probe.active_texts(), ["block-0"])
                 self.write(projects={"a": {**TASKS, "max_concurrency": 2}})
                 # block-0 still occupies one project slot under the old generation, so the new one admits only block-1.
                 await self.until(lambda: len(self.probe.active) == 2)
-                await self.settle()
+                await self.observe_for(0.1)
                 self.assertEqual(self.probe.active_texts(), ["block-0", "block-1"])
                 # Releasing the old generation's run frees its slot and wakes the new generation for block-2.
                 self.probe.release("block-0")
                 await self.until(lambda: self.probe.active_texts() == ["block-1", "block-2"])
-                await self.settle()
+                await self.observe_for(0.1)
                 self.assertEqual(self.probe.active_texts(), ["block-1", "block-2"])
                 # An unusable limit keeps the current generation.
                 self.write(projects={"a": {**TASKS, "max_concurrency": 0}})
@@ -883,11 +914,11 @@ class TestReload(PoolCase):
         self._seq = 0
         self.write(max_concurrency=2, projects={"a": TASKS})
         config = load_config(self.path)
-        daemon = build_daemon_from_config(config)
+        daemon = build_daemon_from_config(config, database=SQLiteDatabase())
         self.addCleanup(daemon.close)
         stop = asyncio.Event()
         with contextlib.redirect_stderr(stderr):
-            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02,
+            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.005,
                                                            outbox_interval_seconds=0.02))
             try:
                 self.post(daemon, "proj:a:issue-0", "block-0")
@@ -898,7 +929,7 @@ class TestReload(PoolCase):
                 await self.until(lambda: "[config] Reloaded" in stderr.getvalue())
                 # New work arriving after reload must wait for an old-generation slot instead of running 3/2.
                 self.post(daemon, "proj:b", "block-2")
-                await self.settle()
+                await self.observe_for(0.1)
                 self.assertEqual(self.probe.active_texts(), ["block-0", "block-1"])
                 self.probe.release("block-0")
                 await self.until(lambda: self.probe.active_texts() == ["block-1", "block-2"])
@@ -922,11 +953,11 @@ class TestReload(PoolCase):
             "writer": {"executor": "sde", "max_concurrency": writer}, "other": {"executor": "sde"}}}
         self.write(writer=1, projects={"a": TASKS})
         config = load_config(self.path)
-        daemon = build_daemon_from_config(config)
+        daemon = build_daemon_from_config(config, database=SQLiteDatabase())
         self.addCleanup(daemon.close)
         stop = asyncio.Event()
         with contextlib.redirect_stderr(stderr):
-            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02,
+            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.005,
                                                            outbox_interval_seconds=0.02))
             try:
                 for n in range(3):
@@ -934,7 +965,7 @@ class TestReload(PoolCase):
                 await self.until(lambda: self.probe.active_texts() == ["block-0"])
                 self.write(writer=2, projects={"a": TASKS})
                 await self.until(lambda: len(self.probe.active) == 2)
-                await self.settle()
+                await self.observe_for(0.1)
                 self.assertEqual(self.probe.active_texts(), ["block-0", "block-1"])
                 # Another agent of the same driver has a slot, and the old Run's goes to the writer's next inbox.
                 self.post(daemon, "proj:a:9", "other", executor="other")
@@ -959,7 +990,7 @@ class TestReload(PoolCase):
         self.raw = lambda: {**base(projects={"a": TASKS}, executors=raw["executors"]), "agents": raw["agents"]}
         self.write()
         config = load_config(self.path)
-        daemon = build_daemon_from_config(config)
+        daemon = build_daemon_from_config(config, database=SQLiteDatabase())
         self.addCleanup(daemon.close)
         stop = asyncio.Event()
 
@@ -969,7 +1000,7 @@ class TestReload(PoolCase):
             await self.until(lambda: "[config] Reloaded" in stderr.getvalue())
 
         with contextlib.redirect_stderr(stderr):
-            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02,
+            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.005,
                                                            outbox_interval_seconds=0.02))
             try:
                 yield daemon, reload
@@ -994,7 +1025,7 @@ class TestReload(PoolCase):
                     self.post(daemon, "proj:a:2", "block-2", executor="writer")
                     self.post(daemon, "proj:a:3", "free", executor=free)
                     await self.until(lambda: "free" in self.probe.finished)
-                    await self.settle()
+                    await self.observe_for(0.1)
                     self.assertEqual(self.probe.active_texts(), ["block-1"])
                     self.probe.release("block-1")
                     await self.until(lambda: self.probe.active_texts() == ["block-2"])
@@ -1018,7 +1049,7 @@ class TestReload(PoolCase):
                     self.post(daemon, "proj:a:2", "block-2", executor="writer")
                     self.post(daemon, "proj:a:3", "free", executor="other")
                     await self.until(lambda: "free" in self.probe.finished)
-                    await self.settle()
+                    await self.observe_for(0.1)
                     self.assertEqual(self.probe.active_texts(), ["block-1"])
                     self.probe.release("block-1")
                     await self.until(lambda: self.probe.active_texts() == ["block-2"])
@@ -1032,11 +1063,11 @@ class TestReload(PoolCase):
         self._seq = 0
         self.write(max_concurrency=3, projects={"a": TASKS})
         config = load_config(self.path)
-        daemon = build_daemon_from_config(config)
+        daemon = build_daemon_from_config(config, database=SQLiteDatabase())
         self.addCleanup(daemon.close)
         stop = asyncio.Event()
         with contextlib.redirect_stderr(stderr):
-            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02,
+            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.005,
                                                            outbox_interval_seconds=0.02))
             try:
                 for n in range(3):
@@ -1047,7 +1078,7 @@ class TestReload(PoolCase):
                 self.post(daemon, "proj:a:issue-3", "block-3")
                 self.probe.release("block-0", "block-1")
                 await self.until(lambda: self.probe.active_texts() == ["block-2"])
-                await self.settle()
+                await self.observe_for(0.1)
                 # Still 1 active (block-2 >= new limit 1), so block-3 must keep waiting.
                 self.assertEqual(self.probe.active_texts(), ["block-2"])
                 self.probe.release("block-2")
@@ -1068,13 +1099,13 @@ class TestReload(PoolCase):
         self._seq = 0
         self.write(max_concurrency=1, projects={"a": TASKS})
         config = load_config(self.path)
-        daemon = build_daemon_from_config(config)
+        daemon = build_daemon_from_config(config, database=SQLiteDatabase())
         self.addCleanup(daemon.close)
         stop = asyncio.Event()
         with contextlib.redirect_stderr(stderr), socket.socket() as occupied:
             occupied.bind(("127.0.0.1", 0))
             occupied.listen()
-            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.02,
+            serving = asyncio.create_task(serve_configured(self.path, config, daemon, stop, reload_interval=0.005,
                                                            outbox_interval_seconds=0.02))
             try:
                 self.post(daemon, "proj:a:issue-0", "block-0")
@@ -1085,7 +1116,7 @@ class TestReload(PoolCase):
                 self.write(max_concurrency=4, projects={"a": TASKS})
                 await self.until(lambda: "Cannot activate settings" in stderr.getvalue())
                 self.port = old_port
-                await self.settle()
+                await self.observe_for(0.1)
                 # Limit stayed at 1 because the reload failed to bind the new port.
                 self.assertEqual(self.probe.active_texts(), ["block-0"])
                 self.probe.release("block-0", "block-1")
@@ -1192,7 +1223,7 @@ class TestAgents(PoolCase):
             await self.until(lambda: {"main", "other"} <= set(self.probe.finished))
             for n, agent in ((1, "writer"), (2, "fixer"), (3, "writer")):
                 await self.until(lambda: self.probe.active == [(agent, f"block-{n}")])
-                await self.settle()
+                await self.waiting_for_quota(daemon, *(f"proj:a:{i}" for i in range(n + 1, 4)))
                 self.assertEqual(self.probe.active, [(agent, f"block-{n}")])
                 self.probe.release(f"block-{n}")
             await self.idle(daemon)
@@ -1333,7 +1364,7 @@ class TestAgents(PoolCase):
             self.post(daemon, "proj:a:2", "by-steward", executor="steward", key="k1")
             self.post(daemon, "proj:a:2", "block-2", key="k2")
             await self.until(lambda: "by-steward" in self.probe.finished)
-            await self.settle()
+            await self.waiting_for_quota(daemon, "proj:a:2")
             self.assertEqual(self.probe.active, [("sde", "block-1")])
             self.probe.release("block-1")
             await self.until(lambda: self.probe.active == [("sde", "block-2")])

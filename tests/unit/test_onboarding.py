@@ -11,6 +11,7 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest import mock
 from unittest.mock import patch
 
 from agent_runtime.app import config as config_module
@@ -512,15 +513,36 @@ class HelperTests(unittest.TestCase):
 
 
 class ReloadStatusTests(unittest.TestCase):
+    def change_when_waiting(self, status: ReloadStatus, change: Callable[[], None]) -> None:
+        entered = threading.Event()
+        wait = status._changed.wait
+
+        def observed_wait(timeout: float) -> bool:
+            entered.set()
+            return wait(timeout)
+
+        def notify() -> None:
+            if entered.wait(5):
+                change()
+
+        self.enterContext(patch.object(status._changed, "wait", observed_wait))
+        thread = threading.Thread(target=notify)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+
     def test_c5_a_version_is_in_force_once_it_is_settled(self) -> None:
         status = ReloadStatus()
         status.watch(Path("/x/h.toml"))
-        with self.assertRaisesRegex(ReloadFailed, "within 0.05"):
-            status.wait(b"a", 0.05)
+        # A spurious wake before the deadline must wait again, using only the remaining budget.
+        with (patch("agent_runtime.app.reload.time") as clock, patch.object(status._changed, "wait") as wait):
+            clock.monotonic.side_effect = [0.0, 0.0, 0.75, 1.0]
+            with self.assertRaisesRegex(ReloadFailed, "within 1 seconds"):
+                status.wait(b"a", 1)
+            self.assertEqual(wait.call_args_list, [mock.call(1), mock.call(0.25)])
         version = status.seen(b"a")
         with self.assertRaises(ReloadFailed):
-            status.wait(b"a", 0.05)
-        threading.Timer(0.05, lambda: status.settle(version)).start()
+            status.wait(b"a", 0)
+        self.change_when_waiting(status, lambda: status.settle(version))
         status.wait(b"a", 5)
         status.settle(status.seen(b"b"), "not valid")
         with self.assertRaisesRegex(ReloadFailed, "not valid"):
@@ -534,13 +556,13 @@ class ReloadStatusTests(unittest.TestCase):
         status.settle(first)
         for contents in (b"a", b"b"):
             with self.assertRaises(ReloadFailed):
-                status.wait(contents, 0.05)
+                status.wait(contents, 0)
 
     def test_c5_a_version_another_one_replaced_is_not_waited_for(self) -> None:
         status = ReloadStatus()
         status.watch(Path("/x/h.toml"))
         status.seen(b"a")
-        threading.Timer(0.05, lambda: status.seen(b"b")).start()
+        self.change_when_waiting(status, lambda: status.seen(b"b"))
         started = time.monotonic()
         with self.assertRaisesRegex(ReloadFailed, "another version"):
             status.wait(b"a", 30)
@@ -549,7 +571,7 @@ class ReloadStatusTests(unittest.TestCase):
     def test_c5_a_daemon_that_stops_ends_the_wait(self) -> None:
         status = ReloadStatus()
         status.watch(Path("/x/h.toml"))
-        threading.Timer(0.05, lambda: status.watch(None)).start()
+        self.change_when_waiting(status, lambda: status.watch(None))
         started = time.monotonic()
         with self.assertRaises(ReloadFailed):
             status.wait(b"a", 30)
@@ -589,15 +611,11 @@ class ConfigChangesTests(unittest.IsolatedAsyncioTestCase):
                 errors.append(error)
             settle(version, error)
 
-        with patch.object(config_module, "parse_config", parse), patch.object(reloads, "settle", settling):
-            task = asyncio.create_task(collect())
-            for _ in range(500):
-                await asyncio.sleep(0.01)
-                if (found or errors) and not pending:
-                    break
-            await asyncio.sleep(0.1)
-            stop.set()
-            await task
+        # One tick per replaced version, then the final parse, any retry, and one unchanged poll.
+        ticks = [TimeoutError] * (len(writes) + self.dropped + 2)
+        with (patch.object(stop, "wait", side_effect=[*ticks, True]),
+              patch.object(config_module, "parse_config", parse), patch.object(reloads, "settle", settling)):
+            await collect()
         return found, errors
 
     async def test_c5_a_version_replaced_while_it_was_parsed_is_not_used(self) -> None:

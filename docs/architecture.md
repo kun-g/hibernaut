@@ -239,6 +239,8 @@
 
 提交前与 `.github/workflows/ci.yml` 强制执行（CI 中四道并行）：`lint-imports`、`ruff check`（`pyproject.toml` 的 `[tool.ruff.lint]`，只查 bug 类规则、不查格式）、`pytest -n auto --dist worksteal -v`（全量覆盖 `tests/unit/` 与 `tests/integration/`）、`pyright`（strict，覆盖 `src/` 下全部包，`pythonPlatform` 固定为 Linux）。类型检查只用 pyright，不再保留 mypy。PR 上由 `scripts/select_tests.py` 按 Python AST 反向依赖图与资源映射仅跑受影响测试（加 `full-ci` 标签或合入 `main` 时跑全量兜底）。
 
+项目接入校验按两条路由正则的原文缓存比较结果，最多保留 256 对。热加载单测驱动轮询和版本通知；配额单测在等待队列就绪后推进独立事件循环的时钟。Switchboard 停机单测用正数等待期限验证投递、发送和 HTTP 请求阻塞时的停机时序，使用真实中继连接验证共享截止时间。检查切断后迟到写入的用例直接传入零剩余预算。
+
 全局与系统 Steward 的路由测试在终端接口处直接启动模拟 CLI，覆盖实际工作目录、提示、MCP 子进程和权限判定。需要观察 Orca 终端创建、账号不符或中断后子进程退出的用例使用真实 shell 包装进程。
 
 术语定义以 [`docs/glossary.md`](glossary.md) 为唯一基准，本文不再重复定义。以下是术语在当前实现中的落地约束：

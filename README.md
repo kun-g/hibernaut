@@ -199,3 +199,5 @@ ruff check     # 查 bug 类问题，规则在 pyproject.toml 的 [tool.ruff.lin
 pytest -n auto --dist worksteal -v   # 单元和集成测试全量（本地快检可用 pytest -n auto $(python scripts/select_tests.py)）
 pyright        # src/ 下全部包的 strict 类型检查
 ```
+
+单独计时一个测试文件可用 `pytest -p no:xdist -q tests/unit/test_concurrency_limits.py`。配额等待用测试时钟推进，跨线程重放仍检查线程归属。
