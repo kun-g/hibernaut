@@ -2235,11 +2235,23 @@ class HeldReturnTests(ForwardCase):
                     folded.extend(caps.poll_folded_events())
                     return Silent()
 
+                checked = asyncio.Event()
+                fetch_pending = self.inbox.fetch_pending
+
+                def observe_pending(inbox_id: str) -> list[Event]:
+                    pending = fetch_pending(inbox_id)
+                    if any(event.source == RETURN_CANCELLED_SOURCE for event in pending):
+                        checked.set()
+                    return pending
+
                 async def busy(events: Sequence[Event], session: SessionRef | None, caps: RunCapabilities) -> RunOutcome:
                     self.agents["steward"].runs.append((list(events), session))
                     await self.decide(card, False)
                     worker.notify_new_event(MAIN)
-                    await asyncio.sleep(0.2)
+                    if policy == "interrupt":
+                        # The watcher inspects the pending batch before yielding back to this run.
+                        with patch.object(self.inbox, "fetch_pending", observe_pending):
+                            await asyncio.wait_for(checked.wait(), timeout=5)
                     return script(events, session, caps)
 
                 self.ingest(text="any news?")

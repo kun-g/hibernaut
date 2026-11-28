@@ -97,6 +97,9 @@ class Deployment:
         if fast_retry:
             entry = ("-c", "from agent_runtime.adapters import runner_bridge; runner_bridge._NODE_POLL_SECONDS = 0.02; "
                            "from agent_runtime.app.main import main; main()")
+        self.launch_hb(entry)
+
+    def launch_hb(self, entry: tuple[str, ...]) -> None:
         with self.hb_log.open("ab") as stream:
             self.hb = subprocess.Popen(
                 [sys.executable, *entry, "--config", str(self.config),

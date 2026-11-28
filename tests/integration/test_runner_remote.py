@@ -345,7 +345,10 @@ def test_the_documented_first_order_is_found_again_in_the_ledger_and_on_the_node
 
 def test_a_run_cut_off_with_its_node_is_run_again_once_the_node_is_back(remote: RemoteDeployment) -> None:
     remote.write()
-    remote.start_hb()
+    # The dropped connection must enter the transient retry lane; shorten only that lane's backoff.
+    remote.launch_hb(("-c", "from functools import partial; from agent_runtime.app import main; "
+                            "main.RunLedger = partial(main.RunLedger, retry_delays=(0.05, 0.15, 0.45)); "
+                            "raise SystemExit(main.main())"))
     remote.start_node()
     release = remote.node / f"release-cli-{uuid.uuid4().hex}"
     assert not release.exists()
