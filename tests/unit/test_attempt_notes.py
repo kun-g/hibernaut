@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import queue
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator
@@ -353,26 +354,38 @@ def test_two_updates_of_one_row_never_overlap(race: Race, writer: str, merge_fir
 
     first, second = (merge, WRITERS[writer]) if merge_first else (WRITERS[writer], merge)
     ours, theirs = race.notes.store.update, race.elsewhere.store.update
-    begun, inside, overlapped = threading.Event(), threading.Event(), list[bool]()
+    entered_change = queue.SimpleQueue[bool]()
+    overlapped = list[bool]()
     other = threading.Thread(target=lambda: second(race.elsewhere.notes))
+    conn = race.elsewhere.db._conn
+    timeout_ms, = conn.execute("PRAGMA busy_timeout").fetchone()
 
     def entered(attempt: str, change: Any) -> Any:
         def noted(row: Any) -> Any:
-            inside.set()
+            entered_change.put(True)
             return change(row)
-        return theirs(attempt, noted)
+
+        # Probe the real update once without waiting. Either its change ran or the writer holds the lock.
+        conn.execute("PRAGMA busy_timeout=0")
+        try:
+            return theirs(attempt, noted)
+        except sqlite3.OperationalError as exc:
+            if exc.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+                raise
+            entered_change.put(False)
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
+        return theirs(attempt, change)
 
     def held(attempt: str, change: Any) -> Any:
         def slow(row: Any) -> Any:
             # The row is read and not yet written: the other connection starts its own update now.
             other.start()
-            assert begun.wait(5)
-            overlapped.append(inside.wait(0.05))
+            overlapped.append(entered_change.get(timeout=5))
             return change(row)
         with patch.object(race.notes.store, "update", ours):
             return ours(attempt, slow)
 
-    race.elsewhere.db._conn.set_trace_callback(lambda sql: begun.set() if sql.startswith("BEGIN") else None)
     with patch.object(race.elsewhere.store, "update", entered), patch.object(race.notes.store, "update", held):
         first(race.notes.notes)
         other.join(10)
