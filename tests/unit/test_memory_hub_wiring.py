@@ -337,8 +337,39 @@ def neighbour(request: pytest.FixtureRequest, hub: GovernedMemoryHub) -> Iterato
     opened.close()
 
 
+@pytest.fixture
+def index_contention(neighbour: GovernedMemoryHub, monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    db = neighbour._index._project_db
+    transaction = db.transaction
+    blocked = threading.Event()
+    # One hub serializes threads on its RLock. Separate hubs contend on BEGIN IMMEDIATE.
+    timeout_ms, = db._conn.execute("PRAGMA busy_timeout").fetchone()
+    db._conn.execute("PRAGMA busy_timeout=0")
+
+    @contextlib.contextmanager
+    def observe_transaction() -> Iterator[None]:
+        if db._lock.acquire(blocking=False):
+            db._lock.release()
+        else:
+            blocked.set()
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(transaction())
+            except sqlite3.OperationalError as exc:
+                if exc.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+                    raise
+                blocked.set()
+                db._conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
+                stack.enter_context(transaction())
+            yield
+
+    monkeypatch.setattr(db, "transaction", observe_transaction)
+    return blocked
+
+
 def test_nothing_changes_the_index_between_a_searchs_sync_and_its_query(
-    hub: GovernedMemoryHub, neighbour: GovernedMemoryHub, monkeypatch: pytest.MonkeyPatch
+    hub: GovernedMemoryHub, neighbour: GovernedMemoryHub, monkeypatch: pytest.MonkeyPatch,
+    index_contention: threading.Event,
 ) -> None:
     _index_three_notes(hub)
     database = hub._index._project_db  # pyright: ignore[reportPrivateUsage]
@@ -348,7 +379,7 @@ def test_nothing_changes_the_index_between_a_searchs_sync_and_its_query(
 
     def query_after_gc_had_its_chance(*args: Any, **kwargs: Any) -> Any:
         gc.start()
-        gc.join(0.5)
+        assert index_contention.wait(5), "GC did not contend for the search transaction"
         waited.append(gc.is_alive())
         return query(*args, **kwargs)
 
@@ -359,7 +390,8 @@ def test_nothing_changes_the_index_between_a_searchs_sync_and_its_query(
 
 
 def test_a_note_written_while_a_search_syncs_stays_indexed(
-    hub: GovernedMemoryHub, neighbour: GovernedMemoryHub, monkeypatch: pytest.MonkeyPatch
+    hub: GovernedMemoryHub, neighbour: GovernedMemoryHub, monkeypatch: pytest.MonkeyPatch,
+    index_contention: threading.Event,
 ) -> None:
     _index_three_notes(hub)
     store = hub._store  # pyright: ignore[reportPrivateUsage]
@@ -370,7 +402,7 @@ def test_a_note_written_while_a_search_syncs_stays_indexed(
         files = list(listing(**kwargs))
         if writer.ident is None:
             writer.start()
-            writer.join(0.5)
+            assert index_contention.wait(5), "writer did not contend for the search transaction"
         return iter(files)
 
     monkeypatch.setattr(store, "iter_indexable_files", list_then_let_the_writer_in)
