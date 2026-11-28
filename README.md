@@ -200,4 +200,6 @@ pytest -n auto --dist worksteal -v   # 单元和集成测试全量（本地快�
 pyright        # src/ 下全部包的 strict 类型检查
 ```
 
+CI 中，选中至少 12 个集成测试文件时，两台 runner 分担 pytest。小改动在一台 runner 上执行检查，GitHub 的 `gates` 汇总所有结果。
+
 单独计时一个测试文件可用 `pytest -p no:xdist -q tests/unit/test_concurrency_limits.py`。配额等待用测试时钟推进，跨线程重放仍检查线程归属。

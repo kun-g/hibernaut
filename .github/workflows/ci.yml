@@ -6,8 +6,34 @@ on:
   pull_request:
 
 jobs:
-  gates:
+  plan:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.tests.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: tests
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          FULL_CI_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+        run: |
+          args=()
+          if [[ "$EVENT_NAME" == pull_request && "$FULL_CI_LABEL" != true ]]; then
+            args+=(--base "origin/$BASE_REF")
+          fi
+          matrix=$(python3 -m scripts.ci_test_matrix "${args[@]}")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: Checks ${{ matrix.lane }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,62 +54,59 @@ jobs:
         run: |
           python -m venv .venv
           .venv/bin/pip install --disable-pip-version-check -e ".[dev]"
-      - name: Run architecture, lint, test and type gates in parallel
+      - name: Run checks
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          FULL_CI_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          LANE: ${{ matrix.lane }}
+          MODE: ${{ matrix.mode }}
+          TEST_ARGS: ${{ toJSON(matrix.args) }}
         run: |
           set -euo pipefail
           export PATH="$PWD/.venv/bin:$PATH"
+          jq -r '.[]' <<< "$TEST_ARGS" > "$RUNNER_TEMP/pytest-args"
+          mapfile -t args < "$RUNNER_TEMP/pytest-args"
 
-          selected_tests=()
-          run_full=1
-          if [ "$EVENT_NAME" = "pull_request" ] && [ "$FULL_CI_LABEL" != "true" ]; then
-            run_full=0
-            while IFS= read -r line; do
-              [ -n "$line" ] && selected_tests+=("$line")
-            done < <(python scripts/select_tests.py --base "origin/$BASE_REF" --explain)
+          run_gate() {
+            local label=$1 start=$SECONDS
+            shift
+            local rc=0
+            "$@" > "$RUNNER_TEMP/$label.log" 2>&1 || rc=$?
+            echo "$label | $((SECONDS - start)) s | $rc" > "$RUNNER_TEMP/$label.result"
+            return "$rc"
+          }
+
+          pids=()
+          labels=()
+          if [[ "$LANE" == 1 ]]; then
+            run_gate imports lint-imports & pids+=($!)
+            run_gate lint ruff check --output-format=github & pids+=($!)
+            run_gate types pyright & pids+=($!)
+            labels+=(imports lint types)
           fi
-
-          lint-imports > /tmp/gate-lint.log 2>&1 &
-          pid_lint=$!
-          ruff check --output-format=github > /tmp/gate-ruff.log 2>&1 &
-          pid_ruff=$!
-          pyright > /tmp/gate-pyright.log 2>&1 &
-          pid_pyright=$!
-
-          if [ "$run_full" -eq 1 ]; then
-            pytest -n auto --dist worksteal -v > /tmp/gate-pytest.log 2>&1 &
-            pid_pytest=$!
-          elif [ "${#selected_tests[@]}" -eq 0 ]; then
-            echo "No tests affected by changed files; skipping pytest on PR." > /tmp/gate-pytest.log
-            pid_pytest=""
-          elif [ "${#selected_tests[@]}" -lt 4 ]; then
-            pytest -v "${selected_tests[@]}" > /tmp/gate-pytest.log 2>&1 &
-            pid_pytest=$!
-          else
-            pytest -n auto --dist worksteal -v "${selected_tests[@]}" > /tmp/gate-pytest.log 2>&1 &
-            pid_pytest=$!
-          fi
+          case "$MODE" in
+            parallel) run_gate pytest pytest -n auto --dist worksteal -v "${args[@]}" & pids+=($!); labels+=(pytest) ;;
+            serial) run_gate pytest pytest -v "${args[@]}" & pids+=($!); labels+=(pytest) ;;
+            skip) echo "No tests affected." >> "$GITHUB_STEP_SUMMARY" ;;
+            *) exit 1 ;;
+          esac
 
           rc=0
-          wait "$pid_lint" || rc=$?
-          echo "=== Gate 1 - Static import boundaries (import-linter) ==="
-          cat /tmp/gate-lint.log
-
-          wait "$pid_ruff" || rc=$?
-          echo "=== Gate 2 - Lint (ruff) ==="
-          cat /tmp/gate-ruff.log
-
-          wait "$pid_pyright" || rc=$?
-          echo "=== Gate 4 - Strict static typing (pyright) ==="
-          cat /tmp/gate-pyright.log
-
-          if [ -n "$pid_pytest" ]; then
-            wait "$pid_pytest" || rc=$?
-          fi
-          echo "=== Gate 3 - Contract & E2E tests (pytest) ==="
-          cat /tmp/gate-pytest.log
-
+          for pid in "${pids[@]}"; do wait "$pid" || rc=$?; done
+          echo -e 'Gate | Duration | Exit code\n--- | ---: | ---:' >> "$GITHUB_STEP_SUMMARY"
+          for label in "${labels[@]}"; do
+            echo "::group::$label"
+            cat "$RUNNER_TEMP/$label.log"
+            echo "::endgroup::"
+            cat "$RUNNER_TEMP/$label.result" >> "$GITHUB_STEP_SUMMARY"
+          done
           exit "$rc"
+
+  gates:
+    needs: [plan, checks]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful selection and all checks
+        env:
+          PLAN: ${{ needs.plan.result }}
+          CHECKS: ${{ needs.checks.result }}
+        run: '[[ "$PLAN" == success && "$CHECKS" == success ]]'
