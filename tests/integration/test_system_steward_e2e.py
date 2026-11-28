@@ -152,8 +152,11 @@ if name == "gh":
         sys.exit(0 if args[1] == "repos/acme/tool" else 1)
     if args[:2] == ["repo", "clone"]:
         url = f"https://github.com/{args[2]}.git"
-        run("git", "clone", "-q", "--config", "user.email=t@example.invalid", "--config", "user.name=t",
-            "--config", f"url.{state / 'origin'}.insteadOf={url}", url, args[3])
+        origin = state / "origin"
+        run("git", "clone", "-q", str(origin), args[3])
+        for key, value in ((f"url.{origin}.insteadOf", url), ("remote.origin.url", url),
+                           ("user.email", "t@example.invalid"), ("user.name", "t")):
+            run("git", "-C", args[3], "config", "--local", key, value)
     sys.exit(0)
 if args[:2] == ["repo", "show"]:
     sys.exit(0 if flag("--repo")[5:] in known else 1)
@@ -329,10 +332,11 @@ class EndToEndTests(ServedCase):
 
         # The developer's new worktree must include changes pushed since onboarding.
         checkout = self.root / "tool"
-        for key, value in (("user.name", "t"), ("user.email", "t@example.invalid"),
-                           ("remote.origin.url", "https://github.com/acme/tool.git")):
-            git(checkout, "config", "--local", "--get", "--fixed-value", key, value)
         origin = self.state / "origin"
+        url = "https://github.com/acme/tool.git"
+        for key, value in (("user.name", "t"), ("user.email", "t@example.invalid"),
+                           ("remote.origin.url", url), (f"url.{origin}.insteadOf", url)):
+            git(checkout, "config", "--local", "--get", "--fixed-value", key, value)
         (origin / "upstream.txt").write_text("after onboarding")
         git(origin, "add", "upstream.txt")
         git(origin, "commit", "-qm", "after onboarding")
