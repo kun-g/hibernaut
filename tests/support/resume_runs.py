@@ -115,11 +115,11 @@ class RuntimeCase(unittest.IsolatedAsyncioTestCase):
         return [m.content for m in self.outbox.fetch_pending(limit=50)]
 
 
-def committed(repo: Path, text: str):
+def committed(repo: Path, text: str, **report):
     def step(session: FakeClaude, msg: Incoming) -> None:
         (repo / "calc.py").write_text(text)
         git(repo, "commit", "-qam", "divide rejects zero")
-        result()(session, msg)
+        result(**report)(session, msg)
     return step
 
 
