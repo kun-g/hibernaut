@@ -518,7 +518,7 @@ class EndToEndTests(ServedCase):
         with patch.object(main_module._Generation, "stop_services", racing):
             self.path.write_text(wanted)
             await self.wait_for(lambda: raced, "the race")
-            await asyncio.sleep(0.3)
+            await asyncio.to_thread(self.daemon.reloads.wait, self.before.encode(), 20)
             self.assertEqual((listens(self.port), listens(moved)), (True, False))
             self.path.write_text(wanted)
             await self.wait_for(lambda: listens(moved) and not listens(self.port), "the new port")
@@ -835,14 +835,16 @@ class BoundaryTests(ServedCase):
 
     async def test_c6_a_reload_that_breaks_a_rule_is_refused(self) -> None:
         await self.serve()
-        for wrong in (
-            self.before.replace("system_tools = true\n", 'system_tools = true\nforward_to = ["proj:a"]\n'),
-            self.before.replace('checkout_access = "readonly"\nsystem_tools', 'checkout_access = "readwrite"\nsystem_tools'),
-            self.before.replace('pattern = "sys:ops"', 'pattern = "sys:.*"'),
+        await self.wait_for(lambda: self.daemon.reloads.path, "the start")
+        for wrong, reason in (
+            (self.before.replace("system_tools = true\n", 'system_tools = true\nforward_to = ["proj:a"]\n'), "forward_to"),
+            (self.before.replace('checkout_access = "readonly"\nsystem_tools', 'checkout_access = "readwrite"\nsystem_tools'), "readonly"),
+            (self.before.replace('pattern = "sys:ops"', 'pattern = "sys:.*"'), "exact inbox"),
         ):
             self.assertNotEqual(wrong, self.before)
             self.path.write_text(wrong)
-            await asyncio.sleep(0.2)
+            with self.assertRaisesRegex(ReloadFailed, reason):
+                await asyncio.to_thread(self.daemon.reloads.wait, wrong.encode(), 20)
         self.assertTrue(self.daemon.forward_targets.has_system_tools(OPS))
         self.assertEqual(self.daemon.forward_targets.allowed(ASH, (OPS,)), (OPS,))
 
