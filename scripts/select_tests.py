@@ -19,6 +19,7 @@ FULL_SUITE_PATTERNS = (
     "pyrightconfig.json",
     ".github/workflows/*",
     "scripts/select_tests.py",
+    "scripts/ci_test_matrix.py",
 )
 
 # Composition roots wire every optional adapter; leaf adapter edits must not fan out through them

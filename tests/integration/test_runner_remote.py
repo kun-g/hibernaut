@@ -366,7 +366,7 @@ def test_a_run_cut_off_with_its_node_is_run_again_once_the_node_is_back(remote: 
 
 
 def test_without_a_node_only_its_own_runs_fail(remote: RemoteDeployment) -> None:
-    remote.write()
+    remote.write(node_wait_seconds=0.1)
     remote.start_hb()
     remote.start_runner()
     asked = remote.ask(("Read", {"file_path": "README.md"}))

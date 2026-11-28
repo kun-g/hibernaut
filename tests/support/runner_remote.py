@@ -79,11 +79,12 @@ class RemoteDeployment(Deployment):
         self.node_proc: subprocess.Popen[bytes] | None = None
         self.runner_enabled = True
 
-    def write(self, *, enabled: bool = True, extra: str = "") -> None:
+    def write(self, *, enabled: bool = True, extra: str = "", node_wait_seconds: float = 8) -> None:
         super().write(enabled=enabled, extra=(
             f'[executors.{AGENT}]\ncommand = "/usr/bin/false"\nmax_concurrency = 1\n'
             f'[runner]\nenabled = {str(self.runner_enabled).lower()}\nmode = "relay"\nexecutors = ["{AGENT}"]\n'
-            'readonly_only = true\nallow_tools = ["Read", "Grep", "Glob"]\nnode_wait_seconds = 8\n'
+            'readonly_only = true\nallow_tools = ["Read", "Grep", "Glob"]\n'
+            f'node_wait_seconds = {node_wait_seconds}\n'
             f'listen_port = {self.remote_port}\ntoken_file = "node-relay.token"\n{extra}'
         ))
 

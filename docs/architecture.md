@@ -237,7 +237,7 @@
 
 ## 6. 三道防腐化门禁与术语基准
 
-提交前与 `.github/workflows/ci.yml` 强制执行（CI 中四道并行）：`lint-imports`、`ruff check`（`pyproject.toml` 的 `[tool.ruff.lint]`，只查 bug 类规则、不查格式）、`pytest -n auto --dist worksteal -v`（全量覆盖 `tests/unit/` 与 `tests/integration/`）、`pyright`（strict，覆盖 `src/` 下全部包，`pythonPlatform` 固定为 Linux）。类型检查只用 pyright，不再保留 mypy。PR 上由 `scripts/select_tests.py` 按 Python AST 反向依赖图与资源映射仅跑受影响测试（加 `full-ci` 标签或合入 `main` 时跑全量兜底）。
+提交前与 `.github/workflows/ci.yml` 强制执行（CI 中四道并行）：`lint-imports`、`ruff check`（`pyproject.toml` 的 `[tool.ruff.lint]`，只查 bug 类规则、不查格式）、`pytest -n auto --dist worksteal -v`（全量覆盖 `tests/unit/` 与 `tests/integration/`）、`pyright`（strict，覆盖 `src/` 下全部包，`pythonPlatform` 固定为 Linux）。类型检查只用 pyright，不再保留 mypy。PR 上由 `scripts/select_tests.py` 按 Python AST 反向依赖图与资源映射仅跑受影响测试（加 `full-ci` 标签或合入 `main` 时跑全量兜底）。选中至少 12 个集成测试文件时，按路径排序后交替分配给两台 runner。第一台同时运行静态检查，全量模式由 pytest 默认发现其余测试。选测或任一分组失败都会使汇总检查 `gates` 失败。
 
 项目接入校验按两条路由正则的原文缓存比较结果，最多保留 256 对。热加载单测驱动轮询和版本通知；配额单测在等待队列就绪后推进独立事件循环的时钟。Switchboard 停机单测用正数等待期限验证投递、发送和 HTTP 请求阻塞时的停机时序，使用真实中继连接验证共享截止时间。检查切断后迟到写入的用例直接传入零剩余预算。
 
