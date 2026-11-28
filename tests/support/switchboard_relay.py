@@ -5,7 +5,9 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
+from unittest.mock import patch
 
+from switchboard import http_server
 from switchboard.app import build_switchboard
 from switchboard.envelope import CanonicalEvent
 from switchboard.ports import DeliverStatus, RecordingAuditSink
@@ -22,6 +24,7 @@ from switchboard.relay_protocol import (
     decode_message,
     encode_message,
 )
+from tests.support.http_listener import serve_with_short_poll
 from tests.support.switchboard_support import RELAY_TOKEN, FakeHttpClient, StaticCredentials, make_config
 
 
@@ -81,7 +84,8 @@ class RelayHarness:
             audit=self.audit,
             http_client=FakeHttpClient(),
         )
-        self.board.start()
+        with patch.object(http_server._Server, "serve_forever", serve_with_short_poll):
+            self.board.start()
         hub = self.board.relay
         assert hub is not None
         self.hub = hub

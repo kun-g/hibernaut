@@ -6,16 +6,19 @@ import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
 from agent_runtime.app.config import HibernautConfig, parse_config
 from agent_runtime.app.main import AlwaysOnDaemon, build_daemon_from_config
 from agent_runtime.core.models import CLOSEOUT_SOURCE
+from taskboard.adapters import http_server
 from taskboard.adapters.http_server import TaskboardHTTPServer
 from taskboard.adapters.mcp_tools import TaskboardMCPServer
 from taskboard.adapters.sqlite_store import SQLiteTaskStore
 from taskboard.engine.ingestion import IngestionService
+from tests.support.http_listener import serve_with_short_poll
 from tests.support.collaboration_hub import fast_hub_shutdown
 from tests.support.collaboration_wiring import config_of
 
@@ -37,7 +40,8 @@ class Board:
             TaskboardMCPServer(self.ingestion), host="127.0.0.1", port=self._port, base_path="", token=BOARD_TOKEN,
             max_body_bytes=1_000_000,
         )
-        self._server.start()
+        with patch.object(http_server._Server, "serve_forever", serve_with_short_poll):
+            self._server.start()
         self._port = self._server.port
 
     def stop(self) -> None:
