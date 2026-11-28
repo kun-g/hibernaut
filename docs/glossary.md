@@ -61,6 +61,7 @@
 - **评审候选**：SDE 的 `reviewer` 写成有序列表时列表里的每一个。每个任务第一次评审前按列表取第一个可用的，选定后各轮都用它；它报额度用完才换下一个。`reviewer` 写一个名字就是固定的评审者，不叫候选，不看可用表。
 - **可用表**：外面的程序写、Hibernaut 只读的一份 JSON（`[availability] file`），说哪些执行器现在不该用和为什么；没列到的算可用。与「额度标记」分开：额度标记是 Hibernaut 在评审报额度用完时自己记的，到期失效，两者任一说不可用就不选。
 - **跟进（评审）**：评审 `notes` 里不阻断的意见，含被降级的阻断；交付时列在 PR 正文与 Outbox 消息，不打回开发。与挂起期间人发来的 follow-up（并入需求）不是一回事。
+- **PR 评论（`pr_comment`）**：SDE 回执的可选字段，任务要求在 PR 上回报时写的评论正文，可用 `{head_sha}`、`{pr_url}`、`{pr_number}`、`{version}` 占位。交付推送并建好或复用 PR 后替换占位、以 hb 的 gh 身份发到 PR，每个推送的 head 至多一条；发不出去只记进交付记录和通知，不改交付结果。与 PR 正文（交付每次写回）和跟进（评审意见）不是一回事。
 - **Taskboard（多源任务与 DAG 排期）**：负责归集来自多源的任务（`TaskItem`），维护任务状态与 DAG 先后依赖关系（`TaskDependency`，含环检测）；上游结案后自动解锁下游并经 Switchboard 发送 `work.ready` 事件唤醒 Hibernaut。不直接触碰 Session、Worktree 或执行器。
 - **Runner → Executor → Agent 三层边界**：Runner 是执行工位，Executor 是工位上的驱动，Agent 是用驱动干活的业务主体；**Inbox 绑定的是 Agent**，不是 Executor 或 Runner。
   - **Runner（执行面 / 执行节点）**：独立部署在本机（如 Mac）或远端 VPS 上的执行宿主服务，负责管理所在机器的磁盘工作区（Orca / `git worktree` 与三关安全回收）、子进程生命周期、日志流落盘及 `yetone/magpie` 环境对接，并在其内部托管多个具体 Executor。与 Hibernaut 控制面通过 `ExecutorPort` / `RunnerPort` 解耦，可跨项目复用；面向分布式部署，对应未来 `runner_id`。

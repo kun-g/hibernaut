@@ -102,7 +102,20 @@ def run(command, *, env, cwd):
         if "mergeStateStatus" in opt(argv, "--json", ""):
             dirty = conflicting(pr)
             view.update(mergeable="CONFLICTING" if dirty else "MERGEABLE", mergeStateStatus="DIRTY" if dirty else "CLEAN")
+        if "comments" in opt(argv, "--json", "").split(","):
+            view["comments"] = pr.get("comments", [])
         return result(json.dumps(view) + "\n")
+    if cmd == "comment":
+        comments = pr.setdefault("comments", [])
+        url = f"{pr['url']}#issuecomment-{len(comments) + 1}"
+        comments.append({"body": opt(argv, "--body"), "url": url})
+        save()
+        if state.get("lose_comment_reply", 0):
+            # The comment is posted but the reply never arrives, as when the connection drops after the request.
+            state["lose_comment_reply"] -= 1
+            save()
+            return result(code=1, stderr="Post \"https://api.github.com/graphql\": EOF\n")
+        return result(url + "\n")
     if cmd == "merge":
         head = branch_head(pr["head"])
         if opt(argv, "--match-head-commit") != head:
