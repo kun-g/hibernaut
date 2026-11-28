@@ -23,11 +23,18 @@ class TestHeldEventsInARunningInbox(unittest.IsolatedAsyncioTestCase):
             with self.subTest(policy=policy):
                 inbox = InMemoryInbox()
                 executor = _RecordingExecutor()
+                checked = asyncio.Event()
+
+                def hold(event: Event) -> str | None:
+                    if event.external_id == "held-2":
+                        checked.set()
+                    return "needs a project" if event.payload.get("held") else None
+
                 worker = AgentWorker(
                     worker_id="w1", inbox=inbox, timers=InMemoryTimerStore(), memory=InMemoryMemoryStore(),
                     permissions=InMemoryPermission(), outbox=InMemoryOutbox(), executor=executor,
                     lock=InMemoryLock(), sessions=InMemorySessionStore(), new_event_policy=policy,
-                    hold=lambda evt: "needs a project" if evt.payload.get("held") else None,
+                    hold=hold,
                 )
 
                 def add(external_id: str, **payload: object) -> Event:
@@ -43,7 +50,8 @@ class TestHeldEventsInARunningInbox(unittest.IsolatedAsyncioTestCase):
                     if not executor.calls:
                         add("held-2", held=True)
                         worker.notify_new_event(ORPHAN)
-                        await asyncio.sleep(0.1)
+                        if policy == "interrupt":
+                            await asyncio.wait_for(checked.wait(), timeout=5)
 
                 executor.during_run = arrive
                 await worker.process_inbox(ORPHAN)
