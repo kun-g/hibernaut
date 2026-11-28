@@ -4,6 +4,7 @@ import importlib
 import re
 from collections import deque
 from collections.abc import Sequence
+from functools import lru_cache
 from typing import Any
 
 # The private modules behind re.compile have no type stubs, so they are typed Any.
@@ -23,6 +24,7 @@ class UncomparablePattern(ValueError):
     pass
 
 
+@lru_cache(maxsize=256)
 def common_match(a: str, b: str) -> str | None:
     # A string both patterns fullmatch, None when there is none.
     parsed = [_parse(a), _parse(b)]

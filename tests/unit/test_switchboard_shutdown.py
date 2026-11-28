@@ -16,11 +16,13 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from switchboard import http_server
 from switchboard.app import Switchboard, build_switchboard
 from switchboard.envelope import CanonicalEvent, utc_now
 from switchboard.http_client import HttpResponse
 from switchboard.ports import DeliverStatus, OutboundMessage
 from switchboard.relay_protocol import Ack, Close, Push, connect, encode_message
+from tests.support.http_listener import serve_with_short_poll
 from tests.support.switchboard_support import (
     FakeHttpClient,
     StaticCredentials,
@@ -93,6 +95,10 @@ def text_message(number: int) -> OutboundMessage:
 
 
 class ShutdownHarness(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.enterClassContext(mock.patch.object(http_server._Server, "serve_forever", serve_with_short_poll))
+
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory(prefix="sb_stop_", ignore_cleanup_errors=True)
         self.addCleanup(tmp.cleanup)
@@ -301,6 +307,7 @@ class DrainTests(ShutdownHarness):
 
     def test_idle_connection_does_not_hold_the_shutdown(self) -> None:
         board = self.board()
+        self.enterContext(mock.patch("switchboard.http_server.HEAD_GRACE_SEC", 0))
         with socket.create_connection(("127.0.0.1", board.http.port), timeout=5) as idle:
             # A request line that never ends is not a request yet.
             idle.sendall(b"POST /webh")
@@ -331,22 +338,24 @@ class DrainTests(ShutdownHarness):
 
 
 class TimeoutTests(ShutdownHarness):
-    def assert_forced(self, board: Switchboard, component: str) -> None:
+    def assert_forced(self, board: Switchboard, component: str, *, timeout: float = 0.02) -> None:
         started = time.monotonic()
         with self.assertLogs("switchboard", level="WARNING") as logs:
-            self.assertFalse(board.stop())
+            self.assertFalse(board.stop(timeout=timeout))
         elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, board.config.shutdown_timeout_seconds)
+        self.assertGreaterEqual(elapsed, timeout)
         self.assertLess(elapsed, 2.5)
         self.assertEqual({r.levelname for r in logs.records}, {"WARNING"})
         self.assertIn(component, "\n".join(logs.output))
-        self.assertIn(f"timed out after {board.config.shutdown_timeout_seconds:g}s", "\n".join(logs.output))
+        self.assertIn(f"timed out after {timeout:g}s", "\n".join(logs.output))
         with self.assertRaises(sqlite3.ProgrammingError):
             board.store.count_inbound()
 
     def stuck_delivery(self, **sections: Mapping[str, Any]) -> tuple[Switchboard, Gate]:
         gate = Gate()
-        board = self.board(timeout=0.2, sections=sections)
+        # The handler is behind our gate until stop returns, including the final join.
+        self.enterContext(mock.patch("switchboard.app._SETTLE_SEC", 0))
+        board = self.board(sections=sections)
         self.addCleanup(gate.opened.set)
 
         def handler(event: CanonicalEvent) -> DeliverStatus:
@@ -375,7 +384,7 @@ class TimeoutTests(ShutdownHarness):
 
     def test_stuck_outbound_send(self) -> None:
         gate = Gate()
-        board = self.board(timeout=0.2, http_client=GatedHttpClient(gate))
+        board = self.board(http_client=GatedHttpClient(gate))
         self.addCleanup(gate.opened.set)
         board.gateway.deliver(text_message(1))
         self.assertTrue(gate.entered.wait(5))
@@ -384,7 +393,8 @@ class TimeoutTests(ShutdownHarness):
 
     def test_stuck_http_request(self) -> None:
         gate = Gate()
-        board = self.board(timeout=0.2, credentials=GatedCredentials(gate))
+        self.enterContext(mock.patch("switchboard.http_server.CUT_SETTLE_SEC", 0))
+        board = self.board(credentials=GatedCredentials(gate))
         before = set(threading.enumerate())
 
         def client() -> None:
@@ -404,7 +414,7 @@ class TimeoutTests(ShutdownHarness):
         self.assertNotIn("ProgrammingError", stderr.getvalue())
 
     def test_request_whose_body_never_arrives_is_cut(self) -> None:
-        board = self.board(timeout=0.2)
+        board = self.board()
         before = set(threading.enumerate())
         with socket.create_connection(("127.0.0.1", board.http.port), timeout=5) as sock:
             sock.sendall(b"POST /mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-mcp-bearer\r\nContent-Length: 100\r\n\r\n{")
@@ -432,7 +442,8 @@ class TimeoutTests(ShutdownHarness):
     # A board with one dead letter and an MCP call held in its token check.
     def stuck_mcp_call(self, tool: str, arguments: dict[str, str]) -> tuple[Switchboard, Gate, set[threading.Thread]]:
         gate = Gate()
-        board = self.board(timeout=0.05, credentials=GatedCredentials(gate, "mcp"))
+        self.enterContext(mock.patch("switchboard.http_server.CUT_SETTLE_SEC", 0))
+        board = self.board(credentials=GatedCredentials(gate, "mcp"))
         self.addCleanup(gate.opened.set)
         dead = ready_event(1, "proj:a")
         # Not due, so the worker leaves it alone.
@@ -464,7 +475,7 @@ class TimeoutTests(ShutdownHarness):
                 board, gate, before = self.stuck_mcp_call(tool, arguments)
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
-                    self.assert_forced(board, "HTTP")
+                    self.assert_forced(board, "HTTP", timeout=0)
                     conn = RecordingConnection(board.store._conn)  # pyright: ignore[reportPrivateUsage]
                     board.store._conn = conn  # type: ignore[assignment]  # pyright: ignore
                     gate.opened.set()
@@ -482,7 +493,7 @@ class TimeoutTests(ShutdownHarness):
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
                     with mock.patch.object(board.store, "close", return_value=False) as close, self.assertLogs("switchboard", level="WARNING") as logs:
-                        self.assertFalse(board.stop())
+                        self.assertFalse(board.stop(timeout=0))
                         close.assert_called_once()
                     self.assertIn("SQLite write", "\n".join(logs.output))
                     conn = RecordingConnection(board.store._conn)  # pyright: ignore[reportPrivateUsage]
@@ -507,19 +518,20 @@ class TimeoutTests(ShutdownHarness):
 
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr), mock.patch.object(board.store, "close", release_then_close):
-                    self.assert_forced(board, "HTTP")
+                    self.assert_forced(board, "HTTP", timeout=0)
                 self.assertNotIn("Traceback", stderr.getvalue())
                 self.assert_no_late_write()
 
     def test_silent_relay_peers_are_cut_at_the_same_deadline(self) -> None:
-        board = self.board(timeout=0.3, sections={"relay": {"enabled": True, "transport": "hybrid"}})
+        self.enterContext(mock.patch("switchboard.relay_hub.CLOSE_FLUSH_SEC", 0.01))
+        board = self.board(timeout=0.05, sections={"relay": {"enabled": True, "transport": "hybrid"}})
         ws, _ = handshake(board.relay_url)
         self.addCleanup(ws.close)
         started = time.monotonic()
         with self.assertLogs("switchboard", level="WARNING") as logs:
             self.assertFalse(board.stop())
         elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, 0.3)
+        self.assertGreaterEqual(elapsed, board.config.shutdown_timeout_seconds)
         self.assertLess(elapsed, 0.9)
         self.assertIn("relay connections", "\n".join(logs.output))
         self.assertIsInstance(recv_message(ws), Close)
@@ -527,22 +539,25 @@ class TimeoutTests(ShutdownHarness):
 
     def test_cut_pushes_do_not_add_a_second_waiting_period(self) -> None:
         board = self.board(
-            timeout=0.3, sections={"relay": {"enabled": True, "transport": "hybrid", "ack_timeout_sec": 30}}
+            timeout=0.05, sections={"relay": {"enabled": True, "transport": "hybrid", "ack_timeout_sec": 30}}
         )
         ws, _ = handshake(board.relay_url)
         self.addCleanup(ws.close)
         board.bus.publish(ready_event(1, "proj:a"))
         self.assertIsInstance(recv_message(ws), Push)
         started = time.monotonic()
-        with self.assertLogs("switchboard", level="WARNING"):
+        assert board.relay is not None
+        with (mock.patch.object(board.relay, "stop", wraps=board.relay.stop) as close_relay,
+              self.assertLogs("switchboard", level="WARNING")):
             self.assertFalse(board.stop())
+        close_relay.assert_called_once_with(0)
         self.assertLess(time.monotonic() - started, 0.9)
         self.assertIsInstance(recv_message(ws), Close)
         self.assertEqual(self.rows("SELECT status, attempts FROM delivery_log"), [("pending", 0)])
 
     def test_unacked_relay_push_goes_back_to_pending_without_an_attempt(self) -> None:
         board = self.board(
-            timeout=0.2, sections={"relay": {"enabled": True, "transport": "hybrid", "ack_timeout_sec": 30}}
+            sections={"relay": {"enabled": True, "transport": "hybrid", "ack_timeout_sec": 30}}
         )
         ws, _ = handshake(board.relay_url)
         self.addCleanup(ws.close)
@@ -553,13 +568,18 @@ class TimeoutTests(ShutdownHarness):
         self.assertEqual(self.rows("SELECT status, attempts FROM delivery_log"), [("pending", 0)])
 
     def test_stuck_write_leaves_the_connection_to_process_exit(self) -> None:
-        board = self.board(timeout=0.2)
+        board = self.board()
+        # Only the held database lock can time out here.
+        self.assertTrue(board.worker.stop())
+        self.assertTrue(board.gateway.stop())
+        self.enterContext(mock.patch("switchboard.app._SETTLE_SEC", 0))
         lock = board.store._lock  # pyright: ignore[reportPrivateUsage]
         lock.acquire()
         try:
             started = time.monotonic()
-            with self.assertLogs("switchboard", level="WARNING"):
-                self.assertFalse(board.stop())
+            with self.assertLogs("switchboard", level="WARNING") as logs:
+                self.assertFalse(board.stop(timeout=0))
+            self.assertIn("SQLite write", "\n".join(logs.output))
             self.assertLess(time.monotonic() - started, 2.5)
         finally:
             lock.release()
