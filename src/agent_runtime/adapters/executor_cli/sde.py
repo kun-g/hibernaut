@@ -159,6 +159,7 @@ SDE_SCHEMA: dict[str, Any] = {
         "change_kind": {"type": "string", "enum": list(CHANGE_KINDS)},
         "change_rationale": {"type": "string"},
         "code_change": {"type": "boolean"},
+        "pr_comment": {"type": "string"},
     },
     "required": ["status", "summary", "test_evidence", "change_kind", "change_rationale"],
     "if": {"properties": {"status": {"enum": ["needs_input"]}}},
@@ -325,6 +326,8 @@ class _State:
     reply: dict[str, str] = field(default_factory=_no_reply)
     # What the first prompt says about the memory tools; taken out of it when the session is launched without them.
     memory_note: str = ""
+    # The comment the developer's last done report asks the delivery to post on the PR ("" for none).
+    pr_comment: str = ""
 
     def fields(self) -> dict[str, Any]:
         return {f: getattr(self, f) for f in self.__slots__}
@@ -961,6 +964,7 @@ class SDEExecutor:
                 state.summary, state.test_evidence = report["summary"], report["test_evidence"]
                 state.change_kind, state.change_rationale = report["change_kind"], report["change_rationale"]
                 state.code_change = report["code_change"]
+                state.pr_comment = report.get("pr_comment", "")
                 unfinished, check = await asyncio.to_thread(self._unfinished, state)
                 if check is not None and not unfinished and not check.commits and not state.code_change:
                     return self._no_code(session_id, native, state, check)
@@ -1314,6 +1318,7 @@ class SDEExecutor:
                                        *self._reviewers(session_id)]),
             issue=state.issue,
             followups=tuple(state.review_notes),
+            pr_comment=state.pr_comment,
         )
         # A stop ends the delivery at its next checkpoint; a resumed Run delivers again from the stored record.
         record = await asyncio.to_thread(
@@ -1537,8 +1542,10 @@ def _validate_report(raw: object) -> dict[str, Any]:
     raw_kind, raw_rationale = data.get("change_kind"), data.get("change_rationale")
     kind = raw_kind if isinstance(raw_kind, str) and raw_kind in CHANGE_KINDS else ""
     rationale = raw_rationale.strip() if isinstance(raw_rationale, str) else ""
+    raw_comment = data.get("pr_comment")
     report = {"status": status, "summary": summary.strip(), "test_evidence": evidence.strip(), "question": "",
-              "change_kind": kind, "change_rationale": rationale, "code_change": data.get("code_change") is not False}
+              "change_kind": kind, "change_rationale": rationale, "code_change": data.get("code_change") is not False,
+              "pr_comment": raw_comment.strip() if isinstance(raw_comment, str) else ""}
     if status == "needs_input":
         errors = schema_errors(data, SDE_SCHEMA)
         if errors:

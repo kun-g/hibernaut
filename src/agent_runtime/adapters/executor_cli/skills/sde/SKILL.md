@@ -23,7 +23,9 @@ Write the question as a proposal the person can approve with one click. For exam
 
 # Versioning and pull request
 
-If the role contract assigns publication to Hibernaut, commit the reviewed work locally, classify the change, and report the evidence. Hibernaut handles the version and PR. For standalone publication, follow these steps:
+If the role contract assigns publication to Hibernaut, commit the reviewed work locally, classify the change, and report the evidence. Hibernaut handles the version and PR. When the task asks for a report on the pull request, such as the new head and the result when you rework someone else's PR, write that comment in the report's `pr_comment` field. Use `{head_sha}` and `{pr_url}` for values you cannot know before delivery. Hibernaut posts the comment once per pushed head. Anyone who can see the PR can read it, so leave out private material such as local paths, session IDs, internal notes, and credentials. Omit the field when the task does not ask for a PR comment.
+
+For standalone publication, follow these steps:
 
 - Locate the repository's version definition (follow the project guidance or README when specified; otherwise inspect standard project files such as `src/*/__init__.py`, `pyproject.toml`, `package.json`, `Cargo.toml`, or `VERSION`). If the repository tracks a version, bump it according to the project's versioning rules (default SemVer: patch for fixes, minor for compatible features, major for breaking changes). On a rework round where this branch already bumped the version, keep that bump unless the change scope grew.
 - Re-run the repository's full checks after bumping the version so the final commit is verified.

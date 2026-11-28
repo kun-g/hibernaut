@@ -57,6 +57,10 @@ _LOG_PREFIX = re.compile(r"^[^\t\n]*\t[^\t\n]*\t[0-9TZ:.-]+ ?", re.M)
 _FAILED_TEST = re.compile(r"^(?:FAILED|ERROR) (\S+)", re.M)
 _NO_RERUN = re.compile(r"HTTP 403\b|admin rights|not accessible|permission", re.I)
 _MAX_TESTS = 20
+COMMENT_PLACEHOLDERS = ("{head_sha}", "{pr_url}", "{pr_number}", "{version}")
+# Waits before each retry of a PR comment after a transient remote error (_REMOTE_TRANSIENT). Kept short and inside
+# the delivery: the comment never changes the delivery's result, so it does not use the delivery's 1/5/15 min retry.
+_COMMENT_RETRY_SECONDS = (10.0, 30.0, 90.0)
 
 
 def bump_version(version: str, bump: Bump) -> str:
@@ -281,6 +285,8 @@ class DeliveryRequest:
     issue: str = ""
     # Review notes that did not block, listed in the PR body.
     followups: tuple[str, ...] = ()
+    # The developer's comment for the PR, posted once per pushed head; may use COMMENT_PLACEHOLDERS.
+    pr_comment: str = ""
 
 
 def _strs() -> list[str]:
@@ -343,6 +349,11 @@ class DeliveryRecord:
     session_id: str = ""
     native_session_id: str = ""
     terminal: str = ""
+    # The developer's PR comment: the head it was posted for (never twice for one head), its URL, and what
+    # happened in this attempt.
+    comment_head: str = ""
+    comment_url: str = ""
+    comment: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
@@ -384,6 +395,8 @@ class DeliveryRecord:
             lines.append(f"CI: {self.ci}")
         if self.merge_sha:
             lines.append(f"Merge commit: {self.merge_sha}")
+        if self.comment:
+            lines.append(f"PR comment: {self.comment}")
         lines += [f"Note: {n}" for n in self.notes]
         lines += [f"History: {h}" for h in self.history[-5:]]
         if self.problem:
@@ -432,7 +445,7 @@ def _operation(argv: Sequence[str]) -> str:
         return "重跑失败的 CI 检查"
     if argv[1] == "pr":
         return {"checks": "查询合并前的检查状态", "create": "创建 PR", "edit": "更新 PR", "list": "查询 PR",
-                "view": "核对 PR 状态", "merge": "合并 PR"}.get(argv[2], "访问 GitHub")
+                "view": "核对 PR 状态", "merge": "合并 PR", "comment": "在 PR 上发评论"}.get(argv[2], "访问 GitHub")
     return {"push": "推送任务分支", "fetch": "获取最新基线", "ls-remote": "核对远端分支"}.get(argv[1], "准备交付")
 
 
@@ -586,7 +599,13 @@ class PRDelivery:
         return (
             f"## Delivery\nAfter you report done (and the review passes), Hibernaut merges the latest "
             f"{cfg.remote}/{cfg.base_branch} into this branch{version}, runs the repository checks, pushes the branch, "
-            f"opens the pull request and {merge}. Commit your work; do not push, open a pull request or merge."
+            f"opens the pull request and {merge}. Commit your work; do not push, open a pull request or merge.\n"
+            "When the task asks you to report back on the pull request (for example the new head and the result), "
+            "put that comment in pr_comment instead of the summary: Hibernaut posts it on the pull request once "
+            "for each pushed head, after pushing, with the delivery's gh account, replacing {head_sha}, {pr_url}, "
+            "{pr_number} and {version} with the delivered values. Everyone who can see the pull request reads it, "
+            "so leave out anything private (local paths, session IDs, internal notes, credentials). Leave "
+            "pr_comment out otherwise."
         )
 
     def deliver(
@@ -610,13 +629,15 @@ class PRDelivery:
         rec.merge_hold, rec.merge_hold_detail = "", ""
         rec.problem_summary = ""
         rec.transient = False
+        rec.comment = ""
         rec.attempts += 1
         if rec.state == "merged":
             rec.notes.append("already merged; nothing to do")
             self._store.save(req.work_key, rec.to_dict())
             return rec
         try:
-            self._publish(req, rec, permissions, approved, stop)
+            if self._publish(req, rec, permissions, approved, stop):
+                self._post_comment(req, rec, should_detach)
             # _publish moves rec.state on; the narrowing from the early return above no longer holds.
             if cast(str, rec.state) == "merged":
                 self._delete_remote_branch(req, rec)
@@ -633,7 +654,8 @@ class PRDelivery:
     def _publish(
         self, req: DeliveryRequest, rec: DeliveryRecord, permissions: PermissionPort, approved: frozenset[str],
         is_interrupted: Callable[[], bool],
-    ) -> None:
+    ) -> bool:
+        # True once this attempt passed the open_pr gate; rec.state then says whether a PR is open or merged.
         cfg = self._config
         if req.change_kind not in BUMP_FOR_KIND:
             raise _Problem(f"unknown change kind {req.change_kind!r} (expected {', '.join(CHANGE_KINDS)})",
@@ -642,21 +664,22 @@ class PRDelivery:
         if not cfg.open_pr:
             rec.notes.append("not pushed: this project does not authorize opening pull requests "
                              "(delivery.open_pr = false)")
-            return
+            return False
         if not self._gate(OPEN_PR_TOOL, req, rec, permissions, approved):
-            return
+            return False
         if rec.pushed_sha and self._merged_elsewhere(req, rec):
-            return
+            return True
         self._prepare(req, rec, is_interrupted)
         self._push(req, rec)
         self._open_pr(req, rec)
         self._confirm(req, rec)
         if rec.state != "pr_open":
-            return
+            return True
         if not cfg.auto_merge:
             rec.notes.append("not merged: this project does not authorize merging (delivery.auto_merge = false)")
-            return
+            return True
         self._merge(req, rec, permissions, approved, is_interrupted)
+        return True
 
     def outcome(self, rec: DeliveryRecord) -> DeliveryOutcome:
         # What the Outbox shows a person: an authorized merge that did not happen always names a reason.
@@ -1142,6 +1165,81 @@ class PRDelivery:
             rec.history.append(f"deleted {label}")
         except _Problem as exc:
             rec.notes.append(f"branch kept: {exc}")
+
+    # --- PR comment ---
+
+    def _post_comment(self, req: DeliveryRequest, rec: DeliveryRecord, should_detach: Callable[[], bool]) -> None:
+        # Raises no _Problem: whatever happens to the comment is reported, and the delivery's result stands.
+        if (not req.pr_comment.strip() or rec.problem or rec.state not in ("pr_open", "merged")
+                or not rec.pr_number or not rec.pushed_sha):
+            return
+        head = rec.pushed_sha
+        if rec.comment_head == head:
+            rec.comment = f"already posted for {head[:12]}: {rec.comment_url}"
+            return
+        # A hidden marker finds a comment the record lost, or one GitHub took before the reply was cut off.
+        marker = f"<!-- hibernaut:pr-comment {head} -->"
+        body = self._comment_body(req, rec, marker)
+        failure = ""
+        for tries, wait in enumerate((*_COMMENT_RETRY_SECONDS, None), start=1):
+            try:
+                url = self._find_comment(req.workdir, rec.pr_number, marker) or self._send_comment(
+                    req.workdir, rec.pr_number, body)
+            except _TransientRemoteError as exc:
+                if wait is not None and self._pause(wait, should_detach):
+                    continue
+                stopped = " (the process is stopping)" if wait is not None else ""
+                failure = f" after {tries} attempt(s){stopped}: {exc}"
+                break
+            except _Problem as exc:
+                failure = f": {exc}"
+                break
+            rec.comment_head, rec.comment_url = head, url
+            rec.comment = f"posted for {head[:12]}: {url}"
+            rec.history.append(f"PR comment posted for {head[:12]}")
+            self._store.save(req.work_key, rec.to_dict())
+            return
+        rec.comment = " ".join(f"not posted for {head[:12]}{failure}".split())
+        rec.history.append(f"PR comment {rec.comment}")
+
+    @staticmethod
+    def _comment_body(req: DeliveryRequest, rec: DeliveryRecord, marker: str) -> str:
+        values = {"{head_sha}": rec.pushed_sha, "{pr_url}": rec.pr_url, "{pr_number}": str(rec.pr_number),
+                  "{version}": rec.version}
+        pattern = "|".join(re.escape(p) for p in COMMENT_PLACEHOLDERS)
+        text = re.sub(pattern, lambda m: values[m.group(0)], req.pr_comment.strip())
+        room = _MAX_BODY - len(marker) - 2
+        if len(text) > room:
+            text = text[:room - 1] + "…"
+        return f"{text}\n\n{marker}"
+
+    def _find_comment(self, cwd: Path, number: int, marker: str) -> str:
+        view = self._gh(cwd, "pr", "view", str(number), "--json", "comments")
+        try:
+            data: object = json.loads(view.stdout)
+        except json.JSONDecodeError:
+            raise _Problem(f"gh pr view returned no JSON: {_tail(view.stdout, 300)}",
+                           "核对 PR 评论时无法读取 GitHub 返回的内容") from None
+        found = cast(dict[str, Any], data).get("comments") if isinstance(data, dict) else None
+        for comment in cast(list[object], found) if isinstance(found, list) else []:
+            if isinstance(comment, dict) and marker in str(cast(dict[str, Any], comment).get("body") or ""):
+                return str(cast(dict[str, Any], comment).get("url") or "") or "(URL not reported)"
+        return ""
+
+    def _send_comment(self, cwd: Path, number: int, body: str) -> str:
+        proc = self._gh(cwd, "pr", "comment", str(number), "--body", body)
+        return next((line.strip() for line in reversed(proc.stdout.splitlines()) if line.strip()),
+                    "(URL not reported)")
+
+    def _pause(self, seconds: float, should_detach: Callable[[], bool]) -> bool:
+        # False once the process is stopping: the comment then gives up instead of holding the stop.
+        left = seconds
+        while left > 0:
+            if should_detach():
+                return False
+            self._sleep(min(1.0, left))
+            left -= 1.0
+        return not should_detach()
 
     def _pr_checks(self, cwd: Path, number: int) -> list[dict[str, Any]]:
         proc = self._gh(cwd, "pr", "checks", str(number), "--json", "name,state,bucket,link", check=False)
