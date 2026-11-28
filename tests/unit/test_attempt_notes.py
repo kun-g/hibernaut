@@ -361,7 +361,11 @@ def test_two_updates_of_one_row_never_overlap(race: Race, writer: str, merge_fir
     timeout_ms, = conn.execute("PRAGMA busy_timeout").fetchone()
 
     def entered(attempt: str, change: Any) -> Any:
+        callback_started = False
+
         def noted(row: Any) -> Any:
+            nonlocal callback_started
+            callback_started = True
             entered_change.put(True)
             return change(row)
 
@@ -370,7 +374,7 @@ def test_two_updates_of_one_row_never_overlap(race: Race, writer: str, merge_fir
         try:
             return theirs(attempt, noted)
         except sqlite3.OperationalError as exc:
-            if exc.sqlite_errorcode != sqlite3.SQLITE_BUSY:
+            if callback_started or exc.sqlite_errorcode != sqlite3.SQLITE_BUSY:
                 raise
             entered_change.put(False)
         finally:
